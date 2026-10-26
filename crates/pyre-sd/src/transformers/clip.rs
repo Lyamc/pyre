@@ -1,0 +1,630 @@
+//! Contrastive Language-Image Pre-Training
+//!
+//! Contrastive Language-Image Pre-Training (CLIP) is an architecture trained on
+//! pairs of images with related texts.
+//!
+//! https://github.com/openai/CLIP
+
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use burn::config::Config;
+use burn::tensor::activation::softmax;
+use burn::{
+    module::Module,
+    nn,
+    tensor::{
+        activation::{gelu, sigmoid},
+        Int, Tensor,
+    },
+};
+use core::f32::consts::SQRT_2;
+
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use num_traits::Float;
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum Activation {
+    Gelu,
+    QuickGelu,
+    GeluErf,
+}
+
+impl Activation {
+    pub fn forward<const D: usize>(&self, xs: Tensor<D>) -> Tensor<D> {
+        match self {
+            Activation::Gelu => gelu(xs),
+            Activation::QuickGelu => xs.clone() * sigmoid(xs * 1.702f64),
+            Activation::GeluErf => (xs.clone() * (Tensor::erf(xs / SQRT_2) + 1)) / 2,
+        }
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct ClipConfig {
+    vocab_size: usize,
+    pub embed_dim: usize,   // aka config.hidden_size
+    activation: Activation, // aka config.hidden_act
+    intermediate_size: usize,
+    max_position_embeddings: usize,
+    // The character to use for padding, use EOS when not set.
+    pad_with: Option<String>,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    #[allow(dead_code)]
+    projection_dim: usize,
+}
+
+impl ClipConfig {
+    // The config details can be found in the "text_config" section of this json file:
+    // https://huggingface.co/openai/clip-vit-large-patch14/blob/main/config.json
+    pub fn v1_5() -> Self {
+        Self {
+            vocab_size: 49408,
+            embed_dim: 768,
+            intermediate_size: 3072,
+            max_position_embeddings: 77,
+            pad_with: None,
+            num_hidden_layers: 12,
+            num_attention_heads: 12,
+            projection_dim: 768,
+            activation: Activation::QuickGelu,
+        }
+    }
+
+    // https://huggingface.co/stabilityai/stable-diffusion-2-1/blob/main/text_encoder/config.json
+    pub fn v2_1() -> Self {
+        Self {
+            vocab_size: 49408,
+            embed_dim: 1024,
+            intermediate_size: 4096,
+            max_position_embeddings: 77,
+            pad_with: Some("!".to_string()),
+            num_hidden_layers: 23,
+            num_attention_heads: 16,
+            projection_dim: 512,
+            activation: Activation::Gelu,
+        }
+    }
+
+    // https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/text_encoder/config.json
+    pub fn sdxl() -> Self {
+        Self {
+            vocab_size: 49408,
+            embed_dim: 768,
+            intermediate_size: 3072,
+            max_position_embeddings: 77,
+            pad_with: Some("!".to_string()),
+            num_hidden_layers: 12,
+            num_attention_heads: 12,
+            projection_dim: 768,
+            activation: Activation::QuickGelu,
+        }
+    }
+
+    // https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/text_encoder_2/config.json
+    pub fn sdxl2() -> Self {
+        Self {
+            vocab_size: 49408,
+            embed_dim: 1280,
+            intermediate_size: 5120,
+            max_position_embeddings: 77,
+            pad_with: Some("!".to_string()),
+            num_hidden_layers: 32,
+            num_attention_heads: 20,
+            projection_dim: 1280,
+            activation: Activation::Gelu,
+        }
+    }
+
+    fn init_text_embeddings(&self, device: &burn::tensor::Device) -> ClipTextEmbeddings {
+        let token_embedding =
+            nn::EmbeddingConfig::new(self.vocab_size, self.embed_dim).init(device);
+        let position_embedding =
+            nn::EmbeddingConfig::new(self.max_position_embeddings, self.embed_dim).init(device);
+        let position_ids =
+            Tensor::arange(0..self.max_position_embeddings as i64, device).unsqueeze();
+
+        ClipTextEmbeddings {
+            token_embedding,
+            position_embedding,
+            position_ids,
+        }
+    }
+
+    fn init_attention(&self, device: &burn::tensor::Device) -> ClipAttention {
+        assert_eq!(
+            self.embed_dim % self.num_attention_heads,
+            0,
+            "embed_dim {} must be a multiple of num_attention_heads {}",
+            self.embed_dim,
+            self.num_attention_heads
+        );
+
+        let embed_dim = self.embed_dim;
+        let num_attention_heads = self.num_attention_heads;
+        // CLIP attention layers have bias (unlike UNet cross-attention which doesn't)
+        let k_proj = nn::LinearConfig::new(embed_dim, embed_dim).init(device);
+        let v_proj = nn::LinearConfig::new(embed_dim, embed_dim).init(device);
+        let q_proj = nn::LinearConfig::new(embed_dim, embed_dim).init(device);
+        let out_proj = nn::LinearConfig::new(embed_dim, embed_dim).init(device);
+        let head_dim = embed_dim / num_attention_heads;
+        let scale = (head_dim as f64).powf(-0.5);
+        ClipAttention {
+            k_proj,
+            v_proj,
+            q_proj,
+            out_proj,
+            head_dim,
+            scale,
+            num_attention_heads,
+        }
+    }
+
+    fn init_mlp(&self, device: &burn::tensor::Device) -> ClipMlp {
+        let fc1 = nn::LinearConfig::new(self.embed_dim, self.intermediate_size).init(device);
+        let fc2 = nn::LinearConfig::new(self.intermediate_size, self.embed_dim).init(device);
+        ClipMlp {
+            fc1,
+            fc2,
+            activation: self.activation.clone(),
+        }
+    }
+
+    fn init_encoder_layer(&self, device: &burn::tensor::Device) -> ClipEncoderLayer {
+        ClipEncoderLayer {
+            self_attn: self.init_attention(device),
+            layer_norm1: nn::LayerNormConfig::new(self.embed_dim).init(device),
+            mlp: self.init_mlp(device),
+            layer_norm2: nn::LayerNormConfig::new(self.embed_dim).init(device),
+        }
+    }
+
+    fn init_encoder(&self, device: &burn::tensor::Device) -> ClipEncoder {
+        let mut layers: Vec<ClipEncoderLayer> = Vec::new();
+        for _index in 0..self.num_hidden_layers {
+            let layer = self.init_encoder_layer(device);
+            layers.push(layer)
+        }
+        ClipEncoder { layers }
+    }
+
+    pub fn init_text_transformer(&self, device: &burn::tensor::Device) -> ClipTextTransformer {
+        let embeddings = self.init_text_embeddings(device);
+        let encoder = self.init_encoder(device);
+        let final_layer_norm = nn::LayerNormConfig::new(self.embed_dim).init(device);
+        ClipTextTransformer {
+            embeddings,
+            encoder,
+            final_layer_norm,
+        }
+    }
+}
+
+// CLIP Text Model
+// https://github.com/huggingface/transformers/blob/674f750a57431222fa2832503a108df3badf1564/src/transformers/models/clip/modeling_clip.py
+#[derive(Module, Debug)]
+struct ClipTextEmbeddings {
+    token_embedding: nn::Embedding,
+    position_embedding: nn::Embedding,
+    position_ids: Tensor<2, Int>,
+}
+
+impl ClipTextEmbeddings {
+    fn forward(&self, xs: Tensor<2, Int>) -> Tensor<3> {
+        let token_embedding = self.token_embedding.forward(xs);
+        let position_embedding = self.position_embedding.forward(self.position_ids.clone());
+        token_embedding + position_embedding
+    }
+}
+
+#[derive(Module, Debug)]
+struct ClipAttention {
+    k_proj: nn::Linear,
+    v_proj: nn::Linear,
+    q_proj: nn::Linear,
+    out_proj: nn::Linear,
+    head_dim: usize,
+    scale: f64,
+    num_attention_heads: usize,
+}
+
+impl ClipAttention {
+    fn shape(&self, xs: Tensor<3>, seq_len: usize, bsz: usize) -> Tensor<4> {
+        xs.reshape([bsz, seq_len, self.num_attention_heads, self.head_dim])
+            .swap_dims(1, 2)
+    }
+
+    fn forward(&self, xs: Tensor<3>, causal_attention_mask: Tensor<4>) -> Tensor<3> {
+        let [bsz, seq_len, embed_dim] = xs.dims();
+        let query_states = self.q_proj.forward(xs.clone()) * self.scale;
+        let proj_shape = [bsz * self.num_attention_heads, seq_len, self.head_dim];
+
+        let query_states = self.shape(query_states, seq_len, bsz).reshape(proj_shape);
+        let key_states = self
+            .shape(self.k_proj.forward(xs.clone()), seq_len, bsz)
+            .reshape(proj_shape);
+        let value_states = self
+            .shape(self.v_proj.forward(xs), seq_len, bsz)
+            .reshape(proj_shape);
+        let src_len = key_states.dims()[1];
+        let attn_weights = query_states.matmul(key_states.swap_dims(1, 2));
+
+        let attn_weights = attn_weights
+            .reshape([bsz, self.num_attention_heads, seq_len, src_len])
+            .add(causal_attention_mask);
+        let attn_weights = attn_weights.reshape([bsz * self.num_attention_heads, seq_len, src_len]);
+        let attn_weights = softmax(attn_weights, 2);
+
+        let attn_output = attn_weights.matmul(value_states);
+        let attn_output = attn_output
+            .reshape([bsz, self.num_attention_heads, seq_len, self.head_dim])
+            .swap_dims(1, 2)
+            .reshape([bsz, seq_len, embed_dim]);
+
+        self.out_proj.forward(attn_output)
+    }
+}
+
+#[derive(Module, Debug)]
+struct ClipMlp {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+    #[module(skip)]
+    activation: Activation,
+}
+
+impl ClipMlp {
+    fn forward<const D: usize>(&self, xs: Tensor<D>) -> Tensor<D> {
+        let xs = self.fc1.forward(xs);
+        self.fc2.forward(self.activation.forward(xs))
+    }
+}
+
+#[derive(Module, Debug)]
+pub(crate) struct ClipEncoderLayer {
+    self_attn: ClipAttention,
+    layer_norm1: nn::LayerNorm,
+    mlp: ClipMlp,
+    layer_norm2: nn::LayerNorm,
+}
+
+impl ClipEncoderLayer {
+    fn forward(&self, xs: Tensor<3>, causal_attention_mask: Tensor<4>) -> Tensor<3> {
+        let residual = xs;
+        let xs = self.layer_norm1.forward(residual.clone());
+        let xs = self.self_attn.forward(xs, causal_attention_mask);
+        let xs = xs + residual;
+
+        let residual = xs.clone();
+        let xs = self.layer_norm2.forward(xs);
+        let xs = self.mlp.forward(xs);
+        xs + residual
+    }
+}
+
+#[derive(Module, Debug)]
+pub(crate) struct ClipEncoder {
+    pub(crate) layers: Vec<ClipEncoderLayer>,
+}
+
+impl ClipEncoder {
+    fn forward(&self, xs: Tensor<3>, causal_attention_mask: Tensor<4>) -> Tensor<3> {
+        let mut xs = xs;
+        for layer in &self.layers {
+            xs = layer.forward(xs, causal_attention_mask.clone());
+        }
+        xs
+    }
+
+    fn forward_to_layer(
+        &self,
+        xs: Tensor<3>,
+        causal_attention_mask: Tensor<4>,
+        n: usize,
+    ) -> Tensor<3> {
+        let mut xs = xs;
+        for layer in self.layers.iter().take(n) {
+            xs = layer.forward(xs, causal_attention_mask.clone());
+        }
+        xs
+    }
+}
+
+/// A CLIP transformer based model.
+#[derive(Module, Debug)]
+pub struct ClipTextTransformer {
+    embeddings: ClipTextEmbeddings,
+    encoder: ClipEncoder,
+    final_layer_norm: nn::LayerNorm,
+}
+
+impl ClipTextTransformer {
+    // https://github.com/huggingface/transformers/blob/674f750a57431222fa2832503a108df3badf1564/src/transformers/models/clip/modeling_clip.py#L678
+    fn generate_causal_attention_mask(
+        bsz: usize,
+        seq_len: usize,
+        device: &burn::tensor::Device,
+    ) -> Tensor<4> {
+        let mask: Tensor<3> = Tensor::full([bsz, seq_len, seq_len], f32::MIN, device);
+        mask.triu(1).unsqueeze_dim(1)
+    }
+
+    /// Forward pass through the CLIP text transformer.
+    ///
+    /// # Arguments
+    /// * `xs` - Token IDs [batch_size, seq_len]
+    ///
+    /// # Returns
+    /// Text embeddings [batch_size, seq_len, embed_dim]
+    pub fn forward(&self, xs: Tensor<2, Int>) -> Tensor<3> {
+        let [bsz, seq_len] = xs.dims();
+        let xs = self.embeddings.forward(xs);
+        let causal_attention_mask =
+            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device());
+        let xs = self.encoder.forward(xs, causal_attention_mask);
+        self.final_layer_norm.forward(xs)
+    }
+
+    /// Returns the penultimate encoder layer output without final_layer_norm.
+    /// Used by SDXL which extracts hidden_states[-2].
+    pub fn forward_penultimate(&self, xs: Tensor<2, Int>) -> Tensor<3> {
+        let [bsz, seq_len] = xs.dims();
+        let xs = self.embeddings.forward(xs);
+        let causal_attention_mask =
+            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device());
+        let n_layers = self.encoder.layers.len();
+        self.encoder
+            .forward_to_layer(xs, causal_attention_mask, n_layers - 1)
+    }
+}
+
+/// Configuration for a CLIP text model with an additional linear projection layer.
+/// Used by SDXL's second text encoder to produce pooled embeddings.
+#[derive(Config, Debug)]
+pub struct CLIPTextModelWithProjectionConfig {
+    pub clip: ClipConfig,
+    pub projection_dim: usize,
+}
+
+impl CLIPTextModelWithProjectionConfig {
+    /// Returns a configuration for the SDXL second text encoder (OpenCLIP ViT-bigG).
+    pub fn sdxl2() -> Self {
+        Self {
+            clip: ClipConfig::sdxl2(),
+            projection_dim: 1280,
+        }
+    }
+
+    pub fn init(&self, device: &burn::tensor::Device) -> CLIPTextModelWithProjection {
+        let transformer = self.clip.init_text_transformer(device);
+        let text_projection = nn::LinearConfig::new(self.clip.embed_dim, self.projection_dim)
+            .with_bias(false)
+            .init(device);
+        CLIPTextModelWithProjection {
+            transformer,
+            text_projection,
+        }
+    }
+}
+
+/// A CLIP text model with a linear projection on top of the pooled output.
+/// Produces both hidden states (from the penultimate layer) and pooled embeddings.
+#[derive(Module, Debug)]
+pub struct CLIPTextModelWithProjection {
+    pub transformer: ClipTextTransformer,
+    pub text_projection: nn::Linear,
+}
+
+impl CLIPTextModelWithProjection {
+    /// Forward pass returning penultimate hidden states and pooled+projected embeddings.
+    ///
+    /// # Arguments
+    /// * `xs` - Token IDs [batch_size, seq_len]
+    ///
+    /// # Returns
+    /// * `hidden_states` - Penultimate layer output [batch_size, seq_len, embed_dim]
+    /// * `pooled` - Projected pooled output [batch_size, projection_dim]
+    pub fn forward(&self, xs: Tensor<2, Int>) -> (Tensor<3>, Tensor<2>) {
+        // Hidden states: penultimate layer (for cross-attention)
+        let hidden_states = self.transformer.forward_penultimate(xs.clone());
+
+        // Pooled output: full forward (all layers + final_layer_norm), then EOS pooling + projection
+        let full_output = self.transformer.forward(xs.clone());
+        let [_bsize, _seq_len, embed_dim] = full_output.dims();
+
+        let eos_indices = xs.argmax(1); // [batch, 1]
+        let gather_indices = eos_indices
+            .unsqueeze_dim(2) // [batch, 1, 1]
+            .repeat_dim(2, embed_dim); // [batch, 1, embed_dim]
+        let pooled: Tensor<2> = full_output
+            .gather(1, gather_indices) // [batch, 1, embed_dim]
+            .squeeze_dim(1); // [batch, embed_dim]
+        let pooled = self.text_projection.forward(pooled);
+
+        (hidden_states, pooled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TestBackend;
+    use burn::tensor::{Shape, TensorData, Tolerance};
+
+    #[test]
+    fn test_init_text_embeddings() {
+        let device = Default::default();
+        let clip_config = ClipConfig::v1_5();
+        let text_embeddings: ClipTextEmbeddings<TestBackend> =
+            clip_config.init_text_embeddings(&device);
+
+        assert_eq!(text_embeddings.position_ids.shape(), Shape::from([1, 77]));
+
+        // Convert to i32 for comparison since wgpu uses I32 while other backends use I64
+        let expected: Vec<i32> = (0..77).collect();
+        assert_eq!(
+            text_embeddings
+                .position_ids
+                .into_data()
+                .convert::<i32>()
+                .to_vec::<i32>()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_clip_attention_shape() {
+        let device = Default::default();
+        let clip_config = ClipConfig::v1_5();
+        let clip_attention: ClipAttention<TestBackend> = clip_config.init_attention(&device);
+
+        let xs = Tensor::<TestBackend, 3>::zeros([2, 77, 768], &device);
+        let xs = clip_attention.shape(xs, 77, 2);
+
+        assert_eq!(xs.shape(), Shape::from([2, 12, 77, 64]));
+    }
+
+    #[test]
+    fn test_generate_causal_attention_mask() {
+        let device = <TestBackend as Backend>::Device::default();
+
+        let mask: Tensor<TestBackend, 4> =
+            ClipTextTransformer::generate_causal_attention_mask(2, 4, &device);
+        assert_eq!(mask.shape(), Shape::from([2, 1, 4, 4]));
+
+        mask.into_data().assert_approx_eq::<f32>(
+            &TensorData::from([
+                [[
+                    [0.0000e0, f32::MIN, f32::MIN, f32::MIN],
+                    [0.0000e0, 0.0000e0, f32::MIN, f32::MIN],
+                    [0.0000e0, 0.0000e0, 0.0000e0, f32::MIN],
+                    [0.0000e0, 0.0000e0, 0.0000e0, 0.0000e0],
+                ]],
+                [[
+                    [0.0000e0, f32::MIN, f32::MIN, f32::MIN],
+                    [0.0000e0, 0.0000e0, f32::MIN, f32::MIN],
+                    [0.0000e0, 0.0000e0, 0.0000e0, f32::MIN],
+                    [0.0000e0, 0.0000e0, 0.0000e0, 0.0000e0],
+                ]],
+            ]),
+            Tolerance::rel_abs(1e-3, 1e-3),
+        );
+    }
+
+    /// Test QuickGelu activation matches diffusers-rs
+    /// QuickGelu: x * sigmoid(1.702 * x)
+    /// Reference values from diffusers-rs v0.3.1
+    #[test]
+    fn test_quick_gelu_matches_diffusers_rs() {
+        let device = Default::default();
+        let xs: Tensor<TestBackend, 1> = Tensor::from_data(
+            TensorData::from([-2.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]),
+            &device,
+        );
+
+        let result = Activation::QuickGelu.forward(xs);
+
+        // Reference values from diffusers-rs: xs * (xs * 1.702).sigmoid()
+        result.into_data().assert_approx_eq::<f32>(
+            &TensorData::from([
+                -0.064341374f32,
+                -0.15420423,
+                -0.14961156,
+                0.0,
+                0.35038844,
+                0.84579575,
+                1.9356586,
+            ]),
+            Tolerance::rel_abs(1e-4, 1e-4),
+        );
+    }
+
+    /// Test GeluErf activation matches diffusers-rs
+    /// GeluErf: 0.5 * x * (1 + erf(x / sqrt(2)))
+    /// Reference values from diffusers-rs v0.3.1
+    #[test]
+    fn test_gelu_erf_matches_diffusers_rs() {
+        let device = Default::default();
+        let xs: Tensor<TestBackend, 1> = Tensor::from_data(
+            TensorData::from([-2.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]),
+            &device,
+        );
+
+        let result = Activation::GeluErf.forward(xs);
+
+        // Reference values from diffusers-rs: (xs * (xs / sqrt(2)).erf() + 1) / 2
+        result.into_data().assert_approx_eq::<f32>(
+            &TensorData::from([
+                -0.04550028f32,
+                -0.15865526,
+                -0.15426877,
+                0.0,
+                0.34573123,
+                0.8413447,
+                1.9544997,
+            ]),
+            Tolerance::rel_abs(1e-4, 1e-4),
+        );
+    }
+
+    /// Test Gelu activation matches diffusers-rs (gelu("none"))
+    /// Reference values from diffusers-rs v0.3.1
+    #[test]
+    fn test_gelu_matches_diffusers_rs() {
+        let device = Default::default();
+        let xs: Tensor<TestBackend, 1> = Tensor::from_data(
+            TensorData::from([-2.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]),
+            &device,
+        );
+
+        let result = Activation::Gelu.forward(xs);
+
+        // Reference values from diffusers-rs: gelu("none")
+        // Note: Burn's gelu() uses the same approximation as PyTorch's gelu("none")
+        result.into_data().assert_approx_eq::<f32>(
+            &TensorData::from([
+                -0.04550028f32,
+                -0.15865526,
+                -0.15426877,
+                0.0,
+                0.34573123,
+                0.8413447,
+                1.9544997,
+            ]),
+            Tolerance::rel_abs(1e-4, 1e-4),
+        );
+    }
+
+    #[test]
+    fn test_clip_forward_penultimate_differs_from_forward() {
+        let device = Default::default();
+        let config = ClipConfig::v1_5();
+        let clip = config.init_text_transformer::<TestBackend>(&device);
+
+        let tokens: Tensor<TestBackend, 2, Int> = Tensor::zeros([1, 77], &device);
+
+        let full_output = clip.forward(tokens.clone());
+        let penultimate = clip.forward_penultimate(tokens);
+
+        let diff: f32 = burn::prelude::ElementConversion::elem(
+            (full_output - penultimate).abs().max().into_scalar(),
+        );
+        assert!(diff > 0.0, "penultimate should differ from full forward");
+    }
+
+    #[test]
+    fn test_clip_with_projection_output_shapes() {
+        let device = Default::default();
+        let config = CLIPTextModelWithProjectionConfig::sdxl2();
+        let model = config.init::<TestBackend>(&device);
+
+        let tokens: Tensor<TestBackend, 2, Int> = Tensor::zeros([1, 77], &device);
+        let (hidden, pooled) = model.forward(tokens);
+
+        assert_eq!(hidden.dims(), [1, 77, 1280]);
+        assert_eq!(pooled.dims(), [1, 1280]);
+    }
+}

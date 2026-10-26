@@ -1,0 +1,22 @@
+[package]
+name = "pyre-sd"
+description = "Stable Diffusion on Burn, vendored from oxiglade/diffusers-burn @ 9061882 and ported to the workspace Burn"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = ["burn/std", "regex", "thiserror", "burn-store", "safetensors", "memmap2"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { workspace = true }
+burn-store = { workspace = true, optional = true }
+num-traits = { version = "0.2.18", default-features = false }
+regex = { version = "1.10", optional = true }
+safetensors = { version = "0.8", optional = true }
+memmap2 = { version = "0.9", optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+thiserror = { version = "1.0", optional = true }

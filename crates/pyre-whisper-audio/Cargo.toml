@@ -1,0 +1,20 @@
+[package]
+name = "pyre-whisper-audio"
+description = "Pure-Rust audio decode, resample, and format export for whisburn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyre-whisper-core = { workspace = true }
+symphonia = { workspace = true }
+rubato = { workspace = true }
+hound = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+opus-rs = "0.1.39"
+
+[dev-dependencies]
+pyre-whisper-core = { workspace = true }

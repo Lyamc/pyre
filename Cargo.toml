@@ -1,3 +1,45 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/*"]
+exclude = ["third_party/hf-hub", "gui"]
+
+[workspace.dependencies]
+# ONE Burn for the whole workspace: Lyamc's fork, pinned (main @ 2026-10-26).
+burn = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std"] }
+burn-store = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std", "safetensors"] }
+pyre-whisper-core = { path = "crates/pyre-whisper-core" }
+pyre-whisper-audio = { path = "crates/pyre-whisper-audio" }
+pyre-whisper-engine = { path = "crates/pyre-whisper-engine", default-features = false }
+pyre-whisper-models = { path = "crates/pyre-whisper-models" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+hf-hub = { path = "third_party/hf-hub", default-features = false, features = ["ureq", "native-tls"] }
+symphonia = { version = "0.5", default-features = false, features = ["wav", "mp3", "flac", "ogg", "pcm", "aac", "isomp4", "mkv"] }
+rubato = "5"
+hound = "3.5"
+tokenizers = { version = "0.23", default-features = false, features = ["onig", "progressbar"] }
+npy = { git = "https://github.com/Lyamc/npy-rs" }
+strum = "0.28"
+strum_macros = "0.28"
+flate2 = "1.0"
+indicatif = "0.18"
+regex = "1.11"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4", "serde", "js"] }
+tempfile = "3"
+safetensors = "0.8"
+half = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
 [package]
 name = "pyre"
 version = "0.1.0"
@@ -6,17 +48,16 @@ license = "MIT OR Apache-2.0"
 description = "llama.cpp-server-style LLM inference server where Burn runs the model"
 
 [features]
-image = ["dep:diffusers-burn", "dep:burn020", "dep:image"]
-stt = ["dep:whisburn-core", "dep:whisburn-audio", "dep:whisburn-engine", "dep:whisburn-models"]
-default = ["cuda", "wgpu", "flex", "ndarray", "stt", "image"]
+image = ["dep:pyre-sd", "dep:image"]
+stt = ["dep:pyre-whisper-core", "dep:pyre-whisper-audio", "dep:pyre-whisper-engine", "dep:pyre-whisper-models"]
+default = ["cuda", "wgpu", "flex", "stt", "image"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/vulkan"]
 flex = ["burn/flex", "burn/rayon"]
-ndarray = ["burn/ndarray"]
 
 [dependencies]
-burn = { version = "0.22.1", default-features = false, features = ["std", "fusion", "autotune"] }
+burn = { workspace = true, default-features = false, features = ["std", "fusion", "autotune", "persistence"] }
 safetensors = "0.8"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 hf-hub = { version = "1.0", features = ["blocking"] }
@@ -38,18 +79,15 @@ toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
-# Image generation: Stable Diffusion via diffusers-burn (MIT/Apache, burn 0.20), pinned.
-diffusers-burn = { git = "https://github.com/oxiglade/diffusers-burn", rev = "906188226ee1d5ccc543d621ab345b0aa1968e03", default-features = false, features = ["std", "cuda", "wgpu"], optional = true }
-burn020 = { package = "burn", version = "0.20.1", default-features = false, features = ["std", "cuda", "wgpu", "fusion", "autotune"], optional = true }
+# Image generation: Stable Diffusion, vendored from oxiglade/diffusers-burn (MIT/Apache) and ported to the workspace Burn.
+pyre-sd = { path = "crates/pyre-sd", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 base64 = "0.22"
-# Speech-to-text: the user's whisburn project (burn 0.21), pinned to a commit of the local repo.
-# A git dependency (not a path dep) so pyre builds against committed whisburn code and never
-# touches or depends on its working tree. Optional so `--no-default-features` skips burn 0.21.
-whisburn-core = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
-whisburn-audio = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
-whisburn-engine = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
-whisburn-models = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
+# Speech-to-text: Whisper (and friends) vendored from the user's whisburn @ d27f1fc, now owned by pyre.
+pyre-whisper-core = { path = "crates/pyre-whisper-core", optional = true }
+pyre-whisper-audio = { path = "crates/pyre-whisper-audio", optional = true }
+pyre-whisper-engine = { path = "crates/pyre-whisper-engine", optional = true }
+pyre-whisper-models = { path = "crates/pyre-whisper-models", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -62,3 +100,8 @@ codegen-units = 16
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
+
+# Local fix (not pushed): cubecl's Turso kernel cache requests multiprocess WAL, unsupported on Windows.
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
+

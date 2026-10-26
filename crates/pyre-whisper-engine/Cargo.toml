@@ -1,0 +1,46 @@
+[package]
+name = "pyre-whisper-engine"
+description = "Burn-based speech inference engine (Whisper, Parakeet, and more)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyre-whisper-core = { workspace = true }
+pyre-whisper-audio = { workspace = true }
+burn = { workspace = true }
+serde = { workspace = true }
+num-traits = "0.2"
+hound = { workspace = true }
+tokenizers = { workspace = true }
+npy = { workspace = true }
+cfg-if = "1.0"
+strum = { workspace = true }
+strum_macros = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+dasp = { version = "0.11", features = ["all"] }
+rtrb = "0.3"
+flate2 = { workspace = true }
+ureq = { workspace = true }
+indicatif = { workspace = true }
+regex = { workspace = true }
+safetensors = { workspace = true }
+half = { workspace = true }
+termsize = "0.1"
+cpal = "0.18"
+clap = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["wgpu", "cpu"]
+wgpu = ["burn/wgpu"]
+# Pure CPU fallback using ndarray (useful when WGPU CPU adapters are unavailable)
+cpu = ["burn/flex"]
+cuda = ["burn/cuda"]
+
+[dev-dependencies]
+indicatif = { workspace = true }
+sysinfo = "0.39"
+pyre-whisper-audio = { workspace = true }

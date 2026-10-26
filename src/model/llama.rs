@@ -155,7 +155,7 @@ impl Llama {
             for i in 0..t { for j in 0..kv_len { m.push(j > start + i); } }
             Some(Tensor::<4, Bool>::from_data(TensorData::new(m, [1, 1, t, kv_len]), &self.device).expand([1, nh, t, kv_len]))
         };
-        let opts = AttentionModuleOptions { scale: None, softcap: None, is_causal: full };
+        let opts = AttentionModuleOptions { scale: None, softcap: None, is_causal: full, causal_alignment: Default::default() };
         for (li, l) in self.layers.iter().enumerate() {
             let h = rms(x.clone(), &l.in_norm, eps, self.dtype);
             let mut q = l.q.fwd(h.clone()).reshape([1, t, nh, hd]).swap_dims(1, 2);

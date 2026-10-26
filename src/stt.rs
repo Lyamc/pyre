@@ -1,4 +1,5 @@
-//! Speech-to-text model kind, backed by the user's whisburn crates (burn 0.21) through a thin adapter.
+//! Speech-to-text model kind, backed by pyre-whisper-* (Whisper & co., vendored from the user's whisburn
+//! @ d27f1fc and ported to the workspace Burn; pyre owns this code now).
 //!
 //! whisburn keeps its own Burn-native bundles (converted `model.mpk` + tokenizer + config) under
 //! `WHISBURN_MODELS_DIR/<name>`. pyre points that at `<pyre store>/stt/whisburn` unless the user
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "stt")]
-use whisburn_engine::{model::registry::MODEL_REGISTRY, runtime::InferenceRuntime};
+use pyre_whisper_engine::{model::registry::MODEL_REGISTRY, runtime::InferenceRuntime};
 
 pub struct SttModel {
     pub name: String,
@@ -36,13 +37,13 @@ fn map_ref(r: &str) -> Result<(String, Option<PathBuf>)> {
     let r = r.strip_prefix("whisburn:").unwrap_or(r);
     for m in MODEL_REGISTRY {
         if m.name.eq_ignore_ascii_case(r) || m.hf_id.eq_ignore_ascii_case(r) {
-            if !matches!(m.category, whisburn_engine::model::registry::ModelCategory::Asr) {
+            if !matches!(m.category, pyre_whisper_engine::model::registry::ModelCategory::Asr) {
                 bail!("whisburn model '{}' is not a speech-recognition model", m.name);
             }
             return Ok((m.name.to_string(), None));
         }
     }
-    let names: Vec<_> = MODEL_REGISTRY.iter().filter(|m| matches!(m.category, whisburn_engine::model::registry::ModelCategory::Asr)).map(|m| m.name).collect();
+    let names: Vec<_> = MODEL_REGISTRY.iter().filter(|m| matches!(m.category, pyre_whisper_engine::model::registry::ModelCategory::Asr)).map(|m| m.name).collect();
     bail!("unknown speech-to-text model '{r}'. whisburn supports: {}", names.join(", "))
 }
 
@@ -64,18 +65,17 @@ impl SttModel {
         std::fs::create_dir_all(&models_dir)?;
         // SAFETY-ish: edition 2021; set before whisburn reads it; pyre loads models one at a time.
         std::env::set_var("WHISBURN_MODELS_DIR", &models_dir);
-        let dir = whisburn_core::resolve_model_dir(&name);
-        let has_bundle = dir.join("model.mpk").is_file() || dir.join("model.mpk.gz").is_file() || dir.join(format!("{name}.mpk")).is_file();
+        let dir = pyre_whisper_core::resolve_model_dir(&name);
+        let has_bundle = dir.join("model.bpk").is_file() || dir.join(format!("{name}.bpk")).is_file();
         if !has_bundle {
             if offline || explicit.is_some() { bail!("no whisburn bundle for '{name}' in {} (offline or explicit path)", dir.display()); }
             tracing::info!("whisburn: downloading + converting '{name}' into {}", models_dir.display());
-            whisburn_models::download_model(&name, &whisburn_models::DownloadOptions::default())
+            pyre_whisper_models::download_model(&name, &pyre_whisper_models::DownloadOptions::default())
                 .map_err(|e| anyhow!("whisburn download/convert failed: {e:#}"))?;
         }
-        // whisburn runs on wgpu (any GPU incl. NVIDIA via Vulkan/DX12) or ndarray CPU. It has no
-        // CUDA runtime, so pyre's `cuda` maps to whisburn's wgpu.
-        let dev = match backend { "cpu" | "ndarray" | "flex" => Some("cpu".to_string()), _ => None };
-        let rt = InferenceRuntime::new(dev, false, false);
+        // Same Burn as the LLM path, so Whisper runs on any pyre backend (cuda, wgpu, vulkan, cpu).
+        let (dev, _dt, _label) = crate::backend::select(if backend == "ndarray" { "cpu" } else { backend }, "f32", None)?;
+        let rt = InferenceRuntime::with_device(dev, false, false);
         let t = std::time::Instant::now();
         rt.warm_model(&name).map_err(|e| anyhow!("whisburn failed to load '{name}': {e}"))?;
         let backend_desc = rt.backend_name();
@@ -133,7 +133,7 @@ struct Transcript;
 fn render(_: &Transcript, _: &str, _: f64, _: bool) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
 
 #[cfg(feature = "stt")]
-type Transcript = whisburn_core::TranscriptResult;
+type Transcript = pyre_whisper_core::TranscriptResult;
 
 #[cfg(feature = "stt")]
 fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64, String)> {
@@ -144,12 +144,12 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     impl Drop for Clear<'_> { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
     let _c = Clear(&stt.busy);
     let ext = Path::new(&q.filename).extension().and_then(|e| e.to_str()).unwrap_or("wav").to_ascii_lowercase();
-    let wav = whisburn_audio::decode_bytes_to_mono_pcm(&q.file, &ext).map_err(|e| anyhow!("could not decode audio ({ext}): {e}"))?;
+    let wav = pyre_whisper_audio::decode_bytes_to_mono_pcm(&q.file, &ext).map_err(|e| anyhow!("could not decode audio ({ext}): {e}"))?;
     let wav = wav.ensure_sample_rate(16_000).map_err(|e| anyhow!("resample: {e}"))?;
     let dur = wav.duration_secs();
-    let mut o = whisburn_core::TaskOptions::default();
-    o.task = if translate { whisburn_core::SpeechTask::Translate } else { whisburn_core::SpeechTask::Transcribe };
-    if let Some(l) = &q.language { o.language = whisburn_core::LanguageCode::new(l.clone()); }
+    let mut o = pyre_whisper_core::TaskOptions::default();
+    o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
+    if let Some(l) = &q.language { o.language = pyre_whisper_core::LanguageCode::new(l.clone()); }
     // whisburn only walks past the first 30 s window / sentence in timestamp mode, so always use it.
     o.include_timestamps = true;
     let t = std::time::Instant::now();
@@ -162,8 +162,8 @@ fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool) -> Response {
     let text = r.text.trim().to_string();
     match fmt {
         "text" => (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], text + "\n").into_response(),
-        "srt" => (StatusCode::OK, [("content-type", "application/x-subrip")], whisburn_audio::format_srt(&r.segments, false)).into_response(),
-        "vtt" => (StatusCode::OK, [("content-type", "text/vtt")], whisburn_audio::format_vtt(&r.segments, false)).into_response(),
+        "srt" => (StatusCode::OK, [("content-type", "application/x-subrip")], pyre_whisper_audio::format_srt(&r.segments, false)).into_response(),
+        "vtt" => (StatusCode::OK, [("content-type", "text/vtt")], pyre_whisper_audio::format_vtt(&r.segments, false)).into_response(),
         "verbose_json" => Json(json!({
             "task": if translate { "translate" } else { "transcribe" },
             "language": r.language, "duration": dur, "text": text,
