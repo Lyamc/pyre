@@ -6,7 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "llama.cpp-server-style LLM inference server where Burn runs the model"
 
 [features]
-default = ["cuda", "wgpu", "flex", "ndarray"]
+stt = ["dep:whisburn-core", "dep:whisburn-audio", "dep:whisburn-engine", "dep:whisburn-models"]
+default = ["cuda", "wgpu", "flex", "ndarray", "stt"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/vulkan"]
@@ -36,6 +37,13 @@ toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
+# Speech-to-text: the user's whisburn project (burn 0.21), pinned to a commit of the local repo.
+# A git dependency (not a path dep) so pyre builds against committed whisburn code and never
+# touches or depends on its working tree. Optional so `--no-default-features` skips burn 0.21.
+whisburn-core = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
+whisburn-audio = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
+whisburn-engine = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
+whisburn-models = { git = "file:///C:/Build/machine-learning/whisburn", rev = "d27f1fc", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

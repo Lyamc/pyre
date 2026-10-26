@@ -105,13 +105,20 @@ pub struct LoadReq<'a> { pub kind: Kind, pub r: &'a str, pub alias: Option<Strin
 
 /// Resolve + load a model (blocking; run on a blocking thread from async code).
 pub fn load(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
+    let backend = q.backend.clone().unwrap_or_else(|| d.backend.clone());
+    if q.kind == Kind::Stt {
+        // STT bundles are whisburn-format (converted .mpk), resolved by the whisburn adapter.
+        let backend = if matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { "cpu".to_string() } else { "wgpu".to_string() };
+        let s = crate::stt::SttModel::load(q.r, &backend, &storage.store.root, storage.offline).context("loading speech-to-text model")?;
+        let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
+        return Ok(Loaded { id, kind: q.kind, backend, path: s.dir.display().to_string(), created: now(), inner: Inner::Stt(Arc::new(s)) });
+    }
     let (dir, src) = storage.resolver().resolve(q.r)?;
     tracing::info!("resolved {} -> {} (via {src:?})", q.r, dir.display());
-    let backend = q.backend.clone().unwrap_or_else(|| d.backend.clone());
     let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
     let inner = match q.kind {
         Kind::Llm => Inner::Llm(Arc::new(crate::load_llm(&dir, &id, &backend, q.dtype.as_deref().unwrap_or(&d.dtype), q.ctx_size.unwrap_or(d.ctx_size), d.n_predict)?)),
-        Kind::Stt => Inner::Stt(Arc::new(crate::stt::SttModel::load(&dir, &backend).context("loading speech-to-text model")?)),
+        Kind::Stt => unreachable!(),
         Kind::Image => Inner::Placeholder("image generation (Stable Diffusion on Burn) is not implemented yet; see README roadmap".into()),
         Kind::Tts => Inner::Placeholder("text-to-speech is not implemented yet; see README roadmap".into()),
         Kind::Unknown => anyhow::bail!("unknown model kind for {}", q.r),

@@ -52,3 +52,50 @@ pyre models rm <name> [--from-hf-cache] [-y]         # never deletes HF blobs un
 pyre models alias <name> <alias>
 pyre models info <name>
 ```
+
+## Speech to text (whisburn)
+
+STT is backed by [whisburn](file:///C:/Build/machine-learning/whisburn), Lyam's Burn speech project. pyre
+uses it unmodified through a thin adapter (`src/stt.rs`).
+
+- **Dependency:** `whisburn-core`, `whisburn-audio`, `whisburn-engine` and `whisburn-models` come in as
+  **git** dependencies on the local repo, pinned to commit `d27f1fc`
+  (`git = "file:///C:/Build/machine-learning/whisburn"`). That keeps pyre building against committed
+  whisburn code rather than its working tree. To bump it, change `rev`.
+  Cargo feature `stt` (on by default) can be dropped with `--no-default-features --features cuda,wgpu,flex`.
+- **Burn versions:** whisburn is on **burn 0.21** and pyre is on **burn 0.22.1**. Cargo treats them as
+  separate crates, so both are compiled and linked (it builds fine, but the first build is longer and
+  the binary is bigger). The STT model runs on burn 0.21's wgpu/ndarray runtime and the LLMs on
+  0.22's. They share no tensors, so this works, but there are two GPU runtimes and two autotune caches.
+  The long-term fix is for whisburn to move to burn 0.22 (see below).
+- **Backends:** whisburn has wgpu (any GPU, including NVIDIA through Vulkan/DX12) and ndarray (CPU).
+  `--backend cuda`/`wgpu` both map to whisburn's wgpu; `cpu`/`flex`/`ndarray` map to its CPU runtime.
+- **Models:** any whisburn ASR registry name (`tiny`, `tiny_en`, `base`, `small_en`, `large-v3-turbo`,
+  `distil-large-v3`, `parakeet-tdt-0.6b-v3`, `moonshine-tiny`, `qwen3-asr-0.6b`, ...), its HF repo id
+  (`openai/whisper-tiny.en`), or a path to an existing whisburn bundle directory.
+  Bundles are whisburn's converted format (`model.mpk` + tokenizer + config), not raw HF safetensors.
+  They live in `WHISBURN_MODELS_DIR` if set, else `<pyre store>/stt/whisburn/<name>`. A missing bundle
+  is fetched by whisburn's own downloader (its published bundle from `lyamc/whisburn`, or a conversion
+  from upstream HF). `--offline` disables this. Because `WHISBURN_MODELS_DIR` is process-global, all
+  STT models in one pyre process share one bundle dir.
+
+```
+pyre serve -m qwen --stt-model tiny_en
+curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F model=whisper-1 -F response_format=verbose_json
+```
+
+`response_format`: `json` (default), `text`, `srt`, `vtt`, `verbose_json` (segments + duration + language).
+`/v1/audio/translations` runs whisburn's translate task. `language` is honoured; `prompt`, `temperature`
+and `timestamp_granularities` are accepted and ignored. Input is decoded by whisburn-audio (symphonia:
+wav/mp3/flac/ogg-vorbis/m4a-aac). Browser mic recordings (webm/opus) may not decode.
+
+Measured on an RTX 3060 with a 7.5 s clip (Windows SAPI voice) and `tiny_en`: wgpu 0.8-1.2 s per request
+(6-9x realtime; the first request is about 4.9 s while kernels compile), ndarray CPU 11.2 s (0.7x). The
+transcript was exact except "Pyre" was heard as "Fire".
+
+**whisburn changes that would help (not made; whisburn is untouched):**
+1. Move to burn 0.22 so pyre shares one Burn/cubecl (and gets CUDA for STT).
+2. Accept a models dir per `InferenceRuntime`/`load_model` call instead of the global `WHISBURN_MODELS_DIR`.
+3. Load Whisper straight from HF safetensors (like the qwen3/parakeet paths) so pyre can reuse the HF cache with zero extra disk.
+4. With `include_timestamps = false`, Whisper decoding stops after the first sentence/window; pyre works around it by always requesting timestamps.
+5. Stop forcing `fancy-regex` on `tokenizers` (pyre uses `onig`; it builds, but both regex engines get compiled in).
