@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
@@ -18,8 +18,8 @@
     <button data-tab="status">Server</button>
   </nav>
   <div class="right">
-    <button id="keyBtn" class="ghost" title="API key">🔑</button>
-    <button id="themeBtn" class="ghost" title="Toggle theme">◐</button>
+    <button id="keyBtn" class="ghost" title="API key">ðŸ”‘</button>
+    <button id="themeBtn" class="ghost" title="Toggle theme">â—</button>
   </div>
 </header>
 
@@ -34,7 +34,7 @@
     <div class="chatbar">
       <select id="modelPick" title="Model"></select>
       <span id="tps" class="muted"></span>
-      <button id="settingsBtn" class="ghost">⚙ Settings</button>
+      <button id="settingsBtn" class="ghost">âš™ Settings</button>
     </div>
     <div id="settings" class="settings hidden">
       <label class="full">System prompt<textarea id="sysPrompt" rows="2" placeholder="You are a helpful assistant."></textarea></label>
@@ -48,8 +48,8 @@
     <form id="composer" class="composer">
       <textarea id="input" rows="2" placeholder="Send a message (Enter to send, Shift+Enter for newline)"></textarea>
       <div class="actions">
-        <button type="button" id="regenBtn" class="ghost" title="Regenerate last reply">↻</button>
-        <button type="button" id="stopBtn" class="danger hidden">■ Stop</button>
+        <button type="button" id="regenBtn" class="ghost" title="Regenerate last reply">â†»</button>
+        <button type="button" id="stopBtn" class="danger hidden">â–  Stop</button>
         <button type="submit" id="sendBtn" class="primary">Send</button>
       </div>
     </form>
@@ -88,7 +88,7 @@
 <!-- IMAGES -->
 <section id="tab-images" class="tab">
   <div class="card" id="imgCard">
-    <div class="disabled-note" id="imgNote">No image-generation model is loaded. Stable Diffusion on Burn is on the roadmap; this page activates once an image model is served.</div>
+    <div class="disabled-note" id="imgNote">No image-generation model is loaded (start with <code>--image-model stable-diffusion-v1-5/stable-diffusion-v1-5</code> or load one on the Models page).</div>
     <fieldset id="imgForm" disabled>
       <label class="full">Prompt<textarea id="imgPrompt" rows="2"></textarea></label>
       <label class="full">Negative prompt<input id="imgNeg"></label>
@@ -112,7 +112,7 @@
       <div class="disabled-note" id="sttNote">No speech-to-text model is loaded (start with <code>--stt-model</code>).</div>
       <fieldset id="sttForm" disabled>
         <div class="row"><input type="file" id="sttFile" accept="audio/*">
-          <button id="recBtn" type="button">● Record</button>
+          <button id="recBtn" type="button">â— Record</button>
           <select id="sttTask"><option value="transcriptions">Transcribe</option><option value="translations">Translate to English</option></select>
           <input id="sttLang" placeholder="language (auto)" size="10">
           <button id="sttGo" class="primary" type="button">Run</button></div>

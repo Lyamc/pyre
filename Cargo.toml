@@ -6,8 +6,9 @@ license = "MIT OR Apache-2.0"
 description = "llama.cpp-server-style LLM inference server where Burn runs the model"
 
 [features]
+image = ["dep:diffusers-burn", "dep:burn020", "dep:image"]
 stt = ["dep:whisburn-core", "dep:whisburn-audio", "dep:whisburn-engine", "dep:whisburn-models"]
-default = ["cuda", "wgpu", "flex", "ndarray", "stt"]
+default = ["cuda", "wgpu", "flex", "ndarray", "stt", "image"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/vulkan"]
@@ -37,6 +38,11 @@ toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
+# Image generation: Stable Diffusion via diffusers-burn (MIT/Apache, burn 0.20), pinned.
+diffusers-burn = { git = "https://github.com/oxiglade/diffusers-burn", rev = "906188226ee1d5ccc543d621ab345b0aa1968e03", default-features = false, features = ["std", "cuda", "wgpu"], optional = true }
+burn020 = { package = "burn", version = "0.20.1", default-features = false, features = ["std", "cuda", "wgpu", "fusion", "autotune"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+base64 = "0.22"
 # Speech-to-text: the user's whisburn project (burn 0.21), pinned to a commit of the local repo.
 # A git dependency (not a path dep) so pyre builds against committed whisburn code and never
 # touches or depends on its working tree. Optional so `--no-default-features` skips burn 0.21.

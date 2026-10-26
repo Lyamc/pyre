@@ -27,7 +27,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/status", get(status))
         .route("/api/logs", get(logs))
         .route("/v1/images/generations", post(images))
-        .route("/sdapi/v1/txt2img", post(images))
+        .route("/sdapi/v1/txt2img", post(txt2img))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/speech", post(speech))
@@ -182,14 +182,66 @@ async fn status(State(app): S) -> Json<Value> {
 
 async fn logs() -> Json<Value> { Json(json!({"lines": crate::logbuf::tail(200)})) }
 
-async fn images(State(app): S, body: Option<Json<Value>>) -> Response {
-    let name = body.as_ref().and_then(|b| b.get("model")).and_then(|m| m.as_str()).map(String::from);
-    match app.find(Kind::Image, name.as_deref()) {
+fn image_model(app: &App, name: Option<&str>) -> Result<Arc<crate::image::ImageModel>, Response> {
+    let m = app.find(Kind::Image, name)?;
+    match &m.inner {
+        crate::registry::Inner::Image(i) => Ok(i.clone()),
+        crate::registry::Inner::Placeholder(r) => Err(err(StatusCode::NOT_IMPLEMENTED, r.clone())),
+        _ => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch")),
+    }
+}
+
+async fn run_images(im: Arc<crate::image::ImageModel>, ps: Vec<crate::image::GenParams>) -> Result<Vec<crate::image::Generated>, Response> {
+    use std::sync::atomic::Ordering;
+    im.queued.fetch_add(ps.len() as u64, Ordering::SeqCst);
+    let r = tokio::task::spawn_blocking(move || {
+        let mut out = vec![];
+        for (i, p) in ps.iter().enumerate() {
+            match im.generate(p) {
+                Ok(g) => { tracing::info!("image {}: {}x{} {} steps in {:.2}s ({:.2} it/s), seed {}", i, p.width, p.height, p.steps, g.seconds, p.steps as f64 / g.seconds, g.seed); out.push(g) }
+                Err(e) => { im.queued.fetch_sub((ps.len() - i - 1) as u64, Ordering::SeqCst); return Err(e) }
+            }
+        }
+        Ok(out)
+    }).await;
+    match r { Ok(Ok(v)) => Ok(v), Ok(Err(e)) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))), Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }
+}
+
+fn seed_of(v: Option<i64>) -> u64 { match v { Some(s) if s >= 0 => s as u64, _ => rand::random::<u32>() as u64 } }
+
+/// OpenAI `/v1/images/generations`. Extensions: negative_prompt, steps, guidance_scale, seed.
+async fn images(State(app): S, Json(b): Json<Value>) -> Response {
+    use base64::Engine;
+    let im = match image_model(&app, b["model"].as_str()) { Ok(i) => i, Err(r) => return r };
+    let Some(prompt) = b["prompt"].as_str() else { return err(StatusCode::BAD_REQUEST, "missing prompt") };
+    let (w, h) = match b["size"].as_str().unwrap_or("512x512").split_once('x').and_then(|(a, c)| Some((a.parse().ok()?, c.parse().ok()?))) { Some(x) => x, None => return err(StatusCode::BAD_REQUEST, "size must look like 512x512") };
+    let n = b["n"].as_u64().unwrap_or(1).clamp(1, 8) as usize;
+    let seed = seed_of(b["seed"].as_i64());
+    let ps = (0..n).map(|i| crate::image::GenParams { prompt: prompt.into(), negative: b["negative_prompt"].as_str().unwrap_or("").into(), width: w, height: h,
+        steps: b["steps"].as_u64().unwrap_or(30) as usize, guidance: b["guidance_scale"].as_f64().unwrap_or(7.5), seed: seed + i as u64 }).collect();
+    let url = b["response_format"].as_str() == Some("url");
+    match run_images(im, ps).await {
         Err(r) => r,
-        Ok(m) => match &m.inner {
-            crate::registry::Inner::Placeholder(r) => err(StatusCode::NOT_IMPLEMENTED, r.clone()),
-            _ => err(StatusCode::NOT_IMPLEMENTED, "image generation backend not available"),
-        },
+        Ok(v) => Json(json!({"created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "data": v.iter().map(|g| { let s = base64::engine::general_purpose::STANDARD.encode(&g.png);
+                if url { json!({"url": format!("data:image/png;base64,{s}"), "revised_prompt": prompt}) } else { json!({"b64_json": s, "revised_prompt": prompt}) } }).collect::<Vec<_>>(),
+            "timings": v.iter().map(|g| json!({"seconds": g.seconds, "seed": g.seed})).collect::<Vec<_>>()})).into_response(),
+    }
+}
+
+/// AUTOMATIC1111-compatible `/sdapi/v1/txt2img` (subset: prompt, negative_prompt, steps, cfg_scale, width, height, seed, batch_size, n_iter).
+async fn txt2img(State(app): S, Json(b): Json<Value>) -> Response {
+    use base64::Engine;
+    let im = match image_model(&app, b["model"].as_str().or(b["override_settings"]["sd_model_checkpoint"].as_str())) { Ok(i) => i, Err(r) => return r };
+    let n = (b["batch_size"].as_u64().unwrap_or(1) * b["n_iter"].as_u64().unwrap_or(1)).clamp(1, 8) as usize;
+    let seed = seed_of(b["seed"].as_i64());
+    let p = |i: usize| crate::image::GenParams { prompt: b["prompt"].as_str().unwrap_or("").into(), negative: b["negative_prompt"].as_str().unwrap_or("").into(),
+        width: b["width"].as_u64().unwrap_or(512) as usize, height: b["height"].as_u64().unwrap_or(512) as usize,
+        steps: b["steps"].as_u64().unwrap_or(20) as usize, guidance: b["cfg_scale"].as_f64().unwrap_or(7.0), seed: seed + i as u64 };
+    match run_images(im, (0..n).map(p).collect()).await {
+        Err(r) => r,
+        Ok(v) => Json(json!({"images": v.iter().map(|g| base64::engine::general_purpose::STANDARD.encode(&g.png)).collect::<Vec<_>>(),
+            "parameters": b, "info": json!({"seeds": v.iter().map(|g| g.seed).collect::<Vec<_>>(), "seconds": v.iter().map(|g| g.seconds).collect::<Vec<_>>(), "sampler_name": "DDIM"}).to_string()})).into_response(),
     }
 }
 

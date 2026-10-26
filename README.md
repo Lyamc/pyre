@@ -99,3 +99,36 @@ transcript was exact except "Pyre" was heard as "Fire".
 3. Load Whisper straight from HF safetensors (like the qwen3/parakeet paths) so pyre can reuse the HF cache with zero extra disk.
 4. With `include_timestamps = false`, Whisper decoding stops after the first sentence/window; pyre works around it by always requesting timestamps.
 5. Stop forcing `fancy-regex` on `tokenizers` (pyre uses `onig`; it builds, but both regex engines get compiled in).
+
+## Image generation (Stable Diffusion 1.5)
+
+Burn runs every step: the CLIP text encoder, the UNet, the VAE and DDIM. pyre uses
+[diffusers-burn](https://github.com/oxiglade/diffusers-burn) (MIT/Apache, a port of diffusers-rs),
+pinned to rev `9061882` as a git dependency. It runs on **burn 0.20**, so a pyre build with every
+feature links three Burn versions (0.20 for SD, 0.21 for whisburn, 0.22 for LLMs). The `image`
+feature is on by default.
+
+- Weights load straight from the diffusers-format HF snapshot (`text_encoder/model.safetensors`,
+  `unet/…`, `vae/…`, `tokenizer/merges.txt`), using zero extra disk. `pyre models pull
+  stable-diffusion-v1-5/stable-diffusion-v1-5` fetches only those files (about 4.3 GB, f32). The repo is not gated.
+- Backends: `cuda` (tested) and `wgpu` (built in, not benchmarked). CPU is refused because it would be too slow.
+- Lockfile note: `burn-store 0.20.1` doesn't build with `zip >= 7.3`, so `Cargo.lock` pins `zip 7.2.0`.
+  `src/main.rs` also sets `#![recursion_limit = "512"]` because of the wgpu 26 + 28 type depth.
+
+```
+pyre serve -m qwen --image-model stable-diffusion-v1-5/stable-diffusion-v1-5
+curl http://127.0.0.1:8080/v1/images/generations -H "content-type: application/json" \
+  -d '{"prompt":"an ancient mossy stone","size":"512x512","steps":20,"seed":42}'
+```
+
+`/v1/images/generations` accepts `prompt`, `n` (≤8), `size` (multiples of 8, 64–1024) and
+`response_format` (`b64_json`, or `url`, which returns a data: URL), plus the extensions
+`negative_prompt`, `steps` (default 30), `guidance_scale` (7.5) and `seed`. It also returns `timings`.
+`/sdapi/v1/txt2img` (the AUTOMATIC1111 subset) accepts `prompt`, `negative_prompt`, `steps`,
+`cfg_scale`, `width`, `height`, `seed`, `batch_size` and `n_iter`, and returns `images` (base64),
+`parameters` and `info`. The only sampler is DDIM.
+
+Measured on an RTX 3060 12 GB (cuda, f32, 512×512, 20 steps): **about 9.4 s per image (2.1 it/s)**
+in steady state. The **first image after startup takes about 9 minutes** while CubeCL JIT-compiles and
+autotunes the UNet kernels. Later images and runs reuse the cache. Samples are in
+`samples/sd_cuda_*.png` and `samples/sdapi_lighthouse.png`.
