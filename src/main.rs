@@ -1,5 +1,10 @@
 mod backend;
 mod engine;
+mod api;
+mod logbuf;
+mod registry;
+mod stt;
+mod ui;
 mod cli_models;
 mod storage;
 mod store;
@@ -117,61 +122,85 @@ pub enum ModelsCmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,cubecl=warn,cubecl_runtime=warn,pliron=warn,cubecl_llvm=warn,xet_client=warn".into())).init();
+    logbuf::init();
     let cli = Cli::parse();
     let ctx = storage::Ctx::new(&cli.storage)?;
     match cli.cmd {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
-        Cmd::Serve(a) => serve(&ctx, a),
+        Cmd::Serve(a) => serve(ctx, a),
     }
 }
 
-fn serve(sctx: &storage::Ctx, args: ServeArgs) -> Result<()> {
-    let mref = args.model.first().cloned().context("serve needs -m <model>")?;
-    let (dir, src) = sctx.resolver().resolve(&mref)?;
-    tracing::info!("resolved {mref} -> {} (via {src:?})", dir.display());
+/// Load one text-generation model and start its worker.
+pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
+    let (llama, tok, template, eos, bname, fdt) = load_llm_parts(dir, backend_name, dtype, ctx_size)?;
+    let n_ctx = llama.max_ctx;
+    let engine = engine::spawn(llama, tok.clone(), eos);
+    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: dir.display().to_string(), n_ctx,
+        backend: bname.to_string(), dtype: format!("{fdt:?}"), default_max_tokens: n_predict })
+}
+
+#[allow(clippy::type_complexity)]
+fn load_llm_parts(dir: &std::path::Path, backend_name: &str, dtype: &str, ctx_size: usize)
+    -> Result<(model::llama::Llama, Arc<tokenizers::Tokenizer>, template::ChatTemplate, Vec<u32>, &'static str, burn::tensor::FloatDType)> {
     let cfg: LlamaConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).context("config.json")?)?;
     let arch = cfg.arch()?;
-    let (device, fdt, bname) = backend::select(&args.backend, &args.dtype, cfg.torch_dtype.as_deref())?;
-    let ctx = args.ctx_size.min(cfg.max_position_embeddings);
+    let (device, fdt, bname) = backend::select(backend_name, dtype, cfg.torch_dtype.as_deref())?;
+    let ctx = ctx_size.min(cfg.max_position_embeddings);
     tracing::info!("model {} arch {:?} | backend {bname} dtype {fdt:?} | ctx {ctx}", dir.display(), arch);
     let t = std::time::Instant::now();
-    let ws = model::loader::Weights::open(&dir, device.clone(), fdt.into())?;
+    let ws = model::loader::Weights::open(dir, device.clone(), fdt.into())?;
     let llama = model::llama::Llama::load(cfg.clone(), &ws, device.clone(), fdt, ctx)?;
     drop(ws);
     tracing::info!("weights loaded in {:.1}s", t.elapsed().as_secs_f64());
-
     let tok = Arc::new(tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
-    let template = template::ChatTemplate::from_model_dir(&dir)?;
+    let template = template::ChatTemplate::from_model_dir(dir)?;
     let mut eos = cfg.eos_ids();
     if let Ok(g) = std::fs::read_to_string(dir.join("generation_config.json")) {
         if let Ok(g) = serde_json::from_str::<serde_json::Value>(&g) { eos.extend(ids(&g.get("eos_token_id").cloned())); }
     }
-    for t in [template.eos_token.as_str(), "<|im_end|>", "<|eot_id|>", "<|endoftext|>", "<|end_of_text|>"] {
-        if let Some(id) = tok.token_to_id(t) { if t == template.eos_token || t == "<|im_end|>" || t == "<|eot_id|>" { eos.push(id); } }
+    for t in [template.eos_token.as_str(), "<|im_end|>", "<|eot_id|>"] {
+        if let Some(id) = tok.token_to_id(t) { eos.push(id); }
     }
     eos.sort(); eos.dedup();
     tracing::info!("eos ids {eos:?}");
+    Ok((llama, tok, template, eos, bname, fdt))
+}
+
+fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
+    use registry::{Kind, LoadReq};
+    let defaults = registry::LoadDefaults { backend: args.backend.clone(), dtype: args.dtype.clone(), ctx_size: args.ctx_size, n_predict: args.n_predict };
+    // collect (kind, ref)
+    let mut want: Vec<(Kind, String)> = args.model.iter().map(|m| (Kind::Llm, m.clone())).collect();
+    for l in &args.load {
+        let (k, r) = l.split_once('=').context("--load expects kind=ref")?;
+        want.push((Kind::parse(k).with_context(|| format!("unknown kind {k}"))?, r.to_string()));
+    }
+    if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone())); }
+    if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone())); }
+    if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone())); }
 
     if let Some(p) = &args.prompt {
+        let r = args.model.first().context("--prompt needs -m")?;
+        let (dir, _) = sctx.resolver().resolve(r)?;
+        let (llama, tok, template, eos, _, _) = load_llm_parts(&dir, &args.backend, &args.dtype, args.ctx_size)?;
         return backend::oneshot(&llama, &tok, &template, &eos, p);
     }
 
-    let engine = engine::spawn(llama, tok.clone(), eos);
-    let st = Arc::new(server::AppState {
-        engine, tok, template,
-        model_id: args.alias.clone().unwrap_or_else(|| mref.clone()),
-        model_path: dir.display().to_string(),
-        n_ctx: ctx, backend: bname.to_string(), dtype: format!("{fdt:?}"),
-        api_key: args.api_key.clone(), default_max_tokens: args.n_predict,
-    });
+    let app = Arc::new(registry::App { models: Default::default(), storage: sctx, defaults: defaults.clone(), api_key: args.api_key.clone(), started: std::time::Instant::now() });
+    for (i, (kind, r)) in want.iter().enumerate() {
+        let alias = if i == 0 && *kind == Kind::Llm { args.alias.clone() } else { None };
+        let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: None, dtype: None, ctx_size: None })?;
+        tracing::info!("loaded {} model '{}' on {}", kind.as_str(), m.id, m.backend);
+        app.insert(m)?;
+    }
+    if want.is_empty() { tracing::warn!("no models given; load them from the web UI or POST /api/models/load"); }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let addr = format!("{}:{}", args.host, args.port);
         let l = tokio::net::TcpListener::bind(&addr).await?;
-        tracing::info!("pyre listening on http://{addr}");
-        axum::serve(l, server::router(st)).await?;
+        tracing::info!("pyre listening on http://{addr} (web UI at /)");
+        axum::serve(l, server::router(app)).await?;
         Ok(())
     })
 }

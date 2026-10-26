@@ -33,11 +33,15 @@ pub fn select(name: &str, dtype: &str, model_dtype: Option<&str>) -> Result<(Dev
         }
     };
     if !dev.supports_dtype(DType::from(want)) { bail!("{label} does not support {want:?}"); }
-    dev.configure(want)?;
+    if let Err(e) = dev.configure(want) {
+        // A second model on an already-initialised device: settings are locked, but tensors are
+        // created with an explicit dtype anyway, so this is only informational.
+        tracing::debug!("device already configured ({e}); using explicit dtype {want:?}");
+    }
     Ok((dev, want, label))
 }
 
-fn enabled() -> Vec<&'static str> {
+pub fn enabled() -> Vec<&'static str> {
     let mut v = vec![];
     if cfg!(feature = "cuda") { v.push("cuda"); }
     if cfg!(feature = "wgpu") { v.push("wgpu"); }

@@ -13,13 +13,13 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-pub struct AppState {
+/// One loaded text-generation model (its own worker queue).
+pub struct Llm {
     pub engine: EngineHandle,
     pub tok: Arc<Tokenizer>,
     pub template: ChatTemplate,
@@ -28,13 +28,14 @@ pub struct AppState {
     pub n_ctx: usize,
     pub backend: String,
     pub dtype: String,
-    pub api_key: Option<String>,
     pub default_max_tokens: usize,
 }
-type S = State<Arc<AppState>>;
+use crate::registry::{App, Kind};
+type S = State<Arc<App>>;
+type AppState = Llm;
 
-pub fn router(st: Arc<AppState>) -> Router {
-    Router::new()
+pub fn router(st: Arc<App>) -> Router {
+    crate::api::routes(Router::new())
         .route("/v1/models", get(models))
         .route("/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -49,11 +50,12 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/props", get(props))
         .route("/slots", get(slots))
         .route("/health", get(health))
+        .route("/v1/health", get(health))
         .layer(middleware::from_fn_with_state(st.clone(), auth))
         .with_state(st)
 }
 
-fn err(code: StatusCode, msg: impl Into<String>) -> Response {
+pub fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     let m = msg.into();
     (code, Json(json!({"error": {"code": code.as_u16(), "message": m, "type": if code == StatusCode::UNAUTHORIZED {"authentication_error"} else {"invalid_request_error"}}}))).into_response()
 }
@@ -61,7 +63,9 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
 async fn auth(State(st): S, req: Request, next: Next) -> Response {
     if let Some(key) = &st.api_key {
         let p = req.uri().path();
-        if p != "/health" && p != "/v1/health" {
+        // health + the static UI shell are public; the UI then sends the key on API calls
+        let public = p == "/health" || p == "/v1/health" || crate::ui::is_static(p);
+        if !public {
             let ok = req.headers().get("authorization").and_then(|v| v.to_str().ok())
                 .map(|v| v.strip_prefix("Bearer ").unwrap_or(v) == key).unwrap_or(false)
                 || req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) == Some(key.as_str());
@@ -77,8 +81,9 @@ fn rid(p: &str) -> String { format!("{p}-{:016x}", rand::random::<u64>()) }
 async fn health() -> Json<Value> { Json(json!({"status": "ok"})) }
 
 async fn models(State(st): S) -> Json<Value> {
-    Json(json!({"object": "list", "data": [{"id": st.model_id, "object": "model", "created": now(), "owned_by": "pyre",
-        "meta": {"n_ctx": st.n_ctx, "backend": st.backend, "dtype": st.dtype}}]}))
+    let data: Vec<Value> = st.loaded().iter().map(|m| json!({"id": m.id, "object": "model", "created": m.created, "owned_by": "pyre",
+        "kind": m.kind.as_str(), "task": m.kind.task(), "meta": m.meta()})).collect();
+    Json(json!({"object": "list", "data": data}))
 }
 
 /// Common sampling fields shared by every generation endpoint (OpenAI + llama.cpp names).
@@ -196,7 +201,8 @@ fn norm_messages(m: &[Value]) -> Vec<Value> {
     }).collect()
 }
 
-async fn chat(State(st): S, Json(req): Json<ChatReq>) -> Response {
+async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
+    let st = match app.llm(req.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let prompt = match st.template.render(&norm_messages(&req.messages), true, req.tools.as_ref()) {
         Ok(p) => p, Err(e) => return err(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")),
     };
@@ -248,7 +254,8 @@ fn prompt_ids(st: &AppState, p: &Value) -> Result<Vec<u32>, Response> {
     }
 }
 
-async fn completions(State(st): S, Json(req): Json<CompReq>) -> Response {
+async fn completions(State(app): S, Json(req): Json<CompReq>) -> Response {
+    let st = match app.llm(req.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let ids = match prompt_ids(&st, &req.prompt) { Ok(i) => i, Err(r) => return r };
     let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
     let id = rid("cmpl");
@@ -284,7 +291,8 @@ async fn completions(State(st): S, Json(req): Json<CompReq>) -> Response {
 #[derive(Deserialize)]
 struct EmbReq { input: Value, model: Option<String> }
 
-async fn embeddings(State(st): S, Json(req): Json<EmbReq>) -> Response {
+async fn embeddings(State(app): S, Json(req): Json<EmbReq>) -> Response {
+    let st = match app.llm(req.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let inputs: Vec<Value> = match &req.input {
         Value::Array(a) if !a.is_empty() && !a[0].is_u64() => a.clone(),
         v => vec![v.clone()],
@@ -309,7 +317,8 @@ async fn embeddings(State(st): S, Json(req): Json<EmbReq>) -> Response {
 #[derive(Deserialize)]
 struct NativeReq { prompt: Value, #[serde(flatten)] g: Gen }
 
-async fn completion(State(st): S, Json(req): Json<NativeReq>) -> Response {
+async fn completion(State(app): S, Json(req): Json<NativeReq>) -> Response {
+    let st = match app.llm(None) { Ok(m) => m, Err(r) => return r };
     let ids = match prompt_ids(&st, &req.prompt) { Ok(i) => i, Err(r) => return r };
     let n_eval = ids.len();
     let rx = start(&st, ids, &req.g);
@@ -338,7 +347,8 @@ async fn completion(State(st): S, Json(req): Json<NativeReq>) -> Response {
 
 #[derive(Deserialize)]
 struct TokReq { content: String, #[serde(default)] add_special: bool, #[serde(default)] with_pieces: bool }
-async fn tokenize(State(st): S, Json(r): Json<TokReq>) -> Response {
+async fn tokenize(State(app): S, Json(r): Json<TokReq>) -> Response {
+    let st = match app.llm(None) { Ok(m) => m, Err(r) => return r };
     match st.tok.encode(r.content.as_str(), r.add_special) {
         Ok(e) if r.with_pieces => Json(json!({"tokens": e.get_ids().iter().zip(e.get_tokens()).map(|(i, p)| json!({"id": i, "piece": p})).collect::<Vec<_>>()})).into_response(),
         Ok(e) => Json(json!({"tokens": e.get_ids()})).into_response(),
@@ -348,14 +358,16 @@ async fn tokenize(State(st): S, Json(r): Json<TokReq>) -> Response {
 
 #[derive(Deserialize)]
 struct DetokReq { tokens: Vec<u32> }
-async fn detokenize(State(st): S, Json(r): Json<DetokReq>) -> Response {
+async fn detokenize(State(app): S, Json(r): Json<DetokReq>) -> Response {
+    let st = match app.llm(None) { Ok(m) => m, Err(r) => return r };
     match st.tok.decode(&r.tokens, false) {
         Ok(s) => Json(json!({"content": s})).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
 
-async fn props(State(st): S) -> Json<Value> {
+async fn props(State(app): S) -> Response {
+    let st = match app.llm(None) { Ok(m) => m, Err(r) => return r };
     let d = SamplingParams::default();
     Json(json!({
         "default_generation_settings": {"n_ctx": st.n_ctx, "params": {"temperature": d.temperature, "top_k": d.top_k, "top_p": d.top_p,
@@ -363,10 +375,11 @@ async fn props(State(st): S) -> Json<Value> {
         "total_slots": 1, "model_path": st.model_path, "model_alias": st.model_id, "chat_template": st.template.source,
         "bos_token": st.template.bos_token, "eos_token": st.template.eos_token,
         "build_info": format!("pyre {} (burn 0.22, backend {}, {})", env!("CARGO_PKG_VERSION"), st.backend, st.dtype),
-    }))
+        "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str()})).collect::<Vec<_>>(),
+    })).into_response()
 }
 
-async fn slots(State(st): S) -> Json<Value> {
-    Json(json!([{"id": 0, "n_ctx": st.n_ctx, "is_processing": st.engine.busy.load(Ordering::SeqCst),
-        "queued": st.engine.queued.load(Ordering::SeqCst)}]))
+async fn slots(State(app): S) -> Json<Value> {
+    Json(json!(app.loaded().iter().enumerate().map(|(i, m)| json!({"id": i, "model": m.id, "kind": m.kind.as_str(),
+        "is_processing": m.busy(), "queued": m.queued(), "n_ctx": m.meta().get("n_ctx").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>()))
 }
