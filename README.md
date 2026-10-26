@@ -132,3 +132,31 @@ Measured on an RTX 3060 12 GB (cuda, f32, 512×512, 20 steps): **about 9.4 s per
 in steady state. The **first image after startup takes about 9 minutes** while CubeCL JIT-compiles and
 autotunes the UNet kernels. Later images and runs reuse the cache. Samples are in
 `samples/sd_cuda_*.png` and `samples/sdapi_lighthouse.png`.
+
+## Text to speech (stub)
+
+`/v1/audio/speech` returns **501** with a clear message, and `--tts-model` registers a placeholder.
+The UI's TTS card stays disabled. I looked at these ports and didn't do any of them yet:
+
+- **Kokoro-82M via burn-onnx** (burn 0.22, Apache weights): tracel's model check compiles the
+  2,464-node graph (about 7 minutes of codegen), but its output still diverges from ONNX Runtime
+  (Pearson r ≈ 0.69, peaks about 1.3× too large; burn-onnx#371). It also needs a phonemizer
+  (espeak-ng is a system library and GPL, which would mean installing something; a pure-Rust G2P
+  would be needed instead).
+- **A hand port of Kokoro (StyleTTS2 + ISTFTNet)**: about 2–3k lines (BERT/ALBERT, LSTM, AdaIN
+  decoders, iSTFT). It's feasible on Burn 0.22 but is a multi-day job.
+- **Piper (VITS)**: also needs espeak-ng phonemes.
+
+Plan: Kokoro through burn-onnx once #371 lands, plus a Rust G2P (misaki-style lexicon), behind a
+`tts` feature, emitting 24 kHz wav/mp3/opus.
+
+## Roadmap / known gaps
+
+- GGUF and quantized weights (Q4/Q8) are skipped; only safetensors f32/f16/bf16 load.
+- Continuous batching: each model has a single worker and a FIFO queue.
+- MoE Qwen3 (A3B), Gemma, vision-language and SDXL (diffusers-burn has SDXL; it isn't wired up) are not done.
+- TTS (see above).
+- Unify Burn versions. SD is on 0.20 (via diffusers-burn), whisburn on 0.21 and pyre on 0.22. Porting
+  diffusers-burn and whisburn to 0.22 would drop two cubecl stacks and give STT CUDA support.
+- SD warm-up: persist and prewarm the CubeCL autotune cache so the first image isn't about 9 minutes.
+- Browser mic recordings (webm/opus) may not decode in whisburn-audio. Uploads of wav/mp3/flac work.
