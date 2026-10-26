@@ -1,0 +1,43 @@
+[package]
+name = "pyre"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "llama.cpp-server-style LLM inference server where Burn runs the model"
+
+[features]
+default = ["cuda", "wgpu", "flex", "ndarray"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+vulkan = ["burn/vulkan"]
+flex = ["burn/flex", "burn/rayon"]
+ndarray = ["burn/ndarray"]
+
+[dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "fusion", "autotune"] }
+safetensors = "0.8"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+hf-hub = { version = "1.0", features = ["blocking"] }
+minijinja = { version = "3", features = ["serde", "json", "builtins", "macros", "loop_controls"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+memmap2 = "0.9"
+
+[profile.release]
+debug = false
+codegen-units = 16
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

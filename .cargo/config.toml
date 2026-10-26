@@ -1,0 +1,9 @@
+# Repo-local overrides. The user-level ~/.cargo/config.toml sets
+# target.x86_64-pc-windows-msvc.linker = "rust-lld"; other HYTE repos route rustc
+# through C:\td\rustc-fix.exe + MinGW. Pin the plain MSVC toolchain here.
+[build]
+target = "x86_64-pc-windows-msvc"
+rustc-wrapper = ""
+
+[target.x86_64-pc-windows-msvc]
+linker = "link.exe"

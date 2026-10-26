@@ -1,0 +1,372 @@
+//! HTTP API: OpenAI-compatible (/v1/*) and llama.cpp-native endpoints.
+use crate::engine::{EngineHandle, Event, GenRequest, Job, Timings};
+use crate::sampler::SamplingParams;
+use crate::template::ChatTemplate;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures::stream::{self, Stream, StreamExt};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::convert::Infallible;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokenizers::Tokenizer;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+
+pub struct AppState {
+    pub engine: EngineHandle,
+    pub tok: Arc<Tokenizer>,
+    pub template: ChatTemplate,
+    pub model_id: String,
+    pub model_path: String,
+    pub n_ctx: usize,
+    pub backend: String,
+    pub dtype: String,
+    pub api_key: Option<String>,
+    pub default_max_tokens: usize,
+}
+type S = State<Arc<AppState>>;
+
+pub fn router(st: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/models", get(models))
+        .route("/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/chat/completions", post(chat))
+        .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/embeddings", post(embeddings))
+        .route("/completion", post(completion))
+        .route("/completions", post(completion))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
+        .route("/props", get(props))
+        .route("/slots", get(slots))
+        .route("/health", get(health))
+        .layer(middleware::from_fn_with_state(st.clone(), auth))
+        .with_state(st)
+}
+
+fn err(code: StatusCode, msg: impl Into<String>) -> Response {
+    let m = msg.into();
+    (code, Json(json!({"error": {"code": code.as_u16(), "message": m, "type": if code == StatusCode::UNAUTHORIZED {"authentication_error"} else {"invalid_request_error"}}}))).into_response()
+}
+
+async fn auth(State(st): S, req: Request, next: Next) -> Response {
+    if let Some(key) = &st.api_key {
+        let p = req.uri().path();
+        if p != "/health" && p != "/v1/health" {
+            let ok = req.headers().get("authorization").and_then(|v| v.to_str().ok())
+                .map(|v| v.strip_prefix("Bearer ").unwrap_or(v) == key).unwrap_or(false)
+                || req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) == Some(key.as_str());
+            if !ok { return err(StatusCode::UNAUTHORIZED, "Invalid API Key"); }
+        }
+    }
+    next.run(req).await
+}
+
+fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() }
+fn rid(p: &str) -> String { format!("{p}-{:016x}", rand::random::<u64>()) }
+
+async fn health() -> Json<Value> { Json(json!({"status": "ok"})) }
+
+async fn models(State(st): S) -> Json<Value> {
+    Json(json!({"object": "list", "data": [{"id": st.model_id, "object": "model", "created": now(), "owned_by": "pyre",
+        "meta": {"n_ctx": st.n_ctx, "backend": st.backend, "dtype": st.dtype}}]}))
+}
+
+/// Common sampling fields shared by every generation endpoint (OpenAI + llama.cpp names).
+#[derive(Deserialize, Default)]
+struct Gen {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    min_p: Option<f32>,
+    max_tokens: Option<usize>,
+    max_completion_tokens: Option<usize>,
+    n_predict: Option<i64>,
+    stop: Option<Value>,
+    seed: Option<u64>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    repeat_last_n: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+    stream_options: Option<Value>,
+}
+
+impl Gen {
+    fn params(&self) -> SamplingParams {
+        let d = SamplingParams::default();
+        SamplingParams {
+            temperature: self.temperature.unwrap_or(d.temperature),
+            top_p: self.top_p.unwrap_or(d.top_p),
+            top_k: self.top_k.unwrap_or(d.top_k),
+            min_p: self.min_p.unwrap_or(d.min_p),
+            repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
+            repeat_last_n: self.repeat_last_n.unwrap_or(d.repeat_last_n),
+            presence_penalty: self.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
+            seed: self.seed,
+        }
+    }
+    fn stops(&self) -> Vec<String> {
+        match &self.stop {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            _ => vec![],
+        }
+    }
+    fn max(&self, st: &AppState, prompt_len: usize) -> usize {
+        let room = st.n_ctx.saturating_sub(prompt_len);
+        let m = self.max_completion_tokens.or(self.max_tokens)
+            .or(self.n_predict.and_then(|n| if n < 0 { None } else { Some(n as usize) }))
+            .unwrap_or(st.default_max_tokens.min(room));
+        m.min(room)
+    }
+    fn include_usage(&self) -> bool {
+        self.stream_options.as_ref().and_then(|o| o.get("include_usage")).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+}
+
+fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> {
+    let (tx, rx) = unbounded_channel();
+    let max_tokens = g.max(st, prompt.len());
+    st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx }));
+    rx
+}
+
+async fn collect(mut rx: UnboundedReceiver<Event>) -> Result<(String, &'static str, Timings, String), String> {
+    while let Some(e) = rx.recv().await {
+        match e {
+            Event::Done { finish_reason, text, timings, stopping_word } => return Ok((text, finish_reason, timings, stopping_word)),
+            Event::Error(m) => return Err(m),
+            _ => {}
+        }
+    }
+    Err("worker dropped request".into())
+}
+
+fn usage(t: &Timings) -> Value {
+    let p = t.prompt_n + t.cached_n;
+    json!({"prompt_tokens": p, "completion_tokens": t.predicted_n, "total_tokens": p + t.predicted_n,
+        "prompt_tokens_details": {"cached_tokens": t.cached_n}})
+}
+
+fn encode(st: &AppState, text: &str, special: bool) -> Result<Vec<u32>, Response> {
+    st.tok.encode(text, special).map(|e| e.get_ids().to_vec()).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+type SseStream = Sse<axum::response::sse::KeepAliveStream<std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>>>>;
+fn sse(s: impl Stream<Item = Value> + Send + 'static, done: bool) -> SseStream {
+    let s = s.map(|v| Ok(SseEvent::default().data(v.to_string())));
+    let s: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> = if done {
+        Box::pin(s.chain(stream::once(async { Ok(SseEvent::default().data("[DONE]")) })))
+    } else { Box::pin(s) };
+    Sse::new(s).keep_alive(KeepAlive::default())
+}
+
+// ---------- OpenAI chat ----------
+#[derive(Deserialize)]
+struct ChatReq {
+    messages: Vec<Value>,
+    model: Option<String>,
+    tools: Option<Value>,
+    #[serde(flatten)]
+    g: Gen,
+}
+
+/// Flatten OpenAI content-part arrays to plain text for the template.
+fn norm_messages(m: &[Value]) -> Vec<Value> {
+    m.iter().map(|msg| {
+        let mut msg = msg.clone();
+        if let Some(Value::Array(parts)) = msg.get("content") {
+            let t: String = parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("");
+            msg["content"] = Value::String(t);
+        }
+        if msg.get("content").map(|c| c.is_null()).unwrap_or(true) { msg["content"] = Value::String(String::new()); }
+        msg
+    }).collect()
+}
+
+async fn chat(State(st): S, Json(req): Json<ChatReq>) -> Response {
+    let prompt = match st.template.render(&norm_messages(&req.messages), true, req.tools.as_ref()) {
+        Ok(p) => p, Err(e) => return err(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")),
+    };
+    let ids = match encode(&st, &prompt, false) { Ok(i) => i, Err(r) => return r };
+    let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
+    let id = rid("chatcmpl");
+    let created = now();
+    let rx = start(&st, ids, &req.g);
+    if !req.g.stream {
+        return match collect(rx).await {
+            Ok((text, fin, t, _)) => Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": fin, "logprobs": null}],
+                "usage": usage(&t), "timings": t})).into_response(),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+    }
+    let inc = req.g.include_usage();
+    let chunk = move |delta: Value, fin: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": fin, "logprobs": null}]});
+    let first = stream::once({ let c = chunk.clone(); async move { c(json!({"role": "assistant", "content": ""}), Value::Null) } });
+    let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
+        let v: Vec<Value> = match e {
+            Event::Token(s) => vec![chunk(json!({"content": s}), Value::Null)],
+            Event::Done { finish_reason, timings, .. } => {
+                let mut f = chunk(json!({}), json!(finish_reason));
+                f["timings"] = json!(timings);
+                let mut v = vec![f];
+                if inc { let mut u = chunk(json!({}), Value::Null); u["choices"] = json!([]); u["usage"] = usage(&timings); v.push(u); }
+                v
+            }
+            Event::Error(m) => vec![json!({"error": {"message": m}})],
+            _ => vec![],
+        };
+        stream::iter(v)
+    });
+    sse(first.chain(body), true).into_response()
+}
+
+// ---------- OpenAI legacy completions ----------
+#[derive(Deserialize)]
+struct CompReq { prompt: Value, model: Option<String>, #[serde(flatten)] g: Gen }
+
+fn prompt_ids(st: &AppState, p: &Value) -> Result<Vec<u32>, Response> {
+    match p {
+        Value::String(s) => encode(st, s, true),
+        Value::Array(a) if a.iter().all(|x| x.is_u64()) => Ok(a.iter().map(|x| x.as_u64().unwrap() as u32).collect()),
+        Value::Array(a) => match a.first() { Some(Value::String(s)) => encode(st, s, true), _ => Err(err(StatusCode::BAD_REQUEST, "unsupported prompt")) },
+        _ => Err(err(StatusCode::BAD_REQUEST, "prompt must be a string or token array")),
+    }
+}
+
+async fn completions(State(st): S, Json(req): Json<CompReq>) -> Response {
+    let ids = match prompt_ids(&st, &req.prompt) { Ok(i) => i, Err(r) => return r };
+    let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
+    let id = rid("cmpl");
+    let created = now();
+    let rx = start(&st, ids, &req.g);
+    if !req.g.stream {
+        return match collect(rx).await {
+            Ok((text, fin, t, _)) => Json(json!({"id": id, "object": "text_completion", "created": created, "model": model,
+                "choices": [{"index": 0, "text": text, "finish_reason": fin, "logprobs": null}], "usage": usage(&t)})).into_response(),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+    }
+    let inc = req.g.include_usage();
+    let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
+        let mk = |text: &str, fin: Value| json!({"id": id, "object": "text_completion", "created": created, "model": model,
+            "choices": [{"index": 0, "text": text, "finish_reason": fin, "logprobs": null}]});
+        let v = match e {
+            Event::Token(s) => vec![mk(&s, Value::Null)],
+            Event::Done { finish_reason, timings, .. } => {
+                let mut f = mk("", json!(finish_reason));
+                if inc { f["usage"] = usage(&timings); }
+                vec![f]
+            }
+            Event::Error(m) => vec![json!({"error": {"message": m}})],
+            _ => vec![],
+        };
+        stream::iter(v)
+    });
+    sse(body, true).into_response()
+}
+
+// ---------- embeddings ----------
+#[derive(Deserialize)]
+struct EmbReq { input: Value, model: Option<String> }
+
+async fn embeddings(State(st): S, Json(req): Json<EmbReq>) -> Response {
+    let inputs: Vec<Value> = match &req.input {
+        Value::Array(a) if !a.is_empty() && !a[0].is_u64() => a.clone(),
+        v => vec![v.clone()],
+    };
+    let mut data = vec![];
+    let mut total = 0;
+    for (i, inp) in inputs.iter().enumerate() {
+        let ids = match prompt_ids(&st, inp) { Ok(i) => i, Err(r) => return r };
+        if ids.is_empty() { return err(StatusCode::BAD_REQUEST, "empty input"); }
+        let (tx, mut rx) = unbounded_channel();
+        st.engine.submit(Job::Embed { tokens: ids, tx });
+        match rx.recv().await {
+            Some(Event::Embedding(v, n)) => { total += n; data.push(json!({"object": "embedding", "index": i, "embedding": v})); }
+            _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "embedding failed"),
+        }
+    }
+    Json(json!({"object": "list", "data": data, "model": req.model.unwrap_or_else(|| st.model_id.clone()),
+        "usage": {"prompt_tokens": total, "total_tokens": total}})).into_response()
+}
+
+// ---------- llama.cpp native ----------
+#[derive(Deserialize)]
+struct NativeReq { prompt: Value, #[serde(flatten)] g: Gen }
+
+async fn completion(State(st): S, Json(req): Json<NativeReq>) -> Response {
+    let ids = match prompt_ids(&st, &req.prompt) { Ok(i) => i, Err(r) => return r };
+    let n_eval = ids.len();
+    let rx = start(&st, ids, &req.g);
+    let model = st.model_path.clone();
+    if !req.g.stream {
+        return match collect(rx).await {
+            Ok((text, fin, t, sw)) => Json(json!({"content": text, "stop": true, "model": model, "tokens_predicted": t.predicted_n,
+                "tokens_evaluated": n_eval, "tokens_cached": t.cached_n, "stopped_eos": fin == "stop" && sw.is_empty(), "stopped_word": !sw.is_empty(),
+                "stopped_limit": fin == "length", "stopping_word": sw, "timings": t, "id_slot": 0})).into_response(),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+    }
+    let body = UnboundedReceiverStream::new(rx).filter_map(move |e| {
+        let model = model.clone();
+        async move { match e {
+            Event::Token(s) => Some(json!({"content": s, "stop": false, "id_slot": 0})),
+            Event::Done { finish_reason, timings, stopping_word, .. } => Some(json!({"content": "", "stop": true, "model": model,
+                "tokens_predicted": timings.predicted_n, "tokens_evaluated": n_eval, "stopped_limit": finish_reason == "length",
+                "stopping_word": stopping_word, "timings": timings, "id_slot": 0})),
+            Event::Error(m) => Some(json!({"error": {"message": m}})),
+            _ => None,
+        }}
+    });
+    sse(body, false).into_response()
+}
+
+#[derive(Deserialize)]
+struct TokReq { content: String, #[serde(default)] add_special: bool, #[serde(default)] with_pieces: bool }
+async fn tokenize(State(st): S, Json(r): Json<TokReq>) -> Response {
+    match st.tok.encode(r.content.as_str(), r.add_special) {
+        Ok(e) if r.with_pieces => Json(json!({"tokens": e.get_ids().iter().zip(e.get_tokens()).map(|(i, p)| json!({"id": i, "piece": p})).collect::<Vec<_>>()})).into_response(),
+        Ok(e) => Json(json!({"tokens": e.get_ids()})).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct DetokReq { tokens: Vec<u32> }
+async fn detokenize(State(st): S, Json(r): Json<DetokReq>) -> Response {
+    match st.tok.decode(&r.tokens, false) {
+        Ok(s) => Json(json!({"content": s})).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
+async fn props(State(st): S) -> Json<Value> {
+    let d = SamplingParams::default();
+    Json(json!({
+        "default_generation_settings": {"n_ctx": st.n_ctx, "params": {"temperature": d.temperature, "top_k": d.top_k, "top_p": d.top_p,
+            "min_p": d.min_p, "repeat_penalty": d.repeat_penalty, "repeat_last_n": d.repeat_last_n, "n_predict": st.default_max_tokens}},
+        "total_slots": 1, "model_path": st.model_path, "model_alias": st.model_id, "chat_template": st.template.source,
+        "bos_token": st.template.bos_token, "eos_token": st.template.eos_token,
+        "build_info": format!("pyre {} (burn 0.22, backend {}, {})", env!("CARGO_PKG_VERSION"), st.backend, st.dtype),
+    }))
+}
+
+async fn slots(State(st): S) -> Json<Value> {
+    Json(json!([{"id": 0, "n_ctx": st.n_ctx, "is_processing": st.engine.busy.load(Ordering::SeqCst),
+        "queued": st.engine.queued.load(Ordering::SeqCst)}]))
+}
