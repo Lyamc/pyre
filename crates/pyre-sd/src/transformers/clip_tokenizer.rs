@@ -331,6 +331,7 @@ impl SimpleTokenizerConfig {
 /// This tokenizer converts text into token IDs that can be processed
 /// by the CLIP text encoder. It uses byte-pair encoding (BPE) with
 /// a vocabulary derived from the original CLIP model.
+#[derive(Clone)]
 pub struct SimpleTokenizer {
     regex: regex::Regex,
     encoder: HashMap<String, usize>,

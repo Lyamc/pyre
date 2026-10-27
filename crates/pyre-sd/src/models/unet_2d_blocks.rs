@@ -44,7 +44,12 @@ impl Downsample2DConfig {
         let conv = if self.use_conv {
             let conv = nn::conv::Conv2dConfig::new([self.in_channels, self.out_channels], [3, 3])
                 .with_stride([2, 2])
-                .with_padding(nn::PaddingConfig2d::Explicit(self.padding, self.padding, self.padding, self.padding))
+                .with_padding(nn::PaddingConfig2d::Explicit(
+                    self.padding,
+                    self.padding,
+                    self.padding,
+                    self.padding,
+                ))
                 .init(device);
 
             Some(conv)

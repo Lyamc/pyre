@@ -79,6 +79,58 @@ pub fn get_timestep_embedding(
     }
 }
 
+/// [`get_timestep_embedding`] for one timestep repeated `batch` times,
+/// computed on the host in f64 and uploaded in the device's float dtype.
+pub fn timestep_embedding_host(
+    timestep: f64,
+    batch: usize,
+    num_channels: usize,
+    flip_sin_to_cos: bool,
+    downscale_freq_shift: f64,
+    device: &burn::tensor::Device,
+) -> Tensor<2> {
+    let row = timestep_embedding_row(
+        timestep,
+        num_channels,
+        flip_sin_to_cos,
+        downscale_freq_shift,
+    );
+    let data: alloc::vec::Vec<f32> = (0..batch).flat_map(|_| row.iter().copied()).collect();
+    Tensor::from_data(
+        burn::tensor::TensorData::new(data, [batch, num_channels]),
+        device,
+    )
+}
+
+/// One row of the sinusoidal timestep embedding (pure, f64 inside).
+pub fn timestep_embedding_row(
+    timestep: f64,
+    num_channels: usize,
+    flip_sin_to_cos: bool,
+    downscale_freq_shift: f64,
+) -> alloc::vec::Vec<f32> {
+    let half = num_channels / 2;
+    let args: alloc::vec::Vec<f64> = (0..half)
+        .map(|i| {
+            timestep * (-(10000f64.ln()) * i as f64 / (half as f64 - downscale_freq_shift)).exp()
+        })
+        .collect();
+    let (first, second): (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>) = if flip_sin_to_cos {
+        (
+            args.iter().map(|a| a.cos()).collect(),
+            args.iter().map(|a| a.sin()).collect(),
+        )
+    } else {
+        (
+            args.iter().map(|a| a.sin()).collect(),
+            args.iter().map(|a| a.cos()).collect(),
+        )
+    };
+    let mut row: alloc::vec::Vec<f32> = first.into_iter().chain(second).map(|v| v as f32).collect();
+    row.resize(num_channels, 0.0);
+    row
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
@@ -89,6 +141,22 @@ mod tests {
     use burn::tensor::{Shape, TensorData, Tolerance};
 
     /// Test get_timestep_embedding with even channels - validated against diffusers-rs v0.3.1
+    #[test]
+    #[cfg(not(feature = "torch"))]
+    fn host_embedding_matches_tensor_version() {
+        let device = Default::default();
+        for (channels, flip, shift) in [(320, true, 0.0), (7, false, 1.0), (4, true, 1.0)] {
+            let t = 981.0;
+            let xs: Tensor<TestBackend, 1> =
+                Tensor::from_data(TensorData::from([t as f32, t as f32]), &device);
+            let reference = get_timestep_embedding(xs, channels, flip, shift);
+            let host = timestep_embedding_host::<TestBackend>(t, 2, channels, flip, shift, &device);
+            assert_eq!(host.dims(), [2, channels]);
+            host.into_data()
+                .assert_approx_eq::<f32>(&reference.into_data(), Tolerance::rel_abs(1e-3, 1e-3));
+        }
+    }
+
     #[test]
     #[cfg(not(feature = "torch"))]
     fn test_timesteps_even_channels() {

@@ -8,7 +8,9 @@ use burn::nn::{
     self, Dropout, DropoutConfig, GroupNorm, GroupNormConfig, LayerNorm, LayerNormConfig,
     LinearConfig,
 };
-use burn::tensor::activation::{gelu, softmax};
+use burn::tensor::activation::gelu;
+
+use super::ops::{self, LAYER_NORM_EPS};
 use burn::tensor::Tensor;
 
 #[cfg(not(feature = "std"))]
@@ -172,23 +174,15 @@ impl CrossAttention {
             let start_idx = i * slice_size;
             let end_idx = (i + 1) * slice_size;
 
-            let xs = query
+            let q = query
                 .clone()
-                .slice([start_idx..end_idx, 0..query.dims()[1]])
-                .matmul(
-                    key.clone()
-                        .slice([start_idx..end_idx, 0..key.dims()[1]])
-                        .swap_dims(3 - 1, 3 - 2)
-                        * self.scale,
-                );
-
-            let xs = softmax(xs, 3 - 1).matmul(
-                value
-                    .clone()
-                    .slice([start_idx..end_idx, 0..value.dims()[1]]),
-            );
-
-            hidden_states.push(xs);
+                .slice([start_idx..end_idx, 0..query.dims()[1]]);
+            let k = key.clone().slice([start_idx..end_idx, 0..key.dims()[1]]);
+            let v = value
+                .clone()
+                .slice([start_idx..end_idx, 0..value.dims()[1]]);
+            let xs = ops::attention(q.unsqueeze(), k.unsqueeze(), v.unsqueeze(), self.scale);
+            hidden_states.push(xs.squeeze_dim(0));
         }
 
         let output = Tensor::cat(hidden_states, 0);
@@ -201,10 +195,14 @@ impl CrossAttention {
         key: Tensor<3>,
         value: Tensor<3>,
     ) -> Tensor<3> {
-        let xs = query.matmul(key.swap_dims(3 - 1, 3 - 2) * self.scale);
-        let xs = softmax(xs, 3 - 1).matmul(value);
-
-        self.reshape_batch_dim_to_heads(xs)
+        // [batch * heads, seq, d] -> [batch, heads, seq, d] for the 4D op.
+        let heads = |t: Tensor<3>| {
+            let [bh, seq, d] = t.dims();
+            t.reshape([bh / self.n_heads, self.n_heads, seq, d])
+        };
+        let xs = ops::attention(heads(query), heads(key), heads(value), self.scale);
+        let [b, h, seq, d] = xs.dims();
+        self.reshape_batch_dim_to_heads(xs.reshape([b * h, seq, d]))
     }
 
     pub fn forward(&self, xs: Tensor<3>, context: Option<Tensor<3>>) -> Tensor<3> {
@@ -280,9 +278,10 @@ impl BasicTransformerBlockConfig {
 
 impl BasicTransformerBlock {
     pub fn forward(&self, xs: Tensor<3>, context: Option<Tensor<3>>) -> Tensor<3> {
-        let xs = self.attn1.forward(self.norm1.forward(xs.clone()), None) + xs;
-        let xs = self.attn2.forward(self.norm2.forward(xs.clone()), context) + xs;
-        self.ff.forward(self.norm3.forward(xs.clone())) + xs
+        let norm = |n: &LayerNorm, x: Tensor<3>| ops::layer_norm(n, x, LAYER_NORM_EPS);
+        let xs = self.attn1.forward(norm(&self.norm1, xs.clone()), None) + xs;
+        let xs = self.attn2.forward(norm(&self.norm2, xs.clone()), context) + xs;
+        self.ff.forward(norm(&self.norm3, xs.clone())) + xs
     }
 }
 
@@ -377,7 +376,7 @@ impl SpatialTransformer {
         let [n_batch, _n_channel, height, weight] = xs.dims();
 
         let residual = xs.clone();
-        let xs = self.norm.forward(xs);
+        let xs = ops::group_norm(&self.norm, xs);
         let xs = self.proj_in.forward(xs);
         let d_inner = xs.dims()[1];
         let xs = xs
@@ -458,9 +457,7 @@ impl AttentionBlock {
     pub fn forward(&self, xs: Tensor<4>) -> Tensor<4> {
         let residual = xs.clone();
         let [n_batch, channel, height, width] = xs.dims();
-        let xs = self
-            .group_norm
-            .forward(xs)
+        let xs = ops::group_norm(&self.group_norm, xs)
             .reshape([n_batch, channel, height * width])
             .swap_dims(1, 2);
 
@@ -472,13 +469,9 @@ impl AttentionBlock {
         let key_states = self.transpose_for_scores(key_proj);
         let value_states = self.transpose_for_scores(value_proj);
 
-        // scale is applied twice, hence the -0.25 here rather than -0.5.
-        // https://github.com/huggingface/diffusers/blob/d3d22ce5a894becb951eec03e663951b28d45135/src/diffusers/models/attention.py#L87
-        let scale = f64::powf(self.channels as f64 / self.n_heads as f64, -0.25);
-        let attention_scores = (query_states * scale).matmul(key_states.transpose() * scale);
-        let attention_probs = softmax(attention_scores, 4 - 1);
-
-        let xs = attention_probs.matmul(value_states);
+        // diffusers applies channels_per_head^-0.25 to q and k; same product.
+        let scale = f64::powf(self.channels as f64 / self.n_heads as f64, -0.5);
+        let xs = ops::attention(query_states, key_states, value_states, scale);
         let xs = xs.swap_dims(1, 2);
         let xs: Tensor<3> = xs.flatten(4 - 2, 4 - 1);
         let xs = self

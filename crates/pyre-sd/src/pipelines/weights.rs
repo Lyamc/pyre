@@ -37,10 +37,85 @@
 //! ```
 
 use std::path::Path;
+use burn_store::{
+    KeyRemapper, ModuleAdapter, ModuleContext, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
+    SafetensorsStore, StoreTensor,
+};
 
-use burn_store::{KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+/// PyTorch -> Burn layout adapter that also casts float tensors to `dtype` (from cabin): an
+/// f16 checkpoint loads as f32 on an f32 device and vice versa, and a model can be loaded in
+/// a dtype other than the device default (the SDXL VAE must run in f32).
+#[derive(Debug, Clone)]
+pub struct PyTorchToBurnDtypeAdapter {
+    pub dtype: burn::tensor::DType,
+}
 
-/// Errors that can occur during weight loading.
+impl Default for PyTorchToBurnDtypeAdapter {
+    fn default() -> Self { Self { dtype: burn::tensor::DType::F32 } }
+}
+
+impl PyTorchToBurnDtypeAdapter {
+    pub fn for_device(device: &burn::tensor::Device) -> Self {
+        Self { dtype: burn::tensor::Tensor::<1>::zeros([1], device).dtype() }
+    }
+}
+
+/// A tensor whose float data is converted to `target` when read (stays deferred).
+pub fn cast_tensor(t: StoreTensor, target: burn::tensor::DType) -> StoreTensor {
+    let dt = t.dtype();
+    if !dt.is_float() || dt == target { return t; }
+    let name = t.name().to_string();
+    let shape = burn::tensor::Shape::from(t.shape().to_vec());
+    burn_store::bridge::map_data(t, name, target, shape, move |d| d.convert_dtype(target))
+}
+
+/// Burn -> Burn adapter that only casts floats.
+#[derive(Debug, Clone)]
+pub struct CastAdapter { pub dtype: burn::tensor::DType }
+
+impl ModuleAdapter for CastAdapter {
+    fn adapt(&self, t: StoreTensor, _ctx: ModuleContext<'_>) -> StoreTensor { cast_tensor(t, self.dtype) }
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> { Box::new(self.clone()) }
+}
+
+impl ModuleAdapter for PyTorchToBurnDtypeAdapter {
+    fn adapt(&self, t: StoreTensor, ctx: ModuleContext<'_>) -> StoreTensor {
+        cast_tensor(PyTorchToBurnAdapter.adapt(t, ctx), self.dtype)
+    }
+    fn get_alternative_param_name(&self, param_name: &str, container_type: &str) -> Option<String> {
+        PyTorchToBurnAdapter.get_alternative_param_name(param_name, container_type)
+    }
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> { Box::new(self.clone()) }
+}
+
+fn load_checkpoint<M>(module: &mut M, path: &Path, key_mappings: Vec<(&str, &str)>, device: &burn::tensor::Device, skip_enum_variants: bool) -> Result<(), WeightLoadError>
+where M: ModuleSnapshot {
+    load_checkpoint_in::<M>(module, path, key_mappings, device, skip_enum_variants, None)
+}
+
+/// Load `path` into `module` with key remapping and the dtype adapter. `dtype` None means the
+/// device default. Missing or mis-shaped tensors are an error naming them (cabin: a silently
+/// skipped tensor keeps its random init and shows up later as a black image).
+fn load_checkpoint_in<M>(module: &mut M, path: &Path, key_mappings: Vec<(&str, &str)>, device: &burn::tensor::Device, skip_enum_variants: bool, dtype: Option<burn::tensor::DType>) -> Result<(), WeightLoadError>
+where M: ModuleSnapshot {
+    let remapper = KeyRemapper::from_patterns(key_mappings).map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
+    let adapter = match dtype { Some(dtype) => PyTorchToBurnDtypeAdapter { dtype }, None => PyTorchToBurnDtypeAdapter::for_device(device) };
+    let mut store = SafetensorsStore::from_file(path.to_path_buf())
+        .with_from_adapter(adapter)
+        .remap(remapper)
+        .skip_enum_variants(skip_enum_variants)
+        .allow_partial(true);
+    let result = store.apply_to(module).map_err(|e| WeightLoadError::SafetensorsLoad(format!("{}: {e}", path.display())))?;
+    if !result.errors.is_empty() {
+        return Err(WeightLoadError::SafetensorsLoad(format!("{}: {} tensors did not fit: {:?}", path.display(), result.errors.len(), result.errors.iter().take(4).collect::<Vec<_>>())));
+    }
+    if !result.missing.is_empty() {
+        let names: Vec<&str> = result.missing.iter().map(|(p, _)| p.as_str()).collect();
+        return Err(WeightLoadError::SafetensorsLoad(format!("{}: {} of the module's tensors are not in the checkpoint: {}", path.display(), names.len(), names.iter().take(8).copied().collect::<Vec<_>>().join(", "))));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeightLoadError {
     #[error("Failed to load safetensors file: {0}")]
@@ -61,7 +136,7 @@ pub enum WeightLoadError {
 pub fn load_clip_safetensors<M, P>(
     mut module: M,
     path: P,
-    _device: &burn::tensor::Device,
+    device: &burn::tensor::Device,
 ) -> Result<M, WeightLoadError>
 where
     M: ModuleSnapshot,
@@ -73,23 +148,12 @@ where
         ("^text_model\\.", ""),
     ];
 
-    let remapper = KeyRemapper::from_patterns(key_mappings)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-
-    let checkpoint_path = path.as_ref().to_path_buf();
-    let mut store = SafetensorsStore::from_file(checkpoint_path)
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .remap(remapper);
-
-    module
-        .load_from(&mut store)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
+    load_checkpoint::<M>(&mut module, path.as_ref(), key_mappings, device, false)?;
 
     Ok(module)
 }
 
-/// Load VAE weights from HuggingFace format.
-///
+/// Load VAE weights from HuggingFace format.///
 /// This handles the key remapping from HuggingFace's naming convention to Burn's.
 /// Main differences:
 /// - HF uses `mid_block.resnets.0/1` but Burn uses `mid_block.resnet` (first) and
@@ -101,19 +165,12 @@ where
 /// Uses `PyTorchToBurnAdapter` to automatically handle:
 /// - Transposing linear layer weights
 /// - Renaming normalization parameters (weight->gamma, bias->beta)
-pub fn load_vae_safetensors<M, P>(
-    mut module: M,
-    path: P,
-    _device: &burn::tensor::Device,
-) -> Result<M, WeightLoadError>
-where
-    M: ModuleSnapshot,
-    P: AsRef<Path>,
-{
-    // Remap HuggingFace VAE keys to our model structure
-    // Order matters: more specific patterns should come first
-    // Note: VAE has encoder/decoder prefixes, so patterns should not use ^ anchor
-    let key_mappings: Vec<(&str, &str)> = vec![
+/// HuggingFace VAE key names to this crate's model structure.
+///
+/// Order matters: more specific patterns come first. Note there is no `^`
+/// anchor, because the VAE's keys start with `encoder.` or `decoder.`.
+fn vae_key_mappings() -> Vec<(&'static str, &'static str)> {
+    vec![
         // Mid block: first resnet (index 0) maps to standalone resnet field
         ("\\.mid_block\\.resnets\\.0\\.", ".mid_block.resnet."),
         // Mid block: second resnet (index 1) maps to attn_resnets.0.resnet_block
@@ -135,20 +192,108 @@ where
         ("\\.downsamplers\\.0\\.", ".downsampler."),
         // Upsamplers: upsamplers.0 -> upsampler
         ("\\.upsamplers\\.0\\.", ".upsampler."),
+    ]
+}
+
+/// Load VAE weights in the device's default float dtype.
+pub fn load_vae_safetensors<M, P>(
+    module: M,
+    path: P,
+    device: &burn::tensor::Device,
+) -> Result<M, WeightLoadError>
+where
+    M: ModuleSnapshot,
+    P: AsRef<Path>,
+{
+    load_vae_safetensors_as(module, path, device, None)
+}
+
+/// Load VAE weights, optionally in an explicit float dtype.
+///
+/// SDXL's VAE is the one model in the pipeline that overflows f16: its decoder
+/// activations climb past 65504, every pixel of the decode comes out non-finite,
+/// and the result is a black image with no error anywhere. diffusers solves the
+/// same problem with `force_upcast`, running the VAE in f32 on an f16 device;
+/// this is the hook for it, and it costs VRAM on a 160 MB model rather than
+/// speed. `None` keeps the device's dtype.
+pub fn load_vae_safetensors_as<M, P>(
+    module: M,
+    path: P,
+    device: &burn::tensor::Device,
+    dtype: Option<burn::tensor::DType>,
+) -> Result<M, WeightLoadError>
+where
+    M: ModuleSnapshot,
+    P: AsRef<Path>,
+{
+    let mut module = module;
+    load_checkpoint_in::<M>(
+        &mut module,
+        path.as_ref(),
+        vae_key_mappings(),
+        device,
+        true,
+        dtype,
+    )?;
+    Ok(module)
+}
+
+/// Load an SD 1.5 ControlNet (down blocks 0–2 with cross-attention, block 3 without).
+pub fn load_controlnet_safetensors<M, P>(
+    mut module: M,
+    path: P,
+    device: &burn::tensor::Device,
+) -> Result<M, WeightLoadError>
+where
+    M: ModuleSnapshot,
+    P: AsRef<Path>,
+{
+    let key_mappings: Vec<(&str, &str)> = vec![
+        ("^mid_block\\.resnets\\.0\\.", "mid_block.resnet."),
+        (
+            "^mid_block\\.resnets\\.1\\.",
+            "mid_block.attn_resnets.0.resnet_block.",
+        ),
+        (
+            "^mid_block\\.attentions\\.([0-9]+)\\.",
+            "mid_block.attn_resnets.$1.spatial_transformer.",
+        ),
+        ("\\.to_k\\.", ".key."),
+        ("\\.to_q\\.", ".query."),
+        ("\\.to_v\\.", ".value."),
+        ("\\.to_out\\.0\\.", ".output."),
+        ("\\.ff\\.net\\.0\\.proj\\.", ".ff.geglu.proj."),
+        ("\\.ff\\.net\\.2\\.", ".ff.linear_outer."),
+        (
+            "^down_blocks\\.0\\.resnets\\.",
+            "down_blocks.0.downblock.resnets.",
+        ),
+        (
+            "^down_blocks\\.0\\.downsamplers\\.0\\.",
+            "down_blocks.0.downblock.downsampler.",
+        ),
+        (
+            "^down_blocks\\.1\\.resnets\\.",
+            "down_blocks.1.downblock.resnets.",
+        ),
+        (
+            "^down_blocks\\.1\\.downsamplers\\.0\\.",
+            "down_blocks.1.downblock.downsampler.",
+        ),
+        (
+            "^down_blocks\\.2\\.resnets\\.",
+            "down_blocks.2.downblock.resnets.",
+        ),
+        (
+            "^down_blocks\\.2\\.downsamplers\\.0\\.",
+            "down_blocks.2.downblock.downsampler.",
+        ),
+        (
+            "^down_blocks\\.3\\.downsamplers\\.0\\.",
+            "down_blocks.3.downsampler.",
+        ),
     ];
-
-    let remapper = KeyRemapper::from_patterns(key_mappings)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-
-    let checkpoint_path = path.as_ref().to_path_buf();
-    let mut store = SafetensorsStore::from_file(checkpoint_path)
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .remap(remapper);
-
-    module
-        .load_from(&mut store)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-
+    load_checkpoint::<M>(&mut module, path.as_ref(), key_mappings, device, true)?;
     Ok(module)
 }
 
@@ -242,7 +387,7 @@ fn inspect_unet_block_types<P: AsRef<Path>>(
 pub fn load_unet_safetensors<M, P>(
     mut module: M,
     path: P,
-    _device: &burn::tensor::Device,
+    device: &burn::tensor::Device,
 ) -> Result<M, WeightLoadError>
 where
     M: ModuleSnapshot,
@@ -327,18 +472,7 @@ where
         .collect();
     key_mappings.extend(dynamic_refs);
 
-    let remapper = KeyRemapper::from_patterns(key_mappings)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-
-    let checkpoint_path = path.as_ref().to_path_buf();
-    let mut store = SafetensorsStore::from_file(checkpoint_path)
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .remap(remapper)
-        .skip_enum_variants(true); // This is the key: skip enum variant names when matching paths
-
-    module
-        .load_from(&mut store)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
+    load_checkpoint::<M>(&mut module, path.as_ref(), key_mappings, device, true)?;
 
     Ok(module)
 }
@@ -355,7 +489,7 @@ where
 pub fn load_clip_with_projection_safetensors<M, P>(
     mut module: M,
     path: P,
-    _device: &burn::tensor::Device,
+    device: &burn::tensor::Device,
 ) -> Result<M, WeightLoadError>
 where
     M: ModuleSnapshot,
@@ -366,18 +500,29 @@ where
     // Our CLIPTextModelWithProjection has a "transformer" field wrapping a ClipTextTransformer
     let key_mappings: Vec<(&str, &str)> = vec![("^text_model\\.", "transformer.")];
 
-    let remapper = KeyRemapper::from_patterns(key_mappings)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
+    load_checkpoint::<M>(&mut module, path.as_ref(), key_mappings, device, false)?;
 
-    let checkpoint_path = path.as_ref().to_path_buf();
-    let mut store = SafetensorsStore::from_file(checkpoint_path)
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .remap(remapper);
+    Ok(module)
+}
 
-    module
-        .load_from(&mut store)
-        .map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-
+/// Load an SD3 / SD 3.5 transformer. Feed-forward and attention output
+/// lists (`net.0.proj`, `net.2`, `to_out.0`) are flattened to the fields
+/// on [`crate::models::sd3::SD3Transformer`].
+pub fn load_sd3_safetensors<M, P>(
+    mut module: M,
+    path: P,
+    device: &burn::tensor::Device,
+) -> Result<M, WeightLoadError>
+where
+    M: ModuleSnapshot,
+    P: AsRef<Path>,
+{
+    let key_mappings: Vec<(&str, &str)> = vec![
+        (r"\.net\.0\.proj\.", ".gelu.proj."),
+        (r"\.net\.2\.", ".out."),
+        (r"\.to_out\.0\.", ".to_out."),
+    ];
+    load_checkpoint::<M>(&mut module, path.as_ref(), key_mappings, device, true)?;
     Ok(module)
 }
 

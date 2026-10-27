@@ -24,7 +24,7 @@ use core::f32::consts::SQRT_2;
 #[allow(unused_imports)]
 use num_traits::Float;
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Activation {
     Gelu,
     QuickGelu,
@@ -168,7 +168,7 @@ impl ClipConfig {
         ClipMlp {
             fc1,
             fc2,
-            activation: self.activation.clone(),
+            activation: self.activation,
         }
     }
 
@@ -293,12 +293,20 @@ pub(crate) struct ClipEncoderLayer {
 impl ClipEncoderLayer {
     fn forward(&self, xs: Tensor<3>, causal_attention_mask: Tensor<4>) -> Tensor<3> {
         let residual = xs;
-        let xs = self.layer_norm1.forward(residual.clone());
+        let xs = crate::models::ops::layer_norm(
+            &self.layer_norm1,
+            residual.clone(),
+            crate::models::ops::LAYER_NORM_EPS,
+        );
         let xs = self.self_attn.forward(xs, causal_attention_mask);
         let xs = xs + residual;
 
         let residual = xs.clone();
-        let xs = self.layer_norm2.forward(xs);
+        let xs = crate::models::ops::layer_norm(
+            &self.layer_norm2,
+            xs,
+            crate::models::ops::LAYER_NORM_EPS,
+        );
         let xs = self.mlp.forward(xs);
         xs + residual
     }
@@ -347,7 +355,7 @@ impl ClipTextTransformer {
         seq_len: usize,
         device: &burn::tensor::Device,
     ) -> Tensor<4> {
-        let mask: Tensor<3> = Tensor::full([bsz, seq_len, seq_len], f32::MIN, device);
+        let mask: Tensor<3> = Tensor::full([bsz, seq_len, seq_len], -65504.0, device); // f16-safe "minus infinity"
         mask.triu(1).unsqueeze_dim(1)
     }
 
@@ -362,9 +370,13 @@ impl ClipTextTransformer {
         let [bsz, seq_len] = xs.dims();
         let xs = self.embeddings.forward(xs);
         let causal_attention_mask =
-            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device());
+            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device()).cast(xs.dtype());
         let xs = self.encoder.forward(xs, causal_attention_mask);
-        self.final_layer_norm.forward(xs)
+        crate::models::ops::layer_norm(
+            &self.final_layer_norm,
+            xs,
+            crate::models::ops::LAYER_NORM_EPS,
+        )
     }
 
     /// Returns the penultimate encoder layer output without final_layer_norm.
@@ -373,7 +385,7 @@ impl ClipTextTransformer {
         let [bsz, seq_len] = xs.dims();
         let xs = self.embeddings.forward(xs);
         let causal_attention_mask =
-            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device());
+            Self::generate_causal_attention_mask(bsz, seq_len, &xs.device()).cast(xs.dtype());
         let n_layers = self.encoder.layers.len();
         self.encoder
             .forward_to_layer(xs, causal_attention_mask, n_layers - 1)
@@ -394,6 +406,14 @@ impl CLIPTextModelWithProjectionConfig {
         Self {
             clip: ClipConfig::sdxl2(),
             projection_dim: 1280,
+        }
+    }
+
+    /// CLIP-L with the projection SD 3 uses for the pooled prompt.
+    pub fn sd3_l() -> Self {
+        Self {
+            clip: ClipConfig::sdxl(),
+            projection_dim: 768,
         }
     }
 
@@ -489,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_generate_causal_attention_mask() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
 
         let mask: Tensor<TestBackend, 4> =
             ClipTextTransformer::generate_causal_attention_mask(2, 4, &device);
@@ -498,15 +518,15 @@ mod tests {
         mask.into_data().assert_approx_eq::<f32>(
             &TensorData::from([
                 [[
-                    [0.0000e0, f32::MIN, f32::MIN, f32::MIN],
-                    [0.0000e0, 0.0000e0, f32::MIN, f32::MIN],
-                    [0.0000e0, 0.0000e0, 0.0000e0, f32::MIN],
+                    [0.0000e0, -65504.0, -65504.0, -65504.0],
+                    [0.0000e0, 0.0000e0, -65504.0, -65504.0],
+                    [0.0000e0, 0.0000e0, 0.0000e0, -65504.0],
                     [0.0000e0, 0.0000e0, 0.0000e0, 0.0000e0],
                 ]],
                 [[
-                    [0.0000e0, f32::MIN, f32::MIN, f32::MIN],
-                    [0.0000e0, 0.0000e0, f32::MIN, f32::MIN],
-                    [0.0000e0, 0.0000e0, 0.0000e0, f32::MIN],
+                    [0.0000e0, -65504.0, -65504.0, -65504.0],
+                    [0.0000e0, 0.0000e0, -65504.0, -65504.0],
+                    [0.0000e0, 0.0000e0, 0.0000e0, -65504.0],
                     [0.0000e0, 0.0000e0, 0.0000e0, 0.0000e0],
                 ]],
             ]),

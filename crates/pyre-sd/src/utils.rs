@@ -11,36 +11,29 @@ where
     K: Numeric,
 {
     if left == 0 && right == 0 {
-        tensor.clone()
-    } else if left == 0 {
-        assert!(
-            dim < D,
-            "dim must be less than the number of dimensions of the tensor"
-        );
+        return tensor.clone();
+    }
+    assert!(
+        dim < D,
+        "dim must be less than the number of dimensions of the tensor"
+    );
+    // The padding has to be in the tensor's own dtype: `Tensor::zeros` follows
+    // the device's default, and a VAE running in f32 on an f16 device would
+    // otherwise ask `cat` to join f32 and f16. That is the encoder's downsample
+    // path, so it is what made an f32 VAE unusable. Both sides are built before
+    // `tensor` is moved into the concatenation.
+    let pad = |n: usize| {
         let mut dims = tensor.dims().to_vec();
-        dims[dim] = right;
-        let right = Tensor::zeros(dims, &tensor.device());
-        Tensor::cat(vec![tensor, right], dim)
-    } else if right == 0 {
-        assert!(
-            dim < D,
-            "dim must be less than the number of dimensions of the tensor"
-        );
-        let mut dims = tensor.dims().to_vec();
-        dims[dim] = left;
-        let left = Tensor::zeros(dims, &tensor.device());
-        Tensor::cat(vec![left, tensor], dim)
-    } else {
-        assert!(
-            dim < D,
-            "dim must be less than the number of dimensions of the tensor"
-        );
-        let mut dims = tensor.dims().to_vec();
-        dims[dim] = left;
-        let left = Tensor::zeros(dims.clone(), &tensor.device());
-        dims[dim] = right;
-        let right = Tensor::zeros(dims, &tensor.device());
-        Tensor::cat(vec![left, tensor, right], dim)
+        dims[dim] = n;
+        Tensor::<D, K>::zeros(dims, (&tensor.device(), tensor.dtype()))
+    };
+    let left_pad = (left > 0).then(|| pad(left));
+    let right_pad = (right > 0).then(|| pad(right));
+    match (left_pad, right_pad) {
+        (None, None) => tensor,
+        (None, Some(right)) => Tensor::cat(vec![tensor, right], dim),
+        (Some(left), None) => Tensor::cat(vec![left, tensor], dim),
+        (Some(left), Some(right)) => Tensor::cat(vec![left, tensor, right], dim),
     }
 }
 

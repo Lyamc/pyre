@@ -435,14 +435,14 @@ mod tests {
     }
 
     /// A ModuleMapper that sets weights to one value and biases to another.
-    struct WeightBiasMapper<'a> {
+    struct WeightBiasMapper<'a, > {
         weight_val: f32,
         bias_val: f32,
         device: &'a burn::tensor::Device,
         current_field: String,
     }
 
-    impl<'a> ModuleMapper for WeightBiasMapper<'a> {
+    impl<'a, > ModuleMapper for WeightBiasMapper<'a, B> {
         fn enter_module(&mut self, name: &str, _container_type: &str) {
             self.current_field = name.to_string();
         }
