@@ -1,6 +1,6 @@
 # pyre
 
-A llama.cpp `llama-server`-style inference server written in Rust where **[Burn](https://github.com/tracel-ai/burn) 0.22** hosts and runs the model. No llama.cpp, candle or ggml does any of the compute: every matmul, attention and norm is a Burn tensor op on CUDA (CubeCL), wgpu (Vulkan/DX12/Metal) or the CPU (Flex / NdArray).
+A llama.cpp `llama-server`-style inference server written in Rust where **[Burn](https://github.com/tracel-ai/burn)** (one version for everything: [Lyamc/burn](https://github.com/Lyamc/burn) @ `9db7598`, 0.23.0-pre.1) hosts and runs the model. No llama.cpp, candle or ggml does any of the compute: every matmul, attention and norm is a Burn tensor op on CUDA (CubeCL), wgpu (Vulkan/DX12/Metal) or the CPU (Flex / NdArray).
 
 ## Build
 
@@ -58,16 +58,14 @@ pyre models info <name>
 STT is backed by [whisburn](file:///C:/Build/machine-learning/whisburn), Lyam's Burn speech project. pyre
 uses it unmodified through a thin adapter (`src/stt.rs`).
 
-- **Dependency:** `whisburn-core`, `whisburn-audio`, `whisburn-engine` and `whisburn-models` come in as
-  **git** dependencies on the local repo, pinned to commit `d27f1fc`
-  (`git = "file:///C:/Build/machine-learning/whisburn"`). That keeps pyre building against committed
-  whisburn code rather than its working tree. To bump it, change `rev`.
-  Cargo feature `stt` (on by default) can be dropped with `--no-default-features --features cuda,wgpu,flex`.
-- **Burn versions:** whisburn is on **burn 0.21** and pyre is on **burn 0.22.1**. Cargo treats them as
-  separate crates, so both are compiled and linked (it builds fine, but the first build is longer and
-  the binary is bigger). The STT model runs on burn 0.21's wgpu/ndarray runtime and the LLMs on
-  0.22's. They share no tensors, so this works, but there are two GPU runtimes and two autotune caches.
-  The long-term fix is for whisburn to move to burn 0.22 (see below).
+- **Code:** whisburn @ `d27f1fc` is vendored as `crates/pyre-whisper-{core,audio,engine,models}` and
+  ported to the Lyamc/burn device-dispatch API (no backend generics). The whisburn repo itself is untouched.
+- **One Burn:** `cargo tree` shows a single burn (0.23.0-pre.1, Lyamc/burn#9db7598) and a single cubecl
+  (4fdcb6e) for LLM, STT and SD. Whisper weights are re-converted from HF into burnpack (`model.bpk`);
+  the published 0.21 `.mpk` bundles are not readable by this Burn and are skipped.
+- **Formats:** wav/mp3/flac/aac/m4a, Vorbis ogg, and Opus in webm/ogg (browser mic recordings) via a
+  pure-Rust Opus decoder (`opus-rs`) registered into symphonia. Verified: `samples/speech.webm` and
+  `speech.ogg` (ffmpeg libopus) transcribe the same as the wav.
 - **Backends:** whisburn has wgpu (any GPU, including NVIDIA through Vulkan/DX12) and ndarray (CPU).
   `--backend cuda`/`wgpu` both map to whisburn's wgpu; `cpu`/`flex`/`ndarray` map to its CPU runtime.
 - **Models:** any whisburn ASR registry name (`tiny`, `tiny_en`, `base`, `small_en`, `large-v3-turbo`,
@@ -89,49 +87,19 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F model=
 and `timestamp_granularities` are accepted and ignored. Input is decoded by whisburn-audio (symphonia:
 wav/mp3/flac/ogg-vorbis/m4a-aac). Browser mic recordings (webm/opus) may not decode.
 
-Measured on an RTX 3060 with a 7.5 s clip (Windows SAPI voice) and `tiny_en`: wgpu 0.8-1.2 s per request
-(6-9x realtime; the first request is about 4.9 s while kernels compile), ndarray CPU 11.2 s (0.7x). The
-transcript was exact except "Pyre" was heard as "Fire".
+Measured on an RTX 3060 12 GB (512x512, 30 steps default, f32):
 
-**whisburn changes that would help (not made; whisburn is untouched):**
-1. Move to burn 0.22 so pyre shares one Burn/cubecl (and gets CUDA for STT).
-2. Accept a models dir per `InferenceRuntime`/`load_model` call instead of the global `WHISBURN_MODELS_DIR`.
-3. Load Whisper straight from HF safetensors (like the qwen3/parakeet paths) so pyre can reuse the HF cache with zero extra disk.
-4. With `include_timestamps = false`, Whisper decoding stops after the first sentence/window; pyre works around it by always requesting timestamps.
-5. Stop forcing `fancy-regex` on `tokenizers` (pyre uses `onig`; it builds, but both regex engines get compiled in).
+| | before (burn 0.20 diffusers-burn) | now (Lyamc/burn, persistent cache + warm-up) |
+|---|---|---|
+| CUDA first image after startup | ~9 min | **14.1 s** (startup incl. warm-up ~4 min on a cold cache, ~28 s warm) |
+| CUDA steady state | ~9.4 s (20 steps) | 13.7 s (30 steps) |
+| wgpu first / steady | n/a | 511 s / 521 s (startup 183 s) - wgpu conv kernels are far slower; use CUDA |
 
-## Image generation (Stable Diffusion 1.5)
-
-Burn runs every step: the CLIP text encoder, the UNet, the VAE and DDIM. pyre uses
-[diffusers-burn](https://github.com/oxiglade/diffusers-burn) (MIT/Apache, a port of diffusers-rs),
-pinned to rev `9061882` as a git dependency. It runs on **burn 0.20**, so a pyre build with every
-feature links three Burn versions (0.20 for SD, 0.21 for whisburn, 0.22 for LLMs). The `image`
-feature is on by default.
-
-- Weights load straight from the diffusers-format HF snapshot (`text_encoder/model.safetensors`,
-  `unet/…`, `vae/…`, `tokenizer/merges.txt`), using zero extra disk. `pyre models pull
-  stable-diffusion-v1-5/stable-diffusion-v1-5` fetches only those files (about 4.3 GB, f32). The repo is not gated.
-- Backends: `cuda` (tested) and `wgpu` (built in, not benchmarked). CPU is refused because it would be too slow.
-- Lockfile note: `burn-store 0.20.1` doesn't build with `zip >= 7.3`, so `Cargo.lock` pins `zip 7.2.0`.
-  `src/main.rs` also sets `#![recursion_limit = "512"]` because of the wgpu 26 + 28 type depth.
-
-```
-pyre serve -m qwen --image-model stable-diffusion-v1-5/stable-diffusion-v1-5
-curl http://127.0.0.1:8080/v1/images/generations -H "content-type: application/json" \
-  -d '{"prompt":"an ancient mossy stone","size":"512x512","steps":20,"seed":42}'
-```
-
-`/v1/images/generations` accepts `prompt`, `n` (≤8), `size` (multiples of 8, 64–1024) and
-`response_format` (`b64_json`, or `url`, which returns a data: URL), plus the extensions
-`negative_prompt`, `steps` (default 30), `guidance_scale` (7.5) and `seed`. It also returns `timings`.
-`/sdapi/v1/txt2img` (the AUTOMATIC1111 subset) accepts `prompt`, `negative_prompt`, `steps`,
-`cfg_scale`, `width`, `height`, `seed`, `batch_size` and `n_iter`, and returns `images` (base64),
-`parameters` and `info`. The only sampler is DDIM.
-
-Measured on an RTX 3060 12 GB (cuda, f32, 512×512, 20 steps): **about 9.4 s per image (2.1 it/s)**
-in steady state. The **first image after startup takes about 9 minutes** while CubeCL JIT-compiles and
-autotunes the UNet kernels. Later images and runs reuse the cache. Samples are in
-`samples/sd_cuda_*.png` and `samples/sdapi_lighthouse.png`.
+The CubeCL kernel/autotune cache is now persisted (`target/environment/default.db`, burn `persistence`
+feature). On Windows this needed a local cubecl fix: its Turso cache requested multiprocess WAL, which
+Turso's Windows IO backend rejects, so the cache silently fell back to memory every run. Fix is on a local
+branch (`C:/Build/ai/cubecl-pyre-fix`, `pyre-windows-wal-fix`) wired in with `[patch]`; not pushed.
+Load-time warm-up: `PYRE_SD_WARMUP=0` disables, `PYRE_SD_WARMUP_STEPS` (default 2).
 
 ## Text to speech (stub)
 
@@ -150,13 +118,30 @@ The UI's TTS card stays disabled. I looked at these ports and didn't do any of t
 Plan: Kokoro through burn-onnx once #371 lands, plus a Rust G2P (misaki-style lexicon), behind a
 `tts` feature, emitting 24 kHz wav/mp3/opus.
 
+## Desktop GUI (GPUI)
+
+`gui/` is a separate workspace (`pyre-gui`) on [Lyamc/gpui](https://github.com/Lyamc/gpui) @ `08629d4`.
+It talks to the server over HTTP only and does not link Burn. Pages: Chat (SSE streaming), Models
+(load/unload/pull/import/alias), Images, Audio (transcribe a file, TTS), Status.
+
+```powershell
+cargo build --release --manifest-path gui/Cargo.toml
+gui\target\x86_64-pc-windows-msvc\release\pyre-gui.exe http://127.0.0.1:8080
+```
+
+Screenshots: `samples/gui-{chat,models,images,audio,status}.png`.
+
 ## Roadmap / known gaps
 
-- GGUF and quantized weights (Q4/Q8) are skipped; only safetensors f32/f16/bf16 load.
-- Continuous batching: each model has a single worker and a FIFO queue.
-- MoE Qwen3 (A3B), Gemma, vision-language and SDXL (diffusers-burn has SDXL; it isn't wired up) are not done.
-- TTS (see above).
-- Unify Burn versions. SD is on 0.20 (via diffusers-burn), whisburn on 0.21 and pyre on 0.22. Porting
-  diffusers-burn and whisburn to 0.22 would drop two cubecl stacks and give STT CUDA support.
-- SD warm-up: persist and prewarm the CubeCL autotune cache so the first image isn't about 9 minutes.
-- Browser mic recordings (webm/opus) may not decode in whisburn-audio. Uploads of wav/mp3/flac work.
+- GGUF / quantized weights (Q8_0, Q4_K) - not done. Options: port Lyamc/burn-gguf (targets upstream
+  burn 0.22, needs porting to the fork's dispatch API) or a pyre-side GGUF reader that dequantizes to
+  f16/bf16 at load (memory-saving only, no quantized matmul).
+- Continuous batching - not done; each model has one worker and a FIFO queue. Needs batched KV cache
+  (per-sequence positions + padding masks) in `src/model/llama.rs` and a scheduler in the registry.
+- MoE (Qwen3-MoE) and Gemma (2/3) - not done. Gemma needs: GeGLU, (1+w) RMSNorm, embedding scaling,
+  logit soft-capping and sliding-window layers; Qwen3-MoE needs router top-k + expert dispatch.
+- TTS (see above) - still a 501 stub.
+- wgpu Stable Diffusion is ~40x slower than CUDA (see table).
+- LLM parity: Qwen2.5-0.5B greedy, 15 tokens, matches HF f32 on the first 14; token 15 is a near tie
+  (`.` vs `.\n`), identical to the pre-port build. Decode (0.5B, RTX 3060): CUDA 43.3 tok/s bf16 /
+  38.2 f32 (was 30.5), wgpu 41.9 tok/s (was 38.4).
