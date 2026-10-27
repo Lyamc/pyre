@@ -139,8 +139,9 @@ fn weight_bytes(dir: &std::path::Path) -> u64 {
 fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
     let backend = q.backend.clone().unwrap_or_else(|| d.backend.clone());
     if q.kind == Kind::Stt {
-        // STT bundles are whisburn-format (converted .mpk), resolved by the whisburn adapter.
-        let backend = if matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { "cpu".to_string() } else { "wgpu".to_string() };
+        // STT bundles are whisburn-format (converted .bpk), resolved by the whisburn adapter. Runs on the
+        // requested backend (cuda/wgpu/vulkan), so it shares the LLM's device and kernel caches.
+        let backend = if matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { "cpu".to_string() } else { backend };
         let s = crate::stt::SttModel::load(q.r, &backend, &storage.store.root, storage.offline).context("loading speech-to-text model")?;
         let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
         return Ok(Loaded { id, kind: q.kind, backend, path: s.dir.display().to_string(), created: now(), inner: Inner::Stt(Arc::new(s)) });

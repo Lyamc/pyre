@@ -133,6 +133,9 @@ pub enum ModelsCmd {
 
 fn main() -> Result<()> {
     logbuf::init();
+    // Persist compiled GPU kernels (PTX/SPIR-V/WGSL pipelines) next to the autotune cache so a
+    // restart doesn't recompile everything; cubecl leaves this off by default. Single-threaded here.
+    if std::env::var_os("CUBECL_COMPILATION_CACHE").is_none() { std::env::set_var("CUBECL_COMPILATION_CACHE", "1"); }
     let cli = Cli::parse();
     let ctx = storage::Ctx::new(&cli.storage)?;
     match cli.cmd {
