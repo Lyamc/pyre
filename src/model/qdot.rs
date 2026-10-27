@@ -32,7 +32,7 @@ pub fn supports(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QT
 
 /// Per-thread decode buffers (reused across rows: no allocation per row).
 #[derive(Default)]
-pub struct Scratch { g: Vec<u8>, s: Vec<u8>, sc: Vec<f32> }
+pub struct Scratch { g: Vec<u8>, s: Vec<u8>, sc: Vec<f32>, c8: Vec<f32> }
 
 fn sign8() -> &'static [u64; 256] {
     static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
@@ -134,11 +134,19 @@ unsafe fn q2_0_avx2(row: &[u8], a: &Q8Act) -> f32 {
     corr + k::hsum(acc)
 }
 
-fn row_dot_generic(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
-    let n = a.q.len();
-    sc.g.resize(n, 0); sc.s.resize(n, 1); sc.sc.resize(n / 16, 0.0);
-    let (g, s, scl) = (&mut sc.g[..], &mut sc.s[..], &mut sc.sc[..]);
-    let s8t = sign8(); let mut corr = 0f32;
+fn row_dot_generic(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 { decode(t, row, a.q.len(), sc); dot_decoded(sc, a) }
+
+/// One decoded row against an activation (prefill: decode once, dot against every token).
+pub fn dot_decoded(sc: &Scratch, a: &Q8Act) -> f32 {
+    let mut corr = 0f32; for (gi, &c) in sc.c8.iter().enumerate() { if c != 0.0 { corr += c * a.d[gi / 4] * a.s8[gi] as f32; } }
+    corr + dot_i8(&sc.g, &sc.s, &sc.sc, a)
+}
+
+/// Decode a row of `n` values into unsigned magnitudes, signs, per-16 scales and per-8 offsets.
+pub fn decode(t: QType, row: &[u8], n: usize, sc: &mut Scratch) {
+    sc.g.resize(n, 0); sc.s.resize(n, 1); sc.sc.resize(n / 16, 0.0); sc.c8.clear(); sc.c8.resize(n / 8, 0.0);
+    let (g, s, scl, c8) = (&mut sc.g[..], &mut sc.s[..], &mut sc.sc[..], &mut sc.c8[..]);
+    let s8t = sign8();
     match t {
         QType::IQ2XXS => for i in 0..n / 256 { let b = &row[i * 66..]; let d = h2f(b, 0); let qs = &b[2..66];
             for ib in 0..8 { let a1 = u32::from_le_bytes([qs[8 * ib + 4], qs[8 * ib + 5], qs[8 * ib + 6], qs[8 * ib + 7]]);
@@ -163,17 +171,16 @@ fn row_dot_generic(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
                     // grid bytes are i8 in {-1,0,1}: magnitude to g, sign to s
                     let w = IQ1S_GRID[idx[l]]; let mag = w & 0x0101010101010101; let neg = (w >> 7) & 0x0101010101010101;
                     put(g, o + 8 * l, mag); put(s, o + 8 * l, 0x0101010101010101 | (neg * 0xFE));
-                    let gi = (o + 8 * l) / 8; corr += dl[l / 2] * del[l] * a.d[gi / 4] * a.s8[gi] as f32;
+                    c8[(o + 8 * l) / 8] = dl[l / 2] * del[l];
                 } } },
         QType::Q2_0 => for i in 0..n / 64 { let b = &row[i * 18..]; let d = h2f(b, 0); let o = i * 64;
             for k in 0..16 { let q = b[2 + k]; for j in 0..4 { g[o + 4 * k + j] = (q >> (2 * j)) & 3; } }
             for k in 0..4 { scl[o / 16 + k] = d; }
             s[o..o + 64].fill(1);
             // value = q - 1: subtract d * sum(x) over the block
-            for h in 0..2 { let blk = o / 32 + h; let sx: i32 = a.s8[blk * 4..blk * 4 + 4].iter().sum(); corr -= d * a.d[blk] * sx as f32; } },
+            c8[o / 8..o / 8 + 8].fill(-d); },
         _ => unreachable!("qdot: unsupported {t:?}"),
     }
-    corr + dot_i8(g, s, scl, a)
 }
 
 fn dot_i8(g: &[u8], s: &[u8], scl: &[f32], a: &Q8Act) -> f32 {
