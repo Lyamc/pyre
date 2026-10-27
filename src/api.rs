@@ -28,6 +28,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/logs", get(logs))
         .route("/v1/images/generations", post(images))
         .route("/sdapi/v1/txt2img", post(txt2img))
+        .route("/v1/images/edits", post(images))
+        .route("/sdapi/v1/img2img", post(txt2img))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/speech", post(speech))
@@ -221,6 +223,14 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
     p.scheduler = s("scheduler").map(|x| x.to_ascii_lowercase());
     p.refiner = b["refiner"].as_bool().unwrap_or(false);
     p.refiner_denoise = b["refiner_denoise"].as_f64();
+    // img2img (`/v1/images/edits` JSON body `image`, or A1111 `init_images[0]`): base64 PNG/JPEG, data URLs too.
+    let img = b["image"].as_str().or(b["init_images"][0].as_str());
+    if let Some(s) = img {
+        use base64::Engine;
+        let s = s.split_once("base64,").map(|(_, d)| d).unwrap_or(s);
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.init_image = Some(std::sync::Arc::new(bytes)); }
+        p.strength = b["strength"].as_f64().or(b["denoising_strength"].as_f64()).unwrap_or(0.75).clamp(0.0, 1.0);
+    }
     p
 }
 

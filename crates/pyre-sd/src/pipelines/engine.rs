@@ -335,6 +335,17 @@ impl Engine {
         Ok((rgb, w, h))
     }
 
+    /// cabin's VAE Encode (posterior mode): RGB8 pixels -> a latent in the sampler's units, for img2img.
+    pub fn encode_image(&self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor<4>> {
+        if w % 8 != 0 || h % 8 != 0 { bail!("image must be 8 px aligned (got {w}x{h})"); }
+        let hw = w * h;
+        let mut planar = vec![0f32; hw * 3];
+        for i in 0..hw { for c in 0..3 { planar[c * hw + i] = rgb[i * 3 + c] as f32 / 255.0; } }
+        let x = host_tensor(planar, [1, 3, h, w], &self.dev, self.vae_dtype);
+        let lat = self.vae.encode(x * 2.0 - 1.0).mode() * self.vae_scale;
+        Ok(Tensor::<4>::cast(lat, self.dtype))
+    }
+
     pub fn device(&self) -> &Device { &self.dev }
 }
 
@@ -343,9 +354,16 @@ impl Engine {
 /// released, the refiner UNet loaded, run at `denoise` over the base latent, then released again.
 pub fn refine(base: &mut Engine, refiner_dir: &Path, latent: Tensor<4>, q: &Request, on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor<4>> {
     if base.family != Family::Sdxl { bail!("a refiner stage needs an SDXL base model"); }
+    // Hand the base UNet's VRAM back before the refiner's 4.5 GB arrives: dropping the module only
+    // returns its buffers to Burn's pool, and on a 12 GB card base + refiner + activations spill
+    // into shared system memory (WDDM) and every step crawls.
     base.unload_unet();
+    let _ = base.dev.sync();
+    base.dev.memory_cleanup();
     let r = load_unet(refiner_dir, Family::SdxlRefiner, &base.dev, base.dtype).context("loading the SDXL refiner UNet")?;
     let out = base.sample(q, Some((&r, Family::SdxlRefiner)), Some(&latent), on_step);
     drop(r);
+    let _ = base.dev.sync();
+    base.dev.memory_cleanup();
     out
 }

@@ -27,11 +27,15 @@ pub struct GenParams {
     pub refiner: bool,
     /// Refiner denoise strength (default 0.3, as in cabin's base+refiner workflow).
     pub refiner_denoise: Option<f64>,
+    /// img2img: an encoded PNG/JPEG to start from; its size (rounded down to 8 px) is the output size.
+    pub init_image: Option<std::sync::Arc<Vec<u8>>>,
+    /// img2img denoise strength (cabin's KSampler `denoise`), 0..=1.
+    pub strength: f64,
 }
 
 impl GenParams {
     pub fn new(prompt: &str, width: usize, height: usize, steps: usize, guidance: f64, seed: u64) -> Self {
-        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None }
+        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0 }
     }
 }
 
@@ -158,6 +162,16 @@ impl ImageModel {
     #[cfg(feature = "image")]
     pub fn generate(&self, q: &GenParams) -> Result<Generated> {
         let mut q = q.clone();
+        let init = match &q.init_image {
+            Some(bytes) => {
+                let img = image::load_from_memory(bytes).context("decoding the init image")?.to_rgb8();
+                let (w, h) = ((img.width() as usize) / 8 * 8, (img.height() as usize) / 8 * 8);
+                let img = image::imageops::crop_imm(&img, 0, 0, w as u32, h as u32).to_image();
+                q.width = w; q.height = h;
+                Some(img.into_raw())
+            }
+            None => None,
+        };
         if q.width == 0 { q.width = if q.height > 0 { q.height } else { self.native }; }
         if q.height == 0 { q.height = q.width; }
         if q.steps == 0 { q.steps = 25; }
@@ -186,7 +200,10 @@ impl ImageModel {
                 sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0 };
             let prog = &self.progress;
             let mut on_step = |i: usize, n: usize| prog.store(((i as u64) << 32) | n as u64, Ordering::SeqCst);
-            let mut lat = eng.sample(&req, None, None, &mut on_step)?;
+            let mut req = req;
+            let init_lat = match &init { Some(rgb) if q.strength < 1.0 => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
+            if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral") { req.sampler = "euler".into(); }
+            let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
             if q.refiner {
                 let dir = self.refiner_dir.clone().ok_or_else(|| anyhow!("no SDXL refiner found (set PYRE_SD_REFINER or put stable-diffusion-xl-refiner-1.0 next to the base)"))?;
                 let mut rq = req.clone();
