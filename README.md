@@ -93,7 +93,7 @@ Measured on an RTX 3060 12 GB (512x512, 30 steps default, f32):
 |---|---|---|
 | CUDA first image after startup | ~9 min | **14.1 s** (startup incl. warm-up ~4 min on a cold cache, ~28 s warm) |
 | CUDA steady state | ~9.4 s (20 steps) | 13.7 s (30 steps) |
-| wgpu first / steady | n/a | 511 s / 521 s (startup 183 s) - wgpu conv kernels are far slower; use CUDA |
+| wgpu first / steady | n/a | **25 s** steady (20 steps; was ~515 s). 3x3 convs run as chunked im2col + matmul (`crates/pyre-sd/src/models/fastconv.rs`), because without tensor-core MMA Burn only has a direct conv kernel, which took 97% of the time. Output matches CUDA (mean abs diff 0.04/255). `PYRE_SD_IM2COL=0/1` overrides; the default is on for non-CUDA. |
 
 The CubeCL kernel/autotune cache is now persisted (`target/environment/default.db`, burn `persistence`
 feature). On Windows this needed a local cubecl fix: its Turso cache requested multiprocess WAL, which
@@ -116,10 +116,28 @@ weights are **CC-BY-NC 4.0** (non-commercial). Samples: `samples/tts-pyre.wav`, 
 
 A folder containing `model.gguf` (plus config.json/tokenizer.json) loads through a local port of
 Lyamc/burn-gguf to the burn fork (`C:/Build/ai/burn-gguf`, branch `pyre-burn-fork`, path dependency,
-not pushed; its tests aren't ported). Q8_0 stays packed as a Burn Q8 block-32 tensor. Q4_K/Q6_K are
-**dequantized at load**, since Burn has no K-quant scheme. `PYRE_GGUF_DEQUANT=1` dequantizes everything.
-Qwen2.5-0.5B-Instruct on CUDA (RTX 3060): Q8_0 32.2 tok/s, +1061 MiB VRAM; Q4_K_M 41.2 tok/s,
-+1379 MiB (same as bf16 safetensors). Both produce correct text.
+not pushed; its 168 tests pass). Weights stay **packed on the GPU** (`src/model/kquant.rs`, exactness unit tests):
+
+- Q8_0 -> Burn Q8F block 32 (f16 scales).
+- Q5_0 -> Q8F block 32, exact.
+- Q6_K -> Q8F block 16 with f32 scales, exact.
+- Q4_K -> Q4F block 32 with the exact f32 sub-block scale and q-8, plus a per-block offset matrix C
+  (`[out, in/32]`). The linear becomes `x·W'ᵀ + blocksum32(x)·Cᵀ`.
+
+`PYRE_GGUF_KQUANT=0` dequantizes the K/Q5 types at load; `PYRE_GGUF_DEQUANT=1` dequantizes everything.
+Burn's quantized matmul dequantizes each weight inside the op (no hand-written fused int4 kernel), so
+speed is roughly bf16 speed, not faster. Token embeddings are dequantized (the lookup needs floats).
+
+RTX 3060, CUDA, util cap off (`scripts/gguf_bench.ps1`; extra VRAM after load + 3 requests):
+
+| model | packed | dequantized | Q8_0 | bf16 safetensors |
+|---|---|---|---|---|
+| Qwen2.5-0.5B Q4_K_M | +991 MiB, 43.4 tok/s | +1376 MiB, 46.4 tok/s | +1040 MiB, 48.9 tok/s | +1376 MiB, 45.8 tok/s |
+| Qwen2.5-1.5B Q4_K_M | +2863 MiB, 28.2 tok/s | +3759 MiB, 28.5 tok/s | +2760 MiB, 38.4 tok/s | — |
+
+All outputs are coherent text. In the 0.5B Q4_K_M file most tensors are Q5_0 (896 is not a multiple of 256).
+In the 1.5B file, packing saves ~0.9 GB. It still doesn't beat Q8_0, because Burn's memory pool keeps
+dequantized f32 temporaries for the largest weights.
 
 ## Continuous batching
 
@@ -153,11 +171,41 @@ Screenshots: `samples/gui-{chat,models,images,audio,status}.png`.
 
 Screenshot with TTS: `samples/gui-audio-tts.png` (`PYRE_GUI_TTS="text"` speaks at startup).
 
+## GPU footprint limits (on by default)
+
+pyre leaves room for the desktop and other apps:
+
+- `--vram-reserve 1G` / `PYRE_VRAM_RESERVE`: VRAM kept free. The default is max(1 GiB, 10% of VRAM), which is 1228 MiB
+  on a 12 GB card; `0` disables. Free VRAM is read from NVML, for both CUDA and wgpu on NVIDIA.
+  - A load whose weight files don't fit above the reserve is refused with a clear error.
+  - A load that leaves less than the reserve free is rolled back.
+  - LLM batch slots, each of which owns a full-context KV cache, are capped to fit. Example:
+    `-c 32768 --vram-reserve 8G` gives 3 slots instead of 8.
+  - Image generation at a new, larger size is checked first.
+- `--gpu-util-max 90` / `PYRE_GPU_UTIL_MAX`: duty-cycle cap; `100` or `0` disables.
+  - After each decode step, prefill chunk and diffusion step, the worker syncs the device and sleeps
+    `busy·(100-u)/u`.
+  - Prefill runs in 512-token chunks (`PYRE_PREFILL_CHUNK`), so no submission runs long. This is gentler
+    on the driver watchdog.
+  - The process runs at below-normal priority (`PYRE_LOW_PRIORITY=0` turns that off).
+- Current limits and usage are in `/api/status` → `limits`, on the web UI Status page and on the GPUI Status page.
+
+Cost of the defaults (RTX 3060):
+
+| workload | default limits | limits off |
+|---|---|---|
+| Qwen2.5-0.5B, 1 stream | 37.8 tok/s | 41.1 tok/s |
+| Qwen2.5-0.5B, 8 streams (aggregate) | 172.4 tok/s | 190.6 tok/s |
+| SD 1.5 512x512, 20 steps, CUDA | 10.5 s | 9.6 s |
+
+Burn's memory pool still caches freed buffers. Once the pool is warm, a long SD session can sit close to
+the reserve (seen: 1566 MiB free with a 1228 MiB reserve), and within one op it can't be capped.
+
 ## Known gaps
 
 - Chat hang under STT + chat: not reproducible after 40+ mixed concurrent rounds (with image generation, 60 s noise audio, stretched audio; `scripts/stress_mix.py`). Most likely it was the old opus wrong-sample-rate bug, which is fixed.
-- K-quants have no quantized matmul (dequantized at load).
-- wgpu Stable Diffusion is ~40x slower than CUDA (see table).
+- K-quants: weights stay packed, but there is no fused int4 matmul kernel (Burn dequantizes inside the op), so Q4_K_M is not faster than bf16. A hand-written CubeCL kernel would need the backend-generic API, which the device-dispatch tensor API does not expose to pyre.
+- wgpu Stable Diffusion: 25 s vs ~10 s on CUDA (no tensor cores through wgpu).
 - LLM parity: Qwen2.5-0.5B greedy, 15 tokens, matches HF f32 on the first 14; token 15 is a near tie
   (`.` vs `.\n`), identical to the pre-port build. Decode (0.5B, RTX 3060): CUDA 43.3 tok/s bf16 /
   38.2 f32 (was 30.5), wgpu 41.9 tok/s (was 38.4).
