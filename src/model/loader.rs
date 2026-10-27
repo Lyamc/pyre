@@ -88,18 +88,56 @@ impl Weights {
         match &self.gguf { Some(r) => r.tensor(&hf_to_gguf(name)).is_some(), None => self.index.contains_key(name) }
     }
 
+    /// A tensor's shape (HF order), without loading it.
+    pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
+        if let Some(r) = &self.gguf {
+            let g = hf_to_gguf(name);
+            let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
+            return Ok(info.dims.iter().rev().copied().collect());
+        }
+        let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        Ok(SafeTensors::deserialize(&self.maps[i])?.tensor(name)?.shape().to_vec())
+    }
+
     /// A float tensor in the model dtype (quantized GGUF data is dequantized).
     pub fn get<const D: usize>(&self, name: &str) -> Result<Tensor<D>> {
         let opts = TensorCreationOptions::new(self.device.clone()).with_dtype(self.dtype);
+        let (data, _) = self.get_data(name, D)?;
+        Ok(Tensor::from_data(data, opts))
+    }
+
+    /// Several float tensors concatenated along dim 0, joined on the host and uploaded once (so
+    /// fusing q/k/v or gate/up costs no extra device memory, unlike a device-side `cat`, whose
+    /// freed inputs stay in the allocator pool).
+    pub fn get_cat0<const D: usize>(&self, names: &[String]) -> Result<Tensor<D>> {
+        let opts = TensorCreationOptions::new(self.device.clone()).with_dtype(self.dtype);
+        let mut bytes = Vec::new();
+        let mut shape: Option<Vec<usize>> = None;
+        let mut dt = None;
+        for n in names {
+            let (d, sh) = self.get_data(n, D)?;
+            if dt.is_some_and(|t| t != d.dtype()) { bail!("{n}: dtype differs from the other fused tensors"); }
+            dt = Some(d.dtype());
+            match &mut shape {
+                None => shape = Some(sh),
+                Some(s) => { if s[1..] != sh[1..] { bail!("{n}: trailing dims {sh:?} differ from {s:?}"); } s[0] += sh[0]; }
+            }
+            bytes.extend_from_slice(d.bytes());
+        }
+        let data = TensorData::from_bytes_vec(bytes, shape.context("no tensors")?, dt.unwrap());
+        Ok(Tensor::from_data(data, opts))
+    }
+
+    fn get_data(&self, name: &str, rank: usize) -> Result<(TensorData, Vec<usize>)> {
         if let Some(r) = &self.gguf {
             let g = hf_to_gguf(name);
             let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
             let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
-            if shape.len() != D { bail!("{name}: expected rank {D}, got {shape:?}"); }
+            if shape.len() != rank { bail!("{name}: expected rank {rank}, got {shape:?}"); }
             let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
             let vals = burn_gguf::dequantize_checked(info.tensor_type, &bytes, info.num_elements().map_err(|e| anyhow!("{e}"))?)
                 .map_err(|e| anyhow!("{g}: {e}"))?;
-            return Ok(Tensor::from_data(TensorData::new(vals, shape), opts));
+            return Ok((TensorData::new(vals, shape.clone()), shape));
         }
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
         let st = SafeTensors::deserialize(&self.maps[i])?;
@@ -111,9 +149,8 @@ impl Weights {
             d => bail!("unsupported safetensors dtype {d:?} for {name}"),
         };
         let shape = v.shape().to_vec();
-        if shape.len() != D { bail!("{name}: expected rank {D}, got {:?}", shape); }
-        let data = TensorData::from_bytes_vec(v.data().to_vec(), shape, dt);
-        Ok(Tensor::from_data(data, opts))
+        if shape.len() != rank { bail!("{name}: expected rank {rank}, got {:?}", shape); }
+        Ok((TensorData::from_bytes_vec(v.data().to_vec(), shape.clone(), dt), shape))
     }
 
     /// A `[out, in]` linear weight kept packed when the GGUF type has an exact Burn scheme

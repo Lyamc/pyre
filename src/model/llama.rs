@@ -38,14 +38,19 @@ impl Lin {
 /// Packed-quant or Q4_K-offset weights stay separate. `PYRE_FUSE_PROJ=0` disables.
 enum Proj { Split(Vec<Lin>), Fused(Lin, Vec<usize>) }
 impl Proj {
-    fn new(parts: Vec<Lin>) -> Self {
+    fn load(ws: &Weights, names: &[String], bias: bool) -> Result<Self> {
         let off = matches!(std::env::var("PYRE_FUSE_PROJ").as_deref(), Ok("0" | "false" | "off"));
-        let bias_mix = parts.iter().any(|l| l.b.is_some()) && parts.iter().any(|l| l.b.is_none());
-        if off || bias_mix || parts.iter().any(|l| l.kb.is_some() || !l.w.dtype().is_float()) { return Proj::Split(parts); }
-        let sizes: Vec<usize> = parts.iter().map(|l| l.w.dims()[1]).collect();
-        let b = if parts[0].b.is_some() { Some(Tensor::cat(parts.iter().map(|l| l.b.clone().unwrap()).collect(), 0)) } else { None };
-        let w = Tensor::cat(parts.into_iter().map(|l| l.w).collect(), 1);
-        Proj::Fused(Lin { w, b, kb: None }, sizes)
+        // Packed (quantized) GGUF weights stay separate; everything else is joined on the host.
+        let packed = ws.is_gguf() && ws.get_quantized(&format!("{}.weight", names[0]))?.is_some();
+        if off || packed {
+            return Ok(Proj::Split(names.iter().map(|n| Lin::load(ws, n, bias)).collect::<Result<_>>()?));
+        }
+        let wn: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
+        let w: Tensor<2> = ws.get_cat0(&wn)?;
+        let mut sizes = Vec::with_capacity(names.len());
+        for n in &wn { sizes.push(ws.shape(n)?[0]); }
+        let b = if bias { Some(ws.get_cat0::<1>(&names.iter().map(|n| format!("{n}.bias")).collect::<Vec<_>>())?) } else { None };
+        Ok(Proj::Fused(Lin { w: w.transpose(), b, kb: None }, sizes))
     }
     fn fwd<const D: usize>(&self, x: Tensor<D>) -> Vec<Tensor<D>> {
         match self {
@@ -168,7 +173,7 @@ impl Llama {
                 }
                 Mlp::Moe { router: Lin::load(ws, &format!("{p}.mlp.gate"), false)?, experts, k: cfg.num_experts_per_tok.unwrap_or(2), renorm: cfg.norm_topk_prob.unwrap_or(false) }
             } else {
-                Mlp::Dense { gate_up: Proj::new(vec![Lin::load(ws, &format!("{p}.mlp.gate_proj"), false)?, Lin::load(ws, &format!("{p}.mlp.up_proj"), false)?]), down: Lin::load(ws, &format!("{p}.mlp.down_proj"), false)? }
+                Mlp::Dense { gate_up: Proj::load(ws, &[format!("{p}.mlp.gate_proj"), format!("{p}.mlp.up_proj")], false)?, down: Lin::load(ws, &format!("{p}.mlp.down_proj"), false)? }
             };
             let window = cfg.layer_window(i);
             layers.push(Layer {
@@ -176,11 +181,7 @@ impl Llama {
                 post_norm: Norm::load(ws, &format!("{p}.post_attention_layernorm.weight"), gemma)?,
                 pre_ff_norm: if gemma { Some(Norm::load(ws, &format!("{p}.pre_feedforward_layernorm.weight"), gemma)?) } else { None },
                 post_ff_norm: if gemma { Some(Norm::load(ws, &format!("{p}.post_feedforward_layernorm.weight"), gemma)?) } else { None },
-                qkv: Proj::new(vec![
-                    Lin::load(ws, &format!("{p}.self_attn.q_proj"), bias)?,
-                    Lin::load(ws, &format!("{p}.self_attn.k_proj"), bias)?,
-                    Lin::load(ws, &format!("{p}.self_attn.v_proj"), bias)?,
-                ]),
+                qkv: Proj::load(ws, &[format!("{p}.self_attn.q_proj"), format!("{p}.self_attn.k_proj"), format!("{p}.self_attn.v_proj")], bias)?,
                 o: Lin::load(ws, &format!("{p}.self_attn.o_proj"), false)?,
                 q_norm: if qkn { Some(Norm::load(ws, &format!("{p}.self_attn.q_norm.weight"), gemma)?) } else { None },
                 k_norm: if qkn { Some(Norm::load(ws, &format!("{p}.self_attn.k_norm.weight"), gemma)?) } else { None },
