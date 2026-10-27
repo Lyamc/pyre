@@ -36,13 +36,29 @@ pub struct LlamaConfig {
     pub torch_dtype: Option<String>,
     pub bos_token_id: Option<serde_json::Value>,
     pub eos_token_id: Option<serde_json::Value>,
+    // Gemma 2/3
+    pub query_pre_attn_scalar: Option<f64>,
+    pub attn_logit_softcapping: Option<f64>,
+    pub final_logit_softcapping: Option<f64>,
+    pub sliding_window: Option<usize>,
+    pub sliding_window_pattern: Option<usize>,
+    pub layer_types: Option<Vec<String>>,
+    pub rope_local_base_freq: Option<f64>,
+    // MoE (Qwen3-MoE)
+    pub num_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub decoder_sparse_step: Option<usize>,
+    pub norm_topk_prob: Option<bool>,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
 }
 fn default_eps() -> f64 { 1e-6 }
 fn default_theta() -> f64 { 10000.0 }
 fn default_max_pos() -> usize { 4096 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3 }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen3Moe, Gemma2, Gemma3 }
 
 impl LlamaConfig {
     pub fn arch(&self) -> anyhow::Result<Arch> {
@@ -50,8 +66,11 @@ impl LlamaConfig {
         Ok(match (self.model_type.as_str(), a) {
             ("qwen2", _) | (_, "Qwen2ForCausalLM") => Arch::Qwen2,
             ("qwen3", _) | (_, "Qwen3ForCausalLM") => Arch::Qwen3,
+            ("qwen3_moe", _) | (_, "Qwen3MoeForCausalLM") => Arch::Qwen3Moe,
+            ("gemma2", _) | (_, "Gemma2ForCausalLM") => Arch::Gemma2,
+            ("gemma3_text", _) | (_, "Gemma3ForCausalLM") => Arch::Gemma3,
             ("llama", _) | ("mistral", _) | (_, "LlamaForCausalLM") | (_, "MistralForCausalLM") => Arch::Llama,
-            (m, a) => anyhow::bail!("unsupported architecture model_type={m} arch={a} (supported: llama, mistral, qwen2, qwen3 dense)"),
+            (m, a) => anyhow::bail!("unsupported architecture model_type={m} arch={a} (supported: llama, mistral, qwen2, qwen3, qwen3_moe, gemma2, gemma3_text)"),
         })
     }
     pub fn n_kv_heads(&self) -> usize { self.num_key_value_heads.unwrap_or(self.num_attention_heads) }
@@ -59,7 +78,23 @@ impl LlamaConfig {
     pub fn qkv_bias(&self) -> bool {
         self.attention_bias.unwrap_or(false) || matches!(self.arch(), Ok(Arch::Qwen2))
     }
-    pub fn qk_norm(&self) -> bool { matches!(self.arch(), Ok(Arch::Qwen3)) }
+    pub fn qk_norm(&self) -> bool { matches!(self.arch(), Ok(Arch::Qwen3 | Arch::Qwen3Moe | Arch::Gemma3)) }
+    pub fn is_gemma(&self) -> bool { matches!(self.arch(), Ok(Arch::Gemma2 | Arch::Gemma3)) }
+    /// Sliding-window size for layer i, if it is a local-attention layer.
+    pub fn layer_window(&self, i: usize) -> Option<usize> {
+        let w = self.sliding_window?;
+        if let Some(t) = &self.layer_types { return (t.get(i).map(String::as_str) == Some("sliding_attention")).then_some(w); }
+        match self.arch().ok()? {
+            Arch::Gemma2 => (i % 2 == 0).then_some(w),
+            Arch::Gemma3 => ((i + 1) % self.sliding_window_pattern.unwrap_or(6) != 0).then_some(w),
+            _ => None,
+        }
+    }
+    /// Whether layer i uses a sparse MoE block.
+    pub fn layer_is_moe(&self, i: usize) -> bool {
+        matches!(self.arch(), Ok(Arch::Qwen3Moe)) && self.num_experts.unwrap_or(0) > 0
+            && !self.mlp_only_layers.contains(&i) && (i + 1) % self.decoder_sparse_step.unwrap_or(1).max(1) == 0
+    }
     pub fn eos_ids(&self) -> Vec<u32> { ids(&self.eos_token_id) }
 }
 

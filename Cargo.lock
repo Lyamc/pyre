@@ -6149,6 +6149,7 @@ dependencies = [
  "burn-gguf",
  "clap",
  "futures",
+ "half",
  "hf-hub 1.0.0",
  "image",
  "memmap2",
