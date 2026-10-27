@@ -31,7 +31,7 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
-pub struct Model { pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct Model { pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -92,35 +92,89 @@ impl Model {
         let ple_tab = if cfg.ple_layers.is_empty() { None } else { Some(g.mat("per_layer_token_embd.weight")?) };
         let half = cfg.n_rot / 2;
         let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
-        Ok(Model { gpu: None, gmats: Default::default(), embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
 
-    /// Projection groups that read the same input, in the order the forward pass uses them.
-    fn groups(&self) -> Vec<Vec<&QMat>> {
-        let mut v: Vec<Vec<&QMat>> = vec![];
-        fn hc<'a>(v: &mut Vec<Vec<&'a QMat>>, h: &'a Hc) { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } v.push(a); }
-        for l in &self.layers {
-            if let Some(p) = &l.ple { v.push(vec![&p.key, &p.value]); }
-            hc(&mut v, &l.hc_a); v.push(vec![&l.hc_a.up]);
-            match &l.mix { Mixer::Attn { q, k, v: vv, o, .. } => { v.push(vec![q, k, vv]); v.push(vec![o]); }
-                           Mixer::Lin { qkv, z, beta, alpha, out, .. } => { v.push(vec![qkv, z, beta, alpha]); v.push(vec![out]); } }
-            hc(&mut v, &l.hc_f); v.push(vec![&l.hc_f.up]);
-            v.push(vec![&l.router, &l.sh_gate, &l.sh_up]); v.push(vec![&l.sh_down]);
+    /// Bring every routed-expert page into this process's working set once, up front (the idea of
+    /// Strata's resident expert arena, without a copy: the pages stay the OS file cache's). Without
+    /// it, each decode step soft-faults on ~10k first-touched 4 KiB pages. Skipped when free RAM is
+    /// short (keeps 16 GiB spare); `PYRE_QN_PREFAULT=0` turns it off. Returns GiB touched.
+    pub fn prefault_experts(&self) -> f64 {
+        if std::env::var("PYRE_QN_PREFAULT").map(|v| v == "0").unwrap_or(false) { return 0.0; }
+        let mats: Vec<&QMat> = self.layers.iter().flat_map(|l| [&l.gate_e, &l.up_e, &l.down_e]).collect();
+        let total: usize = mats.iter().map(|m| m.bytes().len()).sum();
+        let mut sys = sysinfo::System::new(); sys.refresh_memory();
+        if (sys.available_memory() as i64) < total as i64 + (16i64 << 30) {
+            tracing::warn!("qwen4exp: {:.1} GiB of experts not prefaulted: only {:.1} GiB RAM available", total as f64 / (1u64 << 30) as f64, sys.available_memory() as f64 / (1u64 << 30) as f64);
+            return 0.0;
         }
-        hc(&mut v, &self.head); v.push(vec![&self.head.up]); v.push(vec![&self.out]);
-        v
+        let sum: u64 = mats.par_iter().map(|m| m.bytes().par_chunks(1 << 22).map(|c| { let mut a = 0u64; let mut i = 0; while i < c.len() { a = a.wrapping_add(unsafe { std::ptr::read_volatile(c.as_ptr().add(i)) } as u64); i += 4096; } a }).sum::<u64>()).sum();
+        std::hint::black_box(sum);
+        total as f64 / (1u64 << 30) as f64
     }
 
-    /// Strata's split: every non-routed projection to the GPU (Q8), as far as VRAM above pyre's reserve allows.
+    /// Strata's split: each layer's dense half (HC mixers, mixer projections, router, shared expert)
+    /// resident on the GPU as Q8, as far as VRAM above pyre's reserve allows; routed experts stay on the CPU.
     pub fn attach_gpu(&mut self, g: super::qn_gpu::Gpu) -> Result<(usize, usize, f64)> {
-        let mut m = std::collections::HashMap::new(); let (mut on, mut off, mut bytes) = (0, 0, 0f64);
-        for grp in self.groups() {
-            match g.upload(&grp)? { Some(gm) => { bytes += (gm.rows * gm.cols / 32 * 34) as f64; m.insert(grp[0].key(), gm); on += 1; } None => off += 1 }
+        use super::qn_gpu::{GHc, GLayer};
+        let (d, hc) = (self.cfg.d, self.cfg.hc);
+        let ghc = |h: &Hc| -> Result<Option<GHc>> {
+            let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); }
+            let (Some(di), Some(up)) = (g.upload(&a)?, g.upload(&[&h.up])?) else { return Ok(None) };
+            Ok(Some(GHc { norm: g.up3(&h.norm, [1, hc, d]), di, up, inj: h.inject.is_some() }))
+        };
+        let (mut on, mut off) = (0, 0); let b0 = g.budget_left();
+        let mut gl = vec![];
+        for l in &self.layers {
+            let min = match &l.mix { Mixer::Attn { q, k, v, .. } => vec![q, k, v], Mixer::Lin { qkv, z, beta, alpha, .. } => vec![qkv, z, beta, alpha] };
+            let mout = match &l.mix { Mixer::Attn { o, .. } => o, Mixer::Lin { out, .. } => out };
+            let parts = (|| -> Result<Option<GLayer>> { Ok(Some(GLayer {
+                hca: match ghc(&l.hc_a)? { Some(x) => x, None => return Ok(None) },
+                min: match g.upload(&min)? { Some(x) => x, None => return Ok(None) },
+                mout: match g.upload(&[mout])? { Some(x) => x, None => return Ok(None) },
+                hcf: match ghc(&l.hc_f)? { Some(x) => x, None => return Ok(None) },
+                fin: match g.upload(&[&l.router, &l.sh_gate, &l.sh_up])? { Some(x) => x, None => return Ok(None) },
+                sdown: match g.upload(&[&l.sh_down])? { Some(x) => x, None => return Ok(None) },
+            })) })()?;
+            if parts.is_some() { on += 1 } else { off += 1 }
+            gl.push(parts);
         }
-        self.gmats = m; self.gpu = Some(g);
-        Ok((on, off, bytes / (1u64 << 30) as f64))
+        let mut m = std::collections::HashMap::new();
+        let mut extra: Vec<Vec<&QMat>> = vec![];
+        for l in &self.layers { if let Some(p) = &l.ple { extra.push(vec![&p.key, &p.value]); } }
+        extra.push(vec![&self.head.down]); extra.push(vec![&self.head.up]); extra.push(vec![&self.out]);
+        for grp in extra { if let Some(gm) = g.upload(&grp)? { m.insert(grp[0].key(), gm); } }
+        let gb = (b0 - g.budget_left()) as f64 / (1u64 << 30) as f64;
+        self.gmats = m; self.gl = gl; self.gpu = Some(g);
+        Ok((on, off, gb))
+    }
+
+    /// The layer with its dense half on the GPU: two device->host copies (mixer inputs; then the
+    /// MoE input, router logits, shared-expert output and the updated residual).
+    fn layer_gpu(&self, l: &Layer, gl: &super::qn_gpu::GLayer, x: &mut [f32], st: &mut State, ai: &mut usize, li: &mut usize, start: usize, t: usize) {
+        let g = self.gpu.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp);
+        let xg = g.up(x, [t, hc * d]);
+        let (mixed, inj_a) = gl.hca.mix(xg.clone(), t, hc, d, c.eps);
+        let mi = g.read(gl.min.fwd(mixed));
+        let proj = gl.min.split_host(&mi, t);
+        let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, proj, start, t); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, proj, t); *li += 1; o } };
+        let o = gl.mout.fwd(g.up(&core, [t, core.len() / t]));
+        let x2 = super::qn_gpu::combine(xg, o, inj_a.unwrap(), t, hc, d);
+        let (mf, inj_f) = gl.hcf.mix(x2.clone(), t, hc, d, c.eps);
+        let fi = gl.fin.fwd(mf.clone()); let sf = l.sh_gate.rows;
+        let lg = fi.clone().slice([0..t, 0..ne]);
+        let sh = gl.sdown.fwd(burn::tensor::activation::silu(fi.clone().slice([0..t, ne..ne + sf])) * fi.slice([0..t, ne + sf..ne + 2 * sf]));
+        let all = g.read(burn::tensor::Tensor::cat(vec![x2, mf, inj_f.unwrap(), lg, sh], 1));
+        let w = hc * d + d + hc + ne + d;
+        let (mut mfc, mut injc, mut lgc, mut y) = (Vec::with_capacity(t * d), Vec::with_capacity(t * hc), Vec::with_capacity(t * ne), Vec::with_capacity(t * d));
+        for ti in 0..t { let r = &all[ti * w..(ti + 1) * w]; let mut o = 0;
+            x[ti * hc * d..(ti + 1) * hc * d].copy_from_slice(&r[..hc * d]); o += hc * d;
+            mfc.extend_from_slice(&r[o..o + d]); o += d; injc.extend_from_slice(&r[o..o + hc]); o += hc;
+            lgc.extend_from_slice(&r[o..o + ne]); o += ne; y.extend_from_slice(&r[o..o + d]); }
+        self.routed(l, &mfc, &lgc, t, &mut y);
+        self.hc_combine(x, &y, &injc, t);
     }
 
     /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
@@ -296,7 +350,7 @@ impl Model {
 
     /// Shared-expert gate (applied to y's shared output) + the routed experts on the CPU, added into y.
     fn routed(&self, l: &Layer, x: &[f32], lg: &[f32], t: usize, y: &mut [f32]) {
-        let c = &self.cfg; let d = c.d; let ff = c.ff_exp;
+        let c = &self.cfg; let d = c.d; let ff = c.ff_exp; let t_r = std::time::Instant::now();
         for ti in 0..t { let sg = sigm(dot(&l.sh_gate_inp, &x[ti * d..(ti + 1) * d])); for v in &mut y[ti * d..(ti + 1) * d] { *v *= sg; } }
         // routing: softmax -> top-k -> renormalise
         let mut by_exp: Vec<Vec<(usize, f32)>> = vec![vec![]; c.n_exp];
@@ -310,11 +364,22 @@ impl Model {
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
         // one task per (expert, block of rows): keeps all cores busy for decode (10 experts) and prefill alike
-        let blk: usize = if t == 1 { 16 } else { 64 };
+        let blk: usize = env_usize("PYRE_QN_BLK").unwrap_or(if t == 1 { 64 } else { 64 });
+        use super::qdot;
+        let qon = std::env::var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true);
+        let qgu = qon && qdot::supports(l.gate_e.ty) && qdot::supports(l.up_e.ty);
+        let qdn = qon && qdot::supports(l.down_e.ty);
+        let acts: Vec<qdot::Q8Act> = if qgu { (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect() } else { vec![] }; let acts = &acts;
         let parts: Vec<(usize, usize, Vec<f32>)> = work.par_iter().flat_map(|&(e, toks)| (0..ff.div_ceil(blk)).into_par_iter().map(move |b| {
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
-            let mut buf = vec![0f32; d]; let mut hbuf = vec![0f32; toks.len() * (r1 - r0)];
+            let mut hbuf = vec![0f32; toks.len() * (r1 - r0)];
+            if qgu { let mut sc = qdot::Scratch::default();
+                for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                    for (j, &(ti, _)) in toks.iter().enumerate() { hbuf[j * (r1 - r0) + r] = silu(qdot::row_dot(gm.ty, gr, &acts[ti], &mut sc)) * qdot::row_dot(um.ty, ur, &acts[ti], &mut sc); } }
+                return (e, r0, hbuf);
+            }
+            let mut buf = vec![0f32; d];
             for r in 0..r1 - r0 {
                 gm.row(r, &mut buf); let gv: Vec<f32> = toks.iter().map(|&(ti, _)| dot(&buf, &x[ti * d..(ti + 1) * d])).collect();
                 um.row(r, &mut buf); for (j, &(ti, _)) in toks.iter().enumerate() { hbuf[j * (r1 - r0) + r] = silu(gv[j]) * dot(&buf, &x[ti * d..(ti + 1) * d]); }
@@ -325,14 +390,19 @@ impl Model {
         let mut hid: Vec<Vec<f32>> = by_exp.iter().map(|v| vec![0f32; v.len() * ff]).collect();
         for (e, r0, hb) in parts { let n = by_exp[e].len(); let w = hb.len() / n; for j in 0..n { hid[e][j * ff + r0..j * ff + r0 + w].copy_from_slice(&hb[j * w..(j + 1) * w]); } }
         // down projections, row blocks of the output in parallel
-        let dblk: usize = if t == 1 { 32 } else { 128 };
+        let dblk: usize = env_usize("PYRE_QN_DBLK").unwrap_or(if t == 1 { 128 } else { 128 });
+        PH[0].fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let hq: Vec<Vec<qdot::Q8Act>> = if qdn { hid.iter().map(|h| h.chunks(ff).map(qdot::quantize).collect()).collect() } else { vec![] };
         let outs: Vec<(usize, Vec<f32>)> = (0..d.div_ceil(dblk)).into_par_iter().map(|b| {
             let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d)); let mut o = vec![0f32; t * (r1 - r0)]; let mut buf = vec![0f32; ff];
+            let mut sc = qdot::Scratch::default();
             for &(e, toks) in &work { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
+                if qdn { for r in 0..r1 - r0 { let dr = dm.row_raw(r); for (j, &(ti, w)) in toks.iter().enumerate() { o[ti * (r1 - r0) + r] += w * qdot::row_dot(dm.ty, dr, &hq[e][j], &mut sc); } } continue; }
                 for r in 0..r1 - r0 { dm.row(r, &mut buf); for (j, &(ti, w)) in toks.iter().enumerate() { o[ti * (r1 - r0) + r] += w * dot(&buf, &hid[e][j * ff..(j + 1) * ff]); } } }
             (r0, o)
         }).collect();
         for (r0, o) in outs { let w = o.len() / t; for ti in 0..t { for r in 0..w { y[ti * d + r0 + r] += o[ti * w + r]; } } }
+        ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
@@ -349,6 +419,11 @@ impl Model {
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
+            if let Some(Some(gl)) = self.gl.get(il) {
+                self.layer_gpu(l, gl, &mut x, st, &mut ai, &mut li, start, t);
+                if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
+                continue;
+            }
             let (m, inj) = self.hc_mix(&l.hc_a, &x, t);
             let t_hc = tt.elapsed();
             let o = match l.mix { Mixer::Attn { .. } => { let o = self.attn(l, ai, st, &m, start, t); ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear(l, li, st, &m, t); li += 1; o } };
@@ -365,7 +440,12 @@ impl Model {
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
         let lg = self.mm(&[&self.out], &h, 1).pop().unwrap();
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 }
+
+static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
+static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn env_usize(k: &str) -> Option<usize> { std::env::var(k).ok().and_then(|v| v.parse().ok()) }
