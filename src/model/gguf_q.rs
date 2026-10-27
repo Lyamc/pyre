@@ -210,6 +210,19 @@ impl QMat {
     pub fn matmul(&self, x: &[f32], t: usize, y: &mut [f32]) {
         let (rows, cols) = (self.rows, self.cols);
         debug_assert!(x.len() >= t * cols && y.len() >= t * rows);
+        if t >= 16 {
+            // prompt chunks: dequantize a block of rows once, then a cache-blocked SGEMM against all tokens
+            const RB: usize = 64;
+            let outs: Vec<(usize, Vec<f32>)> = (0..rows.div_ceil(RB)).into_par_iter().map(|ci| {
+                let r0 = ci * RB; let nr = (r0 + RB).min(rows) - r0;
+                let mut w = vec![0f32; nr * cols]; for r in 0..nr { self.row(r0 + r, &mut w[r * cols..(r + 1) * cols]); }
+                let mut o = vec![0f32; t * nr];
+                unsafe { matrixmultiply::sgemm(t, cols, nr, 1.0, x.as_ptr(), cols as isize, 1, w.as_ptr(), 1, cols as isize, 0.0, o.as_mut_ptr(), nr as isize, 1); }
+                (r0, o)
+            }).collect();
+            for (r0, o) in outs { let nr = o.len() / t; for ti in 0..t { y[ti * rows + r0..ti * rows + r0 + nr].copy_from_slice(&o[ti * nr..(ti + 1) * nr]); } }
+            return;
+        }
         let chunk = (rows / (rayon::current_num_threads() * 4)).clamp(4, 256);
         let outs: Vec<(usize, Vec<f32>)> = (0..rows.div_ceil(chunk)).into_par_iter().map(|ci| {
             let r0 = ci * chunk; let r1 = (r0 + chunk).min(rows);

@@ -294,7 +294,7 @@ impl Model {
             let kvh = h / grp; let n = start + ti + 1;
             let mut sc: Vec<f32> = (0..n).map(|p| dot(&qh, &kc[p * nkv * hd + kvh * hd..p * nkv * hd + (kvh + 1) * hd]) * scale).collect();
             let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max); let mut sum = 0.0; for s in sc.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
-            for (p, s) in sc.iter().enumerate() { let w = s / sum; let vv = &vc[p * nkv * hd + kvh * hd..]; for i in 0..hd { out[i] += w * vv[i]; } }
+            let inv = 1.0 / sum; for (p, s) in sc.iter().enumerate() { let w = s * inv; let vv = &vc[p * nkv * hd + kvh * hd..p * nkv * hd + (kvh + 1) * hd]; for (o, v) in out.iter_mut().zip(vv) { *o += w * v; } }
             let gate = &qf[base + hd..base + 2 * hd]; for i in 0..hd { out[i] *= sigm(gate[i]); }
         });
         att
