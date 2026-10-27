@@ -96,6 +96,7 @@ impl PyreGui {
             "models" => Page::Models, "images" => Page::Images, "audio" => Page::Audio, "status" => Page::Status, _ => Page::Chat,
         };
         if let Ok(s) = std::env::var("PYRE_GUI_SEND") { me.chat_input = s; me.send_chat(); }
+        if let Ok(s) = std::env::var("PYRE_GUI_TTS") { me.page = Page::Audio; me.tts_text = s; me.do_tts(); }
         me
     }
 
