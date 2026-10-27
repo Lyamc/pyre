@@ -314,26 +314,37 @@ impl Model {
         let (m, zz, bb, aa) = (r.next().unwrap(), r.next().unwrap(), r.next().unwrap(), r.next().unwrap());
         let mut o_all = vec![0f32; t * nv * dv];
         let cs = &mut st.conv[li]; let s = &mut st.ssm[li];
+        // 1) causal depthwise conv + SiLU for every token (sequential in time, vectorised over channels)
+        let mut co_all = vec![0f32; t * ch];
         for ti in 0..t {
-            let cur = &m[ti * ch..(ti + 1) * ch];
-            let mut co = vec![0f32; ch];
+            let cur = &m[ti * ch..(ti + 1) * ch]; let co = &mut co_all[ti * ch..(ti + 1) * ch];
             for cc in 0..ch { let mut o = conv[cc * kk + kk - 1] * cur[cc]; for k in 0..kk - 1 { o += conv[cc * kk + k] * cs[k * ch + cc]; } co[cc] = silu(o); }
             cs.drain(..ch); cs.extend_from_slice(cur);
-            let (qp, rest) = co.split_at_mut(nk * dk); let (kp, vp) = rest.split_at_mut(nk * dk);
+        }
+        // 2) L2-normalise q (and scale) and k per head
+        co_all.par_chunks_mut(ch).for_each(|co| { let (qp, rest) = co.split_at_mut(nk * dk); let (kp, _) = rest.split_at_mut(nk * dk);
             for h in 0..nk { for (buf, sc) in [(&mut qp[h * dk..(h + 1) * dk], (dk as f32).sqrt().recip()), (&mut kp[h * dk..(h + 1) * dk], 1.0)] {
-                let n = (buf.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip() * sc; for v in buf.iter_mut() { *v *= n; } } }
-            let (qp, kp, vp) = (&*qp, &*kp, &*vp);
-            let o_t = &mut o_all[ti * nv * dv..(ti + 1) * nv * dv];
-            s.par_chunks_mut(dk * dv).zip(o_t.par_chunks_mut(dv)).enumerate().for_each(|(h, (sh, oh))| {
-                let kh = h % nk; let kv = &kp[kh * dk..(kh + 1) * dk]; let qv = &qp[kh * dk..(kh + 1) * dk]; let vv = &vp[h * dv..(h + 1) * dv];
+                let n = (buf.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip() * sc; for v in buf.iter_mut() { *v *= n; } } } });
+        // 3) the delta-rule recurrence: heads are independent, so one task per head runs all tokens
+        let co_all = &co_all; let w = nv * dv;
+        let heads: Vec<Vec<f32>> = s.par_chunks_mut(dk * dv).enumerate().map(|(h, sh)| {
+            let kh = h % nk; let mut oh_all = vec![0f32; t * dv]; let mut mem = vec![0f32; dv]; let mut delta = vec![0f32; dv];
+            for ti in 0..t {
+                let co = &co_all[ti * ch..(ti + 1) * ch];
+                let qv = &co[kh * dk..(kh + 1) * dk]; let kv = &co[nk * dk + kh * dk..nk * dk + (kh + 1) * dk]; let vv = &co[2 * nk * dk + h * dv..2 * nk * dk + (h + 1) * dv];
                 let g = (softplus(aa[ti * nv + h] + dt[h]) * a[h]).exp(); let b = sigm(bb[ti * nv + h]);
                 for v in sh.iter_mut() { *v *= g; }
-                let mut mem = vec![0f32; dv]; for i in 0..dk { let ki = kv[i]; let row = &sh[i * dv..(i + 1) * dv]; for j in 0..dv { mem[j] += row[j] * ki; } }
-                let delta: Vec<f32> = (0..dv).map(|j| (vv[j] - mem[j]) * b).collect();
-                for i in 0..dk { let ki = kv[i]; let qi = qv[i]; let row = &mut sh[i * dv..(i + 1) * dv]; for j in 0..dv { row[j] += ki * delta[j]; oh[j] += row[j] * qi; } }
-                rms_inplace(oh, norm, c.eps); let zh = &zz[ti * nv * dv + h * dv..ti * nv * dv + (h + 1) * dv]; for j in 0..dv { oh[j] *= sigm(zh[j]); }
-            });
-        }
+                mem.iter_mut().for_each(|v| *v = 0.0);
+                for i in 0..dk { let ki = kv[i]; let row = &sh[i * dv..(i + 1) * dv]; for (m, r) in mem.iter_mut().zip(row) { *m += r * ki; } }
+                for j in 0..dv { delta[j] = (vv[j] - mem[j]) * b; }
+                let oh = &mut oh_all[ti * dv..(ti + 1) * dv];
+                for i in 0..dk { let ki = kv[i]; let qi = qv[i]; let row = &mut sh[i * dv..(i + 1) * dv];
+                    for ((r, dl), o) in row.iter_mut().zip(&delta).zip(oh.iter_mut()) { *r += ki * dl; *o += *r * qi; } }
+                rms_inplace(oh, norm, c.eps); let zh = &zz[ti * w + h * dv..ti * w + (h + 1) * dv]; for j in 0..dv { oh[j] *= sigm(zh[j]); }
+            }
+            oh_all
+        }).collect();
+        for (h, oh) in heads.iter().enumerate() { for ti in 0..t { o_all[ti * w + h * dv..ti * w + (h + 1) * dv].copy_from_slice(&oh[ti * dv..(ti + 1) * dv]); } }
         o_all
     }
 
