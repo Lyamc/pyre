@@ -1,4 +1,4 @@
-# pyre
+﻿# pyre
 
 A llama.cpp `llama-server`-style inference server written in Rust where **[Burn](https://github.com/tracel-ai/burn)** (one version for everything: [Lyamc/burn](https://github.com/Lyamc/burn) @ `9db7598`, 0.23.0-pre.1) hosts and runs the model. No llama.cpp, candle or ggml does any of the compute: every matmul, attention and norm is a Burn tensor op on CUDA (CubeCL), wgpu (Vulkan/DX12/Metal) or the CPU (Flex / NdArray).
 
@@ -101,22 +101,41 @@ Turso's Windows IO backend rejects, so the cache silently fell back to memory ev
 branch (`C:/Build/ai/cubecl-pyre-fix`, `pyre-windows-wal-fix`) wired in with `[patch]`; not pushed.
 Load-time warm-up: `PYRE_SD_WARMUP=0` disables, `PYRE_SD_WARMUP_STEPS` (default 2).
 
-## Text to speech (stub)
+## Text to speech (VITS, hand-written Burn port)
 
-`/v1/audio/speech` returns **501** with a clear message, and `--tts-model` registers a placeholder.
-The UI's TTS card stays disabled. I looked at these ports and didn't do any of them yet:
+`--tts-model facebook/mms-tts-eng` loads Meta's MMS English VITS (`src/tts.rs`, no burn-onnx). The
+vocabulary is characters, so text handling is pure Rust and there is no phonemizer or espeak-ng. The
+duration predictor's rational-quadratic spline runs on the host. `POST /v1/audio/speech` takes
+`input`, `response_format` (`wav`|`pcm`), `speed`, `noise_scale`, `seed`; output is 16 kHz mono.
+Parity with HF transformers (`scripts/hf_vits_ref.py`): same length (49,664 samples), correlation
+0.999 with noise off. Cold first call ~63 s (kernel autotune), warm ~0.2 s for 3.1 s of audio. A
+Whisper round trip reads it back correctly. The web UI and GUI Audio page call it. Note: the MMS
+weights are **CC-BY-NC 4.0** (non-commercial). Samples: `samples/tts-pyre.wav`, `samples/tts-hf-ref.wav`.
 
-- **Kokoro-82M via burn-onnx** (burn 0.22, Apache weights): tracel's model check compiles the
-  2,464-node graph (about 7 minutes of codegen), but its output still diverges from ONNX Runtime
-  (Pearson r ≈ 0.69, peaks about 1.3× too large; burn-onnx#371). It also needs a phonemizer
-  (espeak-ng is a system library and GPL, which would mean installing something; a pure-Rust G2P
-  would be needed instead).
-- **A hand port of Kokoro (StyleTTS2 + ISTFTNet)**: about 2–3k lines (BERT/ALBERT, LSTM, AdaIN
-  decoders, iSTFT). It's feasible on Burn 0.22 but is a multi-day job.
-- **Piper (VITS)**: also needs espeak-ng phonemes.
+## GGUF
 
-Plan: Kokoro through burn-onnx once #371 lands, plus a Rust G2P (misaki-style lexicon), behind a
-`tts` feature, emitting 24 kHz wav/mp3/opus.
+A folder containing `model.gguf` (plus config.json/tokenizer.json) loads through a local port of
+Lyamc/burn-gguf to the burn fork (`C:/Build/ai/burn-gguf`, branch `pyre-burn-fork`, path dependency,
+not pushed; its tests aren't ported). Q8_0 stays packed as a Burn Q8 block-32 tensor. Q4_K/Q6_K are
+**dequantized at load**, since Burn has no K-quant scheme. `PYRE_GGUF_DEQUANT=1` dequantizes everything.
+Qwen2.5-0.5B-Instruct on CUDA (RTX 3060): Q8_0 32.2 tok/s, +1061 MiB VRAM; Q4_K_M 41.2 tok/s,
++1379 MiB (same as bf16 safetensors). Both produce correct text.
+
+## Continuous batching
+
+The engine (`src/engine.rs`) runs up to `PYRE_PARALLEL` (default 8) sequences per decode step,
+with a KV-cache pool reused by longest common prefix. Aggregate tok/s, Qwen2.5-0.5B on CUDA, 128 tokens
+(`scripts/bench_concurrency.py`): 1 → 26.9, 4 → 80.6, 8 → 129.0 (bf16); in f32, 27.2 / 70.4 / 127.4,
+and batched output is identical to solo output.
+
+## Gemma 2/3 and Qwen3-MoE
+
+Supported in `src/model/llama.rs`: GeGLU, (1+w) norms, embedding scale, pre/post-FFN norms,
+softcaps, sliding window, local RoPE, and the MoE router with top-k. Greedy parity vs HF f32
+(`scripts/hf_greedy.py`, `samples/parity-gemma-moe.log`) is 20/20 tokens for unsloth/gemma-3-1b-it,
+unsloth/gemma-2-2b-it and yujiepan/qwen3-moe-tiny-random. The official google/gemma-* repos are gated
+(401 without a token), so the unsloth mirrors were used. No real MoE fits in 12 GB, so only the tiny
+random one was tested.
 
 ## Desktop GUI (GPUI)
 
@@ -131,16 +150,13 @@ gui\target\x86_64-pc-windows-msvc\release\pyre-gui.exe http://127.0.0.1:8080
 
 Screenshots: `samples/gui-{chat,models,images,audio,status}.png`.
 
-## Roadmap / known gaps
 
-- GGUF / quantized weights (Q8_0, Q4_K) - not done. Options: port Lyamc/burn-gguf (targets upstream
-  burn 0.22, needs porting to the fork's dispatch API) or a pyre-side GGUF reader that dequantizes to
-  f16/bf16 at load (memory-saving only, no quantized matmul).
-- Continuous batching - not done; each model has one worker and a FIFO queue. Needs batched KV cache
-  (per-sequence positions + padding masks) in `src/model/llama.rs` and a scheduler in the registry.
-- MoE (Qwen3-MoE) and Gemma (2/3) - not done. Gemma needs: GeGLU, (1+w) RMSNorm, embedding scaling,
-  logit soft-capping and sliding-window layers; Qwen3-MoE needs router top-k + expert dispatch.
-- TTS (see above) - still a 501 stub.
+Screenshot with TTS: `samples/gui-audio-tts.png` (`PYRE_GUI_TTS="text"` speaks at startup).
+
+## Known gaps
+
+- Chat hang under STT + chat: not reproducible after 40+ mixed concurrent rounds (with image generation, 60 s noise audio, stretched audio; `scripts/stress_mix.py`). Most likely it was the old opus wrong-sample-rate bug, which is fixed.
+- K-quants have no quantized matmul (dequantized at load).
 - wgpu Stable Diffusion is ~40x slower than CUDA (see table).
 - LLM parity: Qwen2.5-0.5B greedy, 15 tokens, matches HF f32 on the first 14; token 15 is a near tie
   (`.` vs `.\n`), identical to the pre-port build. Decode (0.5B, RTX 3060): CUDA 43.3 tok/s bf16 /
