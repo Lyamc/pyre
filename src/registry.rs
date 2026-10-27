@@ -16,6 +16,7 @@ pub enum Inner {
     Llm(Arc<Llm>),
     Stt(Arc<crate::stt::SttModel>),
     Image(Arc<crate::image::ImageModel>),
+    Tts(Arc<crate::tts::TtsModel>),
     /// Registered but not runnable in this build (e.g. image/TTS before their backends land).
     Placeholder(String),
 }
@@ -35,14 +36,15 @@ impl Loaded {
             Inner::Llm(l) => json!({"n_ctx": l.n_ctx, "backend": l.backend, "dtype": l.dtype, "path": self.path}),
             Inner::Stt(s) => json!({"backend": self.backend, "path": self.path, "engine": s.describe()}),
             Inner::Image(i) => json!({"backend": self.backend, "path": self.path, "engine": i.describe()}),
+            Inner::Tts(t) => json!({"backend": self.backend, "path": self.path, "engine": t.describe()}),
             Inner::Placeholder(r) => json!({"backend": self.backend, "path": self.path, "status": "not-runnable", "reason": r}),
         }
     }
     pub fn busy(&self) -> bool {
-        match &self.inner { Inner::Llm(l) => l.engine.busy.load(Ordering::SeqCst), Inner::Stt(s) => s.busy(), Inner::Image(i) => i.busy.load(Ordering::SeqCst), _ => false }
+        match &self.inner { Inner::Llm(l) => l.engine.busy.load(Ordering::SeqCst), Inner::Stt(s) => s.busy(), Inner::Image(i) => i.busy.load(Ordering::SeqCst), Inner::Tts(t) => t.busy.load(Ordering::SeqCst), _ => false }
     }
     pub fn queued(&self) -> u64 {
-        match &self.inner { Inner::Llm(l) => l.engine.queued.load(Ordering::SeqCst), Inner::Stt(s) => s.queued(), Inner::Image(i) => i.queued.load(Ordering::SeqCst), _ => 0 }
+        match &self.inner { Inner::Llm(l) => l.engine.queued.load(Ordering::SeqCst), Inner::Stt(s) => s.queued(), Inner::Image(i) => i.queued.load(Ordering::SeqCst), Inner::Tts(t) => t.queued.load(Ordering::SeqCst), _ => 0 }
     }
 }
 
@@ -122,7 +124,7 @@ pub fn load(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
         Kind::Llm => Inner::Llm(Arc::new(crate::load_llm(&dir, &id, &backend, q.dtype.as_deref().unwrap_or(&d.dtype), q.ctx_size.unwrap_or(d.ctx_size), d.n_predict)?)),
         Kind::Stt => unreachable!(),
         Kind::Image => Inner::Image(Arc::new(crate::image::ImageModel::load(&dir, &backend).context("loading image model")?)),
-        Kind::Tts => Inner::Placeholder("text-to-speech is not implemented yet; see README roadmap".into()),
+        Kind::Tts => Inner::Tts(Arc::new(crate::tts::TtsModel::load(&dir, &backend).context("loading text-to-speech model")?)),
         Kind::Unknown => anyhow::bail!("unknown model kind for {}", q.r),
     };
     Ok(Loaded { id, kind: q.kind, backend, path: dir.display().to_string(), created: now(), inner })

@@ -246,15 +246,45 @@ async fn txt2img(State(app): S, Json(b): Json<Value>) -> Response {
 }
 
 async fn speech(State(app): S, body: Option<Json<Value>>) -> Response {
-    let name = body.as_ref().and_then(|b| b.get("model")).and_then(|m| m.as_str()).map(String::from);
-    match app.find(Kind::Tts, name.as_deref()) {
-        Err(r) => r,
-        Ok(m) => match &m.inner {
-            crate::registry::Inner::Placeholder(r) => err(StatusCode::NOT_IMPLEMENTED, r.clone()),
-            _ => err(StatusCode::NOT_IMPLEMENTED, "text-to-speech backend not available"),
-        },
+    let Some(Json(b)) = body else { return err(StatusCode::BAD_REQUEST, "expected a JSON body with 'input'") };
+    let name = b.get("model").and_then(|m| m.as_str()).map(String::from);
+    let m = match app.find(Kind::Tts, name.as_deref()) { Err(r) => return r, Ok(m) => m };
+    let t = match &m.inner {
+        crate::registry::Inner::Tts(t) => t.clone(),
+        crate::registry::Inner::Placeholder(r) => return err(StatusCode::NOT_IMPLEMENTED, r.clone()),
+        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch"),
+    };
+    let input = b.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if input.trim().is_empty() { return err(StatusCode::BAD_REQUEST, "'input' is required"); }
+    let fmt = b.get("response_format").and_then(|v| v.as_str()).unwrap_or("wav").to_string();
+    if !["wav", "pcm"].contains(&fmt.as_str()) { return err(StatusCode::BAD_REQUEST, format!("response_format '{fmt}' not supported (wav, pcm)")); }
+    let speed = b.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let noise = b.get("noise_scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let seed = b.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
+    t.queued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::task::spawn_blocking(move || {
+        let v = t.vits.lock().unwrap();
+        t.queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        t.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+        let st = std::time::Instant::now();
+        let out = v.synth(&input, speed, noise, seed).map(|s| (s, v.cfg.sampling_rate));
+        t.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok((s, rate)) = &out { tracing::info!("tts: {} chars -> {:.2}s audio in {:.2}s", input.len(), s.len() as f64 / *rate as f64, st.elapsed().as_secs_f64()); }
+        out
+    }).await;
+    match r {
+        Ok(Ok((s, rate))) => {
+            if fmt == "pcm" {
+                let mut v = Vec::with_capacity(s.len() * 2);
+                for x in &s { v.extend_from_slice(&((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()); }
+                ([("content-type", "audio/pcm")], v).into_response()
+            } else {
+                ([("content-type", "audio/wav")], crate::tts::wav_bytes(&s, rate)).into_response()
+            }
+        }
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
-
 async fn transcriptions(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, false).await }
 async fn translations(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, true).await }

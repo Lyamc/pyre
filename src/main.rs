@@ -1,10 +1,11 @@
-﻿#![recursion_limit = "512"]
+#![recursion_limit = "512"]
 mod backend;
 mod engine;
 mod api;
 mod logbuf;
 mod registry;
 mod stt;
+mod tts;
 mod image;
 mod ui;
 mod cli_models;
