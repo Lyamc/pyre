@@ -204,6 +204,7 @@ impl ImageModel {
             let init_lat = match &init { Some(rgb) if q.strength < 1.0 => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
             if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral") { req.sampler = "euler".into(); }
             let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
+            eng.release_free_memory();
             if q.refiner {
                 let dir = self.refiner_dir.clone().ok_or_else(|| anyhow!("no SDXL refiner found (set PYRE_SD_REFINER or put stable-diffusion-xl-refiner-1.0 next to the base)"))?;
                 let mut rq = req.clone();
@@ -212,6 +213,7 @@ impl ImageModel {
                 lat = engine::refine(&mut eng, &dir, lat, &rq, &mut on_step)?;
             }
             let (rgb, w, h) = eng.decode(lat)?;
+            eng.release_free_memory();
             if q.refiner { eng.ensure_unet()?; }
             png(&rgb, w, h)
         })();

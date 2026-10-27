@@ -318,7 +318,8 @@ impl Engine {
         let host = |t: Tensor<4>| -> Result<Vec<f32>> { Tensor::<4>::cast(t, DType::F32).into_data().to_vec::<f32>().map_err(|e| anyhow!("{e:?}")) };
         let forced = std::env::var("PYRE_SD_VAE_TILE").ok().and_then(|v| v.parse::<usize>().ok());
         let tile = forced.unwrap_or(64);
-        let planar = if (lh * lw > 128 * 128 || forced.is_some()) && (lh > tile || lw > tile) {
+        // 1024x1024 (128x128 latents) and up is tiled: one untiled SDXL decode at 1024 needs ~3 GB.
+        let planar = if (lh * lw >= 128 * 128 || forced.is_some()) && (lh > tile || lw > tile) {
             let overlap = tile / 4;
             let plan = tiles::plan(lh, lw, tile, overlap);
             let mut blend = tiles::Blend::new(lw * 8, lh * 8);
@@ -347,6 +348,14 @@ impl Engine {
     }
 
     pub fn device(&self) -> &Device { &self.dev }
+
+    /// Give Burn's pooled-but-unused buffers back to the driver. Sampling, VAE decode and every new
+    /// image size leave differently shaped buffers in the pool; on a 12 GB card SDXL weights plus
+    /// those overflow into shared system memory (CUDA sysmem fallback) and steps get 2-3x slower.
+    pub fn release_free_memory(&self) {
+        let _ = self.dev.sync();
+        self.dev.memory_cleanup();
+    }
 }
 
 /// Two-stage SDXL (cabin's sdxl_base_refiner workflow, but the latent is handed over directly as in
