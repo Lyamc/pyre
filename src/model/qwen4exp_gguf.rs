@@ -23,7 +23,7 @@ pub struct Cfg {
     pub ple_mult: Vec<u64>, pub ple_off: Vec<u64>, pub ple_vocab: Vec<u64>, pub vocab: usize, pub max_ctx: usize,
 }
 
-struct Hc { norm: Vec<f32>, down: QMat, up: QMat, inject: Option<QMat> }
+struct Hc { norm: Vec<f32>, down: QMat, up: QMat, inject: Option<QMat>, q8: Option<(super::qdot::Q8Mat, super::qdot::Q8Mat)> }
 enum Mixer {
     Attn { q: QMat, k: QMat, v: QMat, o: QMat, qn: Vec<f32>, kn: Vec<f32> },
     Lin { qkv: QMat, z: QMat, beta: QMat, alpha: QMat, a: Vec<f32>, dt: Vec<f32>, conv: Vec<f32>, norm: Vec<f32>, out: QMat },
@@ -70,7 +70,7 @@ impl Model {
             // the QSA sparse indexer only kicks in beyond top_k visible tokens; below that attention is dense
             max_ctx: k("attention.indexer.top_k").unwrap_or(2048) as usize,
         };
-        let hc = |p: &str, inj: bool| -> Result<Hc> { Ok(Hc { norm: g.vec(&format!("{p}_norm.weight"))?, down: g.mat(&format!("{p}_down.weight"))?, up: g.mat(&format!("{p}_up.weight"))?, inject: if inj { Some(g.mat(&format!("{p}_inject.weight"))?) } else { None } }) };
+        let hc = |p: &str, inj: bool| -> Result<Hc> { Ok(Hc { norm: g.vec(&format!("{p}_norm.weight"))?, down: g.mat(&format!("{p}_down.weight"))?, up: g.mat(&format!("{p}_up.weight"))?, inject: if inj { Some(g.mat(&format!("{p}_inject.weight"))?) } else { None }, q8: None }) };
         let mut layers = vec![];
         for il in 0..n_layers {
             let p = format!("blk.{il}");
@@ -92,6 +92,11 @@ impl Model {
         let ple_tab = if cfg.ple_layers.is_empty() { None } else { Some(g.mat("per_layer_token_embd.weight")?) };
         let half = cfg.n_rot / 2;
         let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
+        let mut layers = layers; let mut head = head;
+        if std::env::var("PYRE_QN_HC_Q8").map(|v| v != "0").unwrap_or(true) {
+            let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
+            for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
+        }
         Ok(Model { gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
@@ -137,6 +142,7 @@ impl Model {
                 hcf: match ghc(&l.hc_f)? { Some(x) => x, None => return Ok(None) },
                 fin: match g.upload(&[&l.router, &l.sh_gate, &l.sh_up])? { Some(x) => x, None => return Ok(None) },
                 sdown: match g.upload(&[&l.sh_down])? { Some(x) => x, None => return Ok(None) },
+                sgw: g.up(&l.sh_gate_inp, [d, 1]),
             })) })()?;
             if parts.is_some() { on += 1 } else { off += 1 }
             gl.push(parts);
@@ -147,34 +153,46 @@ impl Model {
         extra.push(vec![&self.head.down]); extra.push(vec![&self.head.up]); extra.push(vec![&self.out]);
         for grp in extra { if let Some(gm) = g.upload(&grp)? { m.insert(grp[0].key(), gm); } }
         let gb = (b0 - g.budget_left()) as f64 / (1u64 << 30) as f64;
+        if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(l0)) = gl.iter().find(|x| x.is_some()) {
+            let x1 = vec![0.01f32; d]; let xh = vec![0.01f32; hc * d];
+            let b = |name: &str, f: &dyn Fn() -> usize| { for _ in 0..3 { f(); } let t0 = std::time::Instant::now(); let mut n = 0; for _ in 0..20 { n = f(); } eprintln!("gpubench {name}: {:.3} ms ({n} out)", t0.elapsed().as_secs_f64() * 50.0); };
+            b("readback only (upload+read 2560)", &|| g.read(g.up(&x1, [1, d])).len());
+            b(&format!("min matmul {}x{} Q8 + read", l0.min.cols, l0.min.rows), &|| g.read(l0.min.fwd(g.up(&x1, [1, d]))).len());
+            b(&format!("hc up {}x{} + read", l0.hca.up.cols, l0.hca.up.rows), &|| g.read(l0.hca.up.fwd(g.up(&vec![0.01f32; l0.hca.up.cols], [1, l0.hca.up.cols]))).len());
+            b("hc mix (no read of x) + read mixed", &|| g.read(l0.hca.mix(g.up(&xh, [1, hc * d]), 1, hc, d, self.cfg.eps).0).len());
+            { let mut te = 0f64; let mut tt = 0f64; for _ in 0..20 { let t0 = std::time::Instant::now(); let (m_, _) = l0.hca.mix(g.up(&xh, [1, hc * d]), 1, hc, d, self.cfg.eps); let m2 = l0.hcf.mix(g.up(&xh, [1, hc * d]), 1, hc, d, self.cfg.eps).0; let s_ = m_ + m2; te += t0.elapsed().as_secs_f64(); let _ = g.read(s_); tt += t0.elapsed().as_secs_f64(); }
+              eprintln!("gpubench 2 hc mixes: enqueue {:.3} ms, total {:.3} ms", te * 50.0, tt * 50.0); }
+            b(&format!("hc down {}x{} + read", l0.hca.di.cols, l0.hca.di.rows), &|| g.read(l0.hca.di.fwd(g.up(&xh, [1, hc * d]))).len());
+            b("rms only + read", &|| { let x3 = g.up(&xh, [1, hc * d]).reshape([1, hc, d]); let ms = x3.clone().powi_scalar(2).mean_dim(2); let xn = x3 * ms.add_scalar(1e-6).sqrt().recip() * l0.hca.norm.clone(); g.read(xn.reshape([1, hc * d])).len() });
+            b("sigmoid-mean only + read", &|| { let x3 = g.up(&xh, [1, hc * d]).reshape([1, hc, d]); g.read((x3.clone() * burn::tensor::activation::sigmoid(x3)).mean_dim(1).reshape([1, d])).len() });
+            b("10x min matmul then read", &|| { let mut y = g.up(&x1, [1, d]); let mut acc = None; for _ in 0..10 { let o = l0.min.fwd(y.clone()); y = o.clone().slice([0..1, 0..d]); acc = Some(o); } g.read(acc.unwrap()).len() });
+        } }
         self.gmats = m; self.gl = gl; self.gpu = Some(g);
         Ok((on, off, gb))
     }
 
-    /// The layer with its dense half on the GPU: two device->host copies (mixer inputs; then the
-    /// MoE input, router logits, shared-expert output and the updated residual).
-    fn layer_gpu(&self, l: &Layer, gl: &super::qn_gpu::GLayer, x: &mut [f32], st: &mut State, ai: &mut usize, li: &mut usize, start: usize, t: usize) {
+    /// The layer with its dense half on the GPU; the residual `xd` [t, hc*d] stays on the device.
+    /// Two device->host copies: the mixer inputs, then the MoE input + router logits. The shared expert
+    /// is queued after the second copy so the GPU computes it while the CPU runs the routed experts.
+    fn layer_gpu(&self, l: &Layer, gl: &super::qn_gpu::GLayer, xd: burn::tensor::Tensor<2>, st: &mut State, ai: &mut usize, li: &mut usize, start: usize, t: usize) -> burn::tensor::Tensor<2> {
+        use burn::tensor::activation::{sigmoid, silu};
         let g = self.gpu.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp);
-        let xg = g.up(x, [t, hc * d]);
-        let (mixed, inj_a) = gl.hca.mix(xg.clone(), t, hc, d, c.eps);
+        let (mixed, inj_a) = gl.hca.mix(xd.clone(), t, hc, d, c.eps);
         let mi = g.read(gl.min.fwd(mixed));
         let proj = gl.min.split_host(&mi, t);
         let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, proj, start, t); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, proj, t); *li += 1; o } };
         let o = gl.mout.fwd(g.up(&core, [t, core.len() / t]));
-        let x2 = super::qn_gpu::combine(xg, o, inj_a.unwrap(), t, hc, d);
+        let x2 = super::qn_gpu::combine(xd, o, inj_a.unwrap(), t, hc, d);
         let (mf, inj_f) = gl.hcf.mix(x2.clone(), t, hc, d, c.eps);
         let fi = gl.fin.fwd(mf.clone()); let sf = l.sh_gate.rows;
-        let lg = fi.clone().slice([0..t, 0..ne]);
-        let sh = gl.sdown.fwd(burn::tensor::activation::silu(fi.clone().slice([0..t, ne..ne + sf])) * fi.slice([0..t, ne + sf..ne + 2 * sf]));
-        let all = g.read(burn::tensor::Tensor::cat(vec![x2, mf, inj_f.unwrap(), lg, sh], 1));
-        let w = hc * d + d + hc + ne + d;
-        let (mut mfc, mut injc, mut lgc, mut y) = (Vec::with_capacity(t * d), Vec::with_capacity(t * hc), Vec::with_capacity(t * ne), Vec::with_capacity(t * d));
-        for ti in 0..t { let r = &all[ti * w..(ti + 1) * w]; let mut o = 0;
-            x[ti * hc * d..(ti + 1) * hc * d].copy_from_slice(&r[..hc * d]); o += hc * d;
-            mfc.extend_from_slice(&r[o..o + d]); o += d; injc.extend_from_slice(&r[o..o + hc]); o += hc;
-            lgc.extend_from_slice(&r[o..o + ne]); o += ne; y.extend_from_slice(&r[o..o + d]); }
-        self.routed(l, &mfc, &lgc, t, &mut y);
-        self.hc_combine(x, &y, &injc, t);
+        let both = g.read(burn::tensor::Tensor::cat(vec![mf.clone(), fi.clone().slice([0..t, 0..ne])], 1));
+        let sh = gl.sdown.fwd(silu(fi.clone().slice([0..t, ne..ne + sf])) * fi.slice([0..t, ne + sf..ne + 2 * sf]))
+            * sigmoid(mf.matmul(gl.sgw.clone()));
+        let w = d + ne; let (mut mfc, mut lgc) = (Vec::with_capacity(t * d), Vec::with_capacity(t * ne));
+        for ti in 0..t { mfc.extend_from_slice(&both[ti * w..ti * w + d]); lgc.extend_from_slice(&both[ti * w + d..(ti + 1) * w]); }
+        let mut yr = vec![0f32; t * d];
+        self.routed(l, &mfc, &lgc, t, &mut yr, false);
+        super::qn_gpu::combine(x2, sh + g.up(&yr, [t, d]), inj_f.unwrap(), t, hc, d)
     }
 
     /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
@@ -204,6 +222,16 @@ impl Model {
         let mut xn = vec![0f32; t * w];
         xn.par_chunks_mut(d).enumerate().for_each(|(i, o)| { let s = i % hc; rms(&x[i * d..(i + 1) * d], &h.norm[s * d..(s + 1) * d], self.cfg.eps, o); });
         let mut grp = vec![&h.down]; if let Some(i) = &h.inject { grp.push(i); }
+        if let Some((di, up)) = &h.q8 {
+            // int8 path: down+inject in one pass, then up
+            let nr = di.rows; let lr = h.down.rows; let mut o = vec![0f32; t * nr]; di.matmul(&xn, t, &mut o);
+            let mut lo = vec![0f32; t * lr]; let mut inj = vec![0f32; t * hc];
+            for ti in 0..t { for i in 0..lr { lo[ti * lr + i] = silu(o[ti * nr + i] / hc as f32); } if h.inject.is_some() { for s in 0..hc { inj[ti * hc + s] = o[ti * nr + lr + s] / hc as f32; } } }
+            let mut gate = vec![0f32; t * w]; up.matmul(&lo, t, &mut gate);
+            let mut mixed = vec![0f32; t * d];
+            for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
+            return (mixed, inj);
+        }
         let mut r = self.mm(&grp, &xn, t).into_iter();
         let mut lo = r.next().unwrap();
         for v in lo.iter_mut() { *v = silu(*v / hc as f32); }
@@ -355,7 +383,7 @@ impl Model {
         // shared expert (batched)
         for i in 0..g.len() { g[i] = silu(g[i]) * u[i]; }
         let mut y = self.mm(&[&l.sh_down], &g, t).pop().unwrap();
-        self.routed(l, x, &lg, t, &mut y);
+        self.routed(l, x, &lg, t, &mut y, true);
         y
     }
 
@@ -394,9 +422,9 @@ impl Model {
     }
 
     /// Shared-expert gate (applied to y's shared output) + the routed experts on the CPU, added into y.
-    fn routed(&self, l: &Layer, x: &[f32], lg: &[f32], t: usize, y: &mut [f32]) {
+    fn routed(&self, l: &Layer, x: &[f32], lg: &[f32], t: usize, y: &mut [f32], shared_gate: bool) {
         let c = &self.cfg; let d = c.d; let ff = c.ff_exp; let t_r = std::time::Instant::now();
-        for ti in 0..t { let sg = sigm(dot(&l.sh_gate_inp, &x[ti * d..(ti + 1) * d])); for v in &mut y[ti * d..(ti + 1) * d] { *v *= sg; } }
+        if shared_gate { for ti in 0..t { let sg = sigm(dot(&l.sh_gate_inp, &x[ti * d..(ti + 1) * d])); for v in &mut y[ti * d..(ti + 1) * d] { *v *= sg; } } }
         // routing: softmax -> top-k -> renormalise
         let mut by_exp: Vec<Vec<(usize, f32)>> = vec![vec![]; c.n_exp];
         for ti in 0..t {
@@ -470,13 +498,17 @@ impl Model {
         for (ti, &id) in ids.iter().enumerate() { self.embd.row(id as usize, &mut e); for s in 0..hc { x[(ti * hc + s) * d..(ti * hc + s + 1) * d].copy_from_slice(&e); } }
         let emb = if self.ple_tab.is_some() { Some(self.ple_rows(st, start, t)) } else { None };
         let (mut li, mut ai, mut pi) = (0, 0, 0);
+        let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
         let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
+            if xd.is_some() && (l.ple.is_some() || !matches!(self.gl.get(il), Some(Some(_)))) { x = self.gpu.as_ref().unwrap().read(xd.take().unwrap()); }
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
             if let Some(Some(gl)) = self.gl.get(il) {
-                self.layer_gpu(l, gl, &mut x, st, &mut ai, &mut li, start, t);
+                let g = self.gpu.as_ref().unwrap();
+                let xin = match xd.take() { Some(v) => v, None => g.up(&x, [t, hc * d]) };
+                xd = Some(self.layer_gpu(l, gl, xin, st, &mut ai, &mut li, start, t));
                 if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
                 continue;
             }
@@ -492,6 +524,7 @@ impl Model {
             if prof { prof_acc[0] += t_hc.as_secs_f64() + (t_hc2 - t_mix).as_secs_f64(); prof_acc[if matches!(l.mix, Mixer::Attn { .. }) { 1 } else { 2 }] += (t_mix - t_hc).as_secs_f64(); prof_acc[3] += (tt.elapsed() - t_hc2).as_secs_f64(); }
             if dbg { eprintln!("layer {il}: x[0,:4] = {:?}", &x[(t - 1) * hc * d..(t - 1) * hc * d + 4]); }
         }
+        if let Some(v) = xd.take() { let r = self.gpu.as_ref().unwrap().read(v.slice([t - 1..t, 0..hc * d])); x[(t - 1) * hc * d..t * hc * d].copy_from_slice(&r); }
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();

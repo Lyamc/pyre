@@ -120,4 +120,4 @@ pub fn combine(x: Tensor<2>, out: Tensor<2>, inj: Tensor<2>, t: usize, hc: usize
 
 /// One decoder layer's dense half on the GPU (Strata's split): HC mixers, mixer in/out projections,
 /// router + shared expert. Routed experts and the token-serial DeltaNet/attention cores stay on the host.
-pub struct GLayer { pub hca: GHc, pub min: GMat, pub mout: GMat, pub hcf: GHc, pub fin: GMat, pub sdown: GMat }
+pub struct GLayer { pub hca: GHc, pub min: GMat, pub mout: GMat, pub hcf: GHc, pub fin: GMat, pub sdown: GMat, pub sgw: Tensor<2> }
