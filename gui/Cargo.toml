@@ -1,0 +1,36 @@
+[package]
+name = "pyre-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native GPUI desktop front end for a pyre server (HTTP only; does not link Burn)"
+
+# Its own workspace: GPUI's dependency patches (see below) must not leak into the server build,
+# and keeping it separate guarantees the GUI never links Burn.
+[workspace]
+
+[[bin]]
+name = "pyre-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Lyamc's GPUI fork, same source and features as C:\Build\media\jellyfin-gpui (rev pinned to the
+# commit jellyfin-gpui's Cargo.lock resolves, 08629d4).
+gpui = { git = "https://github.com/Lyamc/gpui", rev = "08629d460d9cb31aff51cb7699f5a8bc1de1a623", default-features = false, features = ["font-kit", "wayland", "x11"] }
+# Plain-HTTP client for talking to pyre (no TLS stack -> no ring/cc).
+ureq = { version = "3", default-features = false }
+serde_json = "1"
+base64 = "0.22"
+
+[build-dependencies]
+embed-manifest = "1.5"
+
+[patch.crates-io]
+# Same patches as jellyfin-gpui: keep the build free of cc/libc C toolchain steps.
+rav1e = { git = "https://github.com/Lyamc/rav1e", branch = "cabin-no-cc" }
+gpui_http_client = { git = "https://github.com/Lyamc/gpui_http_client", branch = "main" }
+hyper-util = { git = "https://github.com/Lyamc/hyper-util", branch = "main" }
+stacker = { git = "https://github.com/Lyamc/stacker", branch = "main" }
+
+[profile.release]
+codegen-units = 16
