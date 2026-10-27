@@ -33,6 +33,32 @@ impl Lin {
     }
 }
 
+/// Projections that read the same input (q/k/v, gate/up). Dense float weights are concatenated
+/// at load into one matmul (fewer launches per decode step), outputs split by column ranges.
+/// Packed-quant or Q4_K-offset weights stay separate. `PYRE_FUSE_PROJ=0` disables.
+enum Proj { Split(Vec<Lin>), Fused(Lin, Vec<usize>) }
+impl Proj {
+    fn new(parts: Vec<Lin>) -> Self {
+        let off = matches!(std::env::var("PYRE_FUSE_PROJ").as_deref(), Ok("0" | "false" | "off"));
+        let bias_mix = parts.iter().any(|l| l.b.is_some()) && parts.iter().any(|l| l.b.is_none());
+        if off || bias_mix || parts.iter().any(|l| l.kb.is_some() || !l.w.dtype().is_float()) { return Proj::Split(parts); }
+        let sizes: Vec<usize> = parts.iter().map(|l| l.w.dims()[1]).collect();
+        let b = if parts[0].b.is_some() { Some(Tensor::cat(parts.iter().map(|l| l.b.clone().unwrap()).collect(), 0)) } else { None };
+        let w = Tensor::cat(parts.into_iter().map(|l| l.w).collect(), 1);
+        Proj::Fused(Lin { w, b, kb: None }, sizes)
+    }
+    fn fwd<const D: usize>(&self, x: Tensor<D>) -> Vec<Tensor<D>> {
+        match self {
+            Proj::Split(ls) => ls.iter().map(|l| l.fwd(x.clone())).collect(),
+            Proj::Fused(l, sizes) => {
+                let y = l.fwd(x);
+                let mut o = 0;
+                sizes.iter().map(|&n| { let t = y.clone().narrow(D - 1, o, n); o += n; t }).collect()
+            }
+        }
+    }
+}
+
 /// RMSNorm weight. Gemma scales by `(1 + w)` in f32; the others by `w` in the model dtype.
 struct Norm { w: Tensor<1>, gemma: bool }
 impl Norm {
@@ -51,7 +77,7 @@ impl Norm {
 struct Expert { gate: Lin, up: Lin, down: Lin }
 
 enum Mlp {
-    Dense { gate: Lin, up: Lin, down: Lin },
+    Dense { gate_up: Proj, down: Lin },
     Moe { router: Lin, experts: Vec<Expert>, k: usize, renorm: bool },
 }
 
@@ -59,7 +85,7 @@ struct Layer {
     in_norm: Norm, post_norm: Norm,
     /// Gemma: norms around the MLP (the `post_norm` above is then the post-attention norm).
     pre_ff_norm: Option<Norm>, post_ff_norm: Option<Norm>,
-    q: Lin, k: Lin, v: Lin, o: Lin,
+    qkv: Proj, o: Lin,
     q_norm: Option<Norm>, k_norm: Option<Norm>,
     mlp: Mlp,
     window: Option<usize>,
@@ -141,7 +167,7 @@ impl Llama {
                 }
                 Mlp::Moe { router: Lin::load(ws, &format!("{p}.mlp.gate"), false)?, experts, k: cfg.num_experts_per_tok.unwrap_or(2), renorm: cfg.norm_topk_prob.unwrap_or(false) }
             } else {
-                Mlp::Dense { gate: Lin::load(ws, &format!("{p}.mlp.gate_proj"), false)?, up: Lin::load(ws, &format!("{p}.mlp.up_proj"), false)?, down: Lin::load(ws, &format!("{p}.mlp.down_proj"), false)? }
+                Mlp::Dense { gate_up: Proj::new(vec![Lin::load(ws, &format!("{p}.mlp.gate_proj"), false)?, Lin::load(ws, &format!("{p}.mlp.up_proj"), false)?]), down: Lin::load(ws, &format!("{p}.mlp.down_proj"), false)? }
             };
             let window = cfg.layer_window(i);
             layers.push(Layer {
@@ -149,9 +175,11 @@ impl Llama {
                 post_norm: Norm::load(ws, &format!("{p}.post_attention_layernorm.weight"), gemma)?,
                 pre_ff_norm: if gemma { Some(Norm::load(ws, &format!("{p}.pre_feedforward_layernorm.weight"), gemma)?) } else { None },
                 post_ff_norm: if gemma { Some(Norm::load(ws, &format!("{p}.post_feedforward_layernorm.weight"), gemma)?) } else { None },
-                q: Lin::load(ws, &format!("{p}.self_attn.q_proj"), bias)?,
-                k: Lin::load(ws, &format!("{p}.self_attn.k_proj"), bias)?,
-                v: Lin::load(ws, &format!("{p}.self_attn.v_proj"), bias)?,
+                qkv: Proj::new(vec![
+                    Lin::load(ws, &format!("{p}.self_attn.q_proj"), bias)?,
+                    Lin::load(ws, &format!("{p}.self_attn.k_proj"), bias)?,
+                    Lin::load(ws, &format!("{p}.self_attn.v_proj"), bias)?,
+                ]),
                 o: Lin::load(ws, &format!("{p}.self_attn.o_proj"), false)?,
                 q_norm: if qkn { Some(Norm::load(ws, &format!("{p}.self_attn.q_norm.weight"), gemma)?) } else { None },
                 k_norm: if qkn { Some(Norm::load(ws, &format!("{p}.self_attn.k_norm.weight"), gemma)?) } else { None },
@@ -254,7 +282,7 @@ impl Llama {
     fn mlp(&self, mlp: &Mlp, h: Tensor<3>) -> Tensor<3> {
         let act = |t: Tensor<3>| if self.gemma { gelu_approximate(t) } else { silu(t) };
         match mlp {
-            Mlp::Dense { gate, up, down } => down.fwd(act(gate.fwd(h.clone())).mul(up.fwd(h))),
+            Mlp::Dense { gate_up, down } => { let mut g = gate_up.fwd(h); let u = g.pop().unwrap(); down.fwd(act(g.pop().unwrap()).mul(u)) }
             Mlp::Moe { router, experts, k, renorm } => {
                 let [b, t, hs] = h.dims();
                 let n = b * t;
@@ -314,9 +342,10 @@ impl Llama {
             let cos = cos_t.clone().narrow(0, start, t).reshape([1, 1, t, hd]);
             let sin = sin_t.clone().narrow(0, start, t).reshape([1, 1, t, hd]);
             let h = l.in_norm.fwd(x.clone(), eps, self.dtype);
-            let mut q = l.q.fwd(h.clone()).reshape([1, t, nh, hd]).swap_dims(1, 2);
-            let mut k = l.k.fwd(h.clone()).reshape([1, t, nkv, hd]).swap_dims(1, 2);
-            let v = l.v.fwd(h).reshape([1, t, nkv, hd]).swap_dims(1, 2);
+            let mut qkv = l.qkv.fwd(h);
+            let v = qkv.pop().unwrap().reshape([1, t, nkv, hd]).swap_dims(1, 2);
+            let mut k = qkv.pop().unwrap().reshape([1, t, nkv, hd]).swap_dims(1, 2);
+            let mut q = qkv.pop().unwrap().reshape([1, t, nh, hd]).swap_dims(1, 2);
             if let (Some(qn), Some(kn)) = (&l.q_norm, &l.k_norm) {
                 q = qn.fwd(q, eps, self.dtype);
                 k = kn.fwd(k, eps, self.dtype);
@@ -387,9 +416,10 @@ impl Llama {
             let cos = cos_t.clone().select(0, pidx.clone()).reshape([n, 1, 1, hd]);
             let sin = sin_t.clone().select(0, pidx.clone()).reshape([n, 1, 1, hd]);
             let h = l.in_norm.fwd(x.clone(), eps, self.dtype);
-            let mut q = l.q.fwd(h.clone()).reshape([n, 1, nh, hd]).swap_dims(1, 2);
-            let mut k = l.k.fwd(h.clone()).reshape([n, 1, nkv, hd]).swap_dims(1, 2);
-            let v = l.v.fwd(h).reshape([n, 1, nkv, hd]).swap_dims(1, 2);
+            let mut qkv = l.qkv.fwd(h);
+            let v = qkv.pop().unwrap().reshape([n, 1, nkv, hd]).swap_dims(1, 2);
+            let mut k = qkv.pop().unwrap().reshape([n, 1, nkv, hd]).swap_dims(1, 2);
+            let mut q = qkv.pop().unwrap().reshape([n, 1, nh, hd]).swap_dims(1, 2);
             if let (Some(qn), Some(kn)) = (&l.q_norm, &l.k_norm) {
                 q = qn.fwd(q, eps, self.dtype);
                 k = kn.fwd(k, eps, self.dtype);
