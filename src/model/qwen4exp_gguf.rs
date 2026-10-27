@@ -348,6 +348,40 @@ impl Model {
         y
     }
 
+    /// Prompt chunks: each expert's rows are dequantized once to f32 and multiplied against all of the
+    /// tokens routed to it with a cache-blocked SGEMM (matrixmultiply), tasks = (expert, row block).
+    fn routed_gemm(&self, l: &Layer, x: &[f32], work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32]) {
+        let c = &self.cfg; let (d, ff) = (c.d, c.ff_exp);
+        const RB: usize = 128; const DB: usize = 512;
+        let gemm = |m: usize, k: usize, n: usize, a: &[f32], w: &[f32], out: &mut [f32]| unsafe {
+            // out[m, n] = a[m, k] * w[n, k]^T
+            matrixmultiply::sgemm(m, k, n, 1.0, a.as_ptr(), k as isize, 1, w.as_ptr(), 1, k as isize, 0.0, out.as_mut_ptr(), n as isize, 1);
+        };
+        let parts: Vec<(usize, usize, Vec<f32>)> = work.par_iter().flat_map(|&(e, toks)| (0..ff.div_ceil(RB)).into_par_iter().map(move |b| {
+            let (r0, r1) = (b * RB, ((b + 1) * RB).min(ff)); let nr = r1 - r0; let n = toks.len();
+            let mut xe = vec![0f32; n * d]; for (j, &(ti, _)) in toks.iter().enumerate() { xe[j * d..(j + 1) * d].copy_from_slice(&x[ti * d..(ti + 1) * d]); }
+            let mut w = vec![0f32; nr * d];
+            let gm = l.gate_e.slice_rows(e * ff + r0, nr); for r in 0..nr { gm.row(r, &mut w[r * d..(r + 1) * d]); }
+            let mut hg = vec![0f32; n * nr]; gemm(n, d, nr, &xe, &w, &mut hg);
+            let um = l.up_e.slice_rows(e * ff + r0, nr); for r in 0..nr { um.row(r, &mut w[r * d..(r + 1) * d]); }
+            let mut hu = vec![0f32; n * nr]; gemm(n, d, nr, &xe, &w, &mut hu);
+            for i in 0..hg.len() { hg[i] = silu(hg[i]) * hu[i]; }
+            (e, r0, hg)
+        })).collect();
+        let mut hid: std::collections::HashMap<usize, Vec<f32>> = work.iter().map(|&(e, toks)| (e, vec![0f32; toks.len() * ff])).collect();
+        for (e, r0, hb) in parts { let h = hid.get_mut(&e).unwrap(); let n = h.len() / ff; let w = hb.len() / n; for j in 0..n { h[j * ff + r0..j * ff + r0 + w].copy_from_slice(&hb[j * w..(j + 1) * w]); } }
+        let hid = &hid;
+        let outs: Vec<(usize, usize, Vec<f32>)> = work.par_iter().flat_map(|&(e, toks)| (0..d.div_ceil(DB)).into_par_iter().map(move |b| {
+            let (r0, r1) = (b * DB, ((b + 1) * DB).min(d)); let nr = r1 - r0; let n = toks.len();
+            let mut w = vec![0f32; nr * ff]; let dm = l.down_e.slice_rows(e * d + r0, nr); for r in 0..nr { dm.row(r, &mut w[r * ff..(r + 1) * ff]); }
+            let mut o = vec![0f32; n * nr]; gemm(n, ff, nr, &hid[&e], &w, &mut o);
+            (e, r0, o)
+        })).collect();
+        let by: std::collections::HashMap<usize, &Vec<(usize, f32)>> = work.iter().copied().collect();
+        for (e, r0, o) in outs { let toks = by[&e]; let nr = o.len() / toks.len();
+            for (j, &(ti, wt)) in toks.iter().enumerate() { let yr = &mut y[ti * d + r0..ti * d + r0 + nr]; for i in 0..nr { yr[i] += wt * o[j * nr + i]; } } }
+    }
+
     /// Shared-expert gate (applied to y's shared output) + the routed experts on the CPU, added into y.
     fn routed(&self, l: &Layer, x: &[f32], lg: &[f32], t: usize, y: &mut [f32]) {
         let c = &self.cfg; let d = c.d; let ff = c.ff_exp; let t_r = std::time::Instant::now();
@@ -363,6 +397,11 @@ impl Model {
             for (&e, w) in top.iter().zip(ws) { by_exp[e].push((ti, w / sum)); }
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
+        if t * c.top_k >= work.len() * env_usize("PYRE_QN_GEMM_MIN").unwrap_or(8) { // >= 8 tokens per expert on average
+            self.routed_gemm(l, x, &work, t, y);
+            ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // one task per (expert, block of rows): keeps all cores busy for decode (10 experts) and prefill alike
         let blk: usize = env_usize("PYRE_QN_BLK").unwrap_or(if t == 1 { 64 } else { 64 });
         use super::qdot;

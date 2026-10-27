@@ -6124,6 +6124,7 @@ dependencies = [
  "hf-hub 1.0.0",
  "image",
  "libc",
+ "matrixmultiply",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

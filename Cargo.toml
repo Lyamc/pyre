@@ -83,6 +83,7 @@ toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
+matrixmultiply = "0.3"
 nvml-wrapper = "0.13"
 # Only for the fused-quant switch in tests/benches (patched to the local fork).
 burn-cubecl = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std"] }
