@@ -142,7 +142,7 @@ impl DPMSolverMultistepScheduler {
             BetaSchedule::SquaredcosCapV2 => {
                 let betas_tensor: Tensor<1> =
                     betas_for_alpha_bar(config.train_timesteps, 0.999, device);
-                let data = betas_tensor.into_data();
+                let data = betas_tensor.cast(burn::tensor::FloatDType::F32).into_data();
                 data.to_vec::<f32>()
                     .unwrap()
                     .into_iter()

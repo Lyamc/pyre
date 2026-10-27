@@ -103,6 +103,8 @@ where
     let mut decoder = crate::opus::codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(map_symphonia_error)?;
+    // The decoder knows its output rate (Opus always decodes at 48 kHz, whatever the container says).
+    let sample_rate = decoder.codec_params().sample_rate.map(|r| r as usize).unwrap_or(sample_rate);
 
     let segment_samples = (segment_secs * sample_rate as f64).round() as usize;
     let overlap_samples = (overlap_secs * sample_rate as f64).round() as usize;
@@ -209,6 +211,8 @@ fn decode_from_mss(
     let mut decoder = crate::opus::codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(map_symphonia_error)?;
+    // The decoder knows its output rate (Opus always decodes at 48 kHz, whatever the container says).
+    let sample_rate = decoder.codec_params().sample_rate.map(|r| r as usize).unwrap_or(sample_rate);
 
     let max_native_samples = max_seconds.map(|max| {
         sample_rate

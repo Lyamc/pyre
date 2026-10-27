@@ -33,7 +33,9 @@ pub fn select(name: &str, dtype: &str, model_dtype: Option<&str>) -> Result<(Dev
         }
     };
     if !dev.supports_dtype(DType::from(want)) { bail!("{label} does not support {want:?}"); }
-    if let Err(e) = dev.configure(want) {
+    // Keep the device default at F32 so models sharing the device (SD/Whisper load f32 weights and
+    // create f32 intermediates) don't inherit the LLM's bf16; the LLM uses explicit dtypes.
+    if let Err(e) = dev.configure(FloatDType::F32) {
         // A second model on an already-initialised device: settings are locked, but tensors are
         // created with an explicit dtype anyway, so this is only informational.
         tracing::debug!("device already configured ({e}); using explicit dtype {want:?}");

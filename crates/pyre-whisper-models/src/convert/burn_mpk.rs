@@ -47,8 +47,7 @@ pub fn save_model_from_npy(name: &str, options: &DownloadOptions) -> anyhow::Res
     if !alias_cfg.exists() {
         model_config.save(&alias_cfg)?;
     }
-
-    decompress_gz_to_aliases(&dump_dir, name)?;
+    // burnpack is saved uncompressed; the old .mpk.gz alias step no longer applies.
 
     options.report(crate::download::PrepProgress::convert(
         format!("Burn bundle saved for '{name}'"),
@@ -57,26 +56,6 @@ pub fn save_model_from_npy(name: &str, options: &DownloadOptions) -> anyhow::Res
     if options.verbose {
         tracing::info!("burn bundle saved to {}", dump_dir.display());
     }
-
-    Ok(())
-}
-
-fn decompress_gz_to_aliases(dir: &Path, _name: &str) -> anyhow::Result<()> {
-    use flate2::read::GzDecoder;
-    use std::fs::File;
-    use std::io::copy;
-
-    let gz = dir.join("model.bpk");
-    if !gz.exists() {
-        return Ok(());
-    }
-
-    let mpk = dir.join("model.bpk");
-    // Always refresh the uncompressed alias — a leftover model.mpk is
-    // preferred by the loader and would keep serving pre-fix weights.
-    let mut decoder = GzDecoder::new(File::open(&gz)?);
-    let mut out = File::create(&mpk)?;
-    copy(&mut decoder, &mut out)?;
 
     Ok(())
 }

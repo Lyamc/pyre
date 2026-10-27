@@ -20,7 +20,7 @@ tracing = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 hf-hub = { path = "third_party/hf-hub", default-features = false, features = ["ureq", "native-tls"] }
-symphonia = { version = "0.5", default-features = false, features = ["wav", "mp3", "flac", "ogg", "pcm", "aac", "isomp4", "mkv"] }
+symphonia = { version = "0.5", default-features = false, features = ["wav", "mp3", "flac", "ogg", "pcm", "aac", "isomp4", "mkv", "vorbis"] }
 rubato = "5"
 hound = "3.5"
 tokenizers = { version = "0.23", default-features = false, features = ["onig", "progressbar"] }
