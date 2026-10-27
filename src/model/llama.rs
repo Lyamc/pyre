@@ -119,19 +119,20 @@ pub struct Llama {
     final_softcap: Option<f64>,
 }
 
+/// `rotate_half` without its sign: `[x2, x1]`. The sign lives in the sin table (its first half is
+/// negated, see `rope_tables`), so RoPE is one flip instead of two narrows + neg + cat.
 fn rotate_half(x: Tensor<4>) -> Tensor<4> {
-    let hd = x.dims()[3];
-    let x1 = x.clone().narrow(3, 0, hd / 2);
-    let x2 = x.narrow(3, hd / 2, hd / 2);
-    Tensor::cat(vec![x2.neg(), x1], 3)
+    let [a, b, c, hd] = x.dims();
+    x.reshape([a * b * c, 2, hd / 2]).flip([1]).reshape([a, b, c, hd])
 }
 
 fn rope_tables(inv: &[f64], ctx: usize, hd: usize, opts: &TensorCreationOptions) -> (Tensor<2>, Tensor<2>) {
     let mut c = Vec::with_capacity(ctx * hd);
     let mut s = Vec::with_capacity(ctx * hd);
     for pos in 0..ctx {
-        for _ in 0..2 {
-            for f in inv { let a = pos as f64 * f; c.push(a.cos() as f32); s.push(a.sin() as f32); }
+        for half in 0..2 {
+            let sign = if half == 0 { -1.0 } else { 1.0 };
+            for f in inv { let a = pos as f64 * f; c.push(a.cos() as f32); s.push((sign * a.sin()) as f32); }
         }
     }
     (Tensor::from_data(TensorData::new(c, [ctx, hd]), opts.clone()), Tensor::from_data(TensorData::new(s, [ctx, hd]), opts.clone()))
