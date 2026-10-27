@@ -156,23 +156,48 @@ impl Weights {
     /// A `[out, in]` linear weight kept packed when the GGUF type has an exact Burn scheme
     /// (Q8_0 -> Q8F block 32, f16 scales). `None` means: use [`Self::get`].
     pub fn get_quantized(&self, name: &str) -> Result<Option<(Tensor<2>, Option<Tensor<2>>)>> {
+        self.get_quantized_cat(&[name.to_string()])
+    }
+
+    /// Like [`Self::get_quantized`] for several `[out_i, in]` weights of the same GGUF type, stacked
+    /// along `out` on the host before repacking (GGUF blocks run along `in`, rows are contiguous),
+    /// so q/k/v or gate/up become one packed weight (and one Q4_K offset matrix). `None` when the
+    /// types or `in` differ, or the type isn't kept packed.
+    pub fn get_quantized_cat(&self, names: &[String]) -> Result<Option<(Tensor<2>, Option<Tensor<2>>)>> {
         use burn_gguf::GgmlType as G;
         let Some(r) = &self.gguf else { return Ok(None) };
         if !self.keep_quant { return Ok(None); }
-        let g = hf_to_gguf(name);
-        let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
-        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
-        let n = info.num_elements().map_err(|e| anyhow!("{e}"))?;
+        let mut infos = Vec::with_capacity(names.len());
+        for name in names {
+            let g = hf_to_gguf(name);
+            infos.push((g.clone(), r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?));
+        }
+        let (g, info) = &infos[0];
+        let g = g.clone();
+        let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        if shape.len() != 2 { return Ok(None); }
+        let mut n = 0;
+        for (_, i) in &infos {
+            let sh: Vec<usize> = i.dims.iter().rev().copied().collect();
+            if i.tensor_type != info.tensor_type || sh.len() != 2 || sh[1] != shape[1] { return Ok(None); }
+            n += i.num_elements().map_err(|e| anyhow!("{e}"))?;
+        }
+        shape[0] = n / shape[1];
+        let raw = || -> Result<Vec<u8>> {
+            let mut b = Vec::new();
+            for (gn, i) in &infos { b.extend_from_slice(&r.tensor_bytes(i).map_err(|e| anyhow!("{gn}: {e}"))?); }
+            Ok(b)
+        };
         let dev = || TensorCreationOptions::new(self.device.clone());
         match info.tensor_type {
             G::Q8_0 => {
                 let scheme = info.tensor_type.to_quant_scheme().unwrap();
-                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let bytes = raw()?;
                 let packed = burn_gguf::repack_to_burn(info.tensor_type, &bytes, scheme, n).map_err(|e| anyhow!("{g}: {e}"))?;
                 Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(scheme)), dev()), None)))
             }
             G::Q4K if self.keep_kquant() => {
-                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let bytes = raw()?;
                 let (packed, offs) = super::kquant::repack_q4k(&bytes, n);
                 let s = super::kquant::q4k_scheme();
                 let w = Tensor::from_data(TensorData::from_bytes_vec(packed, shape.clone(), DType::QFloat(s)), dev());
@@ -180,13 +205,13 @@ impl Weights {
                 Ok(Some((w, Some(c))))
             }
             G::Q5_0 if self.keep_kquant() => {
-                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let bytes = raw()?;
                 let s = super::kquant::q5_0_scheme();
                 let packed = super::kquant::repack_q5_0(&bytes, n);
                 Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(s)), dev()), None)))
             }
             G::Q6K if self.keep_kquant() => {
-                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let bytes = raw()?;
                 let packed = super::kquant::repack_q6k(&bytes, n);
                 let s = super::kquant::q6k_scheme();
                 Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(s)), dev()), None)))

@@ -40,16 +40,25 @@ enum Proj { Split(Vec<Lin>), Fused(Lin, Vec<usize>) }
 impl Proj {
     fn load(ws: &Weights, names: &[String], bias: bool) -> Result<Self> {
         let off = matches!(std::env::var("PYRE_FUSE_PROJ").as_deref(), Ok("0" | "false" | "off"));
-        // Packed (quantized) GGUF weights stay separate; everything else is joined on the host.
-        let packed = ws.is_gguf() && ws.get_quantized(&format!("{}.weight", names[0]))?.is_some();
+        let wn: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
+        let bias_t = |ws: &Weights| -> Result<Option<Tensor<1>>> {
+            if bias { Ok(Some(ws.get_cat0::<1>(&names.iter().map(|n| format!("{n}.bias")).collect::<Vec<_>>())?)) } else { Ok(None) }
+        };
+        let mut sizes = Vec::with_capacity(names.len());
+        for n in &wn { sizes.push(ws.shape(n)?[0]); }
+        // GGUF: same-type packed weights are stacked on the host into one packed weight; mixed
+        // types (e.g. Q4_K q/k + Q6_K v) stay separate.
+        if !off && ws.is_gguf() {
+            if let Some((w, kb)) = ws.get_quantized_cat(&wn)? {
+                return Ok(Proj::Fused(Lin { w: w.transpose(), b: bias_t(ws)?, kb: kb.map(|c| c.transpose()) }, sizes));
+            }
+        }
+        let packed = ws.is_gguf() && ws.get_quantized(&wn[0])?.is_some();
         if off || packed {
             return Ok(Proj::Split(names.iter().map(|n| Lin::load(ws, n, bias)).collect::<Result<_>>()?));
         }
-        let wn: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
         let w: Tensor<2> = ws.get_cat0(&wn)?;
-        let mut sizes = Vec::with_capacity(names.len());
-        for n in &wn { sizes.push(ws.shape(n)?[0]); }
-        let b = if bias { Some(ws.get_cat0::<1>(&names.iter().map(|n| format!("{n}.bias")).collect::<Vec<_>>())?) } else { None };
+        let b = bias_t(ws)?;
         Ok(Proj::Fused(Lin { w: w.transpose(), b, kb: None }, sizes))
     }
     fn fwd<const D: usize>(&self, x: Tensor<D>) -> Vec<Tensor<D>> {
