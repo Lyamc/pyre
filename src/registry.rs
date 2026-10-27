@@ -143,8 +143,10 @@ fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
         // requested backend (cuda/wgpu/vulkan), so it shares the LLM's device and kernel caches.
         let backend = if matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { "cpu".to_string() } else { backend };
         let s = crate::stt::SttModel::load(q.r, &backend, &storage.store.root, storage.offline).context("loading speech-to-text model")?;
+        let s = Arc::new(s);
+        s.warm_in_background();
         let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
-        return Ok(Loaded { id, kind: q.kind, backend, path: s.dir.display().to_string(), created: now(), inner: Inner::Stt(Arc::new(s)) });
+        return Ok(Loaded { id, kind: q.kind, backend, path: s.dir.display().to_string(), created: now(), inner: Inner::Stt(s) });
     }
     let (dir, src) = storage.resolver().resolve(q.r)?;
     tracing::info!("resolved {} -> {} (via {src:?})", q.r, dir.display());

@@ -83,6 +83,25 @@ impl SttModel {
         Ok(Self { name, dir, backend_desc, rt: Mutex::new(rt), busy: AtomicBool::new(false), queued: AtomicU64::new(0) })
     }
     pub fn describe(&self) -> String { format!("whisburn {} on {}", self.name, self.backend_desc) }
+    /// Transcribe 1 s of silence on a background thread so the first real request doesn't pay
+    /// kernel compilation/autotune (holds the model lock, so an early request just waits for it).
+    /// Opt out with PYRE_STT_WARMUP=0.
+    pub fn warm_in_background(self: &Arc<Self>) {
+        if matches!(std::env::var("PYRE_STT_WARMUP").as_deref(), Ok("0" | "false" | "off")) { return; }
+        #[cfg(feature = "stt")]
+        {
+            let me = self.clone();
+            let _ = std::thread::Builder::new().name("stt-warmup".into()).spawn(move || {
+                let rt = me.rt.lock().unwrap();
+                let t = std::time::Instant::now();
+                let o = pyre_whisper_core::TaskOptions::default();
+                match rt.transcribe_waveform(&me.name, vec![0.0f32; 16_000], 16_000, &o) {
+                    Ok(_) => tracing::info!("stt {} warm-up took {:.1}s", me.name, t.elapsed().as_secs_f64()),
+                    Err(e) => tracing::warn!("stt {} warm-up failed: {e}", me.name),
+                }
+            });
+        }
+    }
     pub fn busy(&self) -> bool { self.busy.load(Ordering::SeqCst) }
     pub fn queued(&self) -> u64 { self.queued.load(Ordering::SeqCst) }
 }

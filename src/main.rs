@@ -133,9 +133,7 @@ pub enum ModelsCmd {
 
 fn main() -> Result<()> {
     logbuf::init();
-    // Persist compiled GPU kernels (PTX/SPIR-V/WGSL pipelines) next to the autotune cache so a
-    // restart doesn't recompile everything; cubecl leaves this off by default. Single-threaded here.
-    if std::env::var_os("CUBECL_COMPILATION_CACHE").is_none() { std::env::set_var("CUBECL_COMPILATION_CACHE", "1"); }
+    kernel_cache_config();
     let cli = Cli::parse();
     let ctx = storage::Ctx::new(&cli.storage)?;
     match cli.cmd {
@@ -219,4 +217,22 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         axum::serve(l, server::router(app)).await?;
         Ok(())
     })
+}
+
+/// cubecl persists autotune results but, by default, not the compiled kernels, so every start
+/// recompiled (NVRTC) every kernel on first use: ~45 s before the first tiny.en transcription on
+/// CUDA, ~0.7 s once cached. Turn the compiled-kernel cache on (opt out: PYRE_KERNEL_CACHE=0),
+/// keeping anything else from cubecl.toml / CUBECL_* env. Must run before any device is created.
+fn kernel_cache_config() {
+    use burn_cubecl::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+    let mut c = CubeClRuntimeConfig::from_current_dir().override_from_env();
+    let off = matches!(std::env::var("PYRE_KERNEL_CACHE").as_deref(), Ok("0" | "false" | "off"));
+    c.compilation.cache = !off;
+    // cubecl's default root is <outermost Cargo workspace above cwd>/target/environment, else the user
+    // cache dir, so the same binary used different caches depending on where it was started (repo vs
+    // GUI/elsewhere). Pin it to the user cache (%LOCALAPPDATA%\cubecl) unless configured.
+    if matches!(c.environment.path, burn_cubecl::cubecl::config::cache::CacheConfig::Target) {
+        c.environment.path = burn_cubecl::cubecl::config::cache::CacheConfig::Global;
+    }
+    if !CubeClRuntimeConfig::try_set(c) { tracing::warn!("cubecl config already loaded; kernel cache setting not applied"); }
 }
