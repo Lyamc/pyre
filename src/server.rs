@@ -60,7 +60,25 @@ pub fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(json!({"error": {"code": code.as_u16(), "message": m, "type": if code == StatusCode::UNAUTHORIZED {"authentication_error"} else {"invalid_request_error"}}}))).into_response()
 }
 
+/// CORS (like llama-server: any origin) + optional API-key check. Preflight never needs the key.
 async fn auth(State(st): S, req: Request, next: Next) -> Response {
+    use axum::http::{header, HeaderValue, Method};
+    if req.method() == Method::OPTIONS {
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        let ask = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+        let h = r.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, ask.unwrap_or(HeaderValue::from_static("authorization, content-type, x-api-key")));
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        return r;
+    }
+    let mut r = auth_inner(st, req, next).await;
+    r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    r
+}
+
+async fn auth_inner(st: Arc<App>, req: Request, next: Next) -> Response {
     if let Some(key) = &st.api_key {
         let p = req.uri().path();
         // health + the static UI shell are public; the UI then sends the key on API calls
