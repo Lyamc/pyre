@@ -16,6 +16,7 @@ mod sampler;
 mod server;
 mod limits;
 mod template;
+mod qn_cli;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -57,6 +58,8 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ModelsCmd,
     },
+    /// Run a Qwen3.8-Flash-Next (qwen4_exp) checkpoint directly: greedy text or logits dump
+    QwenNext(qn_cli::QnArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -139,6 +142,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
         Cmd::Serve(a) => serve(ctx, a),
+        Cmd::QwenNext(a) => qn_cli::run(a),
     }
 }
 
@@ -214,6 +218,10 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         let addr = format!("{}:{}", args.host, args.port);
         let l = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("pyre listening on http://{addr} (web UI at /)");
+        for u in lan_urls(&args.host, args.port) { tracing::info!("  reachable at {u}"); }
+        if args.host != "127.0.0.1" && args.host != "localhost" && args.api_key.is_none() {
+            tracing::warn!("listening beyond localhost without --api-key: anyone on the network can use this server");
+        }
         axum::serve(l, server::router(app)).await?;
         Ok(())
     })
@@ -235,4 +243,19 @@ fn kernel_cache_config() {
         c.environment.path = burn_cubecl::cubecl::config::cache::CacheConfig::Global;
     }
     if !CubeClRuntimeConfig::try_set(c) { tracing::warn!("cubecl config already loaded; kernel cache setting not applied"); }
+}
+/// URLs other machines can use when bound to 0.0.0.0 / a specific address.
+fn lan_urls(host: &str, port: u16) -> Vec<String> {
+    let mut v = vec![];
+    if host == "0.0.0.0" || host == "::" {
+        v.push(format!("http://127.0.0.1:{port}"));
+        // primary outbound interface (UDP connect sends no packets)
+        if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if s.connect("8.8.8.8:80").is_ok() {
+                if let Ok(a) = s.local_addr() { if !a.ip().is_loopback() { v.push(format!("http://{}:{port}  (LAN)", a.ip())); } }
+            }
+        }
+        if let Ok(h) = std::env::var("COMPUTERNAME") { v.push(format!("http://{}:{port}", h.to_lowercase())); }
+    }
+    v
 }
