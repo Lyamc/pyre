@@ -1,4 +1,4 @@
-﻿# pyre
+# pyre
 
 A llama.cpp `llama-server`-style inference server written in Rust where **[Burn](https://github.com/tracel-ai/burn)** (one version for everything: [Lyamc/burn](https://github.com/Lyamc/burn) @ `9db7598`, 0.23.0-pre.1) hosts and runs the model. No llama.cpp, candle or ggml does any of the compute: every matmul, attention and norm is a Burn tensor op on CUDA (CubeCL), wgpu (Vulkan/DX12/Metal) or the CPU (Flex / NdArray).
 
@@ -82,7 +82,7 @@ pyre serve -m qwen --stt-model tiny_en
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F model=whisper-1 -F response_format=verbose_json
 ```
 
-`response_format`: `json` (default), `text`, `srt`, `vtt`, `verbose_json` (segments + duration + language).
+`response_format`: `json` (default), `text`, `srt`, `vtt`, `verbose_json` (segments, duration, language, model; speaker when set), plus whisburn renderings `txt` and `whisburn_json`. Extra fields used by [peal](../peal): `timestamps`, `sentences`, `beam_size`, `max_tokens`, and `stream=true` (SSE `segment` events, then `done`).
 `/v1/audio/translations` runs whisburn's translate task. `language` is honoured; `prompt`, `temperature`
 and `timestamp_granularities` are accepted and ignored. Input is decoded by whisburn-audio (symphonia:
 wav/mp3/flac/ogg-vorbis/m4a-aac). Browser mic recordings (webm/opus) may not decode.
@@ -139,6 +139,65 @@ All outputs are coherent text. In the 0.5B Q4_K_M file most tensors are Q5_0 (89
 In the 1.5B file, packing saves ~0.9 GB. It still doesn't beat Q8_0, because Burn's memory pool keeps
 dequantized f32 temporaries for the largest weights.
 
+## Fused K-quant matmul (burn fork `../burn-pyre`, branch `pyre-fused-quant`)
+
+pyre's `[patch."https://github.com/Lyamc/burn"]` points every burn crate at a local clone of the
+fork (based on 9db7598). The changes live in `burn-cubecl/src/kernel/matmul/fused_quant.rs`:
+
+- **What it is.** `try_fused_qmatmul` runs before the normal path in `kernel::matmul::matmul`.
+  It takes a float `x` and the transposed packed weight that pyre keeps resident (`Q4F
+  PackedU32`, Q4_K/Q5_0, block 32; `Q8F/Q8S Native`, Q8_0/Q6_K, block 32/16). It reads the
+  packed words and the f32 block scales straight from the weight's own buffers, so it never
+  creates a dequantized copy. It handles row-pitched buffers and broadcast leading dims.
+- **Decode, m ≤ 8 (the default).** A GEMV: one 32-lane plane per output column, 8 columns per
+  cube, and `plane_sum` to reduce.
+- **Prefill.** A 64×64 shared-memory tiled GEMM exists, but it is opt-in (`BURN_FQ_GEMM=1`)
+  because it is 6–11× slower than dequantize + cubek's matmul (q4 8960×1536, m=300: 6.6 ms vs
+  0.64 ms). Prefill therefore still dequantizes, and only temporarily, one layer at a time.
+- **Switches.** `BURN_FUSED_QMATMUL=0` turns the whole thing off, which also stops
+  burn-cubecl-fusion from capturing the matmul. `BURN_FQ_GEMV_MAX=<m>` lowers the GEMV cutoff.
+- **Exactness.** `cargo test --release --features cuda,wgpu,stt,image fused_qmatmul -- --ignored
+  --nocapture` (`PYRE_TEST_BACKEND=wgpu` for wgpu) compares against bf16 dequant + matmul and
+  checks that the fused kernel really was launched. Max relative error is 3.5e-3–6.9e-3 on CUDA
+  bf16, the same as the unfused path, and 4e-4–9e-4 on wgpu f16. m=1,4,8 run fused; m=37,300
+  run unfused.
+- **Portability.** The kernel runs on wgpu (Vulkan, f16) as well as CUDA. On wgpu, Q8 Native
+  (i8 storage) does not compile even for plain dequantize, so only Q4 is tested there.
+
+Kernel microbenchmarks (m=1, µs):
+
+| shape | CUDA fused | CUDA unfused | CUDA bf16 | wgpu fused | wgpu unfused | wgpu f16 |
+|---|---|---|---|---|---|---|
+| q4 896×896 | 9.8 | 40.4 | 13.6 | 8.9 | 104.8 | 21.3 |
+| q8 4864×896 | 20.2 | 22.5 | 30.1 | — | — | — |
+| q8/b16 1536×8960 | 85.2 | 68.4 | 98.6 | — | — | — |
+| q4 8960×1536 | 427 | 492 | 97 | 47 | 283 | 150 |
+
+End to end on CUDA (`scripts/fq_bench.ps1`): decode tok/s over 3 runs of 256 tokens, with
+`PYRE_GPU_UTIL_MAX=100 PYRE_LOW_PRIORITY=0`, and VRAM above the idle baseline. The desktop was
+in use during these runs (all of them are well below this README's earlier ~41–48 tok/s), so
+compare rows with each other, not with the older table.
+
+| model | fused | unfused (`BURN_FUSED_QMATMUL=0`) |
+|---|---|---|
+| 0.5B Q4_K_M | +1072 MiB, 19.0 tok/s, prefill 425 | +1001 MiB, 17.4 tok/s, prefill 404 |
+| 0.5B Q8_0 | +1038 MiB, 21.9 tok/s, prefill 724 | +1061 MiB, 18.5 tok/s, prefill 570 |
+| 0.5B bf16 | +1390 MiB, 19.8 tok/s | n/a |
+| 1.5B Q4_K_M | **+2026 MiB**, 14.4 tok/s | +2882 MiB, 12.3 tok/s |
+| 1.5B Q8_0 | +2632 MiB, 16.7 tok/s | +2778 MiB, 15.9 tok/s |
+
+Results against the goal:
+
+- The fused kernel speeds up decode by 10–18%.
+- On 1.5B Q4_K_M it removes the temporary dequant memory: 856 MiB less VRAM than unfused, and
+  less than Q8_0.
+- **Q4_K_M is still not faster than Q8_0 at decode.** Two reasons:
+  - At these sizes decode is bound by launch and host overhead, not by weight bandwidth. bf16
+    runs at the same speed.
+  - pyre's Q4_K layout adds an offset matmul per projection.
+  - The q4 8960×1536 shape (the MLP down-projection) is also slower than bf16 in the GEMV on
+    CUDA. That shape is the next thing to tune.
+- 1.5B bf16 was not measured, because it is not downloaded locally.
 ## Continuous batching
 
 The engine (`src/engine.rs`) runs up to `PYRE_PARALLEL` (default 8) sequences per decode step,
@@ -204,7 +263,7 @@ the reserve (seen: 1566 MiB free with a 1228 MiB reserve), and within one op it 
 ## Known gaps
 
 - Chat hang under STT + chat: not reproducible after 40+ mixed concurrent rounds (with image generation, 60 s noise audio, stretched audio; `scripts/stress_mix.py`). Most likely it was the old opus wrong-sample-rate bug, which is fixed.
-- K-quants: weights stay packed, but there is no fused int4 matmul kernel (Burn dequantizes inside the op), so Q4_K_M is not faster than bf16. A hand-written CubeCL kernel would need the backend-generic API, which the device-dispatch tensor API does not expose to pyre.
+- K-quants: a fused decode GEMV exists (see above), but Q4_K_M decode is still not faster than Q8_0, and the tiled prefill GEMM is too slow to turn on by default.
 - wgpu Stable Diffusion: 25 s vs ~10 s on CUDA (no tensor cores through wgpu).
 - LLM parity: Qwen2.5-0.5B greedy, 15 tokens, matches HF f32 on the first 14; token 15 is a near tie
   (`.` vs `.\n`), identical to the pre-port build. Decode (0.5B, RTX 3060): CUDA 43.3 tok/s bf16 /
