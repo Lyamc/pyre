@@ -259,7 +259,7 @@ impl Model {
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
         // one task per (expert, block of rows): keeps all cores busy for decode (10 experts) and prefill alike
-        let blk = 64usize;
+        let blk: usize = if t == 1 { 16 } else { 64 };
         let parts: Vec<(usize, usize, Vec<f32>)> = work.par_iter().flat_map(|&(e, toks)| (0..ff.div_ceil(blk)).into_par_iter().map(move |b| {
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
@@ -274,7 +274,7 @@ impl Model {
         let mut hid: Vec<Vec<f32>> = by_exp.iter().map(|v| vec![0f32; v.len() * ff]).collect();
         for (e, r0, hb) in parts { let n = by_exp[e].len(); let w = hb.len() / n; for j in 0..n { hid[e][j * ff + r0..j * ff + r0 + w].copy_from_slice(&hb[j * w..(j + 1) * w]); } }
         // down projections, row blocks of the output in parallel
-        let dblk = 256usize;
+        let dblk: usize = if t == 1 { 32 } else { 128 };
         let outs: Vec<(usize, Vec<f32>)> = (0..d.div_ceil(dblk)).into_par_iter().map(|b| {
             let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d)); let mut o = vec![0f32; t * (r1 - r0)]; let mut buf = vec![0f32; ff];
             for &(e, toks) in &work { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
@@ -295,18 +295,27 @@ impl Model {
         let emb = if self.ple_tab.is_some() { Some(self.ple_rows(st, start, t)) } else { None };
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
+        let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
+            let tt = std::time::Instant::now();
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
             let (m, inj) = self.hc_mix(&l.hc_a, &x, t);
+            let t_hc = tt.elapsed();
             let o = match l.mix { Mixer::Attn { .. } => { let o = self.attn(l, ai, st, &m, start, t); ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear(l, li, st, &m, t); li += 1; o } };
+            let t_mix = tt.elapsed();
             self.hc_combine(&mut x, &o, &inj, t);
             let (m, inj) = self.hc_mix(&l.hc_f, &x, t);
+            let t_hc2 = tt.elapsed();
             let o = self.ffn(l, &m, t);
             self.hc_combine(&mut x, &o, &inj, t);
+            if prof { prof_acc[0] += t_hc.as_secs_f64() + (t_hc2 - t_mix).as_secs_f64(); prof_acc[if matches!(l.mix, Mixer::Attn { .. }) { 1 } else { 2 }] += (t_mix - t_hc).as_secs_f64(); prof_acc[3] += (tt.elapsed() - t_hc2).as_secs_f64(); }
             if dbg { eprintln!("layer {il}: x[0,:4] = {:?}", &x[(t - 1) * hc * d..(t - 1) * hc * d + 4]); }
         }
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);
-        let mut lg = vec![0f32; self.out.rows]; self.out.matmul(&h, 1, &mut lg); lg
+        let th = std::time::Instant::now();
+        let mut lg = vec![0f32; self.out.rows]; self.out.matmul(&h, 1, &mut lg);
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3}", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        lg
     }
 }

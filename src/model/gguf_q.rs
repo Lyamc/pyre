@@ -42,6 +42,21 @@ impl QType {
     pub fn row_bytes(self, n: usize) -> usize { let (e, b) = self.geom(); n / e * b }
 }
 
+struct Lut { q2: Vec<[f32; 4]>, sign8: Vec<[f32; 8]>, iq2xxs: Vec<[f32; 8]>, iq2xs: Vec<[f32; 8]>, iq2s: Vec<[f32; 8]>, iq3s: Vec<[f32; 4]> }
+fn lut() -> &'static Lut {
+    static L: std::sync::OnceLock<Lut> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let g8 = |t: &[u64]| t.iter().map(|v| { let b = v.to_le_bytes(); std::array::from_fn(|j| b[j] as f32) }).collect::<Vec<[f32; 8]>>();
+        Lut {
+            q2: (0..256u32).map(|b| std::array::from_fn(|j| (((b >> (2 * j)) & 3) as i32 - 1) as f32)).collect(),
+            sign8: (0..256u32).map(|s| std::array::from_fn(|j| if s & (1 << j) != 0 { -1.0 } else { 1.0 })).collect(),
+            iq2xxs: g8(&IQ2XXS_GRID), iq2xs: g8(&IQ2XS_GRID), iq2s: g8(&IQ2S_GRID),
+            iq3s: IQ3S_GRID.iter().map(|v| { let b = v.to_le_bytes(); std::array::from_fn(|j| b[j] as f32) }).collect(),
+        }
+    })
+}
+#[inline(always)] fn put8(y: &mut [f32], d: f32, g: &[f32; 8], s: &[f32; 8]) { let y = &mut y[..8]; for j in 0..8 { y[j] = d * g[j] * s[j]; } }
+
 #[inline] fn h2f(b: &[u8], o: usize) -> f32 { f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32() }
 
 fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
@@ -55,21 +70,22 @@ pub fn dequant(t: QType, x: &[u8], y: &mut [f32]) {
     match t {
         QType::F32 => for (i, v) in y.iter_mut().enumerate() { *v = f32::from_le_bytes([x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]]) },
         QType::F16 => for (i, v) in y.iter_mut().enumerate() { *v = h2f(x, 2 * i) },
-        QType::BF16 => for (i, v) in y.iter_mut().enumerate() { *v = bf16::from_bits(u16::from_le_bytes([x[2 * i], x[2 * i + 1]])).to_f32() },
+        QType::BF16 => { let x = &x[..2 * y.len()]; for (v, c) in y.iter_mut().zip(x.chunks_exact(2)) { *v = f32::from_bits(((c[0] as u32) | ((c[1] as u32) << 8)) << 16) } },
         QType::Q4_0 => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let y = &mut y[i * 32..];
             for j in 0..16 { y[j] = ((b[2 + j] & 0xF) as i32 - 8) as f32 * d; y[j + 16] = ((b[2 + j] >> 4) as i32 - 8) as f32 * d; } },
         QType::Q5_0 => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]); let qs = &b[6..]; let y = &mut y[i * 32..];
             for j in 0..16 { let h0 = (((qh >> j) << 4) & 0x10) as u8; let h1 = ((qh >> (j + 12)) & 0x10) as u8;
                 y[j] = (((qs[j] & 0xF) | h0) as i32 - 16) as f32 * d; y[j + 16] = (((qs[j] >> 4) | h1) as i32 - 16) as f32 * d; } },
         QType::Q8_0 => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); for j in 0..32 { y[i * 32 + j] = (b[2 + j] as i8) as f32 * d; } },
-        QType::Q2_0 => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let y = &mut y[i * 64..];
-            for j in 0..64 { y[j] = (((b[2 + j / 4] >> ((j % 4) * 2)) & 3) as i32 - 1) as f32 * d; } },
-        QType::IQ4NL => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let y = &mut y[i * 32..];
-            for j in 0..16 { y[j] = d * KVALUES_IQ4NL[(b[2 + j] & 0xF) as usize] as f32; y[j + 16] = d * KVALUES_IQ4NL[(b[2 + j] >> 4) as usize] as f32; } },
+        QType::Q2_0 => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..i * bs + 18]; let d = h2f(b, 0); let y = &mut y[i * 64..i * 64 + 64];
+            for (k, yy) in y.chunks_exact_mut(4).enumerate() { let q = &lt.q2[b[2 + k] as usize]; for j in 0..4 { yy[j] = q[j] * d; } } } },
+        QType::IQ4NL => { let kv: [f32; 16] = std::array::from_fn(|i| KVALUES_IQ4NL[i] as f32); for i in 0..nb { let b = &x[i * bs..i * bs + 18]; let d = h2f(b, 0); let (lo, hi) = y[i * 32..i * 32 + 32].split_at_mut(16);
+            for j in 0..16 { lo[j] = d * kv[(b[2 + j] & 0xF) as usize]; hi[j] = d * kv[(b[2 + j] >> 4) as usize]; } } },
         QType::IQ4XS => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let sh = u16::from_le_bytes([b[2], b[3]]); let sl = &b[4..8]; let mut qs = &b[8..];
             let mut y = &mut y[i * 256..];
             for ib in 0..8 { let ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4); let dl = d * (ls - 32) as f32;
-                for j in 0..16 { y[j] = dl * KVALUES_IQ4NL[(qs[j] & 0xF) as usize] as f32; y[j + 16] = dl * KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32; }
+                let kv: [f32; 16] = std::array::from_fn(|i| KVALUES_IQ4NL[i] as f32 * dl); let q16 = &qs[..16]; let (lo, hi) = y[..32].split_at_mut(16);
+                for j in 0..16 { lo[j] = kv[(q16[j] & 0xF) as usize]; hi[j] = kv[(q16[j] >> 4) as usize]; }
                 y = &mut y[32..]; qs = &qs[16..]; } },
         QType::Q3K => for i in 0..nb { let b = &x[i * bs..]; let hm = &b[0..32]; let mut q = &b[32..96]; let sc = &b[96..108]; let d_all = h2f(b, 108);
             let a = |k: usize| u32::from_le_bytes([sc[4 * k], sc[4 * k + 1], sc[4 * k + 2], sc[4 * k + 3]]);
@@ -103,38 +119,31 @@ pub fn dequant(t: QType, x: &[u8], y: &mut [f32]) {
                     y[l] = d * (sc[is] as i8) as f32 * q1 as f32; y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
                     y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32; y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32; }
                 y = &mut y[128..]; ql = &ql[64..]; qh = &qh[32..]; sc = &sc[8..]; } },
-        QType::IQ2XXS => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qs = &b[2..66]; let mut y = &mut y[i * 256..];
+        QType::IQ2XXS => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qs = &b[2..66]; let mut y = &mut y[i * 256..];
             for ib in 0..8 { let a0 = &qs[8 * ib..8 * ib + 4]; let a1 = u32::from_le_bytes([qs[8 * ib + 4], qs[8 * ib + 5], qs[8 * ib + 6], qs[8 * ib + 7]]);
                 let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
-                for l in 0..4 { let g = IQ2XXS_GRID[a0[l] as usize].to_le_bytes(); let s = KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
-                    for j in 0..8 { y[j] = db * g[j] as f32 * if s & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 }; }
-                    y = &mut y[8..]; } } },
-        QType::IQ2XS => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qs = &b[2..66]; let sc = &b[66..74]; let mut y = &mut y[i * 256..];
+                for l in 0..4 { put8(y, db, &lt.iq2xxs[a0[l] as usize], &lt.sign8[KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize] as usize]); y = &mut y[8..]; } } } },
+        QType::IQ2XS => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qs = &b[2..66]; let sc = &b[66..74]; let mut y = &mut y[i * 256..];
             for ib in 0..8 { let db = [d * (0.5 + (sc[ib] & 0xF) as f32) * 0.25, d * (0.5 + (sc[ib] >> 4) as f32) * 0.25];
                 for l in 0..4 { let q = u16::from_le_bytes([qs[2 * (4 * ib + l)], qs[2 * (4 * ib + l) + 1]]);
-                    let g = IQ2XS_GRID[(q & 511) as usize].to_le_bytes(); let s = KSIGNS_IQ2XS[(q >> 9) as usize];
-                    for j in 0..8 { y[j] = db[l / 2] * g[j] as f32 * if s & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 }; }
-                    y = &mut y[8..]; } } },
-        QType::IQ2S => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let mut qs = &b[2..34]; let mut signs = &b[34..66]; let qh = &b[66..74]; let sc = &b[74..82];
+                    put8(y, db[l / 2], &lt.iq2xs[(q & 511) as usize], &lt.sign8[KSIGNS_IQ2XS[(q >> 9) as usize] as usize]); y = &mut y[8..]; } } } },
+        QType::IQ2S => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let mut qs = &b[2..34]; let mut signs = &b[34..66]; let qh = &b[66..74]; let sc = &b[74..82];
             let mut y = &mut y[i * 256..];
             for ib in 0..8 { let db = [d * (0.5 + (sc[ib] & 0xF) as f32) * 0.25, d * (0.5 + (sc[ib] >> 4) as f32) * 0.25];
                 for l in 0..4 { let idx = qs[l] as usize | (((qh[ib] as usize) << (8 - 2 * l)) & 0x300);
-                    let g = IQ2S_GRID[idx].to_le_bytes();
-                    for j in 0..8 { y[j] = db[l / 2] * g[j] as f32 * if signs[l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 }; }
-                    y = &mut y[8..]; }
-                qs = &qs[4..]; signs = &signs[4..]; } },
-        QType::IQ3S => for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let mut qs = &b[2..66]; let mut qh = &b[66..74]; let mut signs = &b[74..106]; let sc = &b[106..110];
+                    put8(y, db[l / 2], &lt.iq2s[idx], &lt.sign8[signs[l] as usize]); y = &mut y[8..]; }
+                qs = &qs[4..]; signs = &signs[4..]; } } },
+        QType::IQ3S => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let mut qs = &b[2..66]; let mut qh = &b[66..74]; let mut signs = &b[74..106]; let sc = &b[106..110];
             let mut y = &mut y[i * 256..];
             for ib in (0..8).step_by(2) {
                 for half in 0..2 { let s = sc[ib / 2]; let db = d * (1 + 2 * if half == 0 { s & 0xF } else { s >> 4 }) as f32;
                     for l in 0..4 {
-                        let g1 = IQ3S_GRID[qs[2 * l] as usize | (((qh[half] as usize) << (8 - 2 * l)) & 256)].to_le_bytes();
-                        let g2 = IQ3S_GRID[qs[2 * l + 1] as usize | (((qh[half] as usize) << (7 - 2 * l)) & 256)].to_le_bytes();
-                        for j in 0..4 { y[j] = db * g1[j] as f32 * if signs[l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                            y[j + 4] = db * g2[j] as f32 * if signs[l] & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 }; }
-                        y = &mut y[8..]; }
+                        let g1 = &lt.iq3s[qs[2 * l] as usize | (((qh[half] as usize) << (8 - 2 * l)) & 256)];
+                        let g2 = &lt.iq3s[qs[2 * l + 1] as usize | (((qh[half] as usize) << (7 - 2 * l)) & 256)];
+                        let g: [f32; 8] = [g1[0], g1[1], g1[2], g1[3], g2[0], g2[1], g2[2], g2[3]];
+                        put8(y, db, &g, &lt.sign8[signs[l] as usize]); y = &mut y[8..]; }
                     qs = &qs[8..]; signs = &signs[4..]; }
-                qh = &qh[2..]; } },
+                qh = &qh[2..]; } } },
         QType::IQ1M => for i in 0..nb { let b = &x[i * bs..]; let mut qs = &b[0..32]; let mut qh = &b[32..48]; let scb = &b[48..56];
             let sc = [u16::from_le_bytes([scb[0], scb[1]]), u16::from_le_bytes([scb[2], scb[3]]), u16::from_le_bytes([scb[4], scb[5]]), u16::from_le_bytes([scb[6], scb[7]])];
             let su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);

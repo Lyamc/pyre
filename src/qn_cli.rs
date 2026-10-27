@@ -86,6 +86,11 @@ fn run_gguf(a: QnArgs) -> Result<()> {
             let s: f64 = v.iter().map(|x| *x as f64).sum();
             let s2: f64 = v.iter().map(|x| (*x as f64).abs()).sum();
             println!("PEEK {n}:{r} {:?} cols={} sum={s:.6} abssum={s2:.6} head={:?}", m.ty, m.cols, &v[..8.min(v.len())]);
+            if std::env::var("PYRE_QN_BENCH").is_ok() {
+                let nr = m.rows.min(4096); let x = vec![0.5f32; m.cols]; let t = std::time::Instant::now(); let mut acc = 0f32;
+                for r in 0..nr { m.row(r, &mut v); acc += crate::model::gguf_q::dot(&v, &x); }
+                let dt = t.elapsed().as_secs_f64(); println!("  bench: {:.2} ns/elem single-thread (dequant+dot, {} rows) [{acc:.1}]", dt * 1e9 / (nr * m.cols) as f64, nr);
+            }
         }
         return Ok(());
     }
