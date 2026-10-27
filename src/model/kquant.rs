@@ -170,6 +170,8 @@ mod tests {
         let quick = std::env::var("PYRE_FQ_QUICK").is_ok();
         let shapes: &[(usize, usize, u32, usize)] = if quick { &[(896, 896, 4, 32)] } else { &[(896, 896, 4, 32), (4864, 896, 8, 32), (1536, 8960, 8, 16), (8960, 1536, 4, 32)] };
         for &(n, k, bits, block) in shapes {
+            // Q8 Native (i8 storage) does not compile on wgpu even for plain dequantize; skip it there.
+            if bits == 8 && backend != "cuda" { println!("skip q8 n={n} k={k} on {backend} (i8 storage unsupported)"); continue; }
             // random packed weight
             let nb = n * k / block;
             let (bytes, scheme) = if bits == 4 {
