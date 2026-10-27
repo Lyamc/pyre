@@ -163,7 +163,9 @@ mod tests {
     fn fused_qmatmul_matches_and_bench() {
         use burn::tensor::{DType, Tensor, TensorCreationOptions, TensorData, FloatDType};
         let backend = std::env::var("PYRE_TEST_BACKEND").unwrap_or_else(|_| "cuda".into());
-        let (dev, _, _) = crate::backend::select(&backend, "bf16", None).unwrap();
+        let act = std::env::var("PYRE_TEST_DTYPE").unwrap_or_else(|_| if backend == "cuda" { "bf16".into() } else { "f16".into() });
+        let (dev, _, _) = crate::backend::select(&backend, &act, None).unwrap();
+        let (adt, afdt) = if act == "f16" { (DType::F16, FloatDType::F16) } else if act == "f32" { (DType::F32, FloatDType::F32) } else { (DType::BF16, FloatDType::BF16) };
         let mut seed = 11u64;
         let quick = std::env::var("PYRE_FQ_QUICK").is_ok();
         let shapes: &[(usize, usize, u32, usize)] = if quick { &[(896, 896, 4, 32)] } else { &[(896, 896, 4, 32), (4864, 896, 8, 32), (1536, 8960, 8, 16), (8960, 1536, 4, 32)] };
@@ -181,15 +183,16 @@ mod tests {
             };
             let wq: Tensor<2> = Tensor::from_data(TensorData::from_bytes_vec(bytes, [n, k], DType::QFloat(scheme)), TensorCreationOptions::new(dev.clone()));
             let wt = wq.clone().transpose();
-            let wf: Tensor<2> = wq.dequantize().cast(FloatDType::BF16).transpose();
+            let wf: Tensor<2> = wq.dequantize().cast(afdt).transpose();
             for &m in &[1usize, 4, 8, 37, 300] {
                 let xs: Vec<f32> = (0..m * k).map(|_| (lcg(&mut seed) as f32 - 127.5) / 128.0).collect();
-                let x: Tensor<2> = Tensor::from_data(TensorData::new(xs, [m, k]), TensorCreationOptions::new(dev.clone()).with_dtype(DType::BF16));
+                let x: Tensor<2> = Tensor::from_data(TensorData::new(xs, [m, k]), TensorCreationOptions::new(dev.clone()).with_dtype(adt));
                 let reference: Vec<f32> = x.clone().matmul(wf.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();
                 burn_cubecl::kernel::matmul::set_fused_qmatmul(true);
                 let l0 = burn_cubecl::kernel::matmul::fused_qmatmul_launches();
                 let fused: Vec<f32> = x.clone().matmul(wt.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();
-                assert!(burn_cubecl::kernel::matmul::fused_qmatmul_launches() > l0, "fused path not taken");
+                let expect_fused = m <= 8 || std::env::var("BURN_FQ_GEMM").as_deref() == Ok("1");
+                assert_eq!(burn_cubecl::kernel::matmul::fused_qmatmul_launches() > l0, expect_fused, "fused path taken={} expected={expect_fused}", !expect_fused);
                 let l1 = burn_cubecl::kernel::matmul::fused_qmatmul_launches();
                 burn_cubecl::kernel::matmul::set_fused_qmatmul(false);
                 let unfused: Vec<f32> = x.clone().matmul(wt.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();

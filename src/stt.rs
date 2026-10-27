@@ -87,16 +87,31 @@ impl SttModel {
     pub fn queued(&self) -> u64 { self.queued.load(Ordering::SeqCst) }
 }
 
-struct Req { file: Vec<u8>, filename: String, model: Option<String>, format: String, language: Option<String> }
+struct Req {
+    file: Vec<u8>, filename: String, model: Option<String>, format: String, language: Option<String>,
+    // whisburn options (pyre extensions, used by peal): decoding + whisburn-identical rendering.
+    beam_size: Option<usize>, max_tokens: Option<usize>, timestamps: Option<bool>, sentences: bool, stream: bool,
+}
+
+fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
+
+/// Formats: OpenAI's `json`/`text`/`srt`/`vtt`/`verbose_json`, plus whisburn's own renderings
+/// `txt` (timestamped lines when timestamps are on) and `whisburn_json` (whisburn's result JSON).
+const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
 async fn parse(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None };
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
             "model" => q.model = Some(f.text().await?),
             "response_format" => q.format = f.text().await?,
             "language" => { let l = f.text().await?; if !l.is_empty() { q.language = Some(l); } }
+            "beam_size" => q.beam_size = Some(f.text().await?.trim().parse().map_err(|_| anyhow!("beam_size must be an integer"))?),
+            "max_tokens" => q.max_tokens = Some(f.text().await?.trim().parse().map_err(|_| anyhow!("max_tokens must be an integer"))?),
+            "timestamps" => q.timestamps = Some(parse_bool(&f.text().await?)),
+            "sentences" => q.sentences = parse_bool(&f.text().await?),
+            "stream" => q.stream = parse_bool(&f.text().await?),
             _ => { let _ = f.bytes().await; } // prompt, temperature, timestamp_granularities: accepted, ignored
         }
     }
@@ -109,16 +124,18 @@ pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bo
     let q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
     let m = match app.find(crate::registry::Kind::Stt, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch") };
-    if !["json", "text", "srt", "vtt", "verbose_json"].contains(&q.format.as_str()) {
+    if !FORMATS.contains(&q.format.as_str()) {
         return err(StatusCode::BAD_REQUEST, format!("unsupported response_format '{}'", q.format));
     }
     let id = m.id.clone();
+    let stream = q.stream;
+    let opts = (q.timestamps, q.sentences);
     stt.queued.fetch_add(1, Ordering::SeqCst);
     let res = tokio::task::spawn_blocking(move || run(&stt, &q, translate)).await;
     match res {
         Ok(Ok((r, dur, secs, fmt))) => {
             tracing::info!("stt {id}: {dur:.2}s audio in {secs:.2}s ({:.1}x realtime)", dur / secs.max(1e-6));
-            render(&r, &fmt, dur, translate)
+            if stream { render_stream(&r, dur, translate) } else { render(&r, &fmt, dur, translate, opts) }
         }
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -130,7 +147,9 @@ fn run(_: &SttModel, _: &Req, _: bool) -> Result<(Transcript, f64, f64, String)>
 #[cfg(not(feature = "stt"))]
 struct Transcript;
 #[cfg(not(feature = "stt"))]
-fn render(_: &Transcript, _: &str, _: f64, _: bool) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
+fn render_stream(_: &Transcript, _: f64, _: bool) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
+#[cfg(not(feature = "stt"))]
+fn render(_: &Transcript, _: &str, _: f64, _: bool, _: (Option<bool>, bool)) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
 
 #[cfg(feature = "stt")]
 type Transcript = pyre_whisper_core::TranscriptResult;
@@ -151,24 +170,58 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
     if let Some(l) = &q.language { o.language = pyre_whisper_core::LanguageCode::new(l.clone()); }
     // whisburn only walks past the first 30 s window / sentence in timestamp mode, so always use it.
-    o.include_timestamps = true;
+    // Callers may turn it off (whisburn CLI default for *_en models) to get whisburn-identical text.
+    o.include_timestamps = q.timestamps.unwrap_or(true);
+    if let Some(b) = q.beam_size { o.beam_size = b.clamp(1, 16); }
+    if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
+    o.group_into_sentences = q.sentences;
     let t = std::time::Instant::now();
     let r = rt.transcribe_waveform(&stt.name, wav.samples, wav.sample_rate, &o).map_err(|e| anyhow!("whisburn: {e}"))?;
     Ok((r, dur, t.elapsed().as_secs_f64(), q.format.clone()))
 }
 
 #[cfg(feature = "stt")]
-fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool) -> Response {
+fn verbose(r: &Transcript, dur: f64, translate: bool) -> serde_json::Value {
+    json!({
+        "task": if translate { "translate" } else { "transcribe" },
+        "language": r.language, "duration": dur, "text": r.text.trim(), "model": r.model,
+        "segments": r.segments.iter().enumerate().map(|(i, s)| {
+            let mut v = json!({"id": i, "start": s.start, "end": s.end, "text": s.text.trim()});
+            if let Some(sp) = &s.speaker { v["speaker"] = json!(sp); }
+            v
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// `stream=true`: SSE with one `segment` event per segment, then `done` carrying verbose_json.
+/// (whisburn decodes a file in one call, so the events go out once decoding finishes.)
+#[cfg(feature = "stt")]
+fn render_stream(r: &Transcript, dur: f64, translate: bool) -> Response {
+    use axum::response::sse::{Event, Sse};
+    let v = verbose(r, dur, translate);
+    let mut evs: Vec<Result<Event, std::convert::Infallible>> = v["segments"].as_array().unwrap().iter()
+        .map(|s| Ok(Event::default().event("segment").data(s.to_string()))).collect();
+    evs.push(Ok(Event::default().event("done").data(v.to_string())));
+    Sse::new(futures::stream::iter(evs)).into_response()
+}
+
+#[cfg(feature = "stt")]
+fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool, (ts, sentences): (Option<bool>, bool)) -> Response {
+    use pyre_whisper_core::OutputFormat as F;
     let text = r.text.trim().to_string();
+    let whis = |f: F, ct: &'static str| match pyre_whisper_audio::encode_result_with_options(r, f, ts.unwrap_or(true), sentences) {
+        Ok(b) => (StatusCode::OK, [("content-type", ct)], b).into_response(),
+        Err(e) => crate::server::err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     match fmt {
+        "txt" => whis(F::Txt, "text/plain; charset=utf-8"),
+        "whisburn_json" => whis(F::Json, "application/json"),
+        "srt" if sentences => whis(F::Srt, "application/x-subrip"),
+        "vtt" if sentences => whis(F::Vtt, "text/vtt"),
         "text" => (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], text + "\n").into_response(),
         "srt" => (StatusCode::OK, [("content-type", "application/x-subrip")], pyre_whisper_audio::format_srt(&r.segments, false)).into_response(),
         "vtt" => (StatusCode::OK, [("content-type", "text/vtt")], pyre_whisper_audio::format_vtt(&r.segments, false)).into_response(),
-        "verbose_json" => Json(json!({
-            "task": if translate { "translate" } else { "transcribe" },
-            "language": r.language, "duration": dur, "text": text,
-            "segments": r.segments.iter().enumerate().map(|(i, s)| json!({"id": i, "start": s.start, "end": s.end, "text": s.text.trim()})).collect::<Vec<_>>(),
-        })).into_response(),
+        "verbose_json" => Json(verbose(r, dur, translate)).into_response(),
         _ => Json(json!({"text": text})).into_response(),
     }
 }
