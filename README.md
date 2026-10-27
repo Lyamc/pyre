@@ -298,3 +298,24 @@ gated attention with partial RoPE, 512-expert MoE + shared expert, hashed n-gram
 the n-gram table sit on the CPU device (Strata's split). Verified against transformers on a tiny random
 config (`scripts/qwen_next_ref.py`). Not yet: QSA indexer (exact only up to 2048 tokens), MTP drafting,
 GGUF/quantized experts, server/engine integration.
+
+### Real weights: GGUF on the CPU (IQ2_XS)
+
+    pyre serve ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF -b cpu      # OpenAI API + web chat
+    pyre qwen-next <dir-with-gguf> --prompt "..." -n 32 [--chat] [--peek TENSOR:ROW]
+
+`src/model/qwen4exp_gguf.rs` runs the `qwen4exp` GGUF arch straight from mmapped, still-quantized shards
+(`src/model/gguf_q.rs`): IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q6_K, Q8_0, BF16, F16, F32 are
+checked bit-for-bit against gguf-py; Q3_K/Q4_K/Q5_K/IQ2_XS decoders exist but no tensor in this file uses them.
+The tokenizer and chat template come from the `Qwen/Qwen3.8-Flash-Next` base repo in the HF cache.
+`<think>...</think>` goes to `reasoning_content` (`PYRE_REASONING=none` turns that off).
+
+Env: `PYRE_QN_QUANT` (default IQ2_XS), `PYRE_QN_THREADS` (16), `PYRE_PREFILL_CHUNK` (256),
+`PYRE_QN_TOKENIZER`, `PYRE_QN_PROFILE`, `PYRE_QN_DEBUG`, `PYRE_QN_BENCH`.
+RAM: about 0.4 GB private plus about 24 GB of evictable mapped file pages. VRAM: none. Speed on a
+16-core desktop: decode about 3 tok/s, prefill about 5-10 tok/s. Context is capped at 2048 tokens.
+
+Attribution: the graph follows llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py`; the
+i-quant grids in `src/model/iq_tables.rs` come from ggml `ggml-common.h`. Both are MIT, (c) the ggml
+authors. The CPU-expert split mirrors Strata. Strata's refusal-direction ("speed projection") vector is
+deliberately not ported.
