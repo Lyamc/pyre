@@ -30,7 +30,7 @@ pub struct Llm {
     pub dtype: String,
     pub default_max_tokens: usize,
 }
-use crate::registry::{App, Kind};
+use crate::registry::App;
 type S = State<Arc<App>>;
 type AppState = Llm;
 
