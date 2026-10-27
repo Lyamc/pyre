@@ -195,6 +195,29 @@ impl Model {
         super::qn_gpu::combine(x2, sh + g.up(&yr, [t, d]), inj_f.unwrap(), t, hc, d)
     }
 
+    /// Hybrid layer: hyper-connection mixes + residual on the CPU (int8), big projections on the GPU.
+    /// Three device round trips per layer and no small GPU kernels.
+    fn layer_hyb(&self, l: &Layer, gl: &super::qn_gpu::GLayer, x: &mut Vec<f32>, st: &mut State, ai: &mut usize, li: &mut usize, start: usize, t: usize) {
+        use burn::tensor::activation::{sigmoid, silu};
+        let g = self.gpu.as_ref().unwrap(); let c = &self.cfg; let (d, ne) = (c.d, c.n_exp);
+        let (mixed, inj_a) = self.hc_mix(&l.hc_a, x, t);
+        let mi = g.read(gl.min.fwd(g.up(&mixed, [t, d])));
+        let proj = gl.min.split_host(&mi, t);
+        let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, proj, start, t); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, proj, t); *li += 1; o } };
+        let o = g.read(gl.mout.fwd(g.up(&core, [t, core.len() / t])));
+        self.hc_combine(x, &o, &inj_a, t);
+        let (mf, inj_f) = self.hc_mix(&l.hc_f, x, t);
+        let mfd = g.up(&mf, [t, d]);
+        let fi = gl.fin.fwd(mfd.clone()); let sf = l.sh_gate.rows;
+        let sh = gl.sdown.fwd(silu(fi.clone().slice([0..t, ne..ne + sf])) * fi.clone().slice([0..t, ne + sf..ne + 2 * sf])) * sigmoid(mfd.matmul(gl.sgw.clone()));
+        let both = g.read(burn::tensor::Tensor::cat(vec![fi.slice([0..t, 0..ne]), sh], 1));
+        let w = d + ne; let mut lgc = Vec::with_capacity(t * ne); let mut yr = vec![0f32; t * d];
+        for ti in 0..t { lgc.extend_from_slice(&both[ti * w..ti * w + ne]); }
+        self.routed(l, &mf, &lgc, t, &mut yr, false);
+        for ti in 0..t { for i in 0..d { yr[ti * d + i] += both[ti * w + ne + i]; } }
+        self.hc_combine(x, &yr, &inj_f, t);
+    }
+
     /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
     fn mm(&self, ms: &[&QMat], x: &[f32], t: usize) -> Vec<Vec<f32>> {
         if let (Some(g), Some(gm)) = (&self.gpu, self.gmats.get(&ms[0].key())) {
@@ -500,6 +523,7 @@ impl Model {
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
+        let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(true);
         let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
@@ -507,6 +531,7 @@ impl Model {
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
             if let Some(Some(gl)) = self.gl.get(il) {
                 let g = self.gpu.as_ref().unwrap();
+                if hyb { self.layer_hyb(l, gl, &mut x, st, &mut ai, &mut li, start, t); if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); } continue; }
                 let xin = match xd.take() { Some(v) => v, None => g.up(&x, [t, hc * d]) };
                 xd = Some(self.layer_gpu(l, gl, xin, st, &mut ai, &mut li, start, t));
                 if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
