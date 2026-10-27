@@ -83,6 +83,8 @@ sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
 nvml-wrapper = "0.13"
+# Only for the fused-quant switch in tests/benches (patched to the local fork).
+burn-cubecl = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std"] }
 # Image generation: Stable Diffusion, vendored from oxiglade/diffusers-burn (MIT/Apache) and ported to the workspace Burn.
 pyre-sd = { path = "crates/pyre-sd", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
@@ -106,6 +108,39 @@ opt-level = 1
 opt-level = 3
 
 # Local fix (not pushed): cubecl's Turso kernel cache requests multiprocess WAL, unsupported on Windows.
+# Local branch of the burn fork (not pushed): fused dequant+matmul for block-quantized weights.
+[patch."https://github.com/Lyamc/burn"]
+burn-cubecl = { path = "../burn-pyre/crates/burn-cubecl" }
+burn-cubecl-fusion = { path = "../burn-pyre/crates/burn-cubecl-fusion" }
+burn = { path = "../burn-pyre/crates/burn" }
+burn-autodiff = { path = "../burn-pyre/crates/burn-autodiff" }
+burn-backend = { path = "../burn-pyre/crates/burn-backend" }
+burn-backend-extension = { path = "../burn-pyre/crates/burn-backend-extension" }
+burn-core = { path = "../burn-pyre/crates/burn-core" }
+burn-cpu = { path = "../burn-pyre/crates/burn-cpu" }
+burn-cuda = { path = "../burn-pyre/crates/burn-cuda" }
+burn-derive = { path = "../burn-pyre/crates/burn-derive" }
+burn-dispatch = { path = "../burn-pyre/crates/burn-dispatch" }
+burn-einsum = { path = "../burn-pyre/crates/burn-einsum" }
+burn-flex = { path = "../burn-pyre/crates/burn-flex" }
+burn-fusion = { path = "../burn-pyre/crates/burn-fusion" }
+burn-instrument = { path = "../burn-pyre/crates/burn-instrument" }
+burn-instrument-macros = { path = "../burn-pyre/crates/burn-instrument-macros" }
+burn-ir = { path = "../burn-pyre/crates/burn-ir" }
+burn-linalg = { path = "../burn-pyre/crates/burn-linalg" }
+burn-nn = { path = "../burn-pyre/crates/burn-nn" }
+burn-optim = { path = "../burn-pyre/crates/burn-optim" }
+burn-pack = { path = "../burn-pyre/crates/burn-pack" }
+burn-remote = { path = "../burn-pyre/crates/burn-remote" }
+burn-rocm = { path = "../burn-pyre/crates/burn-rocm" }
+burn-router = { path = "../burn-pyre/crates/burn-router" }
+burn-signal = { path = "../burn-pyre/crates/burn-signal" }
+burn-std = { path = "../burn-pyre/crates/burn-std" }
+burn-store = { path = "../burn-pyre/crates/burn-store" }
+burn-tensor = { path = "../burn-pyre/crates/burn-tensor" }
+burn-vision = { path = "../burn-pyre/crates/burn-vision" }
+burn-wgpu = { path = "../burn-pyre/crates/burn-wgpu" }
+
 [patch."https://github.com/tracel-ai/cubecl"]
 cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
 

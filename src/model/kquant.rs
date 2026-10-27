@@ -155,4 +155,70 @@ mod tests {
             assert!((w - r[i]).abs() < 1e-5 + 1e-4 * r[i].abs(), "{i}: {w} vs {}", r[i]);
         }
     }
+
+    /// GPU check of the fused dequant+matmul in the burn fork against the unfused path and a host
+    /// reference. `cargo test --release --features cuda kquant::tests::fused -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fused_qmatmul_matches_and_bench() {
+        use burn::tensor::{DType, Tensor, TensorCreationOptions, TensorData, FloatDType};
+        let backend = std::env::var("PYRE_TEST_BACKEND").unwrap_or_else(|_| "cuda".into());
+        let (dev, _, _) = crate::backend::select(&backend, "bf16", None).unwrap();
+        let mut seed = 11u64;
+        let quick = std::env::var("PYRE_FQ_QUICK").is_ok();
+        let shapes: &[(usize, usize, u32, usize)] = if quick { &[(896, 896, 4, 32)] } else { &[(896, 896, 4, 32), (4864, 896, 8, 32), (1536, 8960, 8, 16), (8960, 1536, 4, 32)] };
+        for &(n, k, bits, block) in shapes {
+            // random packed weight
+            let nb = n * k / block;
+            let (bytes, scheme) = if bits == 4 {
+                let mut v: Vec<u8> = (0..n * k / 2).map(|_| lcg(&mut seed)).collect();
+                for b in 0..nb { v.extend_from_slice(&(0.002f32 + (b % 7) as f32 * 0.001).to_le_bytes()); }
+                (v, q4k_scheme())
+            } else {
+                let mut v: Vec<u8> = (0..n * k).map(|_| lcg(&mut seed) / 2).collect();
+                for b in 0..nb { v.extend_from_slice(&(0.001f32 + (b % 5) as f32 * 0.0005).to_le_bytes()); }
+                (v, if block == 16 { q6k_scheme() } else { QuantScheme::default().with_value(QuantValue::Q8F).with_store(QuantStore::Native).per_block([32], ScaleDtype::F32) })
+            };
+            let wq: Tensor<2> = Tensor::from_data(TensorData::from_bytes_vec(bytes, [n, k], DType::QFloat(scheme)), TensorCreationOptions::new(dev.clone()));
+            let wt = wq.clone().transpose();
+            let wf: Tensor<2> = wq.dequantize().cast(FloatDType::BF16).transpose();
+            for &m in &[1usize, 4, 8, 37, 300] {
+                let xs: Vec<f32> = (0..m * k).map(|_| (lcg(&mut seed) as f32 - 127.5) / 128.0).collect();
+                let x: Tensor<2> = Tensor::from_data(TensorData::new(xs, [m, k]), TensorCreationOptions::new(dev.clone()).with_dtype(DType::BF16));
+                let reference: Vec<f32> = x.clone().matmul(wf.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();
+                burn_cubecl::kernel::matmul::set_fused_qmatmul(true);
+                let l0 = burn_cubecl::kernel::matmul::fused_qmatmul_launches();
+                let fused: Vec<f32> = x.clone().matmul(wt.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();
+                assert!(burn_cubecl::kernel::matmul::fused_qmatmul_launches() > l0, "fused path not taken");
+                let l1 = burn_cubecl::kernel::matmul::fused_qmatmul_launches();
+                burn_cubecl::kernel::matmul::set_fused_qmatmul(false);
+                let unfused: Vec<f32> = x.clone().matmul(wt.clone()).cast(FloatDType::F32).into_data().to_vec().unwrap();
+                assert_eq!(burn_cubecl::kernel::matmul::fused_qmatmul_launches(), l1, "unfused run used the fused kernel");
+                println!("    sample fused {:?} unfused {:?}", &fused[..3], &unfused[..3]);
+                let err = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let scale = reference.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+                let (ef, eu) = (err(&fused, &reference) / scale, err(&unfused, &reference) / scale);
+                let fu = err(&fused, &unfused) / scale;
+                println!("q{bits} b{block} n={n} k={k} m={m}: max rel err vs bf16 ref: fused {ef:.2e}, unfused {eu:.2e}; fused vs unfused {fu:.2e}");
+                if ef >= 2e-2 { let bad: Vec<usize> = (0..m * n).filter(|&i| (fused[i] - reference[i]).abs() / scale > 2e-2).collect(); println!("    bad count {} first {:?} rows {:?}", bad.len(), &bad[..bad.len().min(8)], bad.iter().map(|i| i / n).collect::<std::collections::BTreeSet<_>>()); }
+                assert!(ef < 2e-2, "fused mismatch");
+                // timing (device-synced)
+                if m == 1 || m == 300 {
+                    let reps = if m == 1 { 200 } else { 20 };
+                    let mut t = vec![];
+                    for (name, on, w) in [("fused", Some(true), &wt), ("unfused", Some(false), &wt), ("bf16", None, &wf)] {
+                        if let Some(on) = on { burn_cubecl::kernel::matmul::set_fused_qmatmul(on); }
+                        for _ in 0..3 { let _ = x.clone().matmul(w.clone()); }
+                        dev.sync().unwrap();
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..reps { let _ = x.clone().matmul(w.clone()); }
+                        dev.sync().unwrap();
+                        t.push(format!("{name} {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / reps as f64));
+                    }
+                    println!("    timing m={m}: {}", t.join(", "));
+                }
+            }
+        }
+        burn_cubecl::kernel::matmul::set_fused_qmatmul(true);
+    }
 }
