@@ -118,18 +118,46 @@ impl Weights {
 
     /// A `[out, in]` linear weight kept packed when the GGUF type has an exact Burn scheme
     /// (Q8_0 -> Q8F block 32, f16 scales). `None` means: use [`Self::get`].
-    pub fn get_quantized(&self, name: &str) -> Result<Option<Tensor<2>>> {
+    pub fn get_quantized(&self, name: &str) -> Result<Option<(Tensor<2>, Option<Tensor<2>>)>> {
+        use burn_gguf::GgmlType as G;
         let Some(r) = &self.gguf else { return Ok(None) };
         if !self.keep_quant { return Ok(None); }
         let g = hf_to_gguf(name);
         let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
-        let Some(scheme) = info.tensor_type.to_quant_scheme() else { return Ok(None) };
-        if info.tensor_type != burn_gguf::GgmlType::Q8_0 { return Ok(None); }
         let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
         let n = info.num_elements().map_err(|e| anyhow!("{e}"))?;
-        let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
-        let packed = burn_gguf::repack_to_burn(info.tensor_type, &bytes, scheme, n).map_err(|e| anyhow!("{g}: {e}"))?;
-        let data = TensorData::from_bytes_vec(packed, shape, DType::QFloat(scheme));
-        Ok(Some(Tensor::from_data(data, TensorCreationOptions::new(self.device.clone()))))
+        let dev = || TensorCreationOptions::new(self.device.clone());
+        match info.tensor_type {
+            G::Q8_0 => {
+                let scheme = info.tensor_type.to_quant_scheme().unwrap();
+                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let packed = burn_gguf::repack_to_burn(info.tensor_type, &bytes, scheme, n).map_err(|e| anyhow!("{g}: {e}"))?;
+                Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(scheme)), dev()), None)))
+            }
+            G::Q4K if self.keep_kquant() => {
+                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let (packed, offs) = super::kquant::repack_q4k(&bytes, n);
+                let s = super::kquant::q4k_scheme();
+                let w = Tensor::from_data(TensorData::from_bytes_vec(packed, shape.clone(), DType::QFloat(s)), dev());
+                let c = Tensor::from_data(TensorData::new(offs, [shape[0], shape[1] / 32]), dev().with_dtype(self.dtype));
+                Ok(Some((w, Some(c))))
+            }
+            G::Q5_0 if self.keep_kquant() => {
+                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let s = super::kquant::q5_0_scheme();
+                let packed = super::kquant::repack_q5_0(&bytes, n);
+                Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(s)), dev()), None)))
+            }
+            G::Q6K if self.keep_kquant() => {
+                let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+                let packed = super::kquant::repack_q6k(&bytes, n);
+                let s = super::kquant::q6k_scheme();
+                Ok(Some((Tensor::from_data(TensorData::from_bytes_vec(packed, shape, DType::QFloat(s)), dev()), None)))
+            }
+            _ => Ok(None),
+        }
     }
+
+    /// K-quants stay packed unless PYRE_GGUF_KQUANT=0.
+    fn keep_kquant(&self) -> bool { std::env::var("PYRE_GGUF_KQUANT").map(|v| v != "0").unwrap_or(true) }
 }

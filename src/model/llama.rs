@@ -1,4 +1,4 @@
-﻿//! Decoder-only transformer on Burn tensors: Llama 2/3.x, Mistral-dense, Qwen2/2.5, Qwen3,
+//! Decoder-only transformer on Burn tensors: Llama 2/3.x, Mistral-dense, Qwen2/2.5, Qwen3,
 //! Qwen3-MoE, Gemma 2 and Gemma 3 (text). Structure follows HF `modeling_*.py` /
 //! tracel-ai/models llama-burn (MIT/Apache-2.0), on the device-dispatch tensor API.
 use super::config::{inv_freq, Arch, LlamaConfig};
@@ -12,14 +12,25 @@ use burn::tensor::{Bool, DType, Device, FloatDType, IndexingUpdateOp, Int, Tenso
 const KV_BUCKET: usize = 256;
 const PREFILL_BUCKET: usize = 64;
 
-struct Lin { w: Tensor<2>, b: Option<Tensor<1>> }
+struct Lin { w: Tensor<2>, b: Option<Tensor<1>>, kb: Option<Tensor<2>> }
 impl Lin {
     fn load(ws: &Weights, p: &str, bias: bool) -> Result<Self> {
-        let w: Tensor<2> = match ws.get_quantized(&format!("{p}.weight"))? { Some(q) => q, None => ws.get(&format!("{p}.weight"))? };
+        let (w, kb): (Tensor<2>, _) = match ws.get_quantized(&format!("{p}.weight"))? { Some(q) => q, None => (ws.get(&format!("{p}.weight"))?, None) };
         let b = if bias { Some(ws.get(&format!("{p}.bias"))?) } else { None };
-        Ok(Self { w: w.transpose(), b })
+        Ok(Self { w: w.transpose(), b, kb: kb.map(|c| c.transpose()) })
     }
-    fn fwd<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> { linear(x, self.w.clone(), self.b.clone()) }
+    fn fwd<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        let Some(kb) = &self.kb else { return linear(x, self.w.clone(), self.b.clone()) };
+        // Q4_K offsets: y += blocksum_32(x) @ C^T.
+        let dims = x.dims();
+        let inn = dims[D - 1];
+        let rows: usize = dims[..D - 1].iter().product();
+        let y = linear(x.clone(), self.w.clone(), self.b.clone());
+        let mut od = y.dims();
+        od[D - 1] = kb.dims()[1];
+        let xs: Tensor<2> = x.reshape([rows, inn / 32, 32]).sum_dim(2).reshape([rows, inn / 32]);
+        y + xs.matmul(kb.clone()).reshape(od)
+    }
 }
 
 /// RMSNorm weight. Gemma scales by `(1 + w)` in f32; the others by `w` in the model dtype.
