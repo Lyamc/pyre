@@ -31,7 +31,7 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
-pub struct Model { pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct Model { pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -92,10 +92,46 @@ impl Model {
         let ple_tab = if cfg.ple_layers.is_empty() { None } else { Some(g.mat("per_layer_token_embd.weight")?) };
         let half = cfg.n_rot / 2;
         let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
-        Ok(Model { embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { gpu: None, gmats: Default::default(), embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
+
+    /// Projection groups that read the same input, in the order the forward pass uses them.
+    fn groups(&self) -> Vec<Vec<&QMat>> {
+        let mut v: Vec<Vec<&QMat>> = vec![];
+        fn hc<'a>(v: &mut Vec<Vec<&'a QMat>>, h: &'a Hc) { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } v.push(a); }
+        for l in &self.layers {
+            if let Some(p) = &l.ple { v.push(vec![&p.key, &p.value]); }
+            hc(&mut v, &l.hc_a); v.push(vec![&l.hc_a.up]);
+            match &l.mix { Mixer::Attn { q, k, v: vv, o, .. } => { v.push(vec![q, k, vv]); v.push(vec![o]); }
+                           Mixer::Lin { qkv, z, beta, alpha, out, .. } => { v.push(vec![qkv, z, beta, alpha]); v.push(vec![out]); } }
+            hc(&mut v, &l.hc_f); v.push(vec![&l.hc_f.up]);
+            v.push(vec![&l.router, &l.sh_gate, &l.sh_up]); v.push(vec![&l.sh_down]);
+        }
+        hc(&mut v, &self.head); v.push(vec![&self.head.up]); v.push(vec![&self.out]);
+        v
+    }
+
+    /// Strata's split: every non-routed projection to the GPU (Q8), as far as VRAM above pyre's reserve allows.
+    pub fn attach_gpu(&mut self, g: super::qn_gpu::Gpu) -> Result<(usize, usize, f64)> {
+        let mut m = std::collections::HashMap::new(); let (mut on, mut off, mut bytes) = (0, 0, 0f64);
+        for grp in self.groups() {
+            match g.upload(&grp)? { Some(gm) => { bytes += (gm.rows * gm.cols / 32 * 34) as f64; m.insert(grp[0].key(), gm); on += 1; } None => off += 1 }
+        }
+        self.gmats = m; self.gpu = Some(g);
+        Ok((on, off, bytes / (1u64 << 30) as f64))
+    }
+
+    /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
+    fn mm(&self, ms: &[&QMat], x: &[f32], t: usize) -> Vec<Vec<f32>> {
+        if let (Some(g), Some(gm)) = (&self.gpu, self.gmats.get(&ms[0].key())) {
+            let mut y = vec![0f32; t * gm.rows]; gm.matmul(g, x, t, &mut y);
+            return ms.iter().enumerate().map(|(i, m)| { let (a, b) = (gm.splits[i], gm.splits[i + 1]); let mut o = Vec::with_capacity(t * m.rows);
+                for ti in 0..t { o.extend_from_slice(&y[ti * gm.rows + a..ti * gm.rows + b]); } o }).collect();
+        }
+        ms.iter().map(|m| { let mut y = vec![0f32; t * m.rows]; m.matmul(x, t, &mut y); y }).collect()
+    }
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
@@ -113,12 +149,13 @@ impl Model {
         let (d, hc) = (self.cfg.d, self.cfg.hc); let w = hc * d;
         let mut xn = vec![0f32; t * w];
         xn.par_chunks_mut(d).enumerate().for_each(|(i, o)| { let s = i % hc; rms(&x[i * d..(i + 1) * d], &h.norm[s * d..(s + 1) * d], self.cfg.eps, o); });
-        let lr = h.down.rows;
-        let mut lo = vec![0f32; t * lr]; h.down.matmul(&xn, t, &mut lo);
+        let mut grp = vec![&h.down]; if let Some(i) = &h.inject { grp.push(i); }
+        let mut r = self.mm(&grp, &xn, t).into_iter();
+        let mut lo = r.next().unwrap();
         for v in lo.iter_mut() { *v = silu(*v / hc as f32); }
-        let mut inj = vec![0f32; t * hc];
-        if let Some(m) = &h.inject { m.matmul(&xn, t, &mut inj); for v in inj.iter_mut() { *v /= hc as f32; } }
-        let mut gate = vec![0f32; t * w]; h.up.matmul(&lo, t, &mut gate);
+        let mut inj = r.next().unwrap_or_else(|| vec![0f32; t * hc]);
+        if h.inject.is_some() { for v in inj.iter_mut() { *v /= hc as f32; } }
+        let gate = self.mm(&[&h.up], &lo, t).pop().unwrap();
         let mut mixed = vec![0f32; t * d];
         for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
         (mixed, inj)
@@ -150,8 +187,7 @@ impl Model {
 
     fn ple(&self, p: &Ple, hist: &mut Vec<f32>, emb: &[f32], x: &mut [f32], t: usize) {
         let c = &self.cfg; let (d, hc) = (c.d, c.hc); let w = hc * d; let ein = p.key.cols;
-        let mut key = vec![0f32; t * w]; p.key.matmul(emb, t, &mut key);
-        let mut val = vec![0f32; t * d]; p.value.matmul(emb, t, &mut val);
+        let mut r = self.mm(&[&p.key, &p.value], emb, t).into_iter(); let key = r.next().unwrap(); let val = r.next().unwrap();
         let dil = c.ple_ngram; let hl = (c.ple_conv_k - 1) * dil; let _ = ein;
         for ti in 0..t {
             let xt = &mut x[ti * w..(ti + 1) * w];
@@ -182,11 +218,16 @@ impl Model {
     }
 
     fn attn(&self, l: &Layer, ai: usize, st: &mut State, x: &[f32], start: usize, t: usize) -> Vec<f32> {
-        let Mixer::Attn { q, k, v, o, qn, kn } = &l.mix else { unreachable!() };
+        let Mixer::Attn { q, k, v, o, .. } = &l.mix else { unreachable!() };
+        let att = self.attn_core(l, ai, st, self.mm(&[q, k, v], x, t), start, t);
+        self.mm(&[o], &att, t).pop().unwrap()
+    }
+
+    /// Attention after the q/k/v projections; returns the gated heads before the output projection.
+    fn attn_core(&self, l: &Layer, ai: usize, st: &mut State, proj: Vec<Vec<f32>>, start: usize, t: usize) -> Vec<f32> {
+        let Mixer::Attn { qn, kn, .. } = &l.mix else { unreachable!() };
         let c = &self.cfg; let (nh, nkv, hd) = (c.n_head, c.n_kv, c.hd);
-        let mut qf = vec![0f32; t * q.rows]; q.matmul(x, t, &mut qf);
-        let mut kf = vec![0f32; t * k.rows]; k.matmul(x, t, &mut kf);
-        let mut vf = vec![0f32; t * v.rows]; v.matmul(x, t, &mut vf);
+        let mut r = proj.into_iter(); let qf = r.next().unwrap(); let mut kf = r.next().unwrap(); let vf = r.next().unwrap();
         for ti in 0..t { for h in 0..nkv { let kh = &mut kf[ti * nkv * hd + h * hd..ti * nkv * hd + (h + 1) * hd]; rms_inplace(kh, kn, c.eps); self.rope(kh, start + ti); } }
         st.k[ai].extend_from_slice(&kf); st.v[ai].extend_from_slice(&vf);
         let (kc, vc) = (&st.k[ai], &st.v[ai]);
@@ -202,16 +243,21 @@ impl Model {
             for (p, s) in sc.iter().enumerate() { let w = s / sum; let vv = &vc[p * nkv * hd + kvh * hd..]; for i in 0..hd { out[i] += w * vv[i]; } }
             let gate = &qf[base + hd..base + 2 * hd]; for i in 0..hd { out[i] *= sigm(gate[i]); }
         });
-        let mut y = vec![0f32; t * c.d]; o.matmul(&att, t, &mut y); y
+        att
     }
 
     fn linear(&self, l: &Layer, li: usize, st: &mut State, x: &[f32], t: usize) -> Vec<f32> {
-        let Mixer::Lin { qkv, z, beta, alpha, a, dt, conv, norm, out } = &l.mix else { unreachable!() };
+        let Mixer::Lin { qkv, z, beta, alpha, out, .. } = &l.mix else { unreachable!() };
+        let o_all = self.linear_core(l, li, st, self.mm(&[qkv, z, beta, alpha], x, t), t);
+        self.mm(&[out], &o_all, t).pop().unwrap()
+    }
+
+    /// Gated DeltaNet after its input projections (conv, L2 norms, delta-rule recurrence, gated norm).
+    fn linear_core(&self, l: &Layer, li: usize, st: &mut State, proj: Vec<Vec<f32>>, t: usize) -> Vec<f32> {
+        let Mixer::Lin { qkv, a, dt, conv, norm, .. } = &l.mix else { unreachable!() };
         let c = &self.cfg; let (nk, nv, dk, dv) = (c.lin_nk, c.lin_nv, c.lin_dk, c.lin_dv); let ch = qkv.rows; let kk = c.conv_k;
-        let mut m = vec![0f32; t * ch]; qkv.matmul(x, t, &mut m);
-        let mut zz = vec![0f32; t * z.rows]; z.matmul(x, t, &mut zz);
-        let mut bb = vec![0f32; t * nv]; beta.matmul(x, t, &mut bb);
-        let mut aa = vec![0f32; t * nv]; alpha.matmul(x, t, &mut aa);
+        let mut r = proj.into_iter();
+        let (m, zz, bb, aa) = (r.next().unwrap(), r.next().unwrap(), r.next().unwrap(), r.next().unwrap());
         let mut o_all = vec![0f32; t * nv * dv];
         let cs = &mut st.conv[li]; let s = &mut st.ssm[li];
         for ti in 0..t {
@@ -234,18 +280,23 @@ impl Model {
                 rms_inplace(oh, norm, c.eps); let zh = &zz[ti * nv * dv + h * dv..ti * nv * dv + (h + 1) * dv]; for j in 0..dv { oh[j] *= sigm(zh[j]); }
             });
         }
-        let mut y = vec![0f32; t * c.d]; out.matmul(&o_all, t, &mut y); y
+        o_all
     }
 
     fn ffn(&self, l: &Layer, x: &[f32], t: usize) -> Vec<f32> {
         let c = &self.cfg; let d = c.d; let ff = c.ff_exp;
-        let mut lg = vec![0f32; t * c.n_exp]; l.router.matmul(x, t, &mut lg);
+        let mut r = self.mm(&[&l.router, &l.sh_gate, &l.sh_up], x, t).into_iter();
+        let (lg, mut g, u) = (r.next().unwrap(), r.next().unwrap(), r.next().unwrap());
         // shared expert (batched)
-        let sf = l.sh_gate.rows;
-        let mut g = vec![0f32; t * sf]; l.sh_gate.matmul(x, t, &mut g);
-        let mut u = vec![0f32; t * sf]; l.sh_up.matmul(x, t, &mut u);
         for i in 0..g.len() { g[i] = silu(g[i]) * u[i]; }
-        let mut y = vec![0f32; t * d]; l.sh_down.matmul(&g, t, &mut y);
+        let mut y = self.mm(&[&l.sh_down], &g, t).pop().unwrap();
+        self.routed(l, x, &lg, t, &mut y);
+        y
+    }
+
+    /// Shared-expert gate (applied to y's shared output) + the routed experts on the CPU, added into y.
+    fn routed(&self, l: &Layer, x: &[f32], lg: &[f32], t: usize, y: &mut [f32]) {
+        let c = &self.cfg; let d = c.d; let ff = c.ff_exp;
         for ti in 0..t { let sg = sigm(dot(&l.sh_gate_inp, &x[ti * d..(ti + 1) * d])); for v in &mut y[ti * d..(ti + 1) * d] { *v *= sg; } }
         // routing: softmax -> top-k -> renormalise
         let mut by_exp: Vec<Vec<(usize, f32)>> = vec![vec![]; c.n_exp];
@@ -282,7 +333,6 @@ impl Model {
             (r0, o)
         }).collect();
         for (r0, o) in outs { let w = o.len() / t; for ti in 0..t { for r in 0..w { y[ti * d + r0 + r] += o[ti * w + r]; } } }
-        y
     }
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
@@ -314,8 +364,8 @@ impl Model {
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
-        let mut lg = vec![0f32; self.out.rows]; self.out.matmul(&h, 1, &mut lg);
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3}", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        let lg = self.mm(&[&self.out], &h, 1).pop().unwrap();
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 }

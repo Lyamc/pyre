@@ -6,3 +6,4 @@ pub mod qwen4exp;
 pub mod gguf_q;
 pub mod iq_tables;
 pub mod qwen4exp_gguf;
+pub mod qn_gpu;

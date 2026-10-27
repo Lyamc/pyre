@@ -157,7 +157,7 @@ fn main() -> Result<()> {
 
 /// Load one text-generation model and start its worker.
 pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
-    if qn_find::is_qwen4exp(dir) { return load_qn(dir, id, n_predict); }
+    if qn_find::is_qwen4exp(dir) { return load_qn(dir, id, backend_name, n_predict); }
     let (llama, tok, template, eos, bname, fdt) = load_llm_parts(dir, backend_name, dtype, ctx_size)?;
     let n_ctx = llama.max_ctx;
     let engine = engine::spawn(llama, tok.clone(), eos);
@@ -187,19 +187,30 @@ pub fn qn_text_parts(f: &std::path::Path, m: &model::qwen4exp_gguf::Model) -> Re
 }
 
 /// Qwen3.8-Flash-Next GGUF: CPU engine, experts quantized in the mmap (see model::qwen4exp_gguf).
-fn load_qn(dir: &std::path::Path, id: &str, n_predict: usize) -> Result<server::Llm> {
+/// `-b cuda` (and a CUDA build): dense projections to the GPU (Strata's split); otherwise all-CPU.
+pub fn qn_attach_gpu(m: &mut model::qwen4exp_gguf::Model, backend: &str) -> Result<String> {
+    if backend != "cuda" || !cfg!(feature = "cuda") { return Ok("cpu".into()); }
+    let t = std::time::Instant::now();
+    let (on, off, gb) = m.attach_gpu(model::qn_gpu::Gpu::new()?)?;
+    tracing::info!("qwen4exp: {on} projection groups on the GPU ({gb:.2} GiB Q8), {off} left on the CPU (VRAM reserve), in {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!("gpu: {on} groups on the GPU ({gb:.2} GiB Q8), {off} on the CPU, {:.1}s", t.elapsed().as_secs_f64());
+    Ok(if off == 0 { "cuda+cpu-experts".into() } else { "cuda(partial)+cpu".into() })
+}
+
+fn load_qn(dir: &std::path::Path, id: &str, backend_name: &str, n_predict: usize) -> Result<server::Llm> {
     let f = qn_find::find_gguf(dir).context("no .gguf found")?;
     qn_threads();
     let t = std::time::Instant::now();
-    let m = model::qwen4exp_gguf::Model::load(&f)?;
-    tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | CPU, {} threads, experts stay quantized (mmap)",
+    let mut m = model::qwen4exp_gguf::Model::load(&f)?;
+    let label = qn_attach_gpu(&mut m, backend_name)?;
+    tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
         f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
     let (tok, template, eos) = qn_text_parts(&f, &m)?;
     tracing::info!("eos ids {eos:?}");
     let n_ctx = m.max_ctx();
     let engine = engine_qn::spawn(Arc::new(m), tok.clone(), eos);
     Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: f.display().to_string(), n_ctx,
-        backend: "cpu".into(), dtype: "gguf".into(), default_max_tokens: n_predict })
+        backend: label, dtype: "gguf".into(), default_max_tokens: n_predict })
 }
 
 #[allow(clippy::type_complexity)]

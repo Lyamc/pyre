@@ -197,6 +197,8 @@ pub struct QMat { pub ty: QType, pub rows: usize, pub cols: usize, mm: Arc<Mmap>
 
 impl QMat {
     pub fn row_bytes(&self) -> usize { self.ty.row_bytes(self.cols) }
+    /// Identity of the weight data (stable for the mmap's lifetime).
+    pub fn key(&self) -> usize { self.mm.as_ptr() as usize + self.off }
     pub fn bytes(&self) -> &[u8] { &self.mm[self.off..self.off + self.rows * self.row_bytes()] }
     pub fn row(&self, r: usize, y: &mut [f32]) { let rb = self.row_bytes(); dequant(self.ty, &self.mm[self.off + r * rb..self.off + (r + 1) * rb], &mut y[..self.cols]); }
     pub fn to_f32(&self) -> Vec<f32> { let mut v = vec![0f32; self.rows * self.cols]; for r in 0..self.rows { self.row(r, &mut v[r * self.cols..]); } v }
