@@ -12,6 +12,7 @@ cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 
 [dependencies]
+anyhow = "1"
 burn = { workspace = true }
 burn-store = { workspace = true, optional = true }
 num-traits = { version = "0.2.18", default-features = false }

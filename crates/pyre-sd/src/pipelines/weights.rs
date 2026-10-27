@@ -88,6 +88,11 @@ impl ModuleAdapter for PyTorchToBurnDtypeAdapter {
     fn clone_box(&self) -> Box<dyn ModuleAdapter> { Box::new(self.clone()) }
 }
 
+static LOAD_DTYPE: std::sync::Mutex<Option<burn::tensor::DType>> = std::sync::Mutex::new(None);
+/// Float dtype the next loads cast to when no explicit dtype is given (None = device default).
+/// pyre keeps the shared device's default at f32 and loads SD weights in f16 through this.
+pub fn set_load_dtype(dtype: Option<burn::tensor::DType>) { *LOAD_DTYPE.lock().unwrap() = dtype; }
+
 fn load_checkpoint<M>(module: &mut M, path: &Path, key_mappings: Vec<(&str, &str)>, device: &burn::tensor::Device, skip_enum_variants: bool) -> Result<(), WeightLoadError>
 where M: ModuleSnapshot {
     load_checkpoint_in::<M>(module, path, key_mappings, device, skip_enum_variants, None)
@@ -99,7 +104,7 @@ where M: ModuleSnapshot {
 fn load_checkpoint_in<M>(module: &mut M, path: &Path, key_mappings: Vec<(&str, &str)>, device: &burn::tensor::Device, skip_enum_variants: bool, dtype: Option<burn::tensor::DType>) -> Result<(), WeightLoadError>
 where M: ModuleSnapshot {
     let remapper = KeyRemapper::from_patterns(key_mappings).map_err(|e| WeightLoadError::SafetensorsLoad(e.to_string()))?;
-    let adapter = match dtype { Some(dtype) => PyTorchToBurnDtypeAdapter { dtype }, None => PyTorchToBurnDtypeAdapter::for_device(device) };
+    let adapter = match dtype.or(*LOAD_DTYPE.lock().unwrap()) { Some(dtype) => PyTorchToBurnDtypeAdapter { dtype }, None => PyTorchToBurnDtypeAdapter::for_device(device) };
     let mut store = SafetensorsStore::from_file(path.to_path_buf())
         .with_from_adapter(adapter)
         .remap(remapper)

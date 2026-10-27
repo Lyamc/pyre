@@ -1107,3 +1107,7 @@ mod tests {
         let _ = StableDiffusionConfig::v1_5(None, None, Some(513));
     }
 }
+
+/// Called after each denoising step (after a device sync) with the step's start time; the host
+/// uses it to pace GPU duty cycle (pyre's --gpu-util-max).
+pub static STEP_HOOK: std::sync::OnceLock<fn(std::time::Instant)> = std::sync::OnceLock::new();

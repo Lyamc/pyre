@@ -35,7 +35,7 @@ impl Loaded {
         match &self.inner {
             Inner::Llm(l) => json!({"n_ctx": l.n_ctx, "backend": l.backend, "dtype": l.dtype, "path": self.path}),
             Inner::Stt(s) => json!({"backend": self.backend, "path": self.path, "engine": s.describe()}),
-            Inner::Image(i) => json!({"backend": self.backend, "path": self.path, "engine": i.describe()}),
+            Inner::Image(i) => json!({"backend": self.backend, "path": self.path, "engine": i.describe(), "image": i.info()}),
             Inner::Tts(t) => json!({"backend": self.backend, "path": self.path, "engine": t.describe()}),
             Inner::Placeholder(r) => json!({"backend": self.backend, "path": self.path, "status": "not-runnable", "reason": r}),
         }

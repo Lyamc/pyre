@@ -210,16 +210,29 @@ async fn run_images(im: Arc<crate::image::ImageModel>, ps: Vec<crate::image::Gen
 
 fn seed_of(v: Option<i64>) -> u64 { match v { Some(s) if s >= 0 => s as u64, _ => rand::random::<u32>() as u64 } }
 
-/// OpenAI `/v1/images/generations`. Extensions: negative_prompt, steps, guidance_scale, seed.
+/// Shared request fields for both image endpoints. Extensions beyond OpenAI: negative_prompt,
+/// steps, guidance_scale (cfg_scale), seed, sampler (sampler_name), scheduler, refiner,
+/// refiner_denoise. Width/height 0 = the model's native size; defaults follow cabin (euler/normal).
+fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, guidance: Option<f64>, seed: u64) -> crate::image::GenParams {
+    let s = |k: &str| b[k].as_str().filter(|x| !x.is_empty() && *x != "auto").map(String::from);
+    let mut p = crate::image::GenParams::new(prompt, w, h, steps.unwrap_or(0) as usize, guidance.unwrap_or(-1.0), seed);
+    p.negative = b["negative_prompt"].as_str().unwrap_or("").into();
+    p.sampler = s("sampler").or(s("sampler_name")).map(|x| x.to_ascii_lowercase().replace(' ', "_").replace("dpm++", "dpmpp").replace("_a", "_ancestral").replace("ancestralncestral", "ancestral"));
+    p.scheduler = s("scheduler").map(|x| x.to_ascii_lowercase());
+    p.refiner = b["refiner"].as_bool().unwrap_or(false);
+    p.refiner_denoise = b["refiner_denoise"].as_f64();
+    p
+}
+
+/// OpenAI `/v1/images/generations`.
 async fn images(State(app): S, Json(b): Json<Value>) -> Response {
     use base64::Engine;
     let im = match image_model(&app, b["model"].as_str()) { Ok(i) => i, Err(r) => return r };
     let Some(prompt) = b["prompt"].as_str() else { return err(StatusCode::BAD_REQUEST, "missing prompt") };
-    let (w, h) = match b["size"].as_str().unwrap_or("512x512").split_once('x').and_then(|(a, c)| Some((a.parse().ok()?, c.parse().ok()?))) { Some(x) => x, None => return err(StatusCode::BAD_REQUEST, "size must look like 512x512") };
+    let (w, h) = match b["size"].as_str().filter(|s| *s != "auto").unwrap_or("0x0").split_once('x').and_then(|(a, c)| Some((a.parse().ok()?, c.parse().ok()?))) { Some(x) => x, None => return err(StatusCode::BAD_REQUEST, "size must look like 512x512") };
     let n = b["n"].as_u64().unwrap_or(1).clamp(1, 8) as usize;
     let seed = seed_of(b["seed"].as_i64());
-    let ps = (0..n).map(|i| crate::image::GenParams { prompt: prompt.into(), negative: b["negative_prompt"].as_str().unwrap_or("").into(), width: w, height: h,
-        steps: b["steps"].as_u64().unwrap_or(30) as usize, guidance: b["guidance_scale"].as_f64().unwrap_or(7.5), seed: seed + i as u64 }).collect();
+    let ps = (0..n).map(|i| gen_params(&b, prompt, w, h, b["steps"].as_u64(), b["guidance_scale"].as_f64().or(b["cfg_scale"].as_f64()), seed + i as u64)).collect();
     let url = b["response_format"].as_str() == Some("url");
     match run_images(im, ps).await {
         Err(r) => r,
@@ -236,13 +249,11 @@ async fn txt2img(State(app): S, Json(b): Json<Value>) -> Response {
     let im = match image_model(&app, b["model"].as_str().or(b["override_settings"]["sd_model_checkpoint"].as_str())) { Ok(i) => i, Err(r) => return r };
     let n = (b["batch_size"].as_u64().unwrap_or(1) * b["n_iter"].as_u64().unwrap_or(1)).clamp(1, 8) as usize;
     let seed = seed_of(b["seed"].as_i64());
-    let p = |i: usize| crate::image::GenParams { prompt: b["prompt"].as_str().unwrap_or("").into(), negative: b["negative_prompt"].as_str().unwrap_or("").into(),
-        width: b["width"].as_u64().unwrap_or(512) as usize, height: b["height"].as_u64().unwrap_or(512) as usize,
-        steps: b["steps"].as_u64().unwrap_or(20) as usize, guidance: b["cfg_scale"].as_f64().unwrap_or(7.0), seed: seed + i as u64 };
+    let p = |i: usize| gen_params(&b, b["prompt"].as_str().unwrap_or(""), b["width"].as_u64().unwrap_or(0) as usize, b["height"].as_u64().unwrap_or(0) as usize, b["steps"].as_u64(), b["cfg_scale"].as_f64(), seed + i as u64);
     match run_images(im, (0..n).map(p).collect()).await {
         Err(r) => r,
         Ok(v) => Json(json!({"images": v.iter().map(|g| base64::engine::general_purpose::STANDARD.encode(&g.png)).collect::<Vec<_>>(),
-            "parameters": b, "info": json!({"seeds": v.iter().map(|g| g.seed).collect::<Vec<_>>(), "seconds": v.iter().map(|g| g.seconds).collect::<Vec<_>>(), "sampler_name": "DDIM"}).to_string()})).into_response(),
+            "parameters": b, "info": json!({"seeds": v.iter().map(|g| g.seed).collect::<Vec<_>>(), "seconds": v.iter().map(|g| g.seconds).collect::<Vec<_>>(), "sampler_name": b["sampler_name"].as_str().unwrap_or("euler")}).to_string()})).into_response(),
     }
 }
 
