@@ -97,6 +97,17 @@ struct Layer {
     local_rope: bool,
 }
 
+/// Write `val` into layer `li`'s cache in place. Taking the tensor out of the Vec (instead of
+/// `cache[li].clone().slice_assign(..)`) leaves it uniquely owned, so Burn can update the buffer in
+/// place rather than copying the whole `[1, nkv, ctx, hd]` cache every token.
+fn kv_write(cache: &mut Vec<Tensor<4>>, li: usize, r: [std::ops::Range<usize>; 4], val: Tensor<4>) {
+    let t = cache.swap_remove(li);
+    let t = t.slice_assign(r, val);
+    cache.push(t);
+    let last = cache.len() - 1;
+    cache.swap(li, last);
+}
+
 pub struct KvCache {
     pub k: Vec<Tensor<4>>,
     pub v: Vec<Tensor<4>>,
@@ -354,8 +365,8 @@ impl Llama {
             }
             let q = q.clone().mul(cos.clone()).add(rotate_half(q).mul(sin.clone()));
             let k = k.clone().mul(cos.clone()).add(rotate_half(k).mul(sin.clone()));
-            cache.k[li] = cache.k[li].clone().slice_assign([0..1, 0..nkv, start..total, 0..hd], k);
-            cache.v[li] = cache.v[li].clone().slice_assign([0..1, 0..nkv, start..total, 0..hd], v);
+            kv_write(&mut cache.k, li, [0..1, 0..nkv, start..total, 0..hd], k);
+            kv_write(&mut cache.v, li, [0..1, 0..nkv, start..total, 0..hd], v);
             let mut kk = cache.k[li].clone().narrow(2, 0, kv_len);
             let mut vv = cache.v[li].clone().narrow(2, 0, kv_len);
             if rep > 1 {
@@ -432,8 +443,8 @@ impl Llama {
             let mut vs = Vec::with_capacity(n);
             for (i, c) in caches.iter_mut().enumerate() {
                 let p = pos[i];
-                c.k[li] = c.k[li].clone().slice_assign([0..1, 0..nkv, p..p + 1, 0..hd], k.clone().narrow(0, i, 1));
-                c.v[li] = c.v[li].clone().slice_assign([0..1, 0..nkv, p..p + 1, 0..hd], v.clone().narrow(0, i, 1));
+                kv_write(&mut c.k, li, [0..1, 0..nkv, p..p + 1, 0..hd], k.clone().narrow(0, i, 1));
+                kv_write(&mut c.v, li, [0..1, 0..nkv, p..p + 1, 0..hd], v.clone().narrow(0, i, 1));
                 ks.push(c.k[li].clone().narrow(2, 0, kv_len));
                 vs.push(c.v[li].clone().narrow(2, 0, kv_len));
             }
