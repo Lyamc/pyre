@@ -1,4 +1,4 @@
-﻿# Bounded first-request timing: start pyre, time first + second STT (and optionally TTS) request, stop pyre.
+# Bounded first-request timing: start pyre, time first + second STT (and optionally TTS) request, stop pyre.
 # Usage: scripts\first_request.ps1 [-Backend cuda] [-Stt tiny_en] [-Tts ""] [-Port 8099] [-TimeoutSec 600]
 param([string]$Backend = "cuda", [string]$Stt = "tiny_en", [string]$Tts = "", [string]$Llm = "", [int]$Port = 8099, [int]$TimeoutSec = 600, [string]$Extra = "")
 $root = Split-Path $PSScriptRoot -Parent
@@ -17,7 +17,7 @@ try {
     $r = & curl.exe -s -m $TimeoutSec "$base/v1/audio/transcriptions" -F "file=@$root\samples\speech.wav" -F "model=$Stt"
     "stt #$n : {0:N1}s  {1}" -f ((Get-Date) - $t).TotalSeconds, ($r | Out-String).Trim()
   }
-  if ($Tts) { foreach ($n in 1, 2) { $t = Get-Date
-    & curl.exe -s -m $TimeoutSec -o "$env:TEMP\pyre-first.wav" "$base/v1/audio/speech" -H "Content-Type: application/json" -d '{\"model\":\"tts\",\"input\":\"Hello from pyre.\"}'
-    "tts #$n : {0:N1}s" -f ((Get-Date) - $t).TotalSeconds } }
+  if ($Tts) { '{"model":"tts","input":"Hello from pyre. This is a short speech test."}' | Set-Content -Encoding ascii "$env:TEMP\pyre-first-tts.json"; foreach ($n in 1, 2) { $t = Get-Date
+    & curl.exe -s -m $TimeoutSec -o "$env:TEMP\pyre-first.wav" "$base/v1/audio/speech" -H "Content-Type: application/json" -d "@$env:TEMP\pyre-first-tts.json"
+    "tts #$n : {0:N1}s  {1} bytes" -f ((Get-Date) - $t).TotalSeconds, (Get-Item "$env:TEMP\pyre-first.wav").Length } }
 } finally { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }; Start-Sleep 1 }
