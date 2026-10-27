@@ -3,6 +3,7 @@
 //! The 2D UNet models take as input a noisy sample and the current diffusion
 //! timestep and return a denoised version of the input.
 
+use crate::models::fastconv::ConvFwd;
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
@@ -446,7 +447,7 @@ impl UNet2DConditionModel {
         }
 
         // 2. Pre-process
-        let xs = self.conv_in.forward(xs);
+        let xs = self.conv_in.fwd(xs);
 
         // 3. Down blocks
         let mut down_block_res_xs = vec![xs.clone()];
@@ -515,7 +516,7 @@ impl UNet2DConditionModel {
         // 6. Post-process
         let xs = self.conv_norm_out.forward(xs);
         let xs = silu(xs);
-        self.conv_out.forward(xs)
+        self.conv_out.fwd(xs)
     }
 }
 

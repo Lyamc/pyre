@@ -4,6 +4,7 @@
 //! before expanding it back to its original shape. This results in the latent values
 //! compressing the original information.
 
+use crate::models::fastconv::ConvFwd;
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
@@ -115,7 +116,7 @@ impl EncoderConfig {
 impl Encoder {
     /// Forward pass through the encoder.
     pub fn forward(&self, xs: Tensor<4>) -> Tensor<4> {
-        let mut xs = self.conv_in.forward(xs);
+        let mut xs = self.conv_in.fwd(xs);
 
         for down_block in self.down_blocks.iter() {
             xs = down_block.forward(xs);
@@ -124,7 +125,7 @@ impl Encoder {
         let xs = self.mid_block.forward(xs, None);
         let xs = self.conv_norm_out.forward(xs);
         let xs = silu(xs);
-        self.conv_out.forward(xs)
+        self.conv_out.fwd(xs)
     }
 }
 
@@ -218,7 +219,7 @@ impl DecoderConfig {
 impl Decoder {
     /// Forward pass through the decoder.
     pub fn forward(&self, xs: Tensor<4>) -> Tensor<4> {
-        let xs = self.conv_in.forward(xs);
+        let xs = self.conv_in.fwd(xs);
         let mut xs = self.mid_block.forward(xs, None);
 
         for up_block in self.up_blocks.iter() {
@@ -227,7 +228,7 @@ impl Decoder {
 
         let xs = self.conv_norm_out.forward(xs);
         let xs = silu(xs);
-        self.conv_out.forward(xs)
+        self.conv_out.fwd(xs)
     }
 }
 
@@ -371,13 +372,13 @@ impl AutoEncoderKL {
     /// Returns a DiagonalGaussianDistribution that can be sampled from.
     pub fn encode(&self, xs: Tensor<4>) -> DiagonalGaussianDistribution {
         let parameters = self.encoder.forward(xs);
-        let parameters = self.quant_conv.forward(parameters);
+        let parameters = self.quant_conv.fwd(parameters);
         DiagonalGaussianDistribution::new(parameters)
     }
 
     /// Decode latent vectors back to images.
     pub fn decode(&self, xs: Tensor<4>) -> Tensor<4> {
-        let xs = self.post_quant_conv.forward(xs);
+        let xs = self.post_quant_conv.fwd(xs);
         self.decoder.forward(xs)
     }
 }

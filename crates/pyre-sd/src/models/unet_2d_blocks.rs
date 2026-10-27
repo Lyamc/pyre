@@ -1,6 +1,7 @@
 //! 2D UNet Building Blocks
 //!
 
+use crate::models::fastconv::ConvFwd;
 use burn::{
     config::Config,
     module::Module,
@@ -71,7 +72,7 @@ impl Downsample2D {
     fn forward(&self, xs: Tensor<4>) -> Tensor<4> {
         match &self.conv {
             None => avg_pool2d(xs, AvgPoolOptions::new([2, 2]).with_stride([2, 2])),
-            Some(conv) => conv.forward(Self::pad_tensor(xs, self.padding)),
+            Some(conv) => conv.fwd(Self::pad_tensor(xs, self.padding)),
         }
     }
 }
@@ -108,7 +109,7 @@ impl Upsample2D {
             Some((h, w)) => interpolate(xs, InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([h, w])),
         };
 
-        self.conv.forward(xs)
+        self.conv.fwd(xs)
     }
 }
 

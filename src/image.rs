@@ -79,6 +79,7 @@ impl ImageModel {
             "cuda" | "wgpu" | "vulkan" => crate::backend::select(backend, "f32", None)?,
             other => bail!("image generation supports --backend cuda, wgpu or vulkan (got '{other}'; SD on CPU would take many minutes per image)"),
         };
+        pyre_sd::models::fastconv::set_im2col(match std::env::var("PYRE_SD_IM2COL").as_deref() { Ok("1") => true, Ok("0") => false, _ => backend != "cuda" });
         let pipe = build(dir, dev)?;
         let mut me = Self { dir: dir.to_path_buf(), backend: label.into(), pipe: Mutex::new(pipe), tok, busy: AtomicBool::new(false), queued: AtomicU64::new(0), max_area: AtomicU64::new(0), warmup_secs: None };
         // Warm-up: the first image compiles + autotunes every kernel. Doing it at load time (with

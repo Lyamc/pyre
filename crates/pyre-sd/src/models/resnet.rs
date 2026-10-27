@@ -5,6 +5,7 @@
 //! Denoising Diffusion Implicit Models, K. He and al, 2015.
 //! https://arxiv.org/abs/1512.03385
 
+use crate::models::fastconv::ConvFwd;
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
@@ -92,12 +93,12 @@ pub struct ResnetBlock2D {
 impl ResnetBlock2D {
     pub fn forward(&self, xs: Tensor<4>, temb: Option<Tensor<2>>) -> Tensor<4> {
         let shortcut_xs = match &self.conv_shortcut {
-            Some(conv_shortcut) => conv_shortcut.forward(xs.clone()),
+            Some(conv_shortcut) => conv_shortcut.fwd(xs.clone()),
             None => xs.clone(),
         };
 
         let xs = self.norm1.forward(xs.clone());
-        let xs = self.conv1.forward(silu(xs));
+        let xs = self.conv1.fwd(silu(xs));
         let xs = match (temb, &self.time_emb_proj) {
             (Some(temb), Some(time_emb_proj)) => {
                 time_emb_proj
@@ -110,7 +111,7 @@ impl ResnetBlock2D {
         };
         let xs = self.norm2.forward(xs);
         let xs = silu(xs);
-        let xs = self.conv2.forward(xs);
+        let xs = self.conv2.fwd(xs);
         (shortcut_xs + xs) / self.output_scale_factor
     }
 }
