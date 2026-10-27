@@ -169,7 +169,8 @@ impl ImageModel {
         // Burn's memory pool reuses buffers, so only a larger image than any before needs new VRAM.
         let area = (q.width * q.height) as u64;
         let seen = self.max_area.load(Ordering::SeqCst);
-        let per = if self.native >= 1024 { 3072u64 << 20 } else { 1536u64 << 20 };
+        // cabin measured SDXL base 1024x1024 f16 at a 9.4 GB peak with ~7 GB of weights.
+        let per = if self.native >= 1024 { 2048u64 << 20 } else { 1024u64 << 20 };
         if area > seen {
             let base = (self.native * self.native) as u64;
             crate::limits::check_alloc(if seen == 0 { per * area.max(base) / base } else { per * (area - seen) / base }, "an image generation at this size")?;

@@ -440,14 +440,15 @@ impl UNet2DConditionModel {
             self.addition_time_embed_dim,
         ) {
             let [bsize_cond, n_ids] = added_cond.time_ids.dims();
+            // In f32 (arange follows the device default) and cast to the model dtype after.
             let time_embeds = get_timestep_embedding(
-                added_cond.time_ids.clone().flatten::<1>(0, 1),
+                Tensor::<1>::cast(added_cond.time_ids.clone().flatten::<1>(0, 1), burn::tensor::DType::F32),
                 atd,
                 self.flip_sin_to_cos,
                 self.freq_shift,
             );
             // Base SDXL has 6 time ids. The refiner has 5 (it ends with an aesthetic score).
-            let time_embeds = time_embeds.reshape([bsize_cond, atd * n_ids]);
+            let time_embeds = Tensor::<2>::cast(time_embeds.reshape([bsize_cond, atd * n_ids]), added_cond.text_embeds.dtype());
             let add_embeds = Tensor::cat(vec![added_cond.text_embeds.clone(), time_embeds], 1);
             let aug_emb = add_emb.forward(add_embeds);
             emb = emb + aug_emb;
