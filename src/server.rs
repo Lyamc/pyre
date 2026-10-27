@@ -35,7 +35,7 @@ type S = State<Arc<App>>;
 type AppState = Llm;
 
 pub fn router(st: Arc<App>) -> Router {
-    crate::api::routes(Router::new())
+    crate::apps::routes(crate::api::routes(Router::new()))
         .route("/v1/models", get(models))
         .route("/models", get(models))
         .route("/v1/chat/completions", post(chat))

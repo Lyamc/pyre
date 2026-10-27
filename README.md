@@ -268,3 +268,33 @@ the reserve (seen: 1566 MiB free with a 1228 MiB reserve), and within one op it 
 - LLM parity: Qwen2.5-0.5B greedy, 15 tokens, matches HF f32 on the first 14; token 15 is a near tie
   (`.` vs `.\n`), identical to the pre-port build. Decode (0.5B, RTX 3060): CUDA 43.3 tok/s bf16 /
   38.2 f32 (was 30.5), wgpu 41.9 tok/s (was 38.4).
+
+## LAN hosting
+
+    pyre serve --host 0.0.0.0 --port 8099 [--api-key SECRET] -m <model>
+
+The startup log prints the URLs other machines can use (e.g. `http://192.168.0.30:8099`). The web
+UI uses same-origin relative URLs, and the API answers CORS preflights from any origin (like
+llama-server). Without `--api-key` anyone on the network can use the server (a warning is logged).
+
+## Apps (companion programs)
+
+    pyre app list | pyre app install peal | pyre app run peal -- transcribe -i a.wav | pyre app remove peal
+
+An app is described by `pyre-app.toml` in its repo (`[app]` name/description/version/min_pyre_api/web_ui,
+`[source]` path or git, `[[build]]` steps (`cargo` crate dir + `bins`, `prebuilt`, or `command`; `optional`),
+`[[entry]]` cli/gui commands, `[pyre]` url_env / api_key_env / gui_args with `{url}`, `[[models]]` kind + refs).
+Built-in entries live in `apps/*.toml` (peal, cabin). Installs go to `PYRE_APPS_DIR` or
+`%LOCALAPPDATA%\pyre\apps\<name>` (bin/, manifest copy, `<entry>.cmd` launchers with the server URL);
+records in `installed.json`. Same operations over HTTP: `GET /api/apps`, `POST /api/apps/install|remove|run`
+(`{"name": ...}`), and the web UI's Apps page.
+
+## Qwen3.8-Flash-Next (experimental)
+
+    pyre qwen-next <hf-snapshot-dir> --prompt "..." -n 32 [-b cuda] [--experts cpu|same] [--dump logits.json]
+
+Burn port of the `qwen4_exp` text model (`src/model/qwen4exp.rs`): hyper-connections, Gated DeltaNet,
+gated attention with partial RoPE, 512-expert MoE + shared expert, hashed n-gram PLE. Routed experts and
+the n-gram table sit on the CPU device (Strata's split). Verified against transformers on a tiny random
+config (`scripts/qwen_next_ref.py`). Not yet: QSA indexer (exact only up to 2048 tokens), MTP drafting,
+GGUF/quantized experts, server/engine integration.

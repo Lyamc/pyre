@@ -17,6 +17,7 @@ mod server;
 mod limits;
 mod template;
 mod qn_cli;
+mod apps;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -60,6 +61,11 @@ pub enum Cmd {
     },
     /// Run a Qwen3.8-Flash-Next (qwen4_exp) checkpoint directly: greedy text or logits dump
     QwenNext(qn_cli::QnArgs),
+    /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
+    App {
+        #[command(subcommand)]
+        cmd: apps::AppCmd,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -143,6 +149,7 @@ fn main() -> Result<()> {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
         Cmd::Serve(a) => serve(ctx, a),
         Cmd::QwenNext(a) => qn_cli::run(a),
+        Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }
 
@@ -216,6 +223,8 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let addr = format!("{}:{}", args.host, args.port);
+        let local = if args.host == "0.0.0.0" || args.host == "::" { "127.0.0.1".to_string() } else { args.host.clone() };
+        apps::set_server(format!("http://{local}:{}", args.port));
         let l = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("pyre listening on http://{addr} (web UI at /)");
         for u in lan_urls(&args.host, args.port) { tracing::info!("  reachable at {u}"); }

@@ -1,0 +1,26 @@
+# Built-in entry for cabin (Burn image-generation app; becoming a pyre client on its
+# `pyre-client` branch). Paths/bins are provisional until cabin ships its own pyre-app.toml.
+[app]
+name = "cabin"
+description = "Image generation app (Stable Diffusion) using pyre's /v1/images API"
+version = "0.0.0"
+min_pyre_api = 1
+
+[source]
+path = "C:/Build/machine-learning/cabin"
+
+[[build]]
+cargo = "."
+bins = ["cabin"]
+
+[[entry]]
+name = "cabin"
+bin = "cabin"
+kind = "gui"
+
+[pyre]
+url_env = "PYRE_URL"
+
+[[models]]
+kind = "image"
+models = ["stable-diffusion-v1-5/stable-diffusion-v1-5"]

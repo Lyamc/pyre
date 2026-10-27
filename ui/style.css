@@ -52,3 +52,26 @@ fieldset label{display:flex;flex-direction:column;font-size:12px;color:var(--mut
 .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:12px}.gallery img{width:100%;border-radius:8px}
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:12px;min-width:320px}dialog menu{display:flex;gap:8px;justify-content:flex-end;padding:0}
 @media (max-width:760px){.convs{display:none}.cards{grid-template-columns:1fr}.top{flex-wrap:wrap}}
+
+/* chat pass: reasoning blocks, message actions, errors, tables, phone layout */
+details.think{border:1px dashed var(--border);border-radius:8px;padding:4px 10px;margin:4px 0 8px;color:var(--muted)}
+details.think summary{cursor:pointer;font-size:12px}.thinkbody{font-size:13px}
+.err{margin-top:6px;padding:8px 10px;border-radius:8px;background:rgba(220,60,60,.15);border:1px solid rgba(220,60,60,.5);color:#e66}
+.macts{display:flex;gap:4px;margin-top:4px;opacity:0;transition:opacity .15s}.msg:hover .macts,.msg:focus-within .macts{opacity:1}
+.macts button{font-size:11px;padding:1px 6px}.editbox{width:100%;box-sizing:border-box}
+.dots{animation:blink 1s infinite}@keyframes blink{50%{opacity:.3}}
+table.mdt{border-collapse:collapse;margin:6px 0;font-size:13px}table.mdt td,table.mdt th{border:1px solid var(--border);padding:3px 8px}
+.msg blockquote{border-left:3px solid var(--border);margin:4px 0;padding-left:10px;color:var(--muted)}
+.msg h3,.msg h4,.msg h5,.msg h6{margin:.6em 0 .3em}
+#convToggle{display:none}
+@media (max-width:720px){
+  header.top{flex-wrap:wrap;gap:4px}#tabs{overflow-x:auto;white-space:nowrap;max-width:100%}
+  #convToggle{display:inline-block}
+  .convs{display:none;position:fixed;z-index:20;top:0;left:0;bottom:0;width:78vw;box-shadow:0 0 20px rgba(0,0,0,.5)}
+  body.show-convs .convs{display:block}
+  .msg{padding:8px 10px}.macts{opacity:1}
+  .settings{grid-template-columns:1fr 1fr !important}
+  .tab{padding:8px}table{display:block;overflow-x:auto}
+  .composer textarea{font-size:16px}
+}
+.apps{display:flex;flex-direction:column;gap:8px;margin:8px 0}.appcard{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel2)}
