@@ -1,20 +1,62 @@
-//! Memory-mapped HF safetensors (single file or sharded) -> Burn tensors.
-use anyhow::{bail, Context, Result};
+//! Model weights -> Burn tensors: memory-mapped HF safetensors (single file or sharded), or a
+//! GGUF file (llama.cpp naming, mapped back to HF names). GGUF `Q8_0` linear weights stay
+//! packed as Burn `Q8F` block-32 quantized tensors; other quant types are dequantized at load.
+use anyhow::{anyhow, bail, Context, Result};
 use burn::tensor::{DType, Device, Tensor, TensorCreationOptions, TensorData};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct Weights {
     maps: Vec<Mmap>,
     index: HashMap<String, usize>,
+    gguf: Option<Arc<burn_gguf::GgufReader>>,
     device: Device,
     dtype: DType,
+    /// Keep GGUF Q8_0 linear weights quantized (PYRE_GGUF_DEQUANT=1 turns this off).
+    pub keep_quant: bool,
+}
+
+/// The `.gguf` file to use for `dir`: `dir` itself, or the only/first `*.gguf` inside it when
+/// it has no safetensors.
+pub fn gguf_path(dir: &Path) -> Option<PathBuf> {
+    if dir.extension().and_then(|e| e.to_str()) == Some("gguf") { return Some(dir.to_path_buf()); }
+    if dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists() { return None; }
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf")).collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+/// HF parameter name -> llama.cpp GGUF tensor name.
+fn hf_to_gguf(name: &str) -> String {
+    let fixed = [("model.embed_tokens.weight", "token_embd.weight"), ("model.norm.weight", "output_norm.weight"), ("lm_head.weight", "output.weight")];
+    for (a, b) in fixed { if name == a { return b.into(); } }
+    if let Some(rest) = name.strip_prefix("model.layers.") {
+        let (i, tail) = rest.split_once('.').unwrap_or((rest, ""));
+        let map = [
+            ("input_layernorm", "attn_norm"), ("post_attention_layernorm", "ffn_norm"),
+            ("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"), ("self_attn.v_proj", "attn_v"),
+            ("self_attn.o_proj", "attn_output"), ("self_attn.q_norm", "attn_q_norm"), ("self_attn.k_norm", "attn_k_norm"),
+            ("mlp.gate_proj", "ffn_gate"), ("mlp.up_proj", "ffn_up"), ("mlp.down_proj", "ffn_down"),
+        ];
+        for (a, b) in map {
+            if let Some(suf) = tail.strip_prefix(a) { return format!("blk.{i}.{b}{suf}"); }
+        }
+    }
+    name.to_string()
 }
 
 impl Weights {
     pub fn open(dir: &Path, device: Device, dtype: DType) -> Result<Self> {
+        let keep_quant = std::env::var("PYRE_GGUF_DEQUANT").map(|v| v != "1").unwrap_or(true);
+        if let Some(g) = gguf_path(dir) {
+            let r = burn_gguf::GgufReader::open(&g).map_err(|e| anyhow!("gguf {}: {e}", g.display()))?;
+            tracing::info!("GGUF {} (arch {:?}, {} tensors)", g.display(), r.architecture(), r.tensors().len());
+            return Ok(Self { maps: vec![], index: HashMap::new(), gguf: Some(Arc::new(r)), device, dtype, keep_quant });
+        }
         let mut files = vec![];
         let idx = dir.join("model.safetensors.index.json");
         if idx.exists() {
@@ -36,12 +78,29 @@ impl Weights {
             }
             maps.push(m);
         }
-        Ok(Self { maps, index, device, dtype })
+        Ok(Self { maps, index, gguf: None, device, dtype, keep_quant })
     }
 
-    pub fn has(&self, name: &str) -> bool { self.index.contains_key(name) }
+    pub fn is_gguf(&self) -> bool { self.gguf.is_some() }
+    pub fn gguf(&self) -> Option<&burn_gguf::GgufReader> { self.gguf.as_deref() }
 
+    pub fn has(&self, name: &str) -> bool {
+        match &self.gguf { Some(r) => r.tensor(&hf_to_gguf(name)).is_some(), None => self.index.contains_key(name) }
+    }
+
+    /// A float tensor in the model dtype (quantized GGUF data is dequantized).
     pub fn get<const D: usize>(&self, name: &str) -> Result<Tensor<D>> {
+        let opts = TensorCreationOptions::new(self.device.clone()).with_dtype(self.dtype);
+        if let Some(r) = &self.gguf {
+            let g = hf_to_gguf(name);
+            let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
+            let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+            if shape.len() != D { bail!("{name}: expected rank {D}, got {shape:?}"); }
+            let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+            let vals = burn_gguf::dequantize_checked(info.tensor_type, &bytes, info.num_elements().map_err(|e| anyhow!("{e}"))?)
+                .map_err(|e| anyhow!("{g}: {e}"))?;
+            return Ok(Tensor::from_data(TensorData::new(vals, shape), opts));
+        }
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
         let st = SafeTensors::deserialize(&self.maps[i])?;
         let v = st.tensor(name)?;
@@ -54,6 +113,23 @@ impl Weights {
         let shape = v.shape().to_vec();
         if shape.len() != D { bail!("{name}: expected rank {D}, got {:?}", shape); }
         let data = TensorData::from_bytes_vec(v.data().to_vec(), shape, dt);
-        Ok(Tensor::from_data(data, TensorCreationOptions::new(self.device.clone()).with_dtype(self.dtype)))
+        Ok(Tensor::from_data(data, opts))
+    }
+
+    /// A `[out, in]` linear weight kept packed when the GGUF type has an exact Burn scheme
+    /// (Q8_0 -> Q8F block 32, f16 scales). `None` means: use [`Self::get`].
+    pub fn get_quantized(&self, name: &str) -> Result<Option<Tensor<2>>> {
+        let Some(r) = &self.gguf else { return Ok(None) };
+        if !self.keep_quant { return Ok(None); }
+        let g = hf_to_gguf(name);
+        let info = r.tensor(&g).with_context(|| format!("missing tensor {name} (gguf {g})"))?;
+        let Some(scheme) = info.tensor_type.to_quant_scheme() else { return Ok(None) };
+        if info.tensor_type != burn_gguf::GgmlType::Q8_0 { return Ok(None); }
+        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        let n = info.num_elements().map_err(|e| anyhow!("{e}"))?;
+        let bytes = r.tensor_bytes(info).map_err(|e| anyhow!("{g}: {e}"))?;
+        let packed = burn_gguf::repack_to_burn(info.tensor_type, &bytes, scheme, n).map_err(|e| anyhow!("{g}: {e}"))?;
+        let data = TensorData::from_bytes_vec(packed, shape, DType::QFloat(scheme));
+        Ok(Some(Tensor::from_data(data, TensorCreationOptions::new(self.device.clone()))))
     }
 }

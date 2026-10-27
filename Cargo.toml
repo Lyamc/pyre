@@ -75,6 +75,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 memmap2 = "0.9"
+# GGUF (Q8_0 kept packed as Burn Q8F blocks; K-quants dequantized). Local port of Lyamc/burn-gguf to the burn fork.
+burn-gguf = { path = "../burn-gguf", default-features = false, features = ["std", "memmap"] }
 toml = "0.9"
 sha2 = "0.10"
 same-file = "1"

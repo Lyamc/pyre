@@ -15,7 +15,7 @@ const PREFILL_BUCKET: usize = 64;
 struct Lin { w: Tensor<2>, b: Option<Tensor<1>> }
 impl Lin {
     fn load(ws: &Weights, p: &str, bias: bool) -> Result<Self> {
-        let w: Tensor<2> = ws.get(&format!("{p}.weight"))?;
+        let w: Tensor<2> = match ws.get_quantized(&format!("{p}.weight"))? { Some(q) => q, None => ws.get(&format!("{p}.weight"))? };
         let b = if bias { Some(ws.get(&format!("{p}.bias"))?) } else { None };
         Ok(Self { w: w.transpose(), b })
     }
