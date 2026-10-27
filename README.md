@@ -42,7 +42,7 @@ pyre **reuses the standard Hugging Face hub cache in place**, so a model you alr
 * **pyre store** (`--models-dir` > `PYRE_MODELS_DIR` > `models_dir` in the config file `%APPDATA%\pyre\config.toml` / `~/.config/pyre/config.toml` > `%LOCALAPPDATA%\pyre\models` / `~/.local/share/pyre/models`). The layout is `<kind>/<org>/<name>/<rev>/` plus `pyre-model.toml` (source repo/revision, kind, architecture, dtype, files with sizes and sha256, import mode, optional alias).
   * `import --link` (default) hardlinks the files, so they take **no extra space**. If hardlinks fail (different volume) it falls back to symlinks, then to copying, and it tells you which it used.
   * `--copy` copies the files. `--move` takes them out of the cache. `--register` records a local folder in place and copies nothing.
-* Search order for `-m`: explicit path ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ store alias/name ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ HF cache ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ download (unless offline). Change it with `--search-order path,store,hf,download` or `search_order = [...]` in the config file.
+* Search order for `-m`: explicit path ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ store alias/name ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ HF cache ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ download (unless offline). Change it with `--search-order path,store,hf,download` or `search_order = [...]` in the config file.
 
 ```text
 pyre models list [--json]
@@ -131,7 +131,7 @@ not pushed; its 168 tests pass). Weights stay **packed on the GPU** (`src/model/
 - Q5_0 -> Q8F block 32, exact.
 - Q6_K -> Q8F block 16 with f32 scales, exact.
 - Q4_K -> Q4F block 32 with the exact f32 sub-block scale and q-8, plus a per-block offset matrix C
-  (`[out, in/32]`). The linear becomes `xÃƒâ€šÃ‚Â·W'ÃƒÂ¡Ã‚ÂµÃ¢â€šÂ¬ + blocksum32(x)Ãƒâ€šÃ‚Â·CÃƒÂ¡Ã‚ÂµÃ¢â€šÂ¬`.
+  (`[out, in/32]`). The linear becomes `xÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·W'ÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂµÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ + blocksum32(x)ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·CÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂµÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬`.
 
 `PYRE_GGUF_KQUANT=0` dequantizes the K/Q5 types at load; `PYRE_GGUF_DEQUANT=1` dequantizes everything.
 Burn's quantized matmul dequantizes each weight inside the op (no hand-written fused int4 kernel), so
@@ -142,7 +142,7 @@ RTX 3060, CUDA, util cap off (`scripts/gguf_bench.ps1`; extra VRAM after load + 
 | model | packed | dequantized | Q8_0 | bf16 safetensors |
 |---|---|---|---|---|
 | Qwen2.5-0.5B Q4_K_M | +991 MiB, 43.4 tok/s | +1376 MiB, 46.4 tok/s | +1040 MiB, 48.9 tok/s | +1376 MiB, 45.8 tok/s |
-| Qwen2.5-1.5B Q4_K_M | +2863 MiB, 28.2 tok/s | +3759 MiB, 28.5 tok/s | +2760 MiB, 38.4 tok/s | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â |
+| Qwen2.5-1.5B Q4_K_M | +2863 MiB, 28.2 tok/s | +3759 MiB, 28.5 tok/s | +2760 MiB, 38.4 tok/s | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
 
 All outputs are coherent text. In the 0.5B Q4_K_M file most tensors are Q5_0 (896 is not a multiple of 256).
 In the 1.5B file, packing saves ~0.9 GB. It still doesn't beat Q8_0, because Burn's memory pool keeps
@@ -158,33 +158,33 @@ fork (based on 9db7598). The changes live in `burn-cubecl/src/kernel/matmul/fuse
   PackedU32`, Q4_K/Q5_0, block 32; `Q8F/Q8S Native`, Q8_0/Q6_K, block 32/16). It reads the
   packed words and the f32 block scales straight from the weight's own buffers, so it never
   creates a dequantized copy. It handles row-pitched buffers and broadcast leading dims.
-- **Decode, m ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤ 8 (the default).** A GEMV: one 32-lane plane per output column, 8 columns per
+- **Decode, m ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¤ 8 (the default).** A GEMV: one 32-lane plane per output column, 8 columns per
   cube, and `plane_sum` to reduce.
-- **Prefill.** A 64ÃƒÆ’Ã¢â‚¬â€64 shared-memory tiled GEMM exists, but it is opt-in (`BURN_FQ_GEMM=1`)
-  because it is 6ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“11ÃƒÆ’Ã¢â‚¬â€ slower than dequantize + cubek's matmul (q4 8960ÃƒÆ’Ã¢â‚¬â€1536, m=300: 6.6 ms vs
+- **Prefill.** A 64ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â64 shared-memory tiled GEMM exists, but it is opt-in (`BURN_FQ_GEMM=1`)
+  because it is 6ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ11ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â slower than dequantize + cubek's matmul (q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536, m=300: 6.6 ms vs
   0.64 ms). Prefill therefore still dequantizes, and only temporarily, one layer at a time.
 - **Switches.** `BURN_FUSED_QMATMUL=0` turns the whole thing off, which also stops
   burn-cubecl-fusion from capturing the matmul. `BURN_FQ_GEMV_MAX=<m>` lowers the GEMV cutoff.
 - **Exactness.** `cargo test --release --features cuda,wgpu,stt,image fused_qmatmul -- --ignored
   --nocapture` (`PYRE_TEST_BACKEND=wgpu` for wgpu) compares against bf16 dequant + matmul and
-  checks that the fused kernel really was launched. Max relative error is 3.5e-3ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“6.9e-3 on CUDA
-  bf16, the same as the unfused path, and 4e-4ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“9e-4 on wgpu f16. m=1,4,8 run fused; m=37,300
+  checks that the fused kernel really was launched. Max relative error is 3.5e-3ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ6.9e-3 on CUDA
+  bf16, the same as the unfused path, and 4e-4ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ9e-4 on wgpu f16. m=1,4,8 run fused; m=37,300
   run unfused.
 - **Portability.** The kernel runs on wgpu (Vulkan, f16) as well as CUDA. On wgpu, Q8 Native
   (i8 storage) does not compile even for plain dequantize, so only Q4 is tested there.
 
-Kernel microbenchmarks (m=1, Ãƒâ€šÃ‚Âµs):
+Kernel microbenchmarks (m=1, ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âµs):
 
 | shape | CUDA fused | CUDA unfused | CUDA bf16 | wgpu fused | wgpu unfused | wgpu f16 |
 |---|---|---|---|---|---|---|
-| q4 896ÃƒÆ’Ã¢â‚¬â€896 | 9.8 | 40.4 | 13.6 | 8.9 | 104.8 | 21.3 |
-| q8 4864ÃƒÆ’Ã¢â‚¬â€896 | 20.2 | 22.5 | 30.1 | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â |
-| q8/b16 1536ÃƒÆ’Ã¢â‚¬â€8960 | 85.2 | 68.4 | 98.6 | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â |
-| q4 8960ÃƒÆ’Ã¢â‚¬â€1536 | 427 | 492 | 97 | 47 | 283 | 150 |
+| q4 896ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â896 | 9.8 | 40.4 | 13.6 | 8.9 | 104.8 | 21.3 |
+| q8 4864ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â896 | 20.2 | 22.5 | 30.1 | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
+| q8/b16 1536ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â8960 | 85.2 | 68.4 | 98.6 | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
+| q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536 | 427 | 492 | 97 | 47 | 283 | 150 |
 
 End to end on CUDA (`scripts/fq_bench.ps1`): decode tok/s over 3 runs of 256 tokens, with
 `PYRE_GPU_UTIL_MAX=100 PYRE_LOW_PRIORITY=0`, and VRAM above the idle baseline. The desktop was
-in use during these runs (all of them are well below this README's earlier ~41ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“48 tok/s), so
+in use during these runs (all of them are well below this README's earlier ~41ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ48 tok/s), so
 compare rows with each other, not with the older table.
 
 | model | fused | unfused (`BURN_FUSED_QMATMUL=0`) |
@@ -197,14 +197,14 @@ compare rows with each other, not with the older table.
 
 Results against the goal:
 
-- The fused kernel speeds up decode by 10ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“18%.
+- The fused kernel speeds up decode by 10ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ18%.
 - On 1.5B Q4_K_M it removes the temporary dequant memory: 856 MiB less VRAM than unfused, and
   less than Q8_0.
 - **Q4_K_M is still not faster than Q8_0 at decode.** Two reasons:
   - At these sizes decode is bound by launch and host overhead, not by weight bandwidth. bf16
     runs at the same speed.
   - pyre's Q4_K layout adds an offset matmul per projection.
-  - The q4 8960ÃƒÆ’Ã¢â‚¬â€1536 shape (the MLP down-projection) is also slower than bf16 in the GEMV on
+  - The q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536 shape (the MLP down-projection) is also slower than bf16 in the GEMV on
     CUDA. That shape is the next thing to tune.
 - 1.5B bf16 was not measured, because it is not downloaded locally.
 ## Decode launch overhead
@@ -214,11 +214,19 @@ two matmuls fewer per token (`PYRE_FUSE_PROJ=0` disables; packed Q8 / Q4_K-offse
 RoPE's rotate_half is one flip with the sign folded into the sin table. Qwen2.5-0.5B bf16 on CUDA, same
 greedy output: 16.8 -> 21.0 tok/s (noisy: desktop in use, default GPU limits on).
 
+The fused weights are joined on the host and uploaded once (a device-side `cat` left ~220 MiB of freed
+inputs in the allocator pool). GGUF: same-type packed weights (Q8_0, Q4_K, Q5_0, Q6_K) are stacked
+before repacking, so q/k/v and gate/up become one fused GEMV plus, for Q4_K, one block-offset matmul
+(mixed types such as Q4_K q/k + Q6_K v stay separate). Qwen2.5-1.5B, CUDA, same output: Q4_K_M
+15.9 -> ~18 tok/s and -220 MiB; Q8_0 20.3 -> ~25 tok/s. The KV cache is updated in place (no measurable
+change at one sequence). Folding the Q4_K offset into the fused kernel itself would need Burn's quant
+scheme to carry a per-block offset; not done.
+
 ## Continuous batching
 
 The engine (`src/engine.rs`) runs up to `PYRE_PARALLEL` (default 8) sequences per decode step,
 with a KV-cache pool reused by longest common prefix. Aggregate tok/s, Qwen2.5-0.5B on CUDA, 128 tokens
-(`scripts/bench_concurrency.py`): 1 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 26.9, 4 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 80.6, 8 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 129.0 (bf16); in f32, 27.2 / 70.4 / 127.4,
+(`scripts/bench_concurrency.py`): 1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 26.9, 4 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 80.6, 8 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 129.0 (bf16); in f32, 27.2 / 70.4 / 127.4,
 and batched output is identical to solo output.
 
 ## Gemma 2/3 and Qwen3-MoE
@@ -259,11 +267,11 @@ pyre leaves room for the desktop and other apps:
   - Image generation at a new, larger size is checked first.
 - `--gpu-util-max 90` / `PYRE_GPU_UTIL_MAX`: duty-cycle cap; `100` or `0` disables.
   - After each decode step, prefill chunk and diffusion step, the worker syncs the device and sleeps
-    `busyÃƒâ€šÃ‚Â·(100-u)/u`.
+    `busyÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·(100-u)/u`.
   - Prefill runs in 512-token chunks (`PYRE_PREFILL_CHUNK`), so no submission runs long. This is gentler
     on the driver watchdog.
   - The process runs at below-normal priority (`PYRE_LOW_PRIORITY=0` turns that off).
-- Current limits and usage are in `/api/status` ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ `limits`, on the web UI Status page and on the GPUI Status page.
+- Current limits and usage are in `/api/status` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ `limits`, on the web UI Status page and on the GPUI Status page.
 
 Cost of the defaults (RTX 3060):
 
