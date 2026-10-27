@@ -373,7 +373,10 @@ impl PyreGui {
     }
 
     fn status_page(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let pretty = serde_json::to_string_pretty(&self.status).unwrap_or_default();
+        let l = &self.status["limits"];
+        let limits = if l.is_null() { "GPU limits: n/a".to_string() } else { format!("GPU limits: VRAM reserve {} MiB (free {}/{} MiB, headroom {} MiB) | util cap {}% (now {}%, throttled {:.1} s)",
+            l["vram_reserve_mib"], l["vram_free_mib"], l["vram_total_mib"], l["vram_headroom_mib"], l["gpu_util_max_pct"], l["gpu_util_now_pct"], l["throttled_s"].as_f64().unwrap_or(0.0)) };
+        let pretty = format!("{limits}\n\n{}", serde_json::to_string_pretty(&self.status).unwrap_or_default());
         div().flex().flex_col().size_full().gap(px(10.))
             .child(div().flex().gap(px(8.)).child(self.input(Field::Server, &self.server, "server URL", cx)).child(self.button("connect", "Connect", true, cx, |t| { t.refresh_status(); t.refresh_models(); })))
             .child(div().id("status-scroll").flex_1().overflow_y_scroll().p(px(10.)).rounded_md().bg(rgb(PANEL)).text_sm().child(pretty))

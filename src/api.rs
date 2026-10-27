@@ -176,7 +176,8 @@ async fn status(State(app): S) -> Json<Value> {
         "gpus": gpus, "ram": {"process_rss": rss, "total": sys.total_memory(), "used": sys.used_memory()},
         "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>(),
         "store_root": app.storage.store.root, "hf_cache": app.storage.hf_cache,
-        "batching": "single worker per model; continuous batching is TODO",
+        "limits": crate::limits::status(),
+        "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
     }))
 }
 

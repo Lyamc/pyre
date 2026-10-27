@@ -14,6 +14,7 @@ mod store;
 mod model;
 mod sampler;
 mod server;
+mod limits;
 mod template;
 
 use anyhow::{Context, Result};
@@ -96,6 +97,12 @@ pub struct ServeArgs {
     /// Load + one greedy generation, print it and exit (for benchmarking / sanity checks)
     #[arg(long)]
     pub prompt: Option<String>,
+    /// VRAM kept free for other apps, e.g. 1G or 512M (default max(1 GiB, 10% of VRAM); 0 disables). Env PYRE_VRAM_RESERVE
+    #[arg(long = "vram-reserve")]
+    pub vram_reserve: Option<String>,
+    /// Max GPU duty cycle in percent (default 90; 100 or 0 disables). Env PYRE_GPU_UTIL_MAX
+    #[arg(long = "gpu-util-max")]
+    pub gpu_util_max: Option<u32>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -172,6 +179,9 @@ fn load_llm_parts(dir: &std::path::Path, backend_name: &str, dtype: &str, ctx_si
 
 fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     use registry::{Kind, LoadReq};
+    limits::init(args.vram_reserve.as_deref(), args.gpu_util_max);
+    #[cfg(feature = "image")]
+    let _ = pyre_sd::pipelines::stable_diffusion::STEP_HOOK.set(limits::pace);
     let defaults = registry::LoadDefaults { backend: args.backend.clone(), dtype: args.dtype.clone(), ctx_size: args.ctx_size, n_predict: args.n_predict };
     // collect (kind, ref)
     let mut want: Vec<(Kind, String)> = args.model.iter().map(|m| (Kind::Llm, m.clone())).collect();

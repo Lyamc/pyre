@@ -185,6 +185,12 @@ impl Llama {
         Ok(Self { cfg, arch, device, dtype, max_ctx: ctx, embed, lm_head, layers, norm, cos, sin, cos_l, sin_l, gemma, embed_scale, attn_scale, attn_softcap, final_softcap })
     }
 
+    /// Bytes of one full-context KV cache (K and V for every layer).
+    pub fn kv_bytes_per_seq(&self) -> u64 {
+        let el = if matches!(self.dtype, FloatDType::F32) { 4 } else { 2 };
+        (self.cfg.num_hidden_layers * 2 * self.cfg.n_kv_heads() * self.max_ctx * self.cfg.head_dim() * el) as u64
+    }
+
     pub fn new_cache(&self) -> KvCache {
         let shape = [1, self.cfg.n_kv_heads(), self.max_ctx, self.cfg.head_dim()];
         let opts = TensorCreationOptions::new(self.device.clone()).with_dtype(DType::from(self.dtype));

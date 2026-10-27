@@ -6152,9 +6152,11 @@ dependencies = [
  "half",
  "hf-hub 1.0.0",
  "image",
+ "libc",
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "nvml-wrapper",
  "pyre-sd",
  "pyre-whisper-audio",
  "pyre-whisper-core",
@@ -6174,6 +6176,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

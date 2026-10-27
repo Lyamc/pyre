@@ -107,8 +107,36 @@ impl App {
 
 pub struct LoadReq<'a> { pub kind: Kind, pub r: &'a str, pub alias: Option<String>, pub backend: Option<String>, pub dtype: Option<String>, pub ctx_size: Option<usize> }
 
-/// Resolve + load a model (blocking; run on a blocking thread from async code).
+/// Resolve + load a model (blocking; run on a blocking thread from async code). Refuses loads that
+/// would breach the VRAM reserve (estimate from the weight files first, then the measured result).
 pub fn load(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
+    let gpu = !matches!(q.backend.as_deref().unwrap_or(&d.backend), "cpu" | "flex" | "ndarray");
+    let m = load_inner(storage, d, q)?;
+    if gpu && crate::limits::headroom() == Some(0) {
+        let v = crate::limits::vram();
+        drop(m);
+        anyhow::bail!("loading this model left only {} MiB of VRAM free, below the {} MiB reserve for other apps; it was unloaded (lower --vram-reserve / PYRE_VRAM_RESERVE, or unload another model)",
+            v.map(|v| v.free >> 20).unwrap_or(0), crate::limits::reserve() >> 20);
+    }
+    Ok(m)
+}
+
+/// Sum of weight-file sizes under dir (a rough lower bound on the model's VRAM).
+fn weight_bytes(dir: &std::path::Path) -> u64 {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); continue; }
+            if matches!(p.extension().and_then(|e| e.to_str()), Some("safetensors" | "gguf" | "mpk" | "bin")) { n += e.metadata().map(|m| m.len()).unwrap_or(0); }
+        }
+    }
+    n
+}
+
+fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
     let backend = q.backend.clone().unwrap_or_else(|| d.backend.clone());
     if q.kind == Kind::Stt {
         // STT bundles are whisburn-format (converted .mpk), resolved by the whisburn adapter.
@@ -119,6 +147,7 @@ pub fn load(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
     }
     let (dir, src) = storage.resolver().resolve(q.r)?;
     tracing::info!("resolved {} -> {} (via {src:?})", q.r, dir.display());
+    if !matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { crate::limits::check_alloc(weight_bytes(&dir), &format!("loading '{}'", q.r))?; }
     let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
     let inner = match q.kind {
         Kind::Llm => Inner::Llm(Arc::new(crate::load_llm(&dir, &id, &backend, q.dtype.as_deref().unwrap_or(&d.dtype), q.ctx_size.unwrap_or(d.ctx_size), d.n_predict)?)),

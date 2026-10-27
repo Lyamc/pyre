@@ -547,6 +547,7 @@ pub fn generate_image_ddim(
 
     // Diffusion loop
     for &timestep in scheduler.timesteps().iter() {
+        let t_step = std::time::Instant::now();
         // Duplicate latents for classifier-free guidance (uncond + cond)
         let latent_model_input = Tensor::cat(vec![latents.clone(), latents.clone()], 0);
 
@@ -566,11 +567,16 @@ pub fn generate_image_ddim(
 
         // Scheduler step
         latents = scheduler.step(&noise_pred, timestep, &latents);
+        if let Some(h) = STEP_HOOK.get() { let _ = device.sync(); h(t_step); }
     }
 
     // Decode latents to image
     pipeline.decode_latents(latents)
 }
+
+/// Called after each denoising step (after a device sync) with the step's start time; the host
+/// uses it for GPU duty-cycle pacing.
+pub static STEP_HOOK: std::sync::OnceLock<fn(std::time::Instant)> = std::sync::OnceLock::new();
 
 /// Generate an image using the Euler Discrete scheduler.
 ///

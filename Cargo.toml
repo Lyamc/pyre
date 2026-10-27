@@ -82,6 +82,7 @@ toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
 sysinfo = "0.37"
+nvml-wrapper = "0.13"
 # Image generation: Stable Diffusion, vendored from oxiglade/diffusers-burn (MIT/Apache) and ported to the workspace Burn.
 pyre-sd = { path = "crates/pyre-sd", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
@@ -108,3 +109,9 @@ opt-level = 3
 [patch."https://github.com/tracel-ai/cubecl"]
 cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
 
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

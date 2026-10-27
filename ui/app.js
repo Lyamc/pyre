@@ -227,13 +227,19 @@ $("#ttsGo").onclick = async () => {
 };
 
 // ---------- status ----------
+function limitsText(l) {
+  if (!l) return "n/a";
+  const v = l.vram_enforced ? `reserve ${l.vram_reserve_mib} MiB · free ${l.vram_free_mib}/${l.vram_total_mib} MiB · headroom ${l.vram_headroom_mib} MiB` : `VRAM reserve off or not measurable (${l.vram_reserve_mib} MiB)`;
+  const u = l.gpu_util_max_pct >= 100 ? "no duty-cycle cap" : `GPU util cap ${l.gpu_util_max_pct}% (now ${l.gpu_util_now_pct ?? "?"}%, throttled ${l.throttled_s.toFixed(1)} s)`;
+  return v + "<br>" + u + (l.low_priority ? " · low process priority" : "");
+}
 async function loadStatus() {
   try {
     const s = await api("/api/status");
     const g = s.gpus.map(g => `${g.name} — ${g.memory_used_mib}/${g.memory_total_mib} MiB VRAM, ${g.utilization_pct}% util`).join("<br>") || "n/a";
     $("#statusBox").innerHTML = [["version", `pyre ${s.version} (Burn ${s.burn})`], ["default backend", s.default_backend], ["compiled backends", s.backends_compiled.join(", ")], ["GPU", g],
       ["RAM", `process ${human(s.ram.process_rss)} · system ${human(s.ram.used)} / ${human(s.ram.total)}`], ["uptime", s.uptime_s + " s"], ["auth", s.auth ? "API key required" : "open"],
-      ["store", s.store_root], ["HF cache", s.hf_cache], ["batching", s.batching]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
+      ["store", s.store_root], ["HF cache", s.hf_cache], ["GPU limits", limitsText(s.limits)], ["batching", s.batching]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
     $("#slotsTbl tbody").innerHTML = s.models.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${m.busy}</td><td>${m.queued}</td></tr>`).join("");
     const base = location.origin; const model = s.models.find(m => m.kind === "llm")?.id || "model"; const key = s.auth ? "$PYRE_API_KEY" : "none";
     $("#apiSnippet").textContent = `# curl

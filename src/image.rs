@@ -30,6 +30,7 @@ pub struct ImageModel {
     tok: SimpleTokenizer,
     pub busy: AtomicBool,
     pub queued: AtomicU64,
+    max_area: AtomicU64,
     /// Wall time of the load-time warm-up image (kernel compile / autotune), if one ran.
     pub warmup_secs: Option<f64>,
 }
@@ -79,7 +80,7 @@ impl ImageModel {
             other => bail!("image generation supports --backend cuda, wgpu or vulkan (got '{other}'; SD on CPU would take many minutes per image)"),
         };
         let pipe = build(dir, dev)?;
-        let mut me = Self { dir: dir.to_path_buf(), backend: label.into(), pipe: Mutex::new(pipe), tok, busy: AtomicBool::new(false), queued: AtomicU64::new(0), warmup_secs: None };
+        let mut me = Self { dir: dir.to_path_buf(), backend: label.into(), pipe: Mutex::new(pipe), tok, busy: AtomicBool::new(false), queued: AtomicU64::new(0), max_area: AtomicU64::new(0), warmup_secs: None };
         // Warm-up: the first image compiles + autotunes every kernel. Doing it at load time (with
         // the persistent CubeCL cache on disk) moves that cost off the first user request.
         if std::env::var("PYRE_SD_WARMUP").map(|v| v != "0").unwrap_or(true) {
@@ -102,6 +103,12 @@ impl ImageModel {
     #[cfg(feature = "image")]
     pub fn generate(&self, q: &GenParams) -> Result<Generated> {
         if q.width % 8 != 0 || q.height % 8 != 0 || q.width < 64 || q.height < 64 || q.width > 1024 || q.height > 1024 { bail!("width/height must be multiples of 8 in 64..=1024"); }
+        // Burn's memory pool reuses buffers, so only a larger image than any before needs new VRAM.
+        let area = (q.width * q.height) as u64;
+        let seen = self.max_area.load(Ordering::SeqCst);
+        if area > seen {
+            crate::limits::check_alloc(if seen == 0 { 2048 << 20 } else { (2048u64 << 20) * (area - seen) / seen.max(1) }, "an image generation at this size")?;
+        }
         let mut g = self.pipe.lock().unwrap();
         self.queued.fetch_sub(1, Ordering::SeqCst);
         self.busy.store(true, Ordering::SeqCst);
@@ -109,6 +116,7 @@ impl ImageModel {
         let r = gen(&mut g, &self.tok, q);
         self.busy.store(false, Ordering::SeqCst);
         let png = r.context("stable diffusion")?;
+        self.max_area.fetch_max(area, Ordering::SeqCst);
         Ok(Generated { png, seconds: t.elapsed().as_secs_f64(), seed: q.seed })
     }
 }
