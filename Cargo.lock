@@ -6134,6 +6134,7 @@ dependencies = [
  "pyre-whisper-engine",
  "pyre-whisper-models",
  "rand 0.9.5",
+ "rayon",
  "safetensors",
  "same-file",
  "serde",

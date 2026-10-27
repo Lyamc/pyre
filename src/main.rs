@@ -18,6 +18,8 @@ mod limits;
 mod template;
 mod qn_cli;
 mod apps;
+mod engine_qn;
+mod qn_find;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -155,11 +157,49 @@ fn main() -> Result<()> {
 
 /// Load one text-generation model and start its worker.
 pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
+    if qn_find::is_qwen4exp(dir) { return load_qn(dir, id, n_predict); }
     let (llama, tok, template, eos, bname, fdt) = load_llm_parts(dir, backend_name, dtype, ctx_size)?;
     let n_ctx = llama.max_ctx;
     let engine = engine::spawn(llama, tok.clone(), eos);
     Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: dir.display().to_string(), n_ctx,
         backend: bname.to_string(), dtype: format!("{fdt:?}"), default_max_tokens: n_predict })
+}
+
+/// rayon pool for the CPU GGUF path (PYRE_QN_THREADS, default 16 of the 13900K's 32 threads).
+pub fn qn_threads() {
+    let n = std::env::var("PYRE_QN_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+}
+
+/// Tokenizer, chat template and EOS ids for a qwen4exp GGUF (from the base model's HF files).
+pub fn qn_text_parts(f: &std::path::Path, m: &model::qwen4exp_gguf::Model) -> Result<(Arc<tokenizers::Tokenizer>, template::ChatTemplate, Vec<u32>)> {
+    let base = m.g.meta.get("general.base_model.0.repo_url").and_then(|v| v.as_str()).map(String::from);
+    let tdir = qn_find::tokenizer_dir(f, base.as_deref())?;
+    let tok = Arc::new(tokenizers::Tokenizer::from_file(tdir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
+    let template = template::ChatTemplate::from_model_dir(&tdir)?;
+    let mut eos = vec![];
+    if let Ok(g) = std::fs::read_to_string(tdir.join("generation_config.json")) {
+        if let Ok(g) = serde_json::from_str::<serde_json::Value>(&g) { eos.extend(ids(&g.get("eos_token_id").cloned())); }
+    }
+    for t in [template.eos_token.as_str(), "<|im_end|>"] { if let Some(i) = tok.token_to_id(t) { eos.push(i); } }
+    eos.sort(); eos.dedup();
+    Ok((tok, template, eos))
+}
+
+/// Qwen3.8-Flash-Next GGUF: CPU engine, experts quantized in the mmap (see model::qwen4exp_gguf).
+fn load_qn(dir: &std::path::Path, id: &str, n_predict: usize) -> Result<server::Llm> {
+    let f = qn_find::find_gguf(dir).context("no .gguf found")?;
+    qn_threads();
+    let t = std::time::Instant::now();
+    let m = model::qwen4exp_gguf::Model::load(&f)?;
+    tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | CPU, {} threads, experts stay quantized (mmap)",
+        f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
+    let (tok, template, eos) = qn_text_parts(&f, &m)?;
+    tracing::info!("eos ids {eos:?}");
+    let n_ctx = m.max_ctx();
+    let engine = engine_qn::spawn(Arc::new(m), tok.clone(), eos);
+    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: f.display().to_string(), n_ctx,
+        backend: "cpu".into(), dtype: "gguf".into(), default_max_tokens: n_predict })
 }
 
 #[allow(clippy::type_complexity)]

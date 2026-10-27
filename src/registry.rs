@@ -150,7 +150,7 @@ fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
     }
     let (dir, src) = storage.resolver().resolve(q.r)?;
     tracing::info!("resolved {} -> {} (via {src:?})", q.r, dir.display());
-    if !matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { crate::limits::check_alloc(weight_bytes(&dir), &format!("loading '{}'", q.r))?; }
+    if !matches!(backend.as_str(), "cpu" | "flex" | "ndarray") && !crate::qn_find::is_qwen4exp(&dir) { crate::limits::check_alloc(weight_bytes(&dir), &format!("loading '{}'", q.r))?; }
     let id = q.alias.clone().unwrap_or_else(|| q.r.to_string());
     let inner = match q.kind {
         Kind::Llm => Inner::Llm(Arc::new(crate::load_llm(&dir, &id, &backend, q.dtype.as_deref().unwrap_or(&d.dtype), q.ctx_size.unwrap_or(d.ctx_size), d.n_predict)?)),
