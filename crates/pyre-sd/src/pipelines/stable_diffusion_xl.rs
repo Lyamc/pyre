@@ -245,7 +245,7 @@ pub fn generate_image_sdxl_ddim(
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
     // Seed the random number generator for reproducibility
-        device.seed(seed);
+    device.seed(seed);
 
     // Convert tokens to tensors
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();

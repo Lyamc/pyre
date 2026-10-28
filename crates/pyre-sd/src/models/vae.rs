@@ -123,7 +123,7 @@ impl Encoder {
         }
 
         let xs = self.mid_block.forward(xs, None);
-        let xs = self.conv_norm_out.forward(xs);
+        let xs = super::ops::group_norm(&self.conv_norm_out, xs);
         let xs = silu(xs);
         self.conv_out.fwd(xs)
     }
@@ -226,7 +226,7 @@ impl Decoder {
             xs = up_block.forward(xs);
         }
 
-        let xs = self.conv_norm_out.forward(xs);
+        let xs = super::ops::group_norm(&self.conv_norm_out, xs);
         let xs = silu(xs);
         self.conv_out.fwd(xs)
     }
@@ -269,11 +269,11 @@ impl DiagonalGaussianDistribution {
     ///
     /// z = mean + std * epsilon, where epsilon ~ N(0, 1)
     pub fn sample(&self) -> Tensor<4> {
-        let noise: Tensor<4> = Tensor::random(
+        let noise: Tensor<4> = Tensor::<4>::cast(Tensor::random(
             self.mean.shape(),
             Distribution::Normal(0.0, 1.0),
             &self.mean.device(),
-        );
+        ), self.mean.dtype());
         self.mean.clone() + self.std.clone() * noise
     }
 
@@ -303,6 +303,11 @@ pub struct AutoEncoderKLConfig {
     /// Number of groups for group normalization.
     #[config(default = 32)]
     pub norm_num_groups: usize,
+    /// SD 1.x and SDXL have these 1x1 convolutions. SD3's VAE does not.
+    #[config(default = true)]
+    pub use_quant_conv: bool,
+    #[config(default = true)]
+    pub use_post_quant_conv: bool,
 }
 
 /// AutoEncoder with KL divergence loss (VAE).
@@ -313,8 +318,8 @@ pub struct AutoEncoderKLConfig {
 pub struct AutoEncoderKL {
     encoder: Encoder,
     decoder: Decoder,
-    quant_conv: Conv2d,
-    post_quant_conv: Conv2d,
+    quant_conv: Option<Conv2d>,
+    post_quant_conv: Option<Conv2d>,
 }
 
 impl AutoEncoderKLConfig {
@@ -349,13 +354,15 @@ impl AutoEncoderKLConfig {
         .with_norm_num_groups(self.norm_num_groups)
         .init(device);
 
-        // 1x1 convolutions for quantization
-        let quant_conv =
+        // 1x1 convolutions for quantization. Absent on the SD3 VAE.
+        let quant = || {
             Conv2dConfig::new([2 * self.latent_channels, 2 * self.latent_channels], [1, 1])
-                .init(device);
-
-        let post_quant_conv =
-            Conv2dConfig::new([self.latent_channels, self.latent_channels], [1, 1]).init(device);
+                .init(device)
+        };
+        let post =
+            || Conv2dConfig::new([self.latent_channels, self.latent_channels], [1, 1]).init(device);
+        let quant_conv = self.use_quant_conv.then(quant);
+        let post_quant_conv = self.use_post_quant_conv.then(post);
 
         AutoEncoderKL {
             encoder,
@@ -372,13 +379,19 @@ impl AutoEncoderKL {
     /// Returns a DiagonalGaussianDistribution that can be sampled from.
     pub fn encode(&self, xs: Tensor<4>) -> DiagonalGaussianDistribution {
         let parameters = self.encoder.forward(xs);
-        let parameters = self.quant_conv.fwd(parameters);
+        let parameters = match &self.quant_conv {
+            Some(conv) => conv.fwd(parameters),
+            None => parameters,
+        };
         DiagonalGaussianDistribution::new(parameters)
     }
 
     /// Decode latent vectors back to images.
     pub fn decode(&self, xs: Tensor<4>) -> Tensor<4> {
-        let xs = self.post_quant_conv.fwd(xs);
+        let xs = match &self.post_quant_conv {
+            Some(conv) => conv.fwd(xs),
+            None => xs,
+        };
         self.decoder.forward(xs)
     }
 }
@@ -395,14 +408,14 @@ mod tests {
 
     /// A ModuleMapper that sets weights to one value and biases to another.
     /// Uses the field name from enter_module to distinguish weight vs bias.
-    struct WeightBiasMapper<'a> {
+    struct WeightBiasMapper<'a, > {
         weight_val: f32,
         bias_val: f32,
         device: &'a burn::tensor::Device,
         current_field: String,
     }
 
-    impl<'a> ModuleMapper for WeightBiasMapper<'a> {
+    impl<'a, > ModuleMapper for WeightBiasMapper<'a, B> {
         fn enter_module(&mut self, name: &str, _container_type: &str) {
             self.current_field = name.to_string();
         }

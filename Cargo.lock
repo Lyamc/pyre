@@ -6156,6 +6156,7 @@ dependencies = [
 name = "pyre-sd"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "burn",
  "burn-store",
  "memmap2",

@@ -14,7 +14,9 @@ use burn::tensor::Tensor;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::embeddings::{get_timestep_embedding, TimestepEmbedding, TimestepEmbeddingConfig};
+use super::embeddings::{
+    get_timestep_embedding, timestep_embedding_host, TimestepEmbedding, TimestepEmbeddingConfig,
+};
 use super::unet_2d_blocks::{
     CrossAttnDownBlock2D, CrossAttnDownBlock2DConfig, CrossAttnUpBlock2D, CrossAttnUpBlock2DConfig,
     DownBlock2D, DownBlock2DConfig, UNetMidBlock2DCrossAttn, UNetMidBlock2DCrossAttnConfig,
@@ -418,13 +420,17 @@ impl UNet2DConditionModel {
         };
 
         // 1. Time embedding
-        let timesteps: Tensor<1> = Tensor::full([bsize], timestep as f32, &device);
-        let emb = get_timestep_embedding(
-            timesteps,
+        // Computed on the host in f64: timesteps near 1000 don't fit f16
+        // precisely enough for sin/cos.
+        let emb = timestep_embedding_host(
+            timestep,
+            bsize,
             self.time_proj_channels,
             self.flip_sin_to_cos,
             self.freq_shift,
-        );
+            &device,
+        )
+        .cast(xs.dtype());
         let mut emb = self.time_embedding.forward(emb);
 
         // Augmented embedding for SDXL
@@ -433,14 +439,16 @@ impl UNet2DConditionModel {
             added_cond_kwargs,
             self.addition_time_embed_dim,
         ) {
-            let [bsize_cond, _] = added_cond.text_embeds.dims();
+            let [bsize_cond, n_ids] = added_cond.time_ids.dims();
+            // In f32 (arange follows the device default) and cast to the model dtype after.
             let time_embeds = get_timestep_embedding(
-                added_cond.time_ids.clone().flatten::<1>(0, 1),
+                Tensor::<1>::cast(added_cond.time_ids.clone().flatten::<1>(0, 1), burn::tensor::DType::F32),
                 atd,
                 self.flip_sin_to_cos,
                 self.freq_shift,
             );
-            let time_embeds = time_embeds.reshape([bsize_cond, atd * 6]);
+            // Base SDXL has 6 time ids. The refiner has 5 (it ends with an aesthetic score).
+            let time_embeds = Tensor::<2>::cast(time_embeds.reshape([bsize_cond, atd * n_ids]), added_cond.text_embeds.dtype());
             let add_embeds = Tensor::cat(vec![added_cond.text_embeds.clone(), time_embeds], 1);
             let aug_emb = add_emb.forward(add_embeds);
             emb = emb + aug_emb;
@@ -514,7 +522,7 @@ impl UNet2DConditionModel {
         }
 
         // 6. Post-process
-        let xs = self.conv_norm_out.forward(xs);
+        let xs = super::ops::group_norm(&self.conv_norm_out, xs);
         let xs = silu(xs);
         self.conv_out.fwd(xs)
     }
@@ -530,14 +538,14 @@ mod tests {
 
     /// A ModuleMapper that sets weights to one value and biases to another.
     /// Uses the field name from enter_module to distinguish weight vs bias.
-    struct WeightBiasMapper<'a> {
+    struct WeightBiasMapper<'a, > {
         weight_val: f32,
         bias_val: f32,
         device: &'a burn::tensor::Device,
         current_field: String,
     }
 
-    impl<'a> ModuleMapper for WeightBiasMapper<'a> {
+    impl<'a, > ModuleMapper for WeightBiasMapper<'a, B> {
         fn enter_module(&mut self, name: &str, _container_type: &str) {
             self.current_field = name.to_string();
         }

@@ -7,5 +7,6 @@ pub mod weights;
 #[cfg(feature = "std")]
 pub use weights::{
     download_instructions, load_clip_safetensors, load_clip_with_projection_safetensors,
-    load_unet_safetensors, load_vae_safetensors, WeightLoadError,
+    load_controlnet_safetensors, load_unet_safetensors, load_vae_safetensors, WeightLoadError,
 };
+pub mod engine;

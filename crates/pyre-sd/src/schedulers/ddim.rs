@@ -253,7 +253,7 @@ fn linspace(start: f64, end: f64, steps: usize) -> Vec<f64> {
 
 /// Computes cumulative product and returns as Vec<f64>.
 fn cumprod_vec(tensor: Tensor<1>) -> Vec<f64> {
-    let data = tensor.cast(burn::tensor::FloatDType::F32).into_data();
+    let data = tensor.into_data();
     let values: Vec<f32> = data.to_vec().unwrap();
 
     let mut result = Vec::with_capacity(values.len());
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_linear_beta_schedule() {
-        let device = <TestBackend as Backend>::Device::default();
+        let device = Default::default();
         let config = DDIMSchedulerConfig {
             beta_schedule: BetaSchedule::Linear,
             ..Default::default()

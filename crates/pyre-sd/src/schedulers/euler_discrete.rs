@@ -134,6 +134,23 @@ impl EulerDiscreteScheduler {
         self.timesteps.as_slice()
     }
 
+    /// Sigmas aligned with [`timesteps`](Self::timesteps), plus the trailing zero.
+    pub fn sigmas(&self) -> &[f64] {
+        self.sigmas.as_slice()
+    }
+
+    /// Replace the inference schedule. `sigmas` is one longer than `timesteps` (trailing 0).
+    pub fn set_schedule(&mut self, timesteps: Vec<f64>, sigmas: Vec<f64>) {
+        assert_eq!(
+            sigmas.len(),
+            timesteps.len() + 1,
+            "sigmas must include the trailing zero"
+        );
+        self.init_noise_sigma = sigmas.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        self.timesteps = timesteps;
+        self.sigmas = sigmas;
+    }
+
     /// Get the initial noise sigma value.
     pub fn init_noise_sigma(&self) -> f64 {
         self.init_noise_sigma
@@ -190,11 +207,11 @@ impl EulerDiscreteScheduler {
         };
 
         let device = sample.device();
-        let noise: Tensor<4> = Tensor::random(
+        let noise: Tensor<4> = Tensor::<4>::cast(Tensor::random(
             model_output.shape(),
             Distribution::Normal(0.0, 1.0),
             &device,
-        );
+        ), sample.dtype());
         let eps = noise * s_noise;
         let sigma_hat = sigma * (gamma + 1.0);
 

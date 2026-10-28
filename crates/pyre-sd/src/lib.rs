@@ -6,6 +6,7 @@
 
 pub mod models;
 pub mod pipelines;
+pub mod sampling;
 pub mod schedulers;
 pub mod transformers;
 pub mod utils;
@@ -15,8 +16,13 @@ extern crate alloc;
 #[cfg(all(test, feature = "ndarray"))]
 pub type TestBackend = burn::backend::NdArray<f32>;
 
-#[cfg(all(test, feature = "torch"))]
+#[cfg(all(test, feature = "torch", not(feature = "ndarray")))]
 pub type TestBackend = burn::backend::LibTorch<f32>;
 
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(all(
+    test,
+    feature = "wgpu",
+    not(feature = "ndarray"),
+    not(feature = "torch")
+))]
 pub type TestBackend = burn::backend::Wgpu;

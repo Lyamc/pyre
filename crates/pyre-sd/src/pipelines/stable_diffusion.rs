@@ -519,7 +519,7 @@ pub fn generate_image_ddim(
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
     // Seed the random number generator for reproducibility
-        device.seed(seed);
+    device.seed(seed);
 
     // Convert tokens to tensors
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
@@ -547,7 +547,6 @@ pub fn generate_image_ddim(
 
     // Diffusion loop
     for &timestep in scheduler.timesteps().iter() {
-        let t_step = std::time::Instant::now();
         // Duplicate latents for classifier-free guidance (uncond + cond)
         let latent_model_input = Tensor::cat(vec![latents.clone(), latents.clone()], 0);
 
@@ -567,16 +566,11 @@ pub fn generate_image_ddim(
 
         // Scheduler step
         latents = scheduler.step(&noise_pred, timestep, &latents);
-        if let Some(h) = STEP_HOOK.get() { let _ = device.sync(); h(t_step); }
     }
 
     // Decode latents to image
     pipeline.decode_latents(latents)
 }
-
-/// Called after each denoising step (after a device sync) with the step's start time; the host
-/// uses it for GPU duty-cycle pacing.
-pub static STEP_HOOK: std::sync::OnceLock<fn(std::time::Instant)> = std::sync::OnceLock::new();
 
 /// Generate an image using the Euler Discrete scheduler.
 ///
@@ -601,7 +595,7 @@ pub fn generate_image_euler(
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
     // Seed the random number generator for reproducibility
-        device.seed(seed);
+    device.seed(seed);
 
     // Convert tokens to tensors
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
@@ -677,7 +671,7 @@ pub fn generate_image_dpm(
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
     // Seed the random number generator for reproducibility
-        device.seed(seed);
+    device.seed(seed);
 
     // Convert tokens to tensors
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
@@ -756,7 +750,7 @@ pub fn generate_image_pndm(
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
     // Seed the random number generator for reproducibility
-        device.seed(seed);
+    device.seed(seed);
 
     // Convert tokens to tensors
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
@@ -834,7 +828,7 @@ pub fn generate_image_heun(
     seed: u64,
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
-        device.seed(seed);
+    device.seed(seed);
 
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
     let uncond_tokens: Vec<i64> = uncond_tokens.iter().map(|&x| x as i64).collect();
@@ -897,7 +891,7 @@ pub fn generate_image_lms(
     seed: u64,
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
-        device.seed(seed);
+    device.seed(seed);
 
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
     let uncond_tokens: Vec<i64> = uncond_tokens.iter().map(|&x| x as i64).collect();
@@ -960,7 +954,7 @@ pub fn generate_image_kdpm2(
     seed: u64,
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
-        device.seed(seed);
+    device.seed(seed);
 
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
     let uncond_tokens: Vec<i64> = uncond_tokens.iter().map(|&x| x as i64).collect();
@@ -1026,7 +1020,7 @@ pub fn generate_image_kdpm2_ancestral(
     seed: u64,
     device: &burn::tensor::Device,
 ) -> Tensor<4> {
-        device.seed(seed);
+    device.seed(seed);
 
     let prompt_tokens: Vec<i64> = prompt_tokens.iter().map(|&x| x as i64).collect();
     let uncond_tokens: Vec<i64> = uncond_tokens.iter().map(|&x| x as i64).collect();
@@ -1113,3 +1107,7 @@ mod tests {
         let _ = StableDiffusionConfig::v1_5(None, None, Some(513));
     }
 }
+
+/// Called after each denoising step (after a device sync) with the step's start time; the host
+/// uses it to pace GPU duty cycle (pyre's --gpu-util-max).
+pub static STEP_HOOK: std::sync::OnceLock<fn(std::time::Instant)> = std::sync::OnceLock::new();
