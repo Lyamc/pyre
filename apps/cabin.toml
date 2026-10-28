@@ -1,26 +1,51 @@
-# Built-in entry for cabin (Burn image-generation app; becoming a pyre client on its
-# `pyre-client` branch). Paths/bins are provisional until cabin ships its own pyre-app.toml.
+# pyre companion app manifest (see pyre README, "Apps").
 [app]
 name = "cabin"
-description = "Image generation app (Stable Diffusion) using pyre's /v1/images API"
-version = "0.0.0"
+description = "Node-based image-generation workflows (SD 1.5 / SDXL base + refiner) run through pyre's /v1/images API"
+version = "0.1.0"
+license = "MIT"
 min_pyre_api = 1
 
 [source]
-path = "C:/Build/machine-learning/cabin"
+path = "C:/Build/machine-learning/cabin-pyre-client"  # worktree of cabin, branch pyre-client
 
 [[build]]
 cargo = "."
+package = "cabin-pyre"
+bins = ["cabin-pyre"]
+
+[[build]]
+cargo = "."
+package = "cabin"
 bins = ["cabin"]
+
+[[build]]
+cargo = "."
+package = "cabin-runtime"
+bins = ["cabin-run"]
 
 [[entry]]
 name = "cabin"
 bin = "cabin"
 kind = "gui"
+description = "node editor (GPUI); graphs run on pyre (--backend pyre is the default build)"
+
+[[entry]]
+name = "cabin-run"
+bin = "cabin-run"
+kind = "cli"
+description = "cabin-run WORKFLOW.json [--output DIR] (headless runner, same pyre backend as the editor)"
+
+[[entry]]
+name = "cabin-pyre"
+bin = "cabin-pyre"
+kind = "cli"
+description = "cabin-pyre run workflows/sd15_txt2img.json [--output DIR] [--model ID] | status | models | load MODEL | unload ID"
 
 [pyre]
 url_env = "PYRE_URL"
+gui_args = ["--pyre", "{url}"]
 
 [[models]]
 kind = "image"
-models = ["stable-diffusion-v1-5/stable-diffusion-v1-5"]
+models = ["stable-diffusion-v1-5/stable-diffusion-v1-5", "stabilityai/stable-diffusion-xl-base-1.0"]
