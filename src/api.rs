@@ -33,6 +33,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/speech", post(speech))
+        .route("/v1/images/tags", post(tags).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .merge(crate::ui::routes())
 }
 
@@ -310,3 +311,79 @@ async fn speech(State(app): S, body: Option<Json<Value>>) -> Response {
 }
 async fn transcriptions(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, false).await }
 async fn translations(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, true).await }
+
+/// `POST /v1/images/tags`: tag one or more images with the loaded tagger.
+/// JSON: `{"image": "<base64 | data URL>", "images": [...], "threshold": 0.37, "character_threshold": 0.37,
+/// "top_k": 50, "watch": ["tag", ...], "rating_threshold": 0.5, "include_probs": false, "model": "..."}` or multipart
+/// with one or more `image`/`file` parts plus the same fields as text parts.
+async fn tags(State(app): S, req: axum::extract::Request) -> Response {
+    use axum::extract::FromRequest;
+    use base64::Engine;
+    let ct = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let mut imgs: Vec<Vec<u8>> = vec![];
+    let mut b = json!({});
+    if ct.starts_with("multipart/") {
+        let mut mp = match Multipart::from_request(req, &app).await { Ok(m) => m, Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()) };
+        loop {
+            match mp.next_field().await {
+                Ok(Some(f)) => {
+                    let name = f.name().unwrap_or("").to_string();
+                    let Ok(bytes) = f.bytes().await else { return err(StatusCode::BAD_REQUEST, "reading multipart field") };
+                    if matches!(name.as_str(), "image" | "file" | "images" | "image[]") { imgs.push(bytes.to_vec()); continue; }
+                    let t = String::from_utf8_lossy(&bytes).to_string();
+                    b[name.as_str()] = if name == "watch" { json!(t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect::<Vec<_>>()) } else { t.parse::<f64>().map(|v| json!(v)).unwrap_or(json!(t)) };
+                }
+                Ok(None) => break,
+                Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+            }
+        }
+    } else {
+        let Json(j) = match Json::<Value>::from_request(req, &app).await { Ok(j) => j, Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()) };
+        let dec = |v: &Value| -> Option<Vec<u8>> {
+            let s = v.as_str()?;
+            let s = s.split_once(";base64,").map(|x| x.1).unwrap_or(s);
+            base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()
+        };
+        for v in std::iter::once(&j["image"]).chain(j["images"].as_array().into_iter().flatten()) {
+            if v.is_null() { continue; }
+            match dec(v) { Some(x) => imgs.push(x), None => return err(StatusCode::BAD_REQUEST, "images must be base64 strings or data URLs") }
+        }
+        b = j;
+    }
+    if imgs.is_empty() { return err(StatusCode::BAD_REQUEST, "no image given ('image' / 'images' as base64 in JSON, or multipart 'image' parts)"); }
+    if imgs.len() > 64 { return err(StatusCode::BAD_REQUEST, "at most 64 images per request"); }
+    let m = match app.find(Kind::Tagger, b["model"].as_str()) { Err(r) => return r, Ok(m) => m };
+    let t = match &m.inner {
+        crate::registry::Inner::Tagger(t) => t.clone(),
+        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch"),
+    };
+    let mut o = crate::tagger::TagOpts::default();
+    if let Some(v) = b["threshold"].as_f64() { o.threshold = v as f32; }
+    if let Some(v) = b["character_threshold"].as_f64() { o.character_threshold = v as f32; }
+    if let Some(v) = b["rating_threshold"].as_f64() { o.rating_threshold = v as f32; }
+    if let Some(v) = b["top_k"].as_u64() { o.top_k = Some(v as usize); }
+    if let Some(w) = b["watch"].as_array() { o.watch.extend(w.iter().filter_map(|x| x.as_str().map(String::from))); }
+    let include = b["include_probs"].as_bool().unwrap_or(false);
+    let id = m.id.clone();
+    t.queued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let st = std::time::Instant::now();
+        let prepped: anyhow::Result<Vec<Vec<f32>>> = imgs.iter().map(|x| t.prep(x)).collect();
+        t.queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let prepped = prepped?;
+        let ps = t.probs(prepped);
+        let secs = st.elapsed().as_secs_f64();
+        let results: Vec<Value> = ps.iter().map(|p| {
+            let mut s = t.summarize(p, &o);
+            if include { s["probs"] = json!(p); }
+            s
+        }).collect();
+        tracing::info!("tagger: {} image(s) in {secs:.3}s", results.len());
+        Ok(json!({"object": "list", "model": id, "threshold": o.threshold, "seconds": secs, "data": results}))
+    }).await;
+    match r {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}

@@ -23,9 +23,11 @@ pub fn split_rev(spec: &str) -> (&str, Option<&str>) {
     match spec.split_once('@') { Some((r, v)) => (r, Some(v)), None => (spec, None) }
 }
 
-/// A snapshot holds a model: config.json / model_index.json, or GGUF files (top level or one quant sub-folder).
+/// A snapshot holds a model: config.json / model_index.json, a Danbooru tagger (selected_tags.csv +
+/// weights), or GGUF files (top level or one quant sub-folder).
 fn has_model(snap: &Path) -> bool {
     if snap.join("config.json").exists() || snap.join("model_index.json").exists() { return true; }
+    if snap.join("selected_tags.csv").exists() && ["weights.pt", "model.safetensors"].iter().any(|f| snap.join(f).exists()) { return true; }
     let gguf = |d: &Path| std::fs::read_dir(d).map(|r| r.flatten().any(|e| e.path().extension().is_some_and(|x| x == "gguf"))).unwrap_or(false);
     gguf(snap) || std::fs::read_dir(snap).map(|r| r.flatten().any(|e| e.path().is_dir() && gguf(&e.path()))).unwrap_or(false)
 }
@@ -128,10 +130,24 @@ pub fn download(cache: &Path, repo: &str, rev: Option<&str>, progress: &dyn Fn(&
         let b = h.download_file().filename(f);
         Ok(match rev { Some(r) => b.revision(r).send()?, None => b.send()? })
     };
-    // diffusers-style repos have model_index.json instead of config.json
-    let (first, is_sd) = match get("config.json") { Ok(p) => (p, false), Err(_) => (get("model_index.json").context("neither config.json nor model_index.json found")?, true) };
+    // diffusers-style repos have model_index.json instead of config.json; Danbooru taggers
+    // (Kagami / WD) have selected_tags.csv + timm weights (model.safetensors or weights.pt).
+    let (first, is_sd, is_tagger) = match get("config.json") {
+        Ok(p) => (p, false, false),
+        Err(_) => match get("model_index.json") {
+            Ok(p) => (p, true, false),
+            Err(_) => (get("selected_tags.csv").context("none of config.json, model_index.json or selected_tags.csv found")?, false, true),
+        },
+    };
     let dir = first.parent().unwrap().to_path_buf();
     let mut files: Vec<String> = vec![];
+    if is_tagger {
+        let w = get("model.safetensors").or_else(|_| get("weights.pt")).context("tagger repo has neither model.safetensors nor weights.pt")?;
+        tracing::info!("tagger weights: {}", w.display());
+        progress("done", 1, 1);
+        dedupe_snapshot(&dir);
+        return Ok(dir);
+    }
     if is_sd {
         for sub in ["text_encoder", "unet", "vae", "tokenizer", "scheduler"] {
             for f in ["config.json", "model.safetensors", "diffusion_pytorch_model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "special_tokens_map.json", "scheduler_config.json"] {

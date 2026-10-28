@@ -7,6 +7,7 @@ mod registry;
 mod stt;
 mod tts;
 mod image;
+mod tagger;
 mod ui;
 mod cli_models;
 mod storage;
@@ -63,6 +64,8 @@ pub enum Cmd {
     },
     /// Run a Qwen3.8-Flash-Next (qwen4_exp) checkpoint directly: greedy text or logits dump
     QwenNext(qn_cli::QnArgs),
+    /// Tag images (or folders of images) with an EVA02 Danbooru tagger (default Redstonexs/kagami-24k)
+    Tag(tagger::TagArgs),
     /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
     App {
         #[command(subcommand)]
@@ -75,7 +78,7 @@ pub struct ServeArgs {
     /// Text-generation model: alias, store name, HF repo id[@rev] or folder
     #[arg(short = 'm', long = "model")]
     pub model: Vec<String>,
-    /// Extra models as kind=ref (kind: llm|image|stt|tts); repeatable
+    /// Extra models as kind=ref (kind: llm|image|stt|tts|tagger); repeatable
     #[arg(long = "load", value_name = "KIND=REF")]
     pub load: Vec<String>,
     #[arg(long = "image-model")]
@@ -84,6 +87,9 @@ pub struct ServeArgs {
     pub stt_model: Option<String>,
     #[arg(long = "tts-model")]
     pub tts_model: Option<String>,
+    /// Image tagger (EVA02 Danbooru tagger, e.g. Redstonexs/kagami-24k) for POST /v1/images/tags
+    #[arg(long = "tagger-model")]
+    pub tagger_model: Option<String>,
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = 8080)]
@@ -151,6 +157,7 @@ fn main() -> Result<()> {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
         Cmd::Serve(a) => serve(ctx, a),
         Cmd::QwenNext(a) => qn_cli::run(a),
+        Cmd::Tag(a) => tagger::run_cli(&ctx, a),
         Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }
@@ -256,6 +263,7 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone())); }
     if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone())); }
     if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone())); }
+    if let Some(r) = &args.tagger_model { want.push((Kind::Tagger, r.clone())); }
 
     if let Some(p) = &args.prompt {
         let r = args.model.first().context("--prompt needs -m")?;
