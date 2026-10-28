@@ -37,6 +37,10 @@ pub struct State {
     pub tokens: Vec<u32>,
     conv: Vec<Vec<f32>>,  // per linear layer [(conv_k-1) * channels], oldest first
     ssm: Vec<Vec<f32>>,   // per linear layer [nv][dk][dv]
+    /// GPU copies of (conv, ssm) per linear layer while decode runs DeltaNet on the GPU; the host
+    /// Vecs above are stale while `gdn_gpu` is set.
+    gdn: Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>,
+    gdn_gpu: bool,
     k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, // per attn layer [pos][n_kv*hd]
     ple_hist: Vec<Vec<f32>>, // per PLE layer: ring of past normalized values, [(conv_k-1)*dil][hc*d]
 }
@@ -141,13 +145,27 @@ impl Model {
                 for l in &self.layers {
                     let min = match &l.mix { Mixer::Attn { q, k, v, .. } => vec![q, k, v], Mixer::Lin { qkv, z, beta, alpha, .. } => vec![qkv, z, beta, alpha] };
                     let mout = match &l.mix { Mixer::Attn { o, .. } => o, Mixer::Lin { out, .. } => out };
-                    let c = (|| Some(CLayer { hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
+                    let gdn = match &l.mix { Mixer::Lin { conv, a, dt, norm, .. } if self.cfg.lin_dk == self.cfg.lin_dv && self.cfg.lin_dk % 32 == 0 =>
+                        Some(super::qn_cube::GdnW { conv: cb.buf(conv), a: cb.buf(a), dt: cb.buf(dt), norm: cb.buf(norm) }), _ => None };
+                    let c = (|| Some(CLayer { gdn, hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
                         fin: cb.upload(&[&l.router, &l.sh_gate, &l.sh_up], &[&l.sh_gate_inp])?, sdown: cb.upload(&[&l.sh_down], &[])? }))();
                     if c.is_some() { on += 1 } else { off += 1 }
                     cl.push(c); gl.push(None);
                 }
                 let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
                 g.budget.fetch_sub(used, std::sync::atomic::Ordering::Relaxed);
+                if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(c0)) = cl.iter().find(|x| x.is_some()) {
+                    let x = cb.buf(&vec![0.01f32; hc * d]); let xn = cb.empty(hc * d); let o = cb.empty(20000); let dn = cb.buf(&vec![0.01f32; 400]);
+                    let bench = |name: &str, f: &dyn Fn()| { f(); cb.read(&o); let t0 = std::time::Instant::now(); for _ in 0..50 { f(); } cb.read(&o); eprintln!("cubebench {name}: {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / 50.0); };
+                    bench("nothing", &|| {});
+                    bench(&format!("gemv min {}x{} ({:.1} MB)", c0.min.rows, c0.min.cols, (c0.min.rows * c0.min.cols) as f64 / 1e6), &|| cb.gemv(&c0.min, &x, hc * d, 0, &o, 20000, 0));
+                    bench(&format!("gemv hc down {}x{}", c0.hca.di.rows, c0.hca.di.cols), &|| cb.gemv(&c0.hca.di, &x, hc * d, 0, &o, 20000, 0));
+                    bench(&format!("gemv fin {}x{}", c0.fin.rows, c0.fin.cols), &|| cb.gemv(&c0.fin, &x, hc * d, 0, &o, 20000, 0));
+                    bench(&format!("gemv mout {}x{}", c0.mout.rows, c0.mout.cols), &|| cb.gemv(&c0.mout, &x, hc * d, 0, &o, 20000, 0));
+                    bench("rms", &|| cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6));
+                    bench("gate", &|| cb.gate(&x, &dn, &c0.hca.up, &o, 20000, 0, hc, d));
+                    bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
+                } }
                 self.cl = cl; self.cube = Some(cb);
             }
         }
@@ -217,6 +235,7 @@ impl Model {
     /// One decode token through a layer with the dense half in pyre's CubeCL kernels (x stays on the GPU).
     fn layer_cube(&self, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
+        let q0 = std::time::Instant::now();
         let xn = cb.empty(w);
         let lra = cl.hca.up.cols; let da = cb.empty(cl.hca.di.rows);
         cb.rms(x, &cl.hca.norm, &xn, hc, d, c.eps);
@@ -225,11 +244,26 @@ impl Model {
         cb.gate(&xn, &da, &cl.hca.up, &mixed, d, 0, hc, d);
         let proj = cb.empty(cl.min.rows);
         cb.gemv(&cl.min, &mixed, d, 0, &proj, cl.min.rows, 0);
-        let pv = cb.read(&proj);
-        let parts: Vec<Vec<f32>> = (0..cl.min.splits.len() - 1).map(|i| pv[cl.min.splits[i]..cl.min.splits[i + 1]].to_vec()).collect();
-        let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, parts, start, 1); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, parts, 1); *li += 1; o } };
-        let cbuf = cb.buf(&core); let o = cb.empty(d);
-        cb.gemv(&cl.mout, &cbuf, core.len(), 0, &o, d, 0);
+        let q1 = std::time::Instant::now();
+        let o = cb.empty(d);
+        let (q2, q3);
+        if let (Some(gw), true) = (&cl.gdn, st.gdn_gpu) {
+            let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
+            let (cs, ss) = &st.gdn[*li]; *li += 1;
+            let co = cb.empty(ch); let ob = cb.empty(nv * dk);
+            cb.conv(&proj, cl.min.rows, &gw.conv, cs, &co, ch, c.conv_k);
+            cb.delta(&co, ch, &proj, cl.min.rows, gw, ss, &ob, nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
+            cb.gemv(&cl.mout, &ob, nv * dk, 0, &o, d, 0);
+            q2 = std::time::Instant::now(); q3 = q2;
+        } else {
+            let pv = cb.read(&proj);
+            q2 = std::time::Instant::now();
+            let parts: Vec<Vec<f32>> = (0..cl.min.splits.len() - 1).map(|i| pv[cl.min.splits[i]..cl.min.splits[i + 1]].to_vec()).collect();
+            let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, parts, start, 1); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, parts, 1); *li += 1; o } };
+            q3 = std::time::Instant::now();
+            let cbuf = cb.buf(&core);
+            cb.gemv(&cl.mout, &cbuf, core.len(), 0, &o, d, 0);
+        }
         cb.comb(x, &o, None, None, &da, lra, hc, d);
         let lrf = cl.hcf.up.cols; let df = cb.empty(cl.hcf.di.rows);
         cb.rms(x, &cl.hcf.norm, &xn, hc, d, c.eps);
@@ -237,14 +271,19 @@ impl Model {
         let rn = d + cl.fin.rows; let rd = cb.empty(rn);
         cb.gate(&xn, &df, &cl.hcf.up, &rd, rn, 0, hc, d);
         cb.gemv(&cl.fin, &rd, rn, 0, &rd, rn, d);
+        let q4 = std::time::Instant::now();
         let rv = cb.read(&rd);
+        let q5 = std::time::Instant::now();
         let sf = l.sh_gate.rows; let hb = cb.empty(sf); let sh = cb.empty(d);
         cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
         cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
         let mut yr = vec![0f32; d];
         self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
+        let q6 = std::time::Instant::now();
         let yb = cb.buf(&yr);
         cb.comb(x, &sh, Some(&yb), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
+        let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
+        HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
     }
 
     /// Hybrid layer: hyper-connection mixes + residual on the CPU (int8), big projections on the GPU.
@@ -290,7 +329,7 @@ impl Model {
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
-        let mut st = State { tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ple_hist: vec![] };
+        let mut st = State { gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ple_hist: vec![] };
         for l in &self.layers {
             match l.mix { Mixer::Lin { .. } => { st.conv.push(vec![0.0; (c.conv_k - 1) * ch]); st.ssm.push(vec![0.0; c.lin_nv * c.lin_dk * c.lin_dv]); }, Mixer::Attn { .. } => { st.k.push(vec![]); st.v.push(vec![]); } }
             if l.ple.is_some() { st.ple_hist.push(vec![0.0; (c.ple_conv_k - 1) * c.ple_ngram * c.hc * c.d]); }
@@ -622,6 +661,12 @@ impl Model {
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let mut xc: Option<burn_cubecl::cubecl::server::Handle> = None;
+        let gdn_ok = t == 1 && self.cube.is_some() && std::env::var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
+            && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })));
+        if let Some(cb) = &self.cube {
+            if gdn_ok && !st.gdn_gpu { st.gdn = st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect(); st.gdn_gpu = true; }
+            if !gdn_ok && st.gdn_gpu { for (i, (a, b)) in st.gdn.iter().enumerate() { st.conv[i] = cb.read(a); st.ssm[i] = cb.read(b); } st.gdn.clear(); st.gdn_gpu = false; }
+        }
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
         let gpu_tmax = env_usize("PYRE_QN_GPU_TMAX").unwrap_or(8);
         let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(false);
@@ -664,7 +709,7 @@ impl Model {
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
         let lg = self.mm(&[&self.out], &h, 1).pop().unwrap();
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(4), f(5), f(6), f(1), f(2), f(3)); } eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 }

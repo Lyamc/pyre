@@ -138,6 +138,89 @@ fn k_silu_mul(f: &[f32], h: &mut [f32], og: u32, ou: u32, n: u32) {
     }
 }
 
+/// Gated DeltaNet decode, step 1: causal depthwise conv + SiLU per channel, shifting the conv state.
+#[cube(launch_unchecked)]
+fn k_conv(proj: &[f32], w: &[f32], cs: &mut [f32], co: &mut [f32], ch: u32, #[comptime] kk: u32) {
+    let c = ABSOLUTE_POS as u32;
+    if c < ch {
+        let cur = proj[c as usize];
+        let mut o = w[(c * kk + kk - 1) as usize] * cur;
+        #[unroll]
+        for k in 0..kk - 1 {
+            o += w[(c * kk + k) as usize] * cs[(k * ch + c) as usize];
+        }
+        co[c as usize] = o / (1.0f32 + f32::exp(-o));
+        #[unroll]
+        for k in 0..kk - 2 {
+            cs[(k * ch + c) as usize] = cs[((k + 1) * ch + c) as usize];
+        }
+        cs[((kk - 2) * ch + c) as usize] = cur;
+    }
+}
+
+#[cube]
+fn cube_sum(v: f32, red: &mut Shared<[f32]>, #[comptime] planes: u32) -> f32 {
+    let p = plane_sum(v);
+    if UNIT_POS_X % 32 == 0 {
+        red[(UNIT_POS_X / 32) as usize] = p;
+    }
+    sync_cube();
+    let mut t = 0.0f32;
+    #[unroll]
+    for i in 0..planes {
+        t += red[i as usize];
+    }
+    sync_cube();
+    t
+}
+
+/// Gated DeltaNet decode, step 2: one cube per value head, one unit per value column j (dk = dv = CUBE_DIM).
+/// q/k L2 norms, decay g = exp(softplus(alpha + dt) * a), delta rule, RMSNorm * sigmoid(z).
+#[cube(launch_unchecked)]
+fn k_delta(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32],
+    nk: u32, nv: u32, zoff: u32, boff: u32, aoff: u32, eps: f32, #[comptime] dk: u32) {
+    let h = CUBE_POS_X;
+    let j = UNIT_POS_X;
+    let kh = h % nk;
+    let mut qs = Shared::<[f32]>::new_slice(dk as usize);
+    let mut ks = Shared::<[f32]>::new_slice(dk as usize);
+    let mut red = Shared::<[f32]>::new_slice(comptime!((dk / 32) as usize));
+    let qj = co[(kh * dk + j) as usize];
+    let kj = co[(nk * dk + kh * dk + j) as usize];
+    let sq = cube_sum(qj * qj, &mut red, comptime!(dk / 32));
+    let sk = cube_sum(kj * kj, &mut red, comptime!(dk / 32));
+    qs[j as usize] = qj / f32::sqrt(sq + 1e-6f32) / f32::sqrt(f32::cast_from(dk));
+    ks[j as usize] = kj / f32::sqrt(sk + 1e-6f32);
+    sync_cube();
+    let vj = co[(2 * nk * dk + h * dk + j) as usize];
+    let x = proj[(aoff + h) as usize] + dt[h as usize];
+    let mut sp = x;
+    if x <= 20.0f32 {
+        sp = f32::ln(1.0f32 + f32::exp(x));
+    }
+    let g = f32::exp(sp * a[h as usize]);
+    let b = 1.0f32 / (1.0f32 + f32::exp(-proj[(boff + h) as usize]));
+    let base = h * dk * dk;
+    let mut mem = 0.0f32;
+    for i in 0..dk {
+        mem += s[(base + i * dk + j) as usize] * ks[i as usize];
+    }
+    mem *= g;
+    let delta = (vj - mem) * b;
+    let mut o = 0.0f32;
+    for i in 0..dk {
+        let idx = (base + i * dk + j) as usize;
+        let v = s[idx] * g + ks[i as usize] * delta;
+        s[idx] = v;
+        o += v * qs[i as usize];
+    }
+    let so = cube_sum(o * o, &mut red, comptime!(dk / 32));
+    let r = 1.0f32 / f32::sqrt(so / f32::cast_from(dk) + eps);
+    let z = proj[(zoff + h * dk + j) as usize];
+    out[(h * dk + j) as usize] = o * r * norm[j as usize] / (1.0f32 + f32::exp(-z));
+    let _ = nv;
+}
+
 pub struct Cube { pub client: Client, pub budget: std::sync::atomic::AtomicI64 }
 
 pub struct CMat { w: Handle, s: Handle, pub rows: usize, pub cols: usize, pub splits: Vec<usize> }
@@ -205,6 +288,18 @@ impl Cube {
             BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(a.clone(), d), BufferArg::from_raw_parts(bb, d), BufferArg::from_raw_parts(gb, gn),
             BufferArg::from_raw_parts(dn.clone(), lr + hc), d as u32, goff as u32, lr as u32, hc as u32, g.is_some(), b.is_some()) }
     }
+    pub fn conv(&self, proj: &Handle, pn: usize, w: &Handle, cs: &Handle, co: &Handle, ch: usize, kk: usize) {
+        unsafe { k_conv::launch_unchecked(&self.client, CubeCount::Static((ch as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(proj.clone(), pn), BufferArg::from_raw_parts(w.clone(), ch * kk), BufferArg::from_raw_parts(cs.clone(), ch * (kk - 1)),
+            BufferArg::from_raw_parts(co.clone(), ch), ch as u32, kk as u32) }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta(&self, co: &Handle, ch: usize, proj: &Handle, pn: usize, w: &GdnW, s: &Handle, out: &Handle, nk: usize, nv: usize, dk: usize, zoff: usize, boff: usize, aoff: usize, eps: f32) {
+        unsafe { k_delta::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
+            BufferArg::from_raw_parts(co.clone(), ch), BufferArg::from_raw_parts(proj.clone(), pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
+            BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), nv * dk * dk), BufferArg::from_raw_parts(out.clone(), nv * dk),
+            nk as u32, nv as u32, zoff as u32, boff as u32, aoff as u32, eps, dk as u32) }
+    }
     pub fn silu_mul(&self, f: &Handle, fnn: usize, og: usize, ou: usize, h: &Handle, n: usize) {
         unsafe { k_silu_mul::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(f.clone(), fnn), BufferArg::from_raw_parts(h.clone(), n), og as u32, ou as u32, n as u32) }
@@ -214,4 +309,5 @@ impl Cube {
 /// A hyper-connection mixer: norm weights, down(+inject) rows, up rows.
 pub struct CHc { pub norm: Handle, pub di: CMat, pub up: CMat }
 /// One layer's dense half (see `Model::layer_cube`). `fin` = router | shared gate | shared up | shared-gate row.
-pub struct CLayer { pub hca: CHc, pub min: CMat, pub mout: CMat, pub hcf: CHc, pub fin: CMat, pub sdown: CMat }
+pub struct GdnW { pub conv: Handle, pub a: Handle, pub dt: Handle, pub norm: Handle }
+pub struct CLayer { pub gdn: Option<GdnW>, pub hca: CHc, pub min: CMat, pub mout: CMat, pub hcf: CHc, pub fin: CMat, pub sdown: CMat }
