@@ -31,7 +31,7 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
-pub struct XCache { tabs: super::qn_cube::XTabs, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64 }
+pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64 }
 
 pub struct Model { xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
@@ -180,7 +180,9 @@ impl Model {
                 let budget = left.saturating_sub(2048 << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
-                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0 })); }
+                    let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
+                    let nslot = budget / slot; let per = ((1usize << 30) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
+                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0 })); }
                 self.cube = Some(cb);
             }
         }
@@ -301,11 +303,13 @@ impl Model {
             let (on, off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             xcg.hits += on.len() as u64;
             if !on.is_empty() {
-                let xb = cb.empty(d); let y0 = cb.empty(d); let hx = cb.empty(c.ff_exp);
+                let xb = cb.empty(d); let y0 = cb.empty(d);
                 cb.q8copy(&rd, rn, 0, &xb, &y0, d);
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
                 let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
-                for (e, w) in &on { cb.xrun(&xcg.tabs, &xcg.map[&(il, *e)], &xb, d, c.ff_exp, tys, rbs, &hx, &y0, *w); }
+                let _ = rbs; let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
+                for ai in 0..xcg.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ai).cloned().collect(); if grp.is_empty() { continue; }
+                    let hx = cb.empty(c.ff_exp * grp.len()); cb.xrun_b(&xcg.tabs, &xcg.arena[ai], xcg.ar_bytes, &grp, &xb, d, c.ff_exp, tys, &hx, &y0); }
                 yg = Some(y0);
             }
             drop(xcg);
@@ -336,7 +340,7 @@ impl Model {
         let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
         if xc.calls != 1 && xc.calls % every != 0 { return; }
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
-        let size = |l: &Layer| ff * l.gate_e.row_bytes() + ff * l.up_e.row_bytes() + d * l.down_e.row_bytes();
+        let slot = xc.slot; let size = |_: &Layer| slot;
         let mut cand: Vec<(u32, usize, usize)> = vec![];
         for (il, l) in self.layers.iter().enumerate() {
             if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
@@ -354,19 +358,19 @@ impl Model {
             if n >= max_new { break; }
             if !want.contains(&(il, e)) || xc.map.contains_key(&(il, e)) { continue; }
             let l = &self.layers[il];
-            while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; } }, None => break } }
-            if xc.used + size(l) > xc.budget { break; }
+            while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; xc.free.push(v.slot); } }, None => break } }
+            if xc.used + size(l) > xc.budget || xc.free.is_empty() { break; }
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
-            let ent = cb.xupload(l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d), tys);
-            xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
+            let sl = xc.free.pop().unwrap(); let mut ent = cb.xupload(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d), tys);
+            ent.arena = sl / xc.per; ent.slot = sl; xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
         }
         if std::env::var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
             let l = &self.layers[*il]; let _ = e;
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
             let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
             let xb = cb.buf(&vec![0.01f32; d]); let y0 = cb.buf(&vec![0f32; d]); let hx = cb.empty(ff);
-            cb.xrun(&xc.tabs, ent, &xb, d, ff, tys, rbs, &hx, &y0, 0.1); cb.read(&y0);
-            let t1 = std::time::Instant::now(); for _ in 0..50 { cb.xrun(&xc.tabs, ent, &xb, d, ff, tys, rbs, &hx, &y0, 0.1); } cb.read(&y0);
+            let _ = rbs; cb.xrun_b(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &[(ent, 0.1)], &xb, d, ff, tys, &hx, &y0); cb.read(&y0);
+            let t1 = std::time::Instant::now(); for _ in 0..50 { cb.xrun_b(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &[(ent, 0.1)], &xb, d, ff, tys, &hx, &y0); } let tq = t1.elapsed().as_secs_f64(); cb.read(&y0); eprintln!("cubebench expert enqueue {:.1} us", tq * 1e6 / 50.0);
             eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB): {:.1} us", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6, t1.elapsed().as_secs_f64() * 1e6 / 50.0);
         } }
         if n > 0 && std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }

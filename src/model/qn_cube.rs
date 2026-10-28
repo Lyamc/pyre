@@ -621,10 +621,65 @@ fn k_xdown(h: &[f32], wd: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u3
     }
 }
 
+
+/// Batched cached experts (all of one layer in one launch): expert = CUBE_POS_Y, its word offsets
+/// in the arena are meta[4e], meta[4e+1] (gate, up); h is [expert][rows].
+#[cube(launch_unchecked)]
+fn k_xgu_b(x: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], h: &mut [f32], rows: u32, cols: u32, rbg: u32, rbu: u32,
+    #[comptime] tg: u32, #[comptime] tu: u32) {
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let go = meta[(e * 4) as usize] + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let nsb = cols / 8;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        let mut sb = UNIT_POS_X;
+        while sb < nsb {
+            gs += subdot8(ar, go, sb, x, 0u32, g2s, g2x, ks, g1, tg);
+            us += subdot8(ar, uo, sb, x, 0u32, g2s, g2x, ks, g1, tu);
+            sb += 32u32;
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if UNIT_POS_X == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+/// y[row] += sum_e wgt_e * (down_e row . h_e); down offset meta[4e+2], weight bits meta[4e+3].
+#[cube(launch_unchecked)]
+fn k_xdown_b(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, #[comptime] td: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nsb = cols / 8;
+        let mut s = 0.0f32;
+        for e in 0..ne {
+            let dof = meta[(e * 4 + 2) as usize] + row * rbd;
+            let w = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+            let mut p = 0.0f32;
+            let mut sb = UNIT_POS_X;
+            while sb < nsb {
+                p += subdot8(ar, dof, sb, h, e * cols, g2s, g2x, ks, g1, td);
+                sb += 32u32;
+            }
+            s += w * p;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[row as usize] += t;
+        }
+    }
+}
 /// Grid tables for the expert kernels.
 pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle }
 /// One cached expert: raw GGUF bytes of its gate, up and down rows.
-pub struct XEnt { g: Handle, u: Handle, d: Handle, pub bytes: usize }
+pub struct XEnt { pub off: [u32; 3], pub arena: usize, pub slot: usize, pub bytes: usize }
+/// Words of one repacked expert (gate, up, down).
+pub fn xwords(tys: (u32, u32, u32), d: usize, ff: usize) -> (usize, usize, usize) { let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w }; (ff * rw(tys.0, d), ff * rw(tys.1, d), d * rw(tys.2, ff)) }
+/// Words of one repacked expert (gate, up, down). fn xwords(tys: (u32, u32, u32), d: usize, ff: usize) -> (usize, usize, usize) { let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w }; (ff * rw(tys.0, d), ff * rw(tys.1, d), d * rw(tys.2, ff)) }
 pub fn xtype(t: super::gguf_q::QType) -> Option<u32> {
     use super::gguf_q::QType::*;
     match t { IQ2S => Some(0), IQ2XXS => Some(1), IQ1M => Some(2), Q2_0 => Some(3), _ => None }
@@ -718,26 +773,35 @@ impl Cube {
         XTabs { g2s: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2XXS_GRID))),
             ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))) }
     }
-    pub fn xupload(&self, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
-        let (g, u, d) = (repack(tys.0, g), repack(tys.1, u), repack(tys.2, d));
-        XEnt { g: self.client.create_from_slice(u32::as_bytes(&g)), u: self.client.create_from_slice(u32::as_bytes(&u)), d: self.client.create_from_slice(u32::as_bytes(&d)), bytes: 4 * (g.len() + u.len() + d.len()) }
-    }
-    /// One cached expert: h = silu(G x) * (U x) -> Q8 grid -> y += wgt * D h.
+    pub fn xarena(&self, bytes: usize) -> Handle { self.client.empty(bytes) }
+    /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
     #[allow(clippy::too_many_arguments)]
-    pub fn xrun(&self, tb: &XTabs, e: &XEnt, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), rbs_in: (usize, usize, usize), h: &Handle, y: &Handle, wgt: f32) {
+    pub fn xupload(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
+        let mut v = repack(tys.0, g); let uo = v.len(); v.extend(repack(tys.1, u)); let dof = v.len(); v.extend(repack(tys.2, d));
+        let base = slot * slot_bytes; let len = v.len() * 4; assert!(len <= slot_bytes && base + len <= ar_bytes);
+        let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
+        self.client.write(&hd, cubecl::bytes::Bytes::from_elems(v));
+        let b = (base / 4) as u32;
+        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
+    }
+    /// All cached experts of one layer: h[e] = silu(G_e x) * (U_e x) -> Q8 grid -> y += sum_e w_e D_e h[e].
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_b(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle) {
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
         let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
-        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let _ = rbs_in;
-        let (gw, uw, dw) = (ff * rbs.0, ff * rbs.1, d * rbs.2);
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff));
+        let ne = ents.len();
+        let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
+        let mh = self.client.create_from_slice(u32::as_bytes(&meta));
+        let aw = ar_bytes / 4;
         unsafe {
-            k_xgu::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
-                a(x, d), a(&e.g, gw), a(&e.u, uw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ff), 0u32, ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1);
-            k_q8sim::launch_unchecked(&self.client, CubeCount::Static((ff as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ff), ff as u32);
-            k_xdown::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
-                a(h, ff), a(&e.d, dw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), 0u32, d as u32, ff as u32, rbs.2 as u32, wgt, tys.2);
+            k_xgu_b::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(x, d), a(ar, aw), a(&mh, meta.len()), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1);
+            k_q8sim::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ne * ff), (ne * ff) as u32);
+            k_xdown_b::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+                a(h, ne * ff), a(ar, aw), a(&mh, meta.len()), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2);
         }
-    }
-    /// dst = Q8-grid copy of src[soff..soff+n]; z[..n] = 0.
+    }    /// dst = Q8-grid copy of src[soff..soff+n]; z[..n] = 0.
     pub fn q8copy(&self, src: &Handle, sn: usize, soff: usize, dst: &Handle, z: &Handle, n: usize) {
         unsafe { k_q8copy::launch_unchecked(&self.client, CubeCount::Static((n as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(src.clone(), sn), BufferArg::from_raw_parts(dst.clone(), n), BufferArg::from_raw_parts(z.clone(), n), soff as u32, n as u32) }
