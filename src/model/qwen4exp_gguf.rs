@@ -708,7 +708,9 @@ impl Model {
             let mut hbuf = vec![0f32; toks.len() * (r1 - r0)];
             if qgu { let mut sc = qdot::Scratch::default();
                 let mut s2 = qdot::Scratch::default();
+                let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                    if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
                     if toks.len() > 2 { qdot::decode(gm.ty, gr, d, &mut sc); qdot::decode(um.ty, ur, d, &mut s2);
                         for (j, &(ti, _)) in toks.iter().enumerate() { hbuf[j * (r1 - r0) + r] = silu(qdot::dot_decoded(&sc, &acts[ti])) * qdot::dot_decoded(&s2, &acts[ti]); }
                         continue; }
@@ -761,7 +763,9 @@ impl Model {
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
+                let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                    if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
                     for (j, &(ti, _)) in toks.iter().enumerate() {
                         let v = if usek { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
@@ -773,7 +777,7 @@ impl Model {
             let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d));
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
-                    for r in 0..r1 - r0 { let dr = dm.row_raw(r);
+                    for r in 0..r1 - r0 { let dr = dm.row_raw(r); if r + 4 < r1 - r0 { prefetch(dm.row_raw(r + 4)); }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * qdot::row_dot(dm.ty, dr, &hq[wi][j], sc); unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         });
         use std::sync::atomic::Ordering::Relaxed; HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
@@ -856,6 +860,10 @@ static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::ne
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// softmax over the top k router logits (same order of operations as `routed`).
+/// Software prefetch of one weight row (expert rows are short, so hardware prefetch ramps too late).
+#[inline] fn prefetch(b: &[u8]) {
+    #[cfg(target_arch = "x86_64")] unsafe { use std::arch::x86_64::*; let mut o = 0; while o < b.len() { _mm_prefetch::<_MM_HINT_T0>(b.as_ptr().add(o) as *const i8); o += 64; } }
+}
 fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut idx: Vec<usize> = (0..r.len()).collect();
     idx.select_nth_unstable_by(k, |a, b| r[*b].partial_cmp(&r[*a]).unwrap());
