@@ -1,4 +1,4 @@
-﻿//! A small persistent worker pool for the per-layer expert phases of a decode step. Workers spin
+//! A small persistent worker pool for the per-layer expert phases of a decode step. Workers spin
 //! for a short while after each job before parking, so the ~100 short jobs per token do not pay a
 //! thread wake-up each (Strata keeps a dedicated pinned pool for the same reason; this is pyre's own).
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
@@ -35,8 +35,10 @@ impl Pool {
     }
 
     /// Run f(0..n) across the pool (the caller works too) and return when all are done.
-    pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
-        if n == 0 { return; }
+    pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) { self.run_side(n, f, &mut || {}) }
+    /// Like `run`, but the caller first does `side` (e.g. enqueueing GPU work) while the workers start.
+    pub fn run_side(&self, n: usize, f: &(dyn Fn(usize) + Sync), side: &mut dyn FnMut()) {
+        if n == 0 { side(); return; }
         let sh = &*self.sh;
         let job = Job { f, n };
         let g = sh.gen.load(Relaxed) + 1;
@@ -46,6 +48,7 @@ impl Pool {
         sh.ticket.store(g << 32, Relaxed);
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
+        side();
         work(sh, g, &job);
         while sh.done.load(Acquire) < n { std::hint::spin_loop(); }
     }

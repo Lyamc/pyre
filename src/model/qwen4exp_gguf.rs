@@ -317,26 +317,29 @@ impl Model {
             xcg.total += sel.len() as u64;
             let (on, off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             xcg.hits += on.len() as u64;
-            if !on.is_empty() {
-                let xb = cb.empty(d); let y0 = cb.empty(d);
-                cb.q8copy(&rd, rn, 0, &xb, &y0, d);
-                let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
-                let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
-                let _ = rbs; let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
-                for ai in 0..xcg.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ai).cloned().collect(); if grp.is_empty() { continue; }
-                    let hx = cb.empty(c.ff_exp * grp.len()); cb.xrun_b(&xcg.tabs, &xcg.arena[ai], xcg.ar_bytes, &grp, &xb, d, c.ff_exp, tys, &hx, &y0); }
-                yg = Some(y0);
-            }
-            drop(xcg);
-            cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
-            cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+            // CPU workers start on the missed experts while this thread enqueues the GPU side
+            let mut gpu = || {
+                if !on.is_empty() {
+                    let xb = cb.empty(d); let y0 = cb.empty(d);
+                    cb.q8copy(&rd, rn, 0, &xb, &y0, d);
+                    let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+                    let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
+                    let _ = rbs; let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
+                    for ai in 0..xcg.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ai).cloned().collect(); if grp.is_empty() { continue; }
+                        let hx = cb.empty(c.ff_exp * grp.len()); cb.xrun_b(&xcg.tabs, &xcg.arena[ai], xcg.ar_bytes, &grp, &xb, d, c.ff_exp, tys, &hx, &y0); }
+                    yg = Some(y0);
+                }
+                cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
+                cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+            };
             if !off.is_empty() {
                 let lists: Vec<(usize, Vec<(usize, f32)>)> = off.iter().map(|&(e, w)| (e, vec![(0usize, w)])).collect();
                 let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
                 let tr = std::time::Instant::now();
-                self.routed_pool(l, &rv[..d], &work, 1, &mut yr);
+                self.routed_pool(l, &rv[..d], &work, 1, &mut yr, &mut gpu);
                 ROUTED_NS.fetch_add(tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            } else { gpu(); }
+            drop(xcg);
         } else {
             cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
             cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
@@ -692,7 +695,7 @@ impl Model {
         }
         if t <= 4 && std::env::var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
             && std::env::var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true) {
-            self.routed_pool(l, x, &work, t, y);
+            self.routed_pool(l, x, &work, t, y, &mut || {});
             ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             return;
         }
@@ -748,7 +751,7 @@ impl Model {
 
     /// Decode-size expert pass on the spinning pool: gate/up tasks (expert x row block) write the
     /// hidden rows in place, then down tasks (output row block) accumulate into y. No per-task Vecs.
-    fn routed_pool(&self, l: &Layer, x: &[f32], work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32]) {
+    fn routed_pool(&self, l: &Layer, x: &[f32], work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32], side: &mut dyn FnMut()) {
         use super::qdot; use super::spin_pool::SyncPtr;
         let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
         let pool = qn_pool(); let z0 = std::time::Instant::now();
@@ -759,7 +762,7 @@ impl Model {
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
         let mut hid = vec![0f32; hoff[work.len()]]; let hp = SyncPtr(hid.as_mut_ptr());
         thread_local! { static SC: std::cell::RefCell<(super::qdot::Scratch, super::qdot::Scratch)> = std::cell::RefCell::new(Default::default()); }
-        pool.run(work.len() * nb, &|k| {
+        pool.run_side(work.len() * nb, &|k| {
             let (wi, b) = (k / nb, k % nb); let (e, toks) = work[wi];
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
@@ -770,7 +773,7 @@ impl Model {
                     for (j, &(ti, _)) in toks.iter().enumerate() {
                         let v = if usek { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
-        });
+        }, side);
         let z1 = std::time::Instant::now();
         let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && std::env::var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
