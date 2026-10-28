@@ -56,6 +56,52 @@ fn k_gemv(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32
     }
 }
 
+/// GEMV straight from IQ4_XS blocks (repacked: f32 d, scales_h, scales_l, 32 words of nibbles =
+/// 35 words per 256). Each lane takes one qs word: 4 low nibbles (x[32ib+4k..]) and 4 high
+/// nibbles (x[32ib+16+4k..]), so adjacent lanes read adjacent activations. kv = the 16 IQ4_NL levels.
+#[cube(launch_unchecked)]
+fn k_gemv_iq4(x: &[f32], w: &[u32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, ooff: u32) {
+    // x staged in shared memory, padded by one float per 32 so the (sub-block, word) lane layout
+    // below is (nearly) bank-conflict free; the 8 rows of a cube share it.
+    let mut xs = Shared::<[f32]>::new_slice(6336usize);
+    let mut tab = Shared::<[f32]>::new_slice(16usize);
+    let mut i = UNIT_POS;
+    while i < cols {
+        xs[(i + i / 32) as usize] = x[(xoff + i) as usize];
+        i += CUBE_DIM;
+    }
+    if UNIT_POS < 16 {
+        tab[UNIT_POS as usize] = kv[UNIT_POS as usize];
+    }
+    sync_cube();
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let rw = (cols / 256) * 35;
+        let nb = cols / 256;
+        let ib = UNIT_POS_X / 4;
+        let k = UNIT_POS_X % 4;
+        let mut acc = 0.0f32;
+        for blk in 0..nb {
+            let b = row * rw + blk * 35;
+            let d = f32::reinterpret(w[b as usize]);
+            let sh = w[(b + 1) as usize];
+            let sl = w[(b + 2) as usize];
+            let qw = w[(b + 3 + UNIT_POS_X) as usize];
+            let ls = ((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4);
+            let p = blk * 264 + ib * 33 + 4 * k;
+            let mut part = 0.0f32;
+            #[unroll]
+            for j in 0..4u32 {
+                part += tab[((qw >> (8 * j)) & 15u32) as usize] * xs[(p + j) as usize];
+                part += tab[((qw >> (8 * j + 4)) & 15u32) as usize] * xs[(p + 16 + j) as usize];
+            }
+            acc += part * (d * (f32::cast_from(ls) - 32.0f32));
+        }        let t = plane_sum(acc);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t;
+        }
+    }
+}
 /// One cube (256 units) per stream: xn = x * rsqrt(mean(x^2) + eps) * norm.
 #[cube(launch_unchecked)]
 fn k_rms(x: &[f32], norm: &[f32], xn: &mut [f32], d: u32, eps: f32) {
@@ -783,7 +829,9 @@ pub fn xtype(t: super::gguf_q::QType) -> Option<u32> {
 
 pub struct Cube { pub client: Client, pub budget: std::sync::atomic::AtomicI64 }
 
-pub struct CMat { w: Handle, s: Handle, pub rows: usize, pub cols: usize, pub splits: Vec<usize> }
+pub struct CMat { w: Handle, s: Handle, pub rows: usize, pub cols: usize, pub splits: Vec<usize>,
+    /// native IQ4_XS row ranges (out row, rows, words) and Q8 row ranges (out row, rows, row in w/s); empty = all Q8
+    nat: Vec<(usize, usize, Handle)>, qseg: Vec<(usize, usize, usize)>, kv: Option<Handle> }
 
 impl Cube {
     pub fn new() -> anyhow::Result<Self> {
@@ -813,9 +861,42 @@ impl Cube {
         for e in extra { for b in 0..nb { let x = &e[b * 32..(b + 1) * 32]; let amax = x.iter().fold(0f32, |a, v| a.max(v.abs())); let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 };
             sc.push(d); for c in x.chunks_exact(4) { let qb: Vec<u8> = c.iter().map(|v| ((v * id).round().clamp(-127.0, 127.0) as i8) as u8).collect(); words.push(u32::from_le_bytes([qb[0], qb[1], qb[2], qb[3]])); } } }
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); } for _ in extra { splits.push(splits.last().unwrap() + 1); }
-        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows, cols, splits })
+        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows, cols, splits, nat: vec![], qseg: vec![], kv: None })
     }
-    pub fn buf(&self, v: &[f32]) -> Handle { self.client.create_from_slice(f32::as_bytes(v)) }
+    /// Like `upload`, but IQ4_XS matrices stay in their own format (half the bytes of Q8_0);
+    /// the rest are packed as Q8_0 as before. Opt-in (PYRE_QN_NATIVE=1): on the RTX 3060 this kernel is
+    /// still ALU/LSU-bound (mout 2560x6144: 65 us vs 59 us for Q8_0), so it is not a win yet.
+    pub fn upload_mix(&self, ms: &[&QMat], extra: &[&[f32]]) -> Option<CMat> {
+        use super::gguf_q::QType;
+        let cols = ms[0].cols;
+        let native = |m: &QMat| m.ty == QType::IQ4XS && cols % 256 == 0 && cols <= 6144;
+        if std::env::var("PYRE_QN_NATIVE").map(|v| v != "1").unwrap_or(true) || !ms.iter().any(|m| native(m)) { return self.upload(ms, extra); }
+        let q8: Vec<&QMat> = ms.iter().copied().filter(|m| !native(m)).collect();
+        let nq8 = q8.iter().map(|m| m.rows).sum::<usize>() + extra.len();
+        let nnat: usize = ms.iter().filter(|m| native(m)).map(|m| m.rows).sum();
+        if !self.take(nq8 * cols * 9 / 8 + nnat * cols / 256 * 140) { return None; }
+        let (mut words, mut sc): (Vec<u32>, Vec<f32>) = (vec![], vec![]);
+        if !q8.is_empty() { let q = super::qn_gpu::to_q8_0(&q8);
+            for blk in q.chunks_exact(34) { sc.push(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32()); for c in blk[2..].chunks_exact(4) { words.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } } }
+        let nb = cols / 32;
+        for e in extra { for b in 0..nb { let x = &e[b * 32..(b + 1) * 32]; let amax = x.iter().fold(0f32, |a, v| a.max(v.abs())); let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            sc.push(d); for c in x.chunks_exact(4) { let qb: Vec<u8> = c.iter().map(|v| ((v * id).round().clamp(-127.0, 127.0) as i8) as u8).collect(); words.push(u32::from_le_bytes([qb[0], qb[1], qb[2], qb[3]])); } } }
+        if words.is_empty() { words.push(0); sc.push(0.0); }
+        let (mut nat, mut qseg) = (vec![], vec![]); let (mut r0, mut qb) = (0usize, 0usize);
+        for m in ms {
+            if native(m) {
+                let raw = m.raw_rows(0, m.rows); let mut v: Vec<u32> = Vec::with_capacity(raw.len() / 136 * 35);
+                for b in raw.chunks_exact(136) { v.push(half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32().to_bits()); v.push(u16::from_le_bytes([b[2], b[3]]) as u32); v.push(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
+                    for c in b[8..].chunks_exact(4) { v.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } }
+                nat.push((r0, m.rows, self.client.create_from_slice(u32::as_bytes(&v))));
+            } else { match qseg.last_mut() { Some((a, n, _)) if *a + *n == r0 => *n += m.rows, _ => qseg.push((r0, m.rows, qb)) } qb += m.rows; }
+            r0 += m.rows;
+        }
+        for _ in extra { match qseg.last_mut() { Some((a, n, _)) if *a + *n == r0 => *n += 1, _ => qseg.push((r0, 1, qb)) } qb += 1; r0 += 1; }
+        let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); } for _ in extra { splits.push(splits.last().unwrap() + 1); }
+        let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect();
+        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(self.client.create_from_slice(f32::as_bytes(&kv))) })
+    }    pub fn buf(&self, v: &[f32]) -> Handle { self.client.create_from_slice(f32::as_bytes(v)) }
     pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         let t0 = std::time::Instant::now();
@@ -826,6 +907,15 @@ impl Cube {
     }
     /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
     pub fn gemv(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, out: &Handle, on: usize, ooff: usize) {
+        if !m.nat.is_empty() {
+            for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 16),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, (ooff + r0) as u32) } }
+            for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, (ooff + r0) as u32) } }
+            return;
+        }
         unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
             BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
             BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, xoff as u32, ooff as u32) }

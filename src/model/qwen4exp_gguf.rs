@@ -154,8 +154,8 @@ impl Model {
                     let gdn = match &l.mix { Mixer::Lin { conv, a, dt, norm, .. } if self.cfg.lin_dk == self.cfg.lin_dv && self.cfg.lin_dk % 32 == 0 =>
                         Some(super::qn_cube::GdnW { conv: cb.buf(conv), a: cb.buf(a), dt: cb.buf(dt), norm: cb.buf(norm) }), _ => None };
                     let an = match &l.mix { Mixer::Attn { qn, kn, .. } => Some((cb.buf(qn), cb.buf(kn))), _ => None };
-                    let c = (|| Some(CLayer { an, gdn, hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
-                        fin: cb.upload(&[&l.router, &l.sh_gate, &l.sh_up], &[&l.sh_gate_inp])?, sdown: cb.upload(&[&l.sh_down], &[])? }))();
+                    let c = (|| Some(CLayer { an, gdn, hca: chc(&l.hc_a)?, min: cb.upload_mix(&min, &[])?, mout: cb.upload_mix(&[mout], &[])?, hcf: chc(&l.hc_f)?,
+                        fin: cb.upload_mix(&[&l.router, &l.sh_gate, &l.sh_up], &[&l.sh_gate_inp])?, sdown: cb.upload_mix(&[&l.sh_down], &[])? }))();
                     if c.is_some() { on += 1 } else { off += 1 }
                     cl.push(c); gl.push(None);
                 }
