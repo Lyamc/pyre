@@ -301,8 +301,8 @@ impl Model {
             let (on, off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             xcg.hits += on.len() as u64;
             if !on.is_empty() {
-                let q = super::qdot::quantize(&rv[..d]); let xd: Vec<f32> = (0..d).map(|i| q.q[i] as f32 * q.d[i / 32]).collect();
-                let xb = cb.buf(&xd); let y0 = cb.buf(&vec![0f32; d]); let hx = cb.empty(c.ff_exp);
+                let xb = cb.empty(d); let y0 = cb.empty(d); let hx = cb.empty(c.ff_exp);
+                cb.q8copy(&rd, rn, 0, &xb, &y0, d);
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
                 let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
                 for (e, w) in &on { cb.xrun(&xcg.tabs, &xcg.map[&(il, *e)], &xb, d, c.ff_exp, tys, rbs, &hx, &y0, *w); }

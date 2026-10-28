@@ -427,6 +427,24 @@ fn k_q8sim(h: &mut [f32], n: u32) {
     }
 }
 
+/// dst[i] = src[soff + i] rounded to the Q8 grid (per 32); one plane per block. Also zeroes `z`.
+#[cube(launch_unchecked)]
+fn k_q8copy(src: &[f32], dst: &mut [f32], z: &mut [f32], soff: u32, n: u32) {
+    let b = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let i = b * 32 + UNIT_POS_X;
+    if b * 32 < n {
+        let v = src[(soff + i) as usize];
+        let amax = plane_max(f32::abs(v));
+        let d = amax / 127.0f32;
+        let mut q = 0.0f32;
+        if d > 0.0f32 {
+            q = f32::round(v * (1.0f32 / d));
+        }
+        dst[i as usize] = q * d;
+        z[i as usize] = 0.0f32;
+    }
+}
+
 /// y[row] += wgt * (down_row . h) for one cached expert.
 #[cube(launch_unchecked)]
 fn k_xdown(h: &[f32], wd: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], hoff: u32, rows: u32, cols: u32, rbd: u32, wgt: f32, #[comptime] td: u32) {
@@ -558,6 +576,11 @@ impl Cube {
             k_xdown::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
                 a(h, ff), a(&e.d, dw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), 0u32, d as u32, ff as u32, rbs.2 as u32, wgt, tys.2);
         }
+    }
+    /// dst = Q8-grid copy of src[soff..soff+n]; z[..n] = 0.
+    pub fn q8copy(&self, src: &Handle, sn: usize, soff: usize, dst: &Handle, z: &Handle, n: usize) {
+        unsafe { k_q8copy::launch_unchecked(&self.client, CubeCount::Static((n as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+            BufferArg::from_raw_parts(src.clone(), sn), BufferArg::from_raw_parts(dst.clone(), n), BufferArg::from_raw_parts(z.clone(), n), soff as u32, n as u32) }
     }
     pub fn silu_mul(&self, f: &Handle, fnn: usize, og: usize, ou: usize, h: &Handle, n: usize) {
         unsafe { k_silu_mul::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
