@@ -182,7 +182,7 @@ impl Model {
                 // routed-expert cache: whatever VRAM is left above the reserve (PYRE_QN_XCACHE_GB caps it; 0 disables)
                 let left = g.budget_left().max(0) as usize;
                 let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(usize::MAX);
-                let budget = left.saturating_sub(2048 << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
+                let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
@@ -772,14 +772,16 @@ impl Model {
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         });
         let z1 = std::time::Instant::now();
-        let hq: Vec<Vec<qdot::Q8Act>> = work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect();
+        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && std::env::var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
+        let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
+        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
         let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
         pool.run(d.div_ceil(dblk), &|b| {
             let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d));
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
                     for r in 0..r1 - r0 { let dr = dm.row_raw(r); if r + 4 < r1 - r0 { prefetch(dm.row_raw(r + 4)); }
-                        for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * qdot::row_dot(dm.ty, dr, &hq[wi][j], sc); unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
+                        for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         });
         use std::sync::atomic::Ordering::Relaxed; HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
     }

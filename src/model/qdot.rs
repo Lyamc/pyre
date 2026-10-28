@@ -374,3 +374,47 @@ unsafe fn iq1m_k(row: &[u8], a: &Q8K) -> f32 {
         tot += d * (l.iter().sum::<i32>() as f32 + 0.125 * corr as f32); }
     tot
 }
+
+// ---- Q2_0 with activations quantized per 64 (the weight block) and permuted to the weight's
+// bit-plane order: byte j of a block holds elements 4j..4j+3 in bit pairs, so (q >> 2k) & 3 over
+// all 16 bytes gives elements 4j+k for j = 0..15; storing x in that order turns the unpack into
+// two shifts and one AND per 32 values (no table lookups), with int32 accumulation per block.
+pub struct Q8D { pub q: Vec<i8>, pub d: Vec<f32>, pub s: Vec<i32> }
+impl Default for Q8D { fn default() -> Self { Q8D { q: vec![], d: vec![], s: vec![] } } }
+pub fn quantize_d_into(x: &[f32], a: &mut Q8D) {
+    let n = x.len(); a.q.resize(n, 0); a.d.resize(n / 64, 0.0); a.s.resize(n / 64, 0);
+    for b in 0..n / 64 {
+        let xb = &x[b * 64..(b + 1) * 64];
+        let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 }; a.d[b] = d;
+        let mut s = 0i32;
+        for j in 0..16 { for k in 0..4 { let v = (xb[4 * j + k] * id).round() as i8; a.q[b * 64 + 16 * k + j] = v; s += v as i32; } }
+        a.s[b] = s;
+    }
+}
+pub fn q2_0_dot_d(row: &[u8], a: &Q8D) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    { if avx2() { return unsafe { q2_0_d_avx2(row, a) }; } }
+    let mut s = 0f32;
+    for i in 0..a.d.len() { let b = &row[i * 18..i * 18 + 18]; let d = h2f(b, 0); let mut is = 0i32;
+        for j in 0..16 { for k in 0..4 { is += (((b[2 + j] >> (2 * k)) & 3) as i32) * a.q[i * 64 + 16 * k + j] as i32; } }
+        s += d * a.d[i] * (is - a.s[i]) as f32; }
+    s
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q2_0_d_avx2(row: &[u8], a: &Q8D) -> f32 {
+    use std::arch::x86_64::*;
+    let m3 = _mm256_set1_epi8(3); let one = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps(); let mut corr = 0f32; let rp = row.as_ptr(); let xq = a.q.as_ptr();
+    for i in 0..a.d.len() { let b = rp.add(i * 18);
+        let dd = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * *a.d.get_unchecked(i);
+        let qv = _mm_loadu_si128(b.add(2) as *const __m128i);
+        let lo = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 2), qv), m3);
+        let hi = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 6), _mm_srli_epi16(qv, 4)), m3);
+        let x0 = _mm256_loadu_si256(xq.add(i * 64) as *const __m256i); let x1 = _mm256_loadu_si256(xq.add(i * 64 + 32) as *const __m256i);
+        let p = _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc);
+        corr -= dd * *a.s.get_unchecked(i) as f32; }
+    corr + k::hsum(acc)
+}
