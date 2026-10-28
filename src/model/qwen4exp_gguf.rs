@@ -99,7 +99,7 @@ impl Model {
         let half = cfg.n_rot / 2;
         let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
         let mut layers = layers; let mut head = head;
-        if std::env::var("PYRE_QN_HC_Q8").map(|v| v != "0").unwrap_or(true) {
+        if std::env::var("PYRE_QN_HC_Q8").map(|v| v == "1").unwrap_or(false) {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
