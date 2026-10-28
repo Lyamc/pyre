@@ -148,7 +148,7 @@ cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
 
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_SystemInformation"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

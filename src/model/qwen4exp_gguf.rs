@@ -359,6 +359,15 @@ impl Model {
             let ent = cb.xupload(l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d));
             xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
         }
+        if std::env::var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
+            let l = &self.layers[*il]; let _ = e;
+            let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+            let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
+            let xb = cb.buf(&vec![0.01f32; d]); let y0 = cb.buf(&vec![0f32; d]); let hx = cb.empty(ff);
+            cb.xrun(&xc.tabs, ent, &xb, d, ff, tys, rbs, &hx, &y0, 0.1); cb.read(&y0);
+            let t1 = std::time::Instant::now(); for _ in 0..50 { cb.xrun(&xc.tabs, ent, &xb, d, ff, tys, rbs, &hx, &y0, 0.1); } cb.read(&y0);
+            eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB): {:.1} us", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6, t1.elapsed().as_secs_f64() * 1e6 / 50.0);
+        } }
         if n > 0 && std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }
 
@@ -816,7 +825,14 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
 
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
-    P.get_or_init(|| super::spin_pool::Pool::new(env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(rayon::current_num_threads()), std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64)))
+    P.get_or_init(|| {
+        // default: one worker per fast physical core, pinned (PYRE_QN_PIN="0,2,..." overrides, "none" disables)
+        let auto = super::spin_pool::fast_cores();
+        let pin: Vec<usize> = match std::env::var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
+        let n = env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(if pin.len() >= 4 { pin.len() } else { rayon::current_num_threads() });
+        eprintln!("expert pool: {n} workers, pinned to {:?}", pin);
+        super::spin_pool::Pool::new_pinned(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin)
+    })
 }
 
 fn env_usize(k: &str) -> Option<usize> { std::env::var(k).ok().and_then(|v| v.parse().ok()) }

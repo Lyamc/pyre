@@ -22,12 +22,14 @@ struct Shared {
 pub struct Pool { sh: Arc<Shared>, pub threads: usize }
 
 impl Pool {
-    pub fn new(threads: usize, spin: Duration) -> Self {
+    /// `pin`: logical CPU per worker (index 0 is the caller and is not pinned).
+    pub fn new(threads: usize, spin: Duration) -> Self { Self::new_pinned(threads, spin, &[]) }
+    pub fn new_pinned(threads: usize, spin: Duration, pin: &[usize]) -> Self {
         let sh = Arc::new(Shared { gen: AtomicU64::new(0), ticket: AtomicU64::new(0), job: AtomicPtr::new(std::ptr::null_mut()), done: AtomicUsize::new(0), n: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin });
         for i in 1..threads.max(1) {
-            let sh = sh.clone();
-            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || worker(&sh)).expect("spawn pool worker");
+            let sh = sh.clone(); let cpu = pin.get(i).copied();
+            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { if let Some(c) = cpu { pin_to(c); } worker(&sh) }).expect("spawn pool worker");
         }
         Pool { sh, threads: threads.max(1) }
     }
@@ -90,3 +92,36 @@ pub struct SyncPtr(pub *mut f32);
 unsafe impl Send for SyncPtr {}
 unsafe impl Sync for SyncPtr {}
 impl SyncPtr { #[allow(clippy::mut_from_ref)] pub unsafe fn slice(&self, off: usize, n: usize) -> &mut [f32] { std::slice::from_raw_parts_mut(self.0.add(off), n) } }
+
+#[cfg(windows)]
+fn pin_to(cpu: usize) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+    if cpu < usize::BITS as usize { unsafe { SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu); } }
+}
+#[cfg(not(windows))]
+fn pin_to(_cpu: usize) {}
+
+/// One logical CPU per physical core of the fastest efficiency class (P-cores on a hybrid Intel
+/// part), or empty when that cannot be read. Strata likewise runs one pool worker per physical core.
+#[cfg(windows)]
+pub fn fast_cores() -> Vec<usize> {
+    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
+    let mut len = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len); }
+    if len == 0 { return vec![]; }
+    let mut buf = vec![0u8; len as usize];
+    if unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, &mut len) } == 0 { return vec![]; }
+    let mut cores: Vec<(u8, usize)> = vec![]; let mut off = 0usize;
+    while off < len as usize {
+        let p = unsafe { &*(buf.as_ptr().add(off) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) };
+        let pr = unsafe { &p.Anonymous.Processor };
+        let g = pr.GroupMask[0];
+        if g.Group == 0 && g.Mask != 0 { cores.push((pr.EfficiencyClass, g.Mask.trailing_zeros() as usize)); }
+        off += p.Size as usize;
+        if p.Size == 0 { break; }
+    }
+    let best = cores.iter().map(|c| c.0).max().unwrap_or(0);
+    cores.iter().filter(|c| c.0 == best).map(|c| c.1).collect()
+}
+#[cfg(not(windows))]
+pub fn fast_cores() -> Vec<usize> { vec![] }
