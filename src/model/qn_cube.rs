@@ -132,7 +132,7 @@ fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32,
 
 /// x[s,i] += (a[i] * (gate? sigmoid(gb[goff]) : 1) + (b? b[i] : 0)) * 2 sigmoid(dn[lr+s]/hc)
 #[cube(launch_unchecked)]
-fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], gb: &[f32], dn: &[f32], d: u32, goff: u32, lr: u32, #[comptime] hc: u32, #[comptime] gate: bool, #[comptime] addb: bool) {
+fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], c: &[f32], gb: &[f32], dn: &[f32], d: u32, goff: u32, lr: u32, #[comptime] hc: u32, #[comptime] gate: bool, #[comptime] addb: bool, #[comptime] addc: bool) {
     let k = ABSOLUTE_POS as u32;
     if k < d * hc {
         let st = k / d;
@@ -143,6 +143,9 @@ fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], gb: &[f32], dn: &[f32], d: u32, g
         }
         if comptime!(addb) {
             o += b[i as usize];
+        }
+        if comptime!(addc) {
+            o += c[i as usize];
         }
         let inj = dn[(lr + st) as usize] / f32::cast_from(hc);
         x[k as usize] += o * 2.0f32 / (1.0f32 + f32::exp(-inj));
@@ -241,6 +244,217 @@ fn k_delta(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mu
     let _ = nv;
 }
 
+// ---- routed experts cached on the GPU in their native GGUF formats (Strata's expert cache idea) ----
+// type codes: 0 = IQ2_S, 1 = IQ2_XXS, 2 = IQ1_M, 3 = Q2_0
+
+#[cube]
+fn byte(w: &[u32], off: u32) -> u32 {
+    (w[(off / 4) as usize] >> ((off % 4) * 8)) & 255u32
+}
+
+#[cube]
+fn hf(h: u32) -> f32 {
+    let e = (h >> 10) & 31u32;
+    let m = f32::cast_from(h & 1023u32);
+    let mut v = m * 0.000000059604645f32;
+    if e != 0 {
+        v = (1.0f32 + m / 1024.0f32) * f32::powf(2.0f32, f32::cast_from(e) - 15.0f32);
+    }
+    if (h >> 15) & 1u32 == 1u32 {
+        v = -v;
+    }
+    v
+}
+
+/// Dot of the 32 weights of sub-block `sb` of the row starting at byte `rb` with x[xo + sb*32 ..].
+#[cube]
+fn subdot(w: &[u32], rb: u32, sb: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], #[comptime] ty: u32) -> f32 {
+    let mut acc = 0.0f32;
+    let xb = xo + sb * 32;
+    if comptime!(ty == 0) {
+        let blk = rb + (sb / 8) * 82;
+        let ib = sb % 8;
+        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8)) * 0.25f32;
+        let qh = byte(w, blk + 66 + ib);
+        let sc = byte(w, blk + 74 + ib);
+        #[unroll]
+        for l in 0..4u32 {
+            let idx = byte(w, blk + 2 + 4 * ib + l) | ((qh << (8 - 2 * l)) & 768u32);
+            let sg = byte(w, blk + 34 + 4 * ib + l);
+            let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
+            if l >= 2 {
+                scl = 0.5f32 + f32::cast_from(sc >> 4);
+            }
+            let mut part = 0.0f32;
+            #[unroll]
+            for j in 0..8u32 {
+                let gv = f32::cast_from((g2s[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32);
+                let mut v = gv * x[(xb + 8 * l + j) as usize];
+                if (sg >> j) & 1u32 == 1u32 {
+                    v = -v;
+                }
+                part += v;
+            }
+            acc += part * scl * d;
+        }
+    }
+    if comptime!(ty == 1) {
+        let blk = rb + (sb / 8) * 66;
+        let ib = sb % 8;
+        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8)) * 0.25f32;
+        let q = blk + 2 + 8 * ib;
+        let a1 = byte(w, q + 4) | (byte(w, q + 5) << 8) | (byte(w, q + 6) << 16) | (byte(w, q + 7) << 24);
+        let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
+        #[unroll]
+        for l in 0..4u32 {
+            let idx = byte(w, q + l);
+            let sg = ks[((a1 >> (7 * l)) & 127u32) as usize];
+            let mut part = 0.0f32;
+            #[unroll]
+            for j in 0..8u32 {
+                let gv = f32::cast_from((g2x[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32);
+                let mut v = gv * x[(xb + 8 * l + j) as usize];
+                if (sg >> j) & 1u32 == 1u32 {
+                    v = -v;
+                }
+                part += v;
+            }
+            acc += part * db;
+        }
+    }
+    if comptime!(ty == 2) {
+        let blk = rb + (sb / 8) * 56;
+        let ib = sb % 8;
+        let s0 = byte(w, blk + 48) | (byte(w, blk + 49) << 8);
+        let s1 = byte(w, blk + 50) | (byte(w, blk + 51) << 8);
+        let s2 = byte(w, blk + 52) | (byte(w, blk + 53) << 8);
+        let s3 = byte(w, blk + 54) | (byte(w, blk + 55) << 8);
+        let d = hf((s0 >> 12) | ((s1 >> 8) & 240u32) | ((s2 >> 4) & 3840u32) | (s3 & 61440u32));
+        let scw = byte(w, blk + 48 + 2 * (ib / 2)) | (byte(w, blk + 49 + 2 * (ib / 2)) << 8);
+        let sh = 6 * (ib % 2);
+        let dl1 = d * f32::cast_from(2 * ((scw >> sh) & 7u32) + 1);
+        let dl2 = d * f32::cast_from(2 * ((scw >> (sh + 3)) & 7u32) + 1);
+        let h0 = byte(w, blk + 32 + 2 * ib);
+        let h1 = byte(w, blk + 33 + 2 * ib);
+        #[unroll]
+        for l in 0..4u32 {
+            let qb = byte(w, blk + 4 * ib + l);
+            let mut hh = h0;
+            if l >= 2 {
+                hh = h1;
+            }
+            let mut idx = qb | ((hh << 8) & 1792u32);
+            let mut dbit = hh & 8u32;
+            if l % 2 == 1 {
+                idx = qb | ((hh << 4) & 1792u32);
+                dbit = hh & 128u32;
+            }
+            let mut delta = 0.125f32;
+            if dbit != 0 {
+                delta = -0.125f32;
+            }
+            let mut sl = dl1;
+            if l >= 2 {
+                sl = dl2;
+            }
+            let mut part = 0.0f32;
+            #[unroll]
+            for j in 0..8u32 {
+                let gb = (g1[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32;
+                let mut gv = f32::cast_from(gb);
+                if gb >= 128 {
+                    gv = gv - 256.0f32;
+                }
+                part += (gv + delta) * x[(xb + 8 * l + j) as usize];
+            }
+            acc += part * sl;
+        }
+    }
+    if comptime!(ty == 3) {
+        let blk = rb + (sb / 2) * 18;
+        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8));
+        let q = blk + 2 + 8 * (sb % 2);
+        #[unroll]
+        for k in 0..8u32 {
+            let b = byte(w, q + k);
+            #[unroll]
+            for j in 0..4u32 {
+                acc += (f32::cast_from((b >> (2 * j)) & 3u32) - 1.0f32) * x[(xb + 4 * k + j) as usize];
+            }
+        }
+        acc *= d;
+    }
+    acc
+}
+
+/// h[row] = silu(gate_row . x) * (up_row . x) for one cached expert; one plane per row.
+#[cube(launch_unchecked)]
+fn k_xgu(x: &[f32], wg: &[u32], wu: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], h: &mut [f32], hoff: u32, rows: u32, cols: u32, rbg: u32, rbu: u32,
+    #[comptime] tg: u32, #[comptime] tu: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nsb = cols / 32;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        let mut sb = UNIT_POS_X;
+        while sb < nsb {
+            gs += subdot(wg, row * rbg, sb, x, 0u32, g2s, g2x, ks, g1, tg);
+            us += subdot(wu, row * rbu, sb, x, 0u32, g2s, g2x, ks, g1, tu);
+            sb += 32u32;
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if UNIT_POS_X == 0 {
+            h[(hoff + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+/// Round h to the CPU's Q8 activation grid (per 32: d = amax/127), so GPU and CPU experts agree.
+#[cube(launch_unchecked)]
+fn k_q8sim(h: &mut [f32], n: u32) {
+    let b = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let i = b * 32 + UNIT_POS_X;
+    if b * 32 < n {
+        let v = h[i as usize];
+        let amax = plane_max(f32::abs(v));
+        let d = amax / 127.0f32;
+        let mut q = 0.0f32;
+        if d > 0.0f32 {
+            q = f32::round(v * (1.0f32 / d));
+        }
+        h[i as usize] = q * d;
+    }
+}
+
+/// y[row] += wgt * (down_row . h) for one cached expert.
+#[cube(launch_unchecked)]
+fn k_xdown(h: &[f32], wd: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], hoff: u32, rows: u32, cols: u32, rbd: u32, wgt: f32, #[comptime] td: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nsb = cols / 32;
+        let mut s = 0.0f32;
+        let mut sb = UNIT_POS_X;
+        while sb < nsb {
+            s += subdot(wd, row * rbd, sb, h, hoff, g2s, g2x, ks, g1, td);
+            sb += 32u32;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[row as usize] += wgt * t;
+        }
+    }
+}
+
+/// Grid tables for the expert kernels.
+pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle }
+/// One cached expert: raw GGUF bytes of its gate, up and down rows.
+pub struct XEnt { g: Handle, u: Handle, d: Handle, pub bytes: usize }
+pub fn xtype(t: super::gguf_q::QType) -> Option<u32> {
+    use super::gguf_q::QType::*;
+    match t { IQ2S => Some(0), IQ2XXS => Some(1), IQ1M => Some(2), Q2_0 => Some(3), _ => None }
+}
+
 pub struct Cube { pub client: Client, pub budget: std::sync::atomic::AtomicI64 }
 
 pub struct CMat { w: Handle, s: Handle, pub rows: usize, pub cols: usize, pub splits: Vec<usize> }
@@ -301,12 +515,14 @@ impl Cube {
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, lr, hc as u32) }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn comb(&self, x: &Handle, a: &Handle, b: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) {
+    pub fn comb(&self, x: &Handle, a: &Handle, b: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) { self.comb3(x, a, b, None, g, dn, lr, hc, d) }
+    #[allow(clippy::too_many_arguments)]
+    pub fn comb3(&self, x: &Handle, a: &Handle, b: Option<&Handle>, c3: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) {
         let (gb, gn, goff) = g.map(|(h, n, o)| (h.clone(), n, o)).unwrap_or((a.clone(), d, 0));
-        let bb = b.cloned().unwrap_or_else(|| a.clone());
+        let bb = b.cloned().unwrap_or_else(|| a.clone()); let cc = c3.cloned().unwrap_or_else(|| a.clone());
         unsafe { k_comb::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(a.clone(), d), BufferArg::from_raw_parts(bb, d), BufferArg::from_raw_parts(gb, gn),
-            BufferArg::from_raw_parts(dn.clone(), lr + hc), d as u32, goff as u32, lr as u32, hc as u32, g.is_some(), b.is_some()) }
+            BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(a.clone(), d), BufferArg::from_raw_parts(bb, d), BufferArg::from_raw_parts(cc, d), BufferArg::from_raw_parts(gb, gn),
+            BufferArg::from_raw_parts(dn.clone(), lr + hc), d as u32, goff as u32, lr as u32, hc as u32, g.is_some(), b.is_some(), c3.is_some()) }
     }
     pub fn conv(&self, proj: &Handle, pn: usize, w: &Handle, cs: &Handle, co: &Handle, ch: usize, kk: usize) {
         unsafe { k_conv::launch_unchecked(&self.client, CubeCount::Static((ch as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
@@ -319,6 +535,29 @@ impl Cube {
             BufferArg::from_raw_parts(co.clone(), ch), BufferArg::from_raw_parts(proj.clone(), pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
             BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), nv * dk * dk), BufferArg::from_raw_parts(out.clone(), nv * dk),
             nk as u32, nv as u32, zoff as u32, boff as u32, aoff as u32, eps, dk as u32) }
+    }
+    pub fn xtabs(&self) -> XTabs {
+        use super::iq_tables::*;
+        let w64 = |t: &[u64]| -> Vec<u32> { t.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect() };
+        let ks: Vec<u32> = KSIGNS_IQ2XS.iter().map(|&v| v as u32).collect();
+        XTabs { g2s: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2XXS_GRID))),
+            ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))) }
+    }
+    pub fn xupload(&self, g: &[u8], u: &[u8], d: &[u8]) -> XEnt {
+        XEnt { g: self.client.create_from_slice(g), u: self.client.create_from_slice(u), d: self.client.create_from_slice(d), bytes: g.len() + u.len() + d.len() }
+    }
+    /// One cached expert: h = silu(G x) * (U x) -> Q8 grid -> y += wgt * D h.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun(&self, tb: &XTabs, e: &XEnt, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), rbs: (usize, usize, usize), h: &Handle, y: &Handle, wgt: f32) {
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let (gw, uw, dw) = (ff * rbs.0 / 4, ff * rbs.1 / 4, d * rbs.2 / 4);
+        unsafe {
+            k_xgu::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+                a(x, d), a(&e.g, gw), a(&e.u, uw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ff), 0u32, ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1);
+            k_q8sim::launch_unchecked(&self.client, CubeCount::Static((ff as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ff), ff as u32);
+            k_xdown::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+                a(h, ff), a(&e.d, dw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), 0u32, d as u32, ff as u32, rbs.2 as u32, wgt, tys.2);
+        }
     }
     pub fn silu_mul(&self, f: &Handle, fnn: usize, og: usize, ou: usize, h: &Handle, n: usize) {
         unsafe { k_silu_mul::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),

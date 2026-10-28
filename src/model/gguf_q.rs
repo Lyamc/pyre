@@ -205,6 +205,8 @@ impl QMat {
     pub fn row(&self, r: usize, y: &mut [f32]) { let rb = self.row_bytes(); dequant(self.ty, &self.mm[self.off + r * rb..self.off + (r + 1) * rb], &mut y[..self.cols]); }
     pub fn to_f32(&self) -> Vec<f32> { let mut v = vec![0f32; self.rows * self.cols]; for r in 0..self.rows { self.row(r, &mut v[r * self.cols..]); } v }
     /// Sub-matrix of `n` rows starting at `r0` (e.g. one expert out of a fused [E*out, in] tensor).
+    /// Raw bytes of rows r0..r0+n (contiguous).
+    pub fn raw_rows(&self, r0: usize, n: usize) -> &[u8] { let rb = self.row_bytes(); &self.mm[self.off + r0 * rb..self.off + (r0 + n) * rb] }
     pub fn slice_rows(&self, r0: usize, n: usize) -> QMat { QMat { ty: self.ty, rows: n, cols: self.cols, mm: self.mm.clone(), off: self.off + r0 * self.row_bytes() } }
     /// y[t*rows + r] = sum_c W[r,c] * x[t*cols + c] for t in 0..T. Rows split across the rayon pool.
     pub fn matmul(&self, x: &[f32], t: usize, y: &mut [f32]) {

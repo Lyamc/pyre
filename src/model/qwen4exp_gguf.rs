@@ -31,7 +31,9 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
-pub struct Model { cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct XCache { tabs: super::qn_cube::XTabs, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64 }
+
+pub struct Model { xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -101,7 +103,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -154,6 +156,11 @@ impl Model {
                 }
                 let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
                 g.budget.fetch_sub(used, std::sync::atomic::Ordering::Relaxed);
+                if std::env::var("PYRE_QN_TYPES").is_ok() { for (i, l) in self.layers.iter().enumerate().take(4) {
+                    let mut v: Vec<(&str, &QMat)> = vec![("hca.down", &l.hc_a.down), ("hca.up", &l.hc_a.up), ("router", &l.router), ("sh_gate", &l.sh_gate), ("sh_up", &l.sh_up), ("sh_down", &l.sh_down)];
+                    match &l.mix { Mixer::Attn { q, k, v: vv, o, .. } => { v.push(("q", q)); v.push(("k", k)); v.push(("v", vv)); v.push(("o", o)); }, Mixer::Lin { qkv, z, beta, alpha, out, .. } => { v.push(("qkv", qkv)); v.push(("z", z)); v.push(("beta", beta)); v.push(("alpha", alpha)); v.push(("out", out)); } }
+                    eprintln!("types L{i}: {}", v.iter().map(|(n, m)| format!("{n}={:?}[{}x{}]", m.ty, m.rows, m.cols)).collect::<Vec<_>>().join(" "));
+                } eprintln!("types out={:?} embd={:?}", self.out.ty, self.embd.ty); }
                 if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(c0)) = cl.iter().find(|x| x.is_some()) {
                     let x = cb.buf(&vec![0.01f32; hc * d]); let xn = cb.empty(hc * d); let o = cb.empty(20000); let dn = cb.buf(&vec![0.01f32; 400]);
                     let bench = |name: &str, f: &dyn Fn()| { f(); cb.read(&o); let t0 = std::time::Instant::now(); for _ in 0..50 { f(); } cb.read(&o); eprintln!("cubebench {name}: {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / 50.0); };
@@ -166,7 +173,15 @@ impl Model {
                     bench("gate", &|| cb.gate(&x, &dn, &c0.hca.up, &o, 20000, 0, hc, d));
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
-                self.cl = cl; self.cube = Some(cb);
+                self.cl = cl;
+                // routed-expert cache: whatever VRAM is left above the reserve (PYRE_QN_XCACHE_GB caps it; 0 disables)
+                let left = g.budget_left().max(0) as usize;
+                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(usize::MAX);
+                let budget = left.saturating_sub(2048 << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
+                if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
+                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0 })); }
+                self.cube = Some(cb);
             }
         }
         if self.cube.is_none() { for l in &self.layers {
@@ -233,7 +248,7 @@ impl Model {
     }
 
     /// One decode token through a layer with the dense half in pyre's CubeCL kernels (x stays on the GPU).
-    fn layer_cube(&self, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
+    fn layer_cube(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
         let q0 = std::time::Instant::now();
         let xn = cb.empty(w);
@@ -275,15 +290,76 @@ impl Model {
         let rv = cb.read(&rd);
         let q5 = std::time::Instant::now();
         let sf = l.sh_gate.rows; let hb = cb.empty(sf); let sh = cb.empty(d);
-        cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
-        cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
         let mut yr = vec![0f32; d];
-        self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
+        let mut yg = None;
+        if let Some(xm) = &self.xc {
+            // route on the host, run the cached experts on the GPU while the CPU pool runs the rest
+            let sel = top_k(&rv[d..d + ne], c.top_k);
+            let mut xcg = xm.lock().unwrap();
+            for &(e, _) in &sel { xcg.cnt[il][e] += 1; }
+            xcg.total += sel.len() as u64;
+            let (on, off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
+            xcg.hits += on.len() as u64;
+            if !on.is_empty() {
+                let q = super::qdot::quantize(&rv[..d]); let xd: Vec<f32> = (0..d).map(|i| q.q[i] as f32 * q.d[i / 32]).collect();
+                let xb = cb.buf(&xd); let y0 = cb.buf(&vec![0f32; d]); let hx = cb.empty(c.ff_exp);
+                let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+                let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
+                for (e, w) in &on { cb.xrun(&xcg.tabs, &xcg.map[&(il, *e)], &xb, d, c.ff_exp, tys, rbs, &hx, &y0, *w); }
+                yg = Some(y0);
+            }
+            drop(xcg);
+            cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
+            cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+            if !off.is_empty() {
+                let lists: Vec<(usize, Vec<(usize, f32)>)> = off.iter().map(|&(e, w)| (e, vec![(0usize, w)])).collect();
+                let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
+                let tr = std::time::Instant::now();
+                self.routed_pool(l, &rv[..d], &work, 1, &mut yr);
+                ROUTED_NS.fetch_add(tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
+            cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+            self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
+        }
         let q6 = std::time::Instant::now();
         let yb = cb.buf(&yr);
-        cb.comb(x, &sh, Some(&yb), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
+        cb.comb3(x, &sh, Some(&yb), yg.as_ref(), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
         HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
+    }
+
+    /// Keep the most-routed experts (by count so far) resident on the GPU, within the cache budget.
+    fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
+        xc.calls += 1;
+        let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
+        if xc.calls != 1 && xc.calls % every != 0 { return; }
+        let ff = self.cfg.ff_exp; let d = self.cfg.d;
+        let size = |l: &Layer| ff * l.gate_e.row_bytes() + ff * l.up_e.row_bytes() + d * l.down_e.row_bytes();
+        let mut cand: Vec<(u32, usize, usize)> = vec![];
+        for (il, l) in self.layers.iter().enumerate() {
+            if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
+            for e in 0..self.cfg.n_exp { if xc.cnt[il][e] > 0 { cand.push((xc.cnt[il][e], il, e)); } }
+        }
+        cand.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut want = std::collections::HashSet::new(); let mut tot = 0usize;
+        for &(_, il, e) in &cand { let s = size(&self.layers[il]); if tot + s > xc.budget { break; } tot += s; want.insert((il, e)); }
+        // eviction order: resident experts that fell out of the wanted set, least used first
+        let mut evict: Vec<(u32, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xc.cnt[il][e], il, e)).collect();
+        evict.sort_by(|a, b| b.0.cmp(&a.0));
+        let max_new = if xc.calls == 1 { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
+        let t0 = std::time::Instant::now(); let mut n = 0;
+        for &(_, il, e) in &cand {
+            if n >= max_new { break; }
+            if !want.contains(&(il, e)) || xc.map.contains_key(&(il, e)) { continue; }
+            let l = &self.layers[il];
+            while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; } }, None => break } }
+            if xc.used + size(l) > xc.budget { break; }
+            let ent = cb.xupload(l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d));
+            xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
+        }
+        if n > 0 && std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }
 
     /// Hybrid layer: hyper-connection mixes + residual on the CPU (int8), big projections on the GPU.
@@ -557,6 +633,7 @@ impl Model {
             let top = &idx[..c.top_k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
             let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
             for (&e, w) in top.iter().zip(ws) { by_exp[e].push((ti, w / sum)); }
+            if let Some(xm) = &self.xc { if let Some(il) = self.layers.iter().position(|x| std::ptr::eq(x, l)) { let mut g = xm.lock().unwrap(); for &e in top { g.cnt[il][e] += 1; } } }
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
         if t * c.top_k >= work.len() * env_usize("PYRE_QN_GEMM_MIN").unwrap_or(8) { // >= 8 tokens per expert on average
@@ -623,7 +700,7 @@ impl Model {
     fn routed_pool(&self, l: &Layer, x: &[f32], work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32]) {
         use super::qdot; use super::spin_pool::SyncPtr;
         let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
-        let pool = qn_pool();
+        let pool = qn_pool(); let z0 = std::time::Instant::now();
         let acts: Vec<qdot::Q8Act> = (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect();
         let blk = env_usize("PYRE_QN_SBLK").unwrap_or(32); let nb = ff.div_ceil(blk);
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
@@ -639,8 +716,9 @@ impl Model {
                         let v = silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2);
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         });
+        let z1 = std::time::Instant::now();
         let hq: Vec<Vec<qdot::Q8Act>> = work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect();
-        let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr());
+        let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
         pool.run(d.div_ceil(dblk), &|b| {
             let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d));
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
@@ -648,10 +726,18 @@ impl Model {
                     for r in 0..r1 - r0 { let dr = dm.row_raw(r);
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * qdot::row_dot(dm.ty, dr, &hq[wi][j], sc); unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         });
+        use std::sync::atomic::Ordering::Relaxed; HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
     }
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
     pub fn forward(&self, ids: &[u32], st: &mut State) -> Vec<f32> {
+        let lg = self.forward_inner(ids, st);
+        // first fill of the expert cache from the prompt's routing counts (part of prefill time)
+        if let (Some(cb), Some(xm), true) = (&self.cube, &self.xc, ids.len() > 1) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
+        lg
+    }
+
+    fn forward_inner(&self, ids: &[u32], st: &mut State) -> Vec<f32> {
         let c = &self.cfg; let (d, hc) = (c.d, c.hc); let t = ids.len(); let start = st.tokens.len();
         st.tokens.extend_from_slice(ids);
         let mut x = vec![0f32; t * hc * d];
@@ -663,6 +749,7 @@ impl Model {
         let mut xc: Option<burn_cubecl::cubecl::server::Handle> = None;
         let gdn_ok = t == 1 && self.cube.is_some() && std::env::var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })));
+        if let (Some(cb), Some(xm), 1) = (&self.cube, &self.xc, t) { let mut g = xm.lock().unwrap(); if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } }
         if let Some(cb) = &self.cube {
             if gdn_ok && !st.gdn_gpu { st.gdn = st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect(); st.gdn_gpu = true; }
             if !gdn_ok && st.gdn_gpu { for (i, (a, b)) in st.gdn.iter().enumerate() { st.conv[i] = cb.read(a); st.ssm[i] = cb.read(b); } st.gdn.clear(); st.gdn_gpu = false; }
@@ -679,7 +766,7 @@ impl Model {
             if let (Some(Some(cl)), 1) = (self.cl.get(il), t) {
                 let cb = self.cube.as_ref().unwrap();
                 if xc.is_none() { xc = Some(cb.buf(&x)); }
-                self.layer_cube(l, cl, xc.as_ref().unwrap(), st, &mut ai, &mut li, start);
+                self.layer_cube(il, l, cl, xc.as_ref().unwrap(), st, &mut ai, &mut li, start);
                 if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
                 continue;
             }
@@ -717,6 +804,15 @@ impl Model {
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// softmax over the top k router logits (same order of operations as `routed`).
+fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let mut idx: Vec<usize> = (0..r.len()).collect();
+    idx.select_nth_unstable_by(k, |a, b| r[*b].partial_cmp(&r[*a]).unwrap());
+    let top = &idx[..k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
+    let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
+    top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()
+}
 
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
