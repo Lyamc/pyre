@@ -1,0 +1,15 @@
+# Same table as monga's DEFAULT_CATEGORIES (crates/monga-core/src/content.rs, branch content-tags).
+# id | label | threshold | restricted or open | model tags
+sexual_violence | Sexual violence | 0.35 | restricted | rape, imminent_rape, after_rape, implied_rape, assisted_rape, molestation, sleep_molestation, sexual_harassment, you_gonna_get_raped, rape_face, forced, drugged, mind_break, sex_slave, punishment_sex
+sexual | Sexual content | 0.40 | restricted | sex, vaginal, anal, oral, fellatio, cunnilingus, paizuri, handjob, footjob, masturbation, group_sex, gangbang, cum, cum_in_pussy, cumdrip, after_sex, sex_toy, vibrator, dildo, tentacle_sex, erection, ahegao, bestiality, zoophilia, incest, prostitution, clothed_sex, sex_from_behind, implied_sex, bukkake, lactation, futanari
+genitals | Explicit nudity | 0.40 | restricted | penis, pussy, testicles, anus, clitoris, spread_anus, uncensored, censored, mosaic_censoring, bar_censor, heart_censor, novelty_censor, blur_censor, censored_nipples
+nudity | Nudity | 0.45 | restricted | nude, completely_nude, nipples, areolae, areola_slip, bottomless, nipple_slip, naked_apron, naked_towel, naked_shirt, nude_cover, exhibitionism, public_indecency, convenient_censoring, light_censor, steam_censor
+suggestive | Suggestive | 0.55 | open | underwear, panties, lingerie, cleavage, groping, spread_legs, sexually_suggestive, erection_under_clothes, bikini
+child_sexual | Sexualised minors | 0.45 | restricted | loli, shota
+gore | Gore | 0.40 | restricted | guro, ero_guro, decapitation, severed_head, severed_limb, severed_arm, severed_leg, severed_hand, severed_torso, dismemberment, intestines, organs, brain, exposed_bone, disembodied_head, disembodied_torso, impaled, cannibalism, pool_of_blood, pile_of_corpses, corpse, vore
+blood | Blood | 0.50 | open | blood, blood_on_face, blood_splatter, blood_on_clothes, blood_on_hand, blood_on_weapon, blood_from_mouth, blood_on_knife, blood_spray, bloody_handprints
+violence | Violence | 0.45 | restricted | violence, murder, execution, torture, strangling, abuse, stab, injury, bruise, death, imminent_death
+self_harm | Self-harm and suicide | 0.35 | restricted | self-harm, self-harm_scar, implied_self-harm, wrist_cutting, cutting, suicide, attempted_suicide, imminent_suicide, implied_suicide, hanging, noose
+drugs | Drugs | 0.45 | open | drugs, syringe, joint_(drug)
+bondage | Bondage | 0.45 | restricted | bondage, bdsm, restrained, bound, tied_up_(nonsexual), nipple_torture
+horror | Horror | 0.50 | open | horror_(theme)
