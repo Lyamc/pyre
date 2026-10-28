@@ -533,7 +533,7 @@ impl Model {
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
         let gpu_tmax = env_usize("PYRE_QN_GPU_TMAX").unwrap_or(8);
-        let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(true);
+        let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(false);
         let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
