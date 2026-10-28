@@ -387,3 +387,10 @@ deliberately not ported.
 Attribution: the graph follows llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py`. The
 i-quant grids in `src/model/iq_tables.rs` and the vec_dot activation-quantization scheme come from ggml
 (MIT, (c) the ggml authors).
+
+### Qwen-Next decode, Oct 27 evening round
+- CPU experts: Q8_K-style activations (one scale per 256) with int32 super-block accumulation for IQ2_S/IQ2_XXS/IQ1_M (the q8_K vec_dot idea from ggml, MIT); software prefetch of expert rows.
+- GPU: full attention for decode (RMS norm + RoPE + KV append, softmax*V with gate), KV synced lazily with the host; cached experts of a layer in one batched launch from 1 GiB arenas; 8-values-per-lane expert kernels.
+- Native IQ4_XS dense GEMV exists but is opt-in (PYRE_QN_NATIVE=1); it is not faster than Q8_0 on an RTX 3060 yet.
+- Int8 HC mix is opt-in (PYRE_QN_HC_Q8=1): it changed greedy output on a short prompt.
+- Steady decode about 12-14 tok/s (prompt A) and 12-13 tok/s (prompt B), vs Strata 25.9 / 15.4 tok/s.
