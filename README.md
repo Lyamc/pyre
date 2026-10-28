@@ -335,7 +335,8 @@ Measured on a 16-core desktop with a 12 GB RTX card (Windows/WDDM). Prompt B is 
 |---|---|---|---|
 | pyre CPU, start of this work | 2.8 | 13 (noisy) / 6 | 0 |
 | pyre CPU now | 3.4 | 9.8 | 0 |
-| pyre `-b cuda` now | 4.3-4.9 | 9.1-9.9 | ~5 GB |
+| pyre `-b cuda`, Burn ops (`PYRE_QN_CUBE=0`) | 4.3-4.9 | 9.1-9.9 | ~5 GB |
+| pyre `-b cuda` now (own CubeCL kernels + GPU expert cache) | 10.8-12.0 steady (~10 overall) | 8-10 | ~8.9 GB peak |
 | Strata 0.1.48 (same GGUF) | 15.4 (B), 25.9 (short prompt) | 80 | 10.9 GB |
 
 Greedy output matches between the pyre CPU and GPU paths. It also matches Strata token for token on a
@@ -353,9 +354,34 @@ contain no Strata code:
 - Large prefill chunks with batched dense work and per-head DeltaNet threading (CPU prefill on a
   720-token prompt went from 8.3 to 16.7 tok/s).
 
-Not adopted yet: the GPU expert cache, CUDA graphs and fused kernels (the main gap; each Burn op costs tens
-of µs on WDDM), MTP/prompt-lookup drafting (this GGUF has no MTP tensors), the QSA indexer beyond 2048
-tokens, and GPU expert streaming for prefill. Strata's refusal-direction ("speed projection") vector is
+Decode path with `-b cuda` (`src/model/qn_cube.rs`, pyre's own CubeCL kernels on one stream): Q8 GEMV,
+fused hyper-connection RMSNorm / gate / combine, Gated DeltaNet conv + delta rule with the recurrent state
+kept on the GPU (copied back when a CPU prefill continues the same session), the shared expert, and a
+routed-expert cache. The cache holds the most-routed experts (counted from the prompt, refreshed every 16
+tokens) in their native IQ2_S / IQ2_XXS / IQ1_M / Q2_0 bytes, repacked word-aligned. It is sized from the
+VRAM left above pyre's reserve minus 2 GiB of headroom (`PYRE_QN_XCACHE_GB` caps it; 0 disables it).
+Cached experts run on the GPU while a spinning, P-core-pinned worker pool (`src/model/spin_pool.rs`) runs
+the rest. This leaves two readbacks per attention layer, one per DeltaNet layer, and a few for PLE and the
+head. More env: `PYRE_QN_CUBE`, `PYRE_QN_GDN_GPU`, `PYRE_QN_XREFILL`, `PYRE_QN_XSWAP`, `PYRE_QN_XDEBUG`,
+`PYRE_QN_SPIN`, `PYRE_QN_SPIN_US` (100), `PYRE_QN_SPIN_THREADS`, `PYRE_QN_PIN` (cpu list or `none`),
+`PYRE_QN_SBLK`/`PYRE_QN_SDBLK`.
+
+More ideas taken from Strata, with their effect on prompt B decode:
+- The fused per-layer GPU step instead of many framework ops (Burn path 4.5 -> 6.1 tok/s).
+- DeltaNet on the GPU (100 -> 64 readbacks per token, ~8.1 tok/s).
+- A persistent pool with one worker per physical P-core, pinned (routed 47 -> ~22 ms/token).
+- The GPU expert cache ranked by usage, overlapping the CPU pool (45-55% hits).
+Together: about 10-12 tok/s.
+
+Not adopted yet:
+- CUDA graphs. cubecl at this revision exposes `graph_prepare`/`start_capture`/`stop_capture`, so no cubecl
+  change is needed. But GPU utilisation is only ~35% and host enqueue is ~2 ms/token, so the remaining cost
+  is readback latency more than launch overhead.
+- Native IQ4_XS dense weights. Q8 doubles the bytes, about 5 ms/token at the 3060's bandwidth.
+- MTP/prompt-lookup drafting (this GGUF has no MTP tensors).
+- The QSA indexer beyond 2048 tokens.
+- GPU expert streaming for prefill.
+Strata's refusal-direction ("speed projection") vector is
 deliberately not ported.
 
 Attribution: the graph follows llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py`. The
