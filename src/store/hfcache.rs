@@ -23,17 +23,24 @@ pub fn split_rev(spec: &str) -> (&str, Option<&str>) {
     match spec.split_once('@') { Some((r, v)) => (r, Some(v)), None => (spec, None) }
 }
 
+/// A snapshot holds a model: config.json / model_index.json, or GGUF files (top level or one quant sub-folder).
+fn has_model(snap: &Path) -> bool {
+    if snap.join("config.json").exists() || snap.join("model_index.json").exists() { return true; }
+    let gguf = |d: &Path| std::fs::read_dir(d).map(|r| r.flatten().any(|e| e.path().extension().is_some_and(|x| x == "gguf"))).unwrap_or(false);
+    gguf(snap) || std::fs::read_dir(snap).map(|r| r.flatten().any(|e| e.path().is_dir() && gguf(&e.path()))).unwrap_or(false)
+}
+
 /// Resolve `repo[@rev]` to a snapshot directory if it is present in the cache.
 pub fn find(cache: &Path, repo: &str, rev: Option<&str>) -> Option<PathBuf> {
     let root = cache.join(repo_folder(repo));
     let rev = rev.unwrap_or("main");
     let commit = std::fs::read_to_string(root.join("refs").join(rev)).map(|s| s.trim().to_string()).unwrap_or_else(|_| rev.to_string());
     let snap = root.join("snapshots").join(&commit);
-    if snap.is_dir() && (snap.join("config.json").exists() || snap.join("model_index.json").exists()) { return Some(snap); }
+    if snap.is_dir() && has_model(&snap) { return Some(snap); }
     // a ref-less cache (e.g. copied around): take the newest snapshot when asking for "main"
     if rev == "main" {
         let mut snaps: Vec<_> = std::fs::read_dir(root.join("snapshots")).ok()?.flatten()
-            .filter(|e| e.path().join("config.json").exists() || e.path().join("model_index.json").exists())
+            .filter(|e| has_model(&e.path()))
             .collect();
         snaps.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
         return snaps.last().map(|e| e.path());

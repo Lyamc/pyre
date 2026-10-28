@@ -15,6 +15,7 @@
     <button data-tab="models">Models</button>
     <button data-tab="images">Images</button>
     <button data-tab="audio">Audio</button>
+    <button data-tab="apps">Apps</button>
     <button data-tab="status">Server</button>
   </nav>
   <div class="right">
@@ -32,6 +33,7 @@
   </aside>
   <div class="chat">
     <div class="chatbar">
+      <button id="convToggle" class="ghost" title="Conversations">☰</button>
       <select id="modelPick" title="Model"></select>
       <span id="tps" class="muted"></span>
       <button id="settingsBtn" class="ghost">⚙ Settings</button>
@@ -129,6 +131,16 @@
         <audio id="ttsAudio" controls class="hidden"></audio>
       </fieldset>
     </div>
+  </div>
+</section>
+
+<!-- APPS -->
+<section id="tab-apps" class="tab">
+  <div class="card"><h3>Apps <span class="muted small" id="appsInfo"></span></h3>
+    <p class="muted small">Companion programs that use this pyre server. Install builds the app into pyre's apps folder and configures it with this server's URL. "Run" starts it on the machine pyre runs on.</p>
+    <div id="appsList" class="apps"></div>
+    <div class="row"><input id="appSrc" placeholder="folder with pyre-app.toml, or manifest path"><button id="appAdd">Install from path</button></div>
+    <pre id="appLog" class="out logs hidden"></pre>
   </div>
 </section>
 

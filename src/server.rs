@@ -35,7 +35,7 @@ type S = State<Arc<App>>;
 type AppState = Llm;
 
 pub fn router(st: Arc<App>) -> Router {
-    crate::api::routes(Router::new())
+    crate::apps::routes(crate::api::routes(Router::new()))
         .route("/v1/models", get(models))
         .route("/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -60,7 +60,25 @@ pub fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(json!({"error": {"code": code.as_u16(), "message": m, "type": if code == StatusCode::UNAUTHORIZED {"authentication_error"} else {"invalid_request_error"}}}))).into_response()
 }
 
+/// CORS (like llama-server: any origin) + optional API-key check. Preflight never needs the key.
 async fn auth(State(st): S, req: Request, next: Next) -> Response {
+    use axum::http::{header, HeaderValue, Method};
+    if req.method() == Method::OPTIONS {
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        let ask = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+        let h = r.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, ask.unwrap_or(HeaderValue::from_static("authorization, content-type, x-api-key")));
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        return r;
+    }
+    let mut r = auth_inner(st, req, next).await;
+    r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    r
+}
+
+async fn auth_inner(st: Arc<App>, req: Request, next: Next) -> Response {
     if let Some(key) = &st.api_key {
         let p = req.uri().path();
         // health + the static UI shell are public; the UI then sends the key on API calls
@@ -178,6 +196,58 @@ fn sse(s: impl Stream<Item = Value> + Send + 'static, done: bool) -> SseStream {
     Sse::new(s).keep_alive(KeepAlive::default())
 }
 
+// ---------- reasoning split ----------
+/// Splits `<think>...</think>` off a chat completion into `reasoning_content` (llama.cpp's
+/// "deepseek" reasoning format). Handles templates whose generation prompt already opens
+/// `<think>` (Qwen3.x thinking models): then the output starts inside the block.
+/// PYRE_REASONING=none keeps everything in `content`.
+struct Think { on: bool, enabled: bool, at_start: bool, strip_nl: bool, buf: String }
+impl Think {
+    fn new(prompt: &str) -> Self {
+        let enabled = std::env::var("PYRE_REASONING").map(|v| v != "none").unwrap_or(true);
+        Think { on: enabled && prompt.trim_end().ends_with("<think>"), enabled, at_start: true, strip_nl: false, buf: String::new() }
+    }
+    fn partial(s: &str, tag: &str) -> usize { (1..tag.len()).rev().find(|&k| s.len() >= k && s.is_char_boundary(s.len() - k) && tag.starts_with(&s[s.len() - k..])).unwrap_or(0) }
+    /// Feed streamed text; returns (reasoning, content) ready to send.
+    fn push(&mut self, s: &str) -> (String, String) {
+        self.buf.push_str(s);
+        let (mut r, mut c) = (String::new(), String::new());
+        loop {
+            if self.on {
+                if let Some(k) = self.buf.find("</think>") { r.push_str(&self.buf[..k]); self.buf.drain(..k + 8); self.on = false; self.strip_nl = true; continue; }
+                let n = self.buf.len() - Self::partial(&self.buf, "</think>");
+                r.push_str(&self.buf[..n]); self.buf.drain(..n);
+            } else {
+                if self.enabled && self.at_start {
+                    let t = self.buf.trim_start();
+                    if t.starts_with("<think>") { let k = self.buf.find("<think>").unwrap(); self.buf.drain(..k + 7); self.on = true; self.at_start = false; continue; }
+                    if "<think>".starts_with(t) { break; } // could still become the open tag
+                }
+                self.at_start = false;
+                let mut out = std::mem::take(&mut self.buf);
+                if self.strip_nl { let t = out.trim_start_matches(['\n', '\r']).to_string(); if !t.is_empty() { self.strip_nl = false; } out = t; }
+                c.push_str(&out);
+            }
+            break;
+        }
+        if self.on { self.at_start = false; }
+        (r, c)
+    }
+    fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.buf);
+        if self.on { (rest, String::new()) } else { (String::new(), rest) }
+    }
+}
+
+fn think_delta(r: String, c: String) -> Option<Value> {
+    match (r.is_empty(), c.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(json!({"reasoning_content": r})),
+        (true, false) => Some(json!({"content": c})),
+        (false, false) => Some(json!({"reasoning_content": r, "content": c})),
+    }
+}
+
 // ---------- OpenAI chat ----------
 #[derive(Deserialize)]
 struct ChatReq {
@@ -210,12 +280,17 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
     let id = rid("chatcmpl");
     let created = now();
+    let mut think = Think::new(&prompt);
     let rx = start(&st, ids, &req.g);
     if !req.g.stream {
         return match collect(rx).await {
-            Ok((text, fin, t, _)) => Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": fin, "logprobs": null}],
-                "usage": usage(&t), "timings": t})).into_response(),
+            Ok((text, fin, t, _)) => {
+                let (mut r, mut c) = think.push(&text); let (r2, c2) = think.finish(); r.push_str(&r2); c.push_str(&c2);
+                let mut msg = json!({"role": "assistant", "content": c});
+                if !r.is_empty() { msg["reasoning_content"] = json!(r); }
+                Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": msg, "finish_reason": fin, "logprobs": null}],
+                "usage": usage(&t), "timings": t})).into_response() }
             Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
     }
@@ -225,11 +300,13 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let first = stream::once({ let c = chunk.clone(); async move { c(json!({"role": "assistant", "content": ""}), Value::Null) } });
     let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
         let v: Vec<Value> = match e {
-            Event::Token(s) => vec![chunk(json!({"content": s}), Value::Null)],
+            Event::Token(s) => { let (r, c) = think.push(&s); think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
             Event::Done { finish_reason, timings, .. } => {
+                let (r, c) = think.finish();
+                let mut v: Vec<Value> = think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect();
                 let mut f = chunk(json!({}), json!(finish_reason));
                 f["timings"] = json!(timings);
-                let mut v = vec![f];
+                v.push(f);
                 if inc { let mut u = chunk(json!({}), Value::Null); u["choices"] = json!([]); u["usage"] = usage(&timings); v.push(u); }
                 v
             }

@@ -39,25 +39,49 @@ function md(src) {
       html += `<pre><button class="copy small">copy</button><code data-lang="${esc(lang)}">${esc(code.replace(/\n$/, ""))}</code></pre>`; return; }
     let t = esc(p);
     t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
-      .replace(/^#{1,6} (.*)$/gm, "<b>$1</b>").replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      .replace(/^(#{1,6}) (.*)$/gm, (_, h, t) => `<h${Math.min(h.length + 2, 6)}>${t}</h${Math.min(h.length + 2, 6)}>`).replace(/^(-{3,}|\*{3,})$/gm, "<hr>").replace(/^&gt; ?(.*)$/gm, "<blockquote>$1</blockquote>").replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     const lines = t.split("\n"); let out = "", list = null;
-    for (const l of lines) {
+    for (let li = 0; li < lines.length; li++) {
+      const l = lines[li];
+      if (/^\s*\|.*\|\s*$/.test(l) && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[li + 1] || "") && (lines[li + 1] || "").includes("-")) { // GFM table
+        if (list) { out += `</${list}>`; list = null; }
+        const cells = r => r.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+        out += "<table class=\"mdt\"><thead><tr>" + cells(l).map(c => `<th>${c}</th>`).join("") + "</tr></thead><tbody>"; li += 2;
+        while (li < lines.length && /^\s*\|/.test(lines[li])) { out += "<tr>" + cells(lines[li]).map(c => `<td>${c}</td>`).join("") + "</tr>"; li++; }
+        li--; out += "</tbody></table>"; continue;
+      }
       const m = l.match(/^\s*([-*]|\d+\.)\s+(.*)/);
       if (m) { const tag = /\d/.test(m[1]) ? "ol" : "ul"; if (list !== tag) { if (list) out += `</${list}>`; out += `<${tag}>`; list = tag; } out += `<li>${m[2]}</li>`; continue; }
       if (!l.trim()) continue; // blank lines don't break a list
       if (list && /^\s{2,}/.test(l)) { out = out.replace(/<\/li>$/, `<br>${l.trim()}</li>`); continue; }
       if (list) { out += `</${list}>`; list = null; }
-      out += `<p>${l}</p>`;
+      out += /^<(h\d|hr|blockquote)/.test(l) ? l : `<p>${l}</p>`;
     }
     if (list) out += `</${list}>`; html += out;
   });
   return html;
 }
+// Qwen3-style reasoning: <think>…</think> (or the API's reasoning_content) shown collapsed.
+function splitThink(text) {
+  const m = text.match(/^\s*<think>([\s\S]*?)(<\/think>|$)([\s\S]*)$/);
+  if (!m) { const k = text.indexOf("</think>"); return k >= 0 ? { think: text.slice(0, k), done: true, answer: text.slice(k + 8) } : { think: "", done: true, answer: text }; }
+  return { think: m[1], done: !!m[2], answer: m[3] };
+}
+function renderAssistant(m) {
+  const t = splitThink(m.content); const think = (m.reasoning || "") + t.think;
+  let h = "";
+  if (think.trim()) h += `<details class="think"><summary>${t.done && m.content.length > 0 && (t.answer.trim() || !m.streaming) ? "Thought process" : "Thinking…"} <span class="muted">(${think.trim().split(/\s+/).length} words)</span></summary><div class="thinkbody">${md(think.trim())}</div></details>`;
+  h += md(t.answer);
+  if (m.error) h += `<div class="err">⚠ ${esc(m.error)}</div>`;
+  if (m.streaming && !t.answer && !think) h += `<span class="dots">…</span>`;
+  return h;
+}
+function plainAnswer(m) { return splitThink(m.content).answer.trim(); }
 document.addEventListener("click", e => { if (e.target.classList.contains("copy")) { navigator.clipboard.writeText(e.target.nextElementSibling.textContent); e.target.textContent = "copied"; setTimeout(() => e.target.textContent = "copy", 1000); } });
 
 // ---------- tabs / theme ----------
 $$("#tabs button").forEach(b => b.onclick = () => { $$("#tabs button").forEach(x => x.classList.toggle("active", x === b)); $$(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + b.dataset.tab)); location.hash = b.dataset.tab; onTab(b.dataset.tab); });
-function onTab(t) { if (t === "models") loadModels(); if (t === "status") loadStatus(); if (t === "images" || t === "audio") loadKinds(); }
+function onTab(t) { if (t === "models") loadModels(); if (t === "status") loadStatus(); if (t === "images" || t === "audio") loadKinds(); if (t === "apps") loadApps(); }
 document.documentElement.dataset.theme = LS.get("theme", matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
 $("#themeBtn").onclick = () => { const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = t; LS.set("theme", t); };
 $("#keyBtn").onclick = askKey;
@@ -83,7 +107,8 @@ $("#convList").onclick = e => {
 $("#newConv").onclick = newConv;
 function msgEl(m, i) {
   const d = document.createElement("div"); d.className = "msg " + m.role;
-  d.innerHTML = `<div class="role"><span>${m.role}</span><span class="muted">${m.stats ? esc(m.stats) : ""}</span></div><div class="body">${m.role === "assistant" ? md(m.content) : esc(m.content).replace(/\n/g, "<br>")}</div>`;
+  d.innerHTML = `<div class="role"><span>${m.role}</span><span class="muted">${m.stats ? esc(m.stats) : ""}</span></div><div class="body">${m.role === "assistant" ? renderAssistant(m) : esc(m.content).replace(/\n/g, "<br>")}</div>
+    <div class="macts"><button class="small ghost" data-mact="copy">copy</button>${m.role === "user" ? `<button class="small ghost" data-mact="edit">edit</button>` : `<button class="small ghost" data-mact="regen">regenerate</button>`}<button class="small ghost" data-mact="del">delete</button></div>`;
   d.dataset.i = i; return d;
 }
 function renderMsgs() {
@@ -94,25 +119,31 @@ function renderMsgs() {
 async function generate() {
   const c = conv(); const model = $("#modelPick").value;
   const msgs = []; const sys = $("#sysPrompt").value.trim(); if (sys) msgs.push({ role: "system", content: sys });
-  c.messages.forEach(m => msgs.push({ role: m.role, content: m.content }));
+  c.messages.forEach(m => { if (m.role === "assistant" && m.error && !m.content) return; msgs.push({ role: m.role, content: m.role === "assistant" ? plainAnswer(m) : m.content }); });
   const body = { model, messages: msgs, stream: true, stream_options: { include_usage: true },
     temperature: +$("#sTemp").value, top_p: +$("#sTopP").value, top_k: +$("#sTopK").value, max_tokens: +$("#sMax").value };
   if ($("#sSeed").value !== "") body.seed = +$("#sSeed").value;
-  const a = { role: "assistant", content: "" }; c.messages.push(a);
+  if (!model) { const a = { role: "assistant", content: "", error: "No text model is loaded. Load one on the Models page (or start pyre with -m <model>)." }; c.messages.push(a); save(); renderMsgs(); return; }
+  const a = { role: "assistant", content: "", reasoning: "", streaming: true }; c.messages.push(a);
   const el = msgEl(a, c.messages.length - 1); $("#messages").appendChild(el); const bodyEl = $(".body", el);
   ctrl = new AbortController(); $("#stopBtn").classList.remove("hidden"); $("#sendBtn").disabled = true;
-  const t0 = performance.now(); let first = 0, n = 0, timings = null;
+  const t0 = performance.now(); let first = 0, n = 0, timings = null, raf = 0;
+  const box = $("#messages"); const stick = () => box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const paint = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; const s = stick(); const open = $("details.think", bodyEl)?.open; bodyEl.innerHTML = renderAssistant(a); if (open) $("details.think", bodyEl).open = true; if (s) box.scrollTop = 1e9; }); };
+  paint();
   try {
     for await (const ch of sse("/v1/chat/completions", body, ctrl.signal)) {
       if (ch.error) throw new Error(ch.error.message);
-      const d = ch.choices?.[0]?.delta?.content; if (d) { if (!first) first = performance.now(); n++; a.content += d; bodyEl.innerHTML = md(a.content); $("#messages").scrollTop = 1e9; }
+      const dl = ch.choices?.[0]?.delta || {}; const d = dl.content, r = dl.reasoning_content;
+      if (d || r) { if (!first) first = performance.now(); n++; if (d) a.content += d; if (r) a.reasoning += r; paint(); }
       if (ch.timings) timings = ch.timings;
     }
-  } catch (e) { if (e.name !== "AbortError") a.content += `\n\n**error:** ${e.message}`; bodyEl.innerHTML = md(a.content); }
+  } catch (e) { if (e.name !== "AbortError") a.error = e.message || String(e); else a.stats = "stopped"; }
   finally {
+    if (raf) cancelAnimationFrame(raf); delete a.streaming; bodyEl.innerHTML = renderAssistant(a);
     ctrl = null; $("#stopBtn").classList.add("hidden"); $("#sendBtn").disabled = false;
     if (timings) a.stats = `${timings.predicted_n} tok · ${timings.predicted_per_second.toFixed(1)} tok/s · prompt ${timings.prompt_per_second.toFixed(0)} tok/s`;
-    else if (n) a.stats = `${n} chunks · ${(n / ((performance.now() - (first || t0)) / 1000)).toFixed(1)} tok/s`;
+    else if (n && a.stats !== "stopped") a.stats = `${n} chunks · ${(n / ((performance.now() - (first || t0)) / 1000)).toFixed(1)} tok/s`;
     $("#tps").textContent = a.stats || ""; $(".role .muted", el).textContent = a.stats || "";
     save();
   }
@@ -126,6 +157,22 @@ $("#composer").onsubmit = e => {
 $("#input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#composer").requestSubmit(); } };
 $("#stopBtn").onclick = () => ctrl?.abort();
 $("#regenBtn").onclick = () => { const c = conv(); if (!c || ctrl) return; while (c.messages.length && c.messages.at(-1).role === "assistant") c.messages.pop(); if (!c.messages.length) return; renderMsgs(); generate(); };
+
+$("#messages").onclick = e => {
+  const act = e.target.dataset?.mact; if (!act) return; const c = conv(); const el = e.target.closest(".msg"); const i = +el.dataset.i; const m = c.messages[i];
+  if (act === "copy") { navigator.clipboard.writeText(m.role === "assistant" ? plainAnswer(m) : m.content); e.target.textContent = "copied"; return; }
+  if (ctrl) return;
+  if (act === "del") { c.messages.splice(i, 1); save(); renderMsgs(); }
+  else if (act === "regen") { c.messages.splice(i); save(); renderMsgs(); generate(); }
+  else if (act === "edit") {
+    const body = $(".body", el); body.innerHTML = `<textarea class="editbox" rows="4"></textarea><div class="row"><button class="small primary" data-mact="editsave">Save & send</button><button class="small" data-mact="editcancel">Cancel</button></div>`;
+    $("textarea", body).value = m.content; $("textarea", body).focus();
+  }
+  else if (act === "editcancel") renderMsgs();
+  else if (act === "editsave") { m.content = $("textarea", el).value; c.messages.splice(i + 1); save(); renderMsgs(); generate(); }
+};
+$("#convToggle").onclick = () => document.body.classList.toggle("show-convs");
+$("#convList").addEventListener("click", () => document.body.classList.remove("show-convs"));
 
 // ---------- models ----------
 let kinds = {};
@@ -224,6 +271,33 @@ $("#ttsGo").onclick = async () => {
     if (!r.ok) throw new Error((await r.json()).error?.message);
     $("#ttsAudio").src = URL.createObjectURL(await r.blob()); $("#ttsAudio").classList.remove("hidden"); $("#ttsAudio").play();
   } catch (e) { alert(e.message); }
+};
+
+// ---------- apps ----------
+async function loadApps() {
+  let r; try { r = await api("/api/apps"); } catch (e) { $("#appsInfo").textContent = e.message; return; }
+  $("#appsInfo").textContent = `folder: ${r.apps_dir} · apps are configured with ${r.server}`;
+  $("#appsList").innerHTML = r.apps.map(a => { const m = a.manifest?.app || {}; const inst = a.installed; const ents = a.manifest?.entry || [];
+    const models = (a.manifest?.models || []).map(x => `${x.kind}: ${x.models[0]}`).join(", ");
+    return `<div class="appcard"><div><b>${esc(a.name)}</b> <span class="muted small">${esc(m.version || "")}</span>${inst ? ' <span class="tag llm">installed</span>' : ""}<div class="small">${esc(m.description || "")}</div>
+      <div class="muted small">${models ? "needs " + esc(models) : ""}${inst ? " · " + esc(inst.dir) : ""}${inst?.warnings?.length ? " · ⚠ " + esc(inst.warnings.join("; ")) : ""}</div></div>
+      <div class="row">${inst ? ents.map(e => `<button class="small" data-apprun="${esc(a.name)}" data-entry="${esc(e.name)}" title="${esc(e.description || "")}">Run ${esc(e.name)}</button>`).join("") + `<button class="small" data-appinst="${esc(a.name)}">Update</button><button class="small danger" data-apprm="${esc(a.name)}">Remove</button>` : `<button class="small primary" data-appinst="${esc(a.name)}">Install</button>`}
+      ${m.web_ui ? `<a class="small" href="${esc(m.web_ui)}" target="_blank">Open</a>` : ""}</div></div>`; }).join("");
+}
+async function appInstall(name) {
+  const lg = $("#appLog"); lg.classList.remove("hidden"); lg.textContent = `installing ${name} (building can take a few minutes)…`;
+  try { const r = await api("/api/apps/install", { name }); lg.textContent = r.log.join("\n") + (r.models?.length ? "\n\nmodels: " + r.models.map(m => `${m.kind} → ${m.models.join(", ")}`).join("; ") + " (load them on the Models page)" : ""); }
+  catch (e) { lg.textContent = "error: " + e.message; }
+  loadApps();
+}
+$("#tab-apps").onclick = async e => {
+  const b = e.target;
+  try {
+    if (b.dataset.appinst) { b.disabled = true; await appInstall(b.dataset.appinst); }
+    else if (b.dataset.apprm) { if (!confirm(`Remove ${b.dataset.apprm}? (deletes its folder in pyre's apps dir)`)) return; await api("/api/apps/remove", { name: b.dataset.apprm }); loadApps(); }
+    else if (b.dataset.apprun) { const r = await api("/api/apps/run", { name: b.dataset.apprun, entry: b.dataset.entry }); b.textContent = `started (pid ${r.pid})`; }
+    else if (b.id === "appAdd") { const p = $("#appSrc").value.trim(); if (p) await appInstall(p); }
+  } catch (err) { alert(err.message); }
 };
 
 // ---------- status ----------

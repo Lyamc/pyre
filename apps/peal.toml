@@ -1,0 +1,39 @@
+# pyre companion app manifest (see pyre README, "Apps").
+[app]
+name = "peal"
+description = "Speech-to-text client (whisburn's CLI + GPUI app) that transcribes through pyre"
+version = "0.1.0"
+license = "MIT"
+min_pyre_api = 1
+
+[source]
+path = "C:/Build/ai/peal"
+
+[[build]]
+cargo = "."
+bins = ["peal"]
+
+[[build]]
+cargo = "gui"
+bins = ["peal-gui"]
+optional = true
+
+[[entry]]
+name = "peal"
+bin = "peal"
+kind = "cli"
+description = "peal transcribe -i FILE [-m tiny_en] [--format srt|txt|json]"
+
+[[entry]]
+name = "peal-gui"
+bin = "peal-gui"
+kind = "gui"
+description = "desktop app"
+
+[pyre]
+url_env = "PEAL_SERVER"
+gui_args = ["{url}"]
+
+[[models]]
+kind = "stt"
+models = ["tiny_en", "base_en", "base"]

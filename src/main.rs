@@ -16,6 +16,10 @@ mod sampler;
 mod server;
 mod limits;
 mod template;
+mod qn_cli;
+mod apps;
+mod engine_qn;
+mod qn_find;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -56,6 +60,13 @@ pub enum Cmd {
     Models {
         #[command(subcommand)]
         cmd: ModelsCmd,
+    },
+    /// Run a Qwen3.8-Flash-Next (qwen4_exp) checkpoint directly: greedy text or logits dump
+    QwenNext(qn_cli::QnArgs),
+    /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
+    App {
+        #[command(subcommand)]
+        cmd: apps::AppCmd,
     },
 }
 
@@ -139,16 +150,68 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
         Cmd::Serve(a) => serve(ctx, a),
+        Cmd::QwenNext(a) => qn_cli::run(a),
+        Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }
 
 /// Load one text-generation model and start its worker.
 pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
+    if qn_find::is_qwen4exp(dir) { return load_qn(dir, id, backend_name, n_predict); }
     let (llama, tok, template, eos, bname, fdt) = load_llm_parts(dir, backend_name, dtype, ctx_size)?;
     let n_ctx = llama.max_ctx;
     let engine = engine::spawn(llama, tok.clone(), eos);
     Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: dir.display().to_string(), n_ctx,
         backend: bname.to_string(), dtype: format!("{fdt:?}"), default_max_tokens: n_predict })
+}
+
+/// rayon pool for the CPU GGUF path (PYRE_QN_THREADS, default 16 of the 13900K's 32 threads).
+pub fn qn_threads() {
+    let n = std::env::var("PYRE_QN_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+}
+
+/// Tokenizer, chat template and EOS ids for a qwen4exp GGUF (from the base model's HF files).
+pub fn qn_text_parts(f: &std::path::Path, m: &model::qwen4exp_gguf::Model) -> Result<(Arc<tokenizers::Tokenizer>, template::ChatTemplate, Vec<u32>)> {
+    let base = m.g.meta.get("general.base_model.0.repo_url").and_then(|v| v.as_str()).map(String::from);
+    let tdir = qn_find::tokenizer_dir(f, base.as_deref())?;
+    let tok = Arc::new(tokenizers::Tokenizer::from_file(tdir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
+    let template = template::ChatTemplate::from_model_dir(&tdir)?;
+    let mut eos = vec![];
+    if let Ok(g) = std::fs::read_to_string(tdir.join("generation_config.json")) {
+        if let Ok(g) = serde_json::from_str::<serde_json::Value>(&g) { eos.extend(ids(&g.get("eos_token_id").cloned())); }
+    }
+    for t in [template.eos_token.as_str(), "<|im_end|>"] { if let Some(i) = tok.token_to_id(t) { eos.push(i); } }
+    eos.sort(); eos.dedup();
+    Ok((tok, template, eos))
+}
+
+/// Qwen3.8-Flash-Next GGUF: CPU engine, experts quantized in the mmap (see model::qwen4exp_gguf).
+/// `-b cuda` (and a CUDA build): dense projections to the GPU (Strata's split); otherwise all-CPU.
+pub fn qn_attach_gpu(m: &mut model::qwen4exp_gguf::Model, backend: &str) -> Result<String> {
+    if backend != "cuda" || !cfg!(feature = "cuda") { return Ok("cpu".into()); }
+    let t = std::time::Instant::now();
+    let (on, off, gb) = m.attach_gpu(model::qn_gpu::Gpu::new()?)?;
+    tracing::info!("qwen4exp: {on} projection groups on the GPU ({gb:.2} GiB Q8), {off} left on the CPU (VRAM reserve), in {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!("gpu: {on} groups on the GPU ({gb:.2} GiB Q8), {off} on the CPU, {:.1}s", t.elapsed().as_secs_f64());
+    Ok(if off == 0 { "cuda+cpu-experts".into() } else { "cuda(partial)+cpu".into() })
+}
+
+fn load_qn(dir: &std::path::Path, id: &str, backend_name: &str, n_predict: usize) -> Result<server::Llm> {
+    let f = qn_find::find_gguf(dir).context("no .gguf found")?;
+    qn_threads();
+    let t = std::time::Instant::now();
+    let mut m = model::qwen4exp_gguf::Model::load(&f)?;
+    let label = qn_attach_gpu(&mut m, backend_name)?;
+    let tp = std::time::Instant::now(); let gb = m.prefault_experts(); if gb > 0.0 { tracing::info!("qwen4exp: {gb:.1} GiB of routed experts made resident in {:.1}s", tp.elapsed().as_secs_f64()); }
+    tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
+        f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
+    let (tok, template, eos) = qn_text_parts(&f, &m)?;
+    tracing::info!("eos ids {eos:?}");
+    let n_ctx = m.max_ctx();
+    let engine = engine_qn::spawn(Arc::new(m), tok.clone(), eos);
+    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: f.display().to_string(), n_ctx,
+        backend: label, dtype: "gguf".into(), default_max_tokens: n_predict })
 }
 
 #[allow(clippy::type_complexity)]
@@ -212,8 +275,14 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let addr = format!("{}:{}", args.host, args.port);
+        let local = if args.host == "0.0.0.0" || args.host == "::" { "127.0.0.1".to_string() } else { args.host.clone() };
+        apps::set_server(format!("http://{local}:{}", args.port));
         let l = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("pyre listening on http://{addr} (web UI at /)");
+        for u in lan_urls(&args.host, args.port) { tracing::info!("  reachable at {u}"); }
+        if args.host != "127.0.0.1" && args.host != "localhost" && args.api_key.is_none() {
+            tracing::warn!("listening beyond localhost without --api-key: anyone on the network can use this server");
+        }
         axum::serve(l, server::router(app)).await?;
         Ok(())
     })
@@ -235,4 +304,19 @@ fn kernel_cache_config() {
         c.environment.path = burn_cubecl::cubecl::config::cache::CacheConfig::Global;
     }
     if !CubeClRuntimeConfig::try_set(c) { tracing::warn!("cubecl config already loaded; kernel cache setting not applied"); }
+}
+/// URLs other machines can use when bound to 0.0.0.0 / a specific address.
+fn lan_urls(host: &str, port: u16) -> Vec<String> {
+    let mut v = vec![];
+    if host == "0.0.0.0" || host == "::" {
+        v.push(format!("http://127.0.0.1:{port}"));
+        // primary outbound interface (UDP connect sends no packets)
+        if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if s.connect("8.8.8.8:80").is_ok() {
+                if let Ok(a) = s.local_addr() { if !a.ip().is_loopback() { v.push(format!("http://{}:{port}  (LAN)", a.ip())); } }
+            }
+        }
+        if let Ok(h) = std::env::var("COMPUTERNAME") { v.push(format!("http://{}:{port}", h.to_lowercase())); }
+    }
+    v
 }
