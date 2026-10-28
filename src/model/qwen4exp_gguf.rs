@@ -31,7 +31,7 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
-pub struct Model { pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct Model { cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -97,7 +97,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -132,7 +132,26 @@ impl Model {
         };
         let (mut on, mut off) = (0, 0); let b0 = g.budget_left();
         let mut gl = vec![];
-        for l in &self.layers {
+        if std::env::var("PYRE_QN_CUBE").map(|v| v != "0").unwrap_or(true) {
+            if let Ok(cb) = super::qn_cube::Cube::new() {
+                use super::qn_cube::{CHc, CLayer};
+                let cb0 = cb.budget.load(std::sync::atomic::Ordering::Relaxed);
+                let chc = |h: &Hc| -> Option<CHc> { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } Some(CHc { norm: cb.buf(&h.norm), di: cb.upload(&a, &[])?, up: cb.upload(&[&h.up], &[])? }) };
+                let mut cl = vec![];
+                for l in &self.layers {
+                    let min = match &l.mix { Mixer::Attn { q, k, v, .. } => vec![q, k, v], Mixer::Lin { qkv, z, beta, alpha, .. } => vec![qkv, z, beta, alpha] };
+                    let mout = match &l.mix { Mixer::Attn { o, .. } => o, Mixer::Lin { out, .. } => out };
+                    let c = (|| Some(CLayer { hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
+                        fin: cb.upload(&[&l.router, &l.sh_gate, &l.sh_up], &[&l.sh_gate_inp])?, sdown: cb.upload(&[&l.sh_down], &[])? }))();
+                    if c.is_some() { on += 1 } else { off += 1 }
+                    cl.push(c); gl.push(None);
+                }
+                let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
+                g.budget.fetch_sub(used, std::sync::atomic::Ordering::Relaxed);
+                self.cl = cl; self.cube = Some(cb);
+            }
+        }
+        if self.cube.is_none() { for l in &self.layers {
             let min = match &l.mix { Mixer::Attn { q, k, v, .. } => vec![q, k, v], Mixer::Lin { qkv, z, beta, alpha, .. } => vec![qkv, z, beta, alpha] };
             let mout = match &l.mix { Mixer::Attn { o, .. } => o, Mixer::Lin { out, .. } => out };
             let parts = (|| -> Result<Option<GLayer>> { Ok(Some(GLayer {
@@ -146,7 +165,7 @@ impl Model {
             })) })()?;
             if parts.is_some() { on += 1 } else { off += 1 }
             gl.push(parts);
-        }
+        } }
         let mut m = std::collections::HashMap::new();
         let mut extra: Vec<Vec<&QMat>> = vec![];
         for l in &self.layers { if let Some(p) = &l.ple { extra.push(vec![&p.key, &p.value]); } }
@@ -193,6 +212,39 @@ impl Model {
         let mut yr = vec![0f32; t * d];
         self.routed(l, &mfc, &lgc, t, &mut yr, false);
         super::qn_gpu::combine(x2, sh + g.up(&yr, [t, d]), inj_f.unwrap(), t, hc, d)
+    }
+
+    /// One decode token through a layer with the dense half in pyre's CubeCL kernels (x stays on the GPU).
+    fn layer_cube(&self, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
+        let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
+        let xn = cb.empty(w);
+        let lra = cl.hca.up.cols; let da = cb.empty(cl.hca.di.rows);
+        cb.rms(x, &cl.hca.norm, &xn, hc, d, c.eps);
+        cb.gemv(&cl.hca.di, &xn, w, 0, &da, cl.hca.di.rows, 0);
+        let mixed = cb.empty(d);
+        cb.gate(&xn, &da, &cl.hca.up, &mixed, d, 0, hc, d);
+        let proj = cb.empty(cl.min.rows);
+        cb.gemv(&cl.min, &mixed, d, 0, &proj, cl.min.rows, 0);
+        let pv = cb.read(&proj);
+        let parts: Vec<Vec<f32>> = (0..cl.min.splits.len() - 1).map(|i| pv[cl.min.splits[i]..cl.min.splits[i + 1]].to_vec()).collect();
+        let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, parts, start, 1); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, parts, 1); *li += 1; o } };
+        let cbuf = cb.buf(&core); let o = cb.empty(d);
+        cb.gemv(&cl.mout, &cbuf, core.len(), 0, &o, d, 0);
+        cb.comb(x, &o, None, None, &da, lra, hc, d);
+        let lrf = cl.hcf.up.cols; let df = cb.empty(cl.hcf.di.rows);
+        cb.rms(x, &cl.hcf.norm, &xn, hc, d, c.eps);
+        cb.gemv(&cl.hcf.di, &xn, w, 0, &df, cl.hcf.di.rows, 0);
+        let rn = d + cl.fin.rows; let rd = cb.empty(rn);
+        cb.gate(&xn, &df, &cl.hcf.up, &rd, rn, 0, hc, d);
+        cb.gemv(&cl.fin, &rd, rn, 0, &rd, rn, d);
+        let rv = cb.read(&rd);
+        let sf = l.sh_gate.rows; let hb = cb.empty(sf); let sh = cb.empty(d);
+        cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
+        cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+        let mut yr = vec![0f32; d];
+        self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
+        let yb = cb.buf(&yr);
+        cb.comb(x, &sh, Some(&yb), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
     }
 
     /// Hybrid layer: hyper-connection mixes + residual on the CPU (int8), big projections on the GPU.
@@ -531,14 +583,23 @@ impl Model {
         let emb = if self.ple_tab.is_some() { Some(self.ple_rows(st, start, t)) } else { None };
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
+        let mut xc: Option<burn_cubecl::cubecl::server::Handle> = None;
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
         let gpu_tmax = env_usize("PYRE_QN_GPU_TMAX").unwrap_or(8);
         let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(false);
         let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
+            if let Some(h) = &xc { if l.ple.is_some() || !matches!(self.cl.get(il), Some(Some(_))) { x = self.cube.as_ref().unwrap().read(h); xc = None; } }
             if xd.is_some() && (l.ple.is_some() || !matches!(self.gl.get(il), Some(Some(_)))) { x = self.gpu.as_ref().unwrap().read(xd.take().unwrap()); }
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
+            if let (Some(Some(cl)), 1) = (self.cl.get(il), t) {
+                let cb = self.cube.as_ref().unwrap();
+                if xc.is_none() { xc = Some(cb.buf(&x)); }
+                self.layer_cube(l, cl, xc.as_ref().unwrap(), st, &mut ai, &mut li, start);
+                if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
+                continue;
+            }
             if let (Some(Some(gl)), true) = (self.gl.get(il), t <= gpu_tmax) {
                 let g = self.gpu.as_ref().unwrap();
                 if hyb { self.layer_hyb(l, gl, &mut x, st, &mut ai, &mut li, start, t); if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); } continue; }
@@ -559,6 +620,7 @@ impl Model {
             if prof { prof_acc[0] += t_hc.as_secs_f64() + (t_hc2 - t_mix).as_secs_f64(); prof_acc[if matches!(l.mix, Mixer::Attn { .. }) { 1 } else { 2 }] += (t_mix - t_hc).as_secs_f64(); prof_acc[3] += (tt.elapsed() - t_hc2).as_secs_f64(); }
             if dbg { eprintln!("layer {il}: x[0,:4] = {:?}", &x[(t - 1) * hc * d..(t - 1) * hc * d + 4]); }
         }
+        if let Some(h) = xc.take() { x = self.cube.as_ref().unwrap().read(&h); }
         if let Some(v) = xd.take() { let r = self.gpu.as_ref().unwrap().read(v.slice([t - 1..t, 0..hc * d])); x[(t - 1) * hc * d..t * hc * d].copy_from_slice(&r); }
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);

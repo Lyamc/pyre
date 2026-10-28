@@ -13,7 +13,7 @@ pub struct Gpu { pub dev: Device, pub dt: FloatDType, pub budget: std::sync::ato
 pub struct GMat { w: Tensor<2>, pub rows: usize, pub cols: usize, pub splits: Vec<usize> }
 
 /// ggml Q8_0 bytes (f16 scale + 32 x i8 per block) of the rows of `ms`, concatenated.
-fn to_q8_0(ms: &[&QMat]) -> Vec<u8> {
+pub fn to_q8_0(ms: &[&QMat]) -> Vec<u8> {
     use rayon::prelude::*;
     let cols = ms[0].cols; let nb = cols / 32; let rb = nb * 34;
     let rows: Vec<(&QMat, usize)> = ms.iter().flat_map(|m| (0..m.rows).map(move |r| (*m, r))).collect();
