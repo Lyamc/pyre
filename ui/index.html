@@ -95,10 +95,13 @@
       <label class="full">Prompt<textarea id="imgPrompt" rows="2"></textarea></label>
       <label class="full">Negative prompt<input id="imgNeg"></label>
       <div class="row">
-        <label>Size<select id="imgSize"><option>512x512</option><option>768x768</option><option>512x768</option><option>768x512</option></select></label>
+        <label>Size<select id="imgSize"><option>512x512</option><option>768x768</option><option>512x768</option><option>768x512</option><option>1024x1024</option><option value="0x0">model native</option></select></label>
         <label>Steps<input id="imgSteps" type="number" value="25"></label>
         <label>Guidance<input id="imgCfg" type="number" step="0.5" value="7.5"></label>
         <label>Seed<input id="imgSeed" type="number" placeholder="random"></label>
+        <label>Refiner<input id="imgRefiner" type="checkbox" title="SDXL: run the refiner model if one is loaded"></label>
+        <label>Init image<input id="imgInit" type="file" accept="image/png,image/jpeg" title="img2img: start from this image"></label>
+        <label>Strength<input id="imgStrength" type="number" step="0.05" min="0" max="1" value="0.75" title="img2img denoising strength"></label>
         <button id="imgGo" class="primary">Generate</button>
       </div>
     </fieldset>

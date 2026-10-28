@@ -237,8 +237,12 @@ $("#imgGo").onclick = async e => {
   e.preventDefault(); const [w, h] = $("#imgSize").value.split("x").map(Number);
   const body = { prompt: $("#imgPrompt").value, negative_prompt: $("#imgNeg").value, size: `${w}x${h}`, n: 1, response_format: "b64_json", steps: +$("#imgSteps").value, guidance_scale: +$("#imgCfg").value };
   if ($("#imgSeed").value !== "") body.seed = +$("#imgSeed").value;
+  if (w === 0) delete body.size;
+  if ($("#imgRefiner").checked) body.refiner = true;
+  const initF = $("#imgInit").files[0]; let path = "/v1/images/generations";
+  if (initF) { body.image = await new Promise((ok, bad) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = bad; fr.readAsDataURL(initF); }); body.strength = +$("#imgStrength").value; path = "/v1/images/edits"; }
   $("#imgGo").disabled = true; $("#imgGo").textContent = "generating…";
-  try { const r = await api("/v1/images/generations", body); r.data.forEach(d => { const im = new Image(); im.src = "data:image/png;base64," + d.b64_json; im.title = body.prompt; $("#gallery").prepend(im); }); }
+  try { const r = await api(path, body); r.data.forEach(d => { const im = new Image(); im.src = "data:image/png;base64," + d.b64_json; im.title = body.prompt; $("#gallery").prepend(im); }); }
   catch (err) { alert(err.message); }
   $("#imgGo").disabled = false; $("#imgGo").textContent = "Generate";
 };
