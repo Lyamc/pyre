@@ -525,6 +525,12 @@ impl Model {
             ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        if t <= 4 && std::env::var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
+            && std::env::var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true) {
+            self.routed_pool(l, x, &work, t, y);
+            ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // one task per (expert, block of rows): keeps all cores busy for decode (10 experts) and prefill alike
         let blk: usize = env_usize("PYRE_QN_BLK").unwrap_or(if t == 1 { 64 } else { 64 });
         use super::qdot;
@@ -571,6 +577,38 @@ impl Model {
         }).collect();
         for (r0, o) in outs { let w = o.len() / t; for ti in 0..t { for r in 0..w { y[ti * d + r0 + r] += o[ti * w + r]; } } }
         ROUTED_NS.fetch_add(t_r.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Decode-size expert pass on the spinning pool: gate/up tasks (expert x row block) write the
+    /// hidden rows in place, then down tasks (output row block) accumulate into y. No per-task Vecs.
+    fn routed_pool(&self, l: &Layer, x: &[f32], work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32]) {
+        use super::qdot; use super::spin_pool::SyncPtr;
+        let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
+        let pool = qn_pool();
+        let acts: Vec<qdot::Q8Act> = (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect();
+        let blk = env_usize("PYRE_QN_SBLK").unwrap_or(32); let nb = ff.div_ceil(blk);
+        let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
+        let mut hid = vec![0f32; hoff[work.len()]]; let hp = SyncPtr(hid.as_mut_ptr());
+        thread_local! { static SC: std::cell::RefCell<(super::qdot::Scratch, super::qdot::Scratch)> = std::cell::RefCell::new(Default::default()); }
+        pool.run(work.len() * nb, &|k| {
+            let (wi, b) = (k / nb, k % nb); let (e, toks) = work[wi];
+            let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
+            let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
+            SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
+                for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                    for (j, &(ti, _)) in toks.iter().enumerate() {
+                        let v = silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2);
+                        unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
+        });
+        let hq: Vec<Vec<qdot::Q8Act>> = work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect();
+        let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr());
+        pool.run(d.div_ceil(dblk), &|b| {
+            let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d));
+            SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
+                for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
+                    for r in 0..r1 - r0 { let dr = dm.row_raw(r);
+                        for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * qdot::row_dot(dm.ty, dr, &hq[wi][j], sc); unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
+        });
     }
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
@@ -634,5 +672,10 @@ impl Model {
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn qn_pool() -> &'static super::spin_pool::Pool {
+    static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
+    P.get_or_init(|| super::spin_pool::Pool::new(env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(rayon::current_num_threads()), std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64)))
+}
 
 fn env_usize(k: &str) -> Option<usize> { std::env::var(k).ok().and_then(|v| v.parse().ok()) }
