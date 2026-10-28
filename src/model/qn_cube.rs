@@ -81,21 +81,46 @@ fn k_gemv_iq4(x: &[f32], w: &[u32], kv: &[f32], out: &mut [f32], rows: u32, cols
         let ib = UNIT_POS_X / 4;
         let k = UNIT_POS_X % 4;
         let mut acc = 0.0f32;
-        for blk in 0..nb {
-            let b = row * rw + blk * 35;
-            let d = f32::reinterpret(w[b as usize]);
-            let sh = w[(b + 1) as usize];
-            let sl = w[(b + 2) as usize];
-            let qw = w[(b + 3 + UNIT_POS_X) as usize];
-            let ls = ((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4);
-            let p = blk * 264 + ib * 33 + 4 * k;
-            let mut part = 0.0f32;
+        // two blocks per step: all eight global loads issued before any use
+        let mut blk = 0u32;
+        while blk < nb {
+            let b0 = row * rw + blk * 35;
+            let b1 = b0 + 35;
+            let d0 = f32::reinterpret(w[b0 as usize]);
+            let sh0 = w[(b0 + 1) as usize];
+            let sl0 = w[(b0 + 2) as usize];
+            let q0 = w[(b0 + 3 + UNIT_POS_X) as usize];
+            let mut d1 = 0.0f32;
+            let mut sh1 = 0u32;
+            let mut sl1 = 0u32;
+            let mut q1 = 0u32;
+            if blk + 1 < nb {
+                d1 = f32::reinterpret(w[b1 as usize]);
+                sh1 = w[(b1 + 1) as usize];
+                sl1 = w[(b1 + 2) as usize];
+                q1 = w[(b1 + 3 + UNIT_POS_X) as usize];
+            }
+            let ls0 = ((sl0 >> (4 * ib)) & 15u32) | (((sh0 >> (2 * ib)) & 3u32) << 4);
+            let ls1 = ((sl1 >> (4 * ib)) & 15u32) | (((sh1 >> (2 * ib)) & 3u32) << 4);
+            let p0 = blk * 264 + ib * 33 + 4 * k;
+            let p1 = p0 + 264;
+            let mut part0 = 0.0f32;
+            let mut part1 = 0.0f32;
             #[unroll]
             for j in 0..4u32 {
-                part += tab[((qw >> (8 * j)) & 15u32) as usize] * xs[(p + j) as usize];
-                part += tab[((qw >> (8 * j + 4)) & 15u32) as usize] * xs[(p + 16 + j) as usize];
+                part0 += tab[((q0 >> (8 * j)) & 15u32) as usize] * xs[(p0 + j) as usize];
+                part0 += tab[((q0 >> (8 * j + 4)) & 15u32) as usize] * xs[(p0 + 16 + j) as usize];
             }
-            acc += part * (d * (f32::cast_from(ls) - 32.0f32));
+            acc += part0 * (d0 * (f32::cast_from(ls0) - 32.0f32));
+            if blk + 1 < nb {
+                #[unroll]
+                for j in 0..4u32 {
+                    part1 += tab[((q1 >> (8 * j)) & 15u32) as usize] * xs[(p1 + j) as usize];
+                    part1 += tab[((q1 >> (8 * j + 4)) & 15u32) as usize] * xs[(p1 + 16 + j) as usize];
+                }
+                acc += part1 * (d1 * (f32::cast_from(ls1) - 32.0f32));
+            }
+            blk += 2u32;
         }        let t = plane_sum(acc);
         if UNIT_POS_X == 0 {
             out[(ooff + row) as usize] = t;
