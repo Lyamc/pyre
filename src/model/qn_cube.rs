@@ -10,6 +10,18 @@ use cubecl::server::Handle;
 
 const ROWS_PER_CUBE: u32 = 8;
 
+#[cube]
+fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
+    let mut part = 0.0f32;
+    #[unroll]
+    for j in 0..4u32 {
+        let raw = (word >> (j * 8)) & 255u32;
+        let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
+        part += v * x[(base + j) as usize];
+    }
+    part
+}
+
 #[cube(launch_unchecked)]
 fn k_gemv(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, ooff: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
@@ -19,18 +31,23 @@ fn k_gemv(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32
         let sb = row * (cols / 32);
         let mut acc = 0.0f32;
         let mut wi = UNIT_POS_X;
-        while wi < words {
-            let word = w[(wb + wi) as usize];
+        // four independent loads in flight per lane
+        while wi + 96 < words {
+            let w0 = w[(wb + wi) as usize];
+            let w1 = w[(wb + wi + 32) as usize];
+            let w2 = w[(wb + wi + 64) as usize];
+            let w3 = w[(wb + wi + 96) as usize];
             let k = wi * 4;
-            let mut part = 0.0f32;
-            #[unroll]
-            for j in 0..4u32 {
-                let raw = (word >> (j * 8)) & 255u32;
-                let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
-                part += v * x[(xoff + k + j) as usize];
-            }
-            acc += part * s[(sb + k / 32) as usize];
-            wi += CUBE_DIM_X;
+            acc += dot4(w0, x, xoff + k) * s[(sb + k / 32) as usize];
+            acc += dot4(w1, x, xoff + k + 128) * s[(sb + k / 32 + 4) as usize];
+            acc += dot4(w2, x, xoff + k + 256) * s[(sb + k / 32 + 8) as usize];
+            acc += dot4(w3, x, xoff + k + 384) * s[(sb + k / 32 + 12) as usize];
+            wi += 128;
+        }
+        while wi < words {
+            let k = wi * 4;
+            acc += dot4(w[(wb + wi) as usize], x, xoff + k) * s[(sb + k / 32) as usize];
+            wi += 32;
         }
         let t = plane_sum(acc);
         if UNIT_POS_X == 0 {
@@ -69,19 +86,20 @@ fn k_rms(x: &[f32], norm: &[f32], xn: &mut [f32], d: u32, eps: f32) {
     }
 }
 
-/// mixed[i] = mean_s xn[s,i] * sigmoid(up[s*d+i] . silu(dn[0..lr]/hc)).
+/// mixed[i] = mean_s xn[s,i] * sigmoid(up[s*d+i] . silu(dn[0..lr]/hc)); one plane per output i.
 #[cube(launch_unchecked)]
 fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, #[comptime] lr: usize, #[comptime] hc: u32) {
     let mut lo = Shared::<[f32]>::new_slice(lr);
     let hcf = f32::cast_from(hc);
-    let mut j = UNIT_POS_X;
+    let tid = UNIT_POS_Y * 32 + UNIT_POS_X;
+    let mut j = tid;
     while (j as usize) < lr {
         let v = dn[j as usize] / hcf;
         lo[j as usize] = v / (1.0f32 + f32::exp(-v));
-        j += CUBE_DIM_X;
+        j += 256u32;
     }
     sync_cube();
-    let i = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let i = CUBE_POS_X * 8 + UNIT_POS_Y;
     if i < d {
         let words = comptime!(lr as u32 / 4);
         let nb = comptime!(lr as u32 / 32);
@@ -90,23 +108,25 @@ fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32,
         for st in 0..hc {
             let row = st * d + i;
             let mut g = 0.0f32;
-            for b in 0..nb {
+            let mut wi = UNIT_POS_X;
+            while wi < words {
+                let word = w[(row * words + wi) as usize];
                 let mut part = 0.0f32;
                 #[unroll]
-                for q in 0..8u32 {
-                    let word = w[(row * words + b * 8 + q) as usize];
-                    #[unroll]
-                    for jj in 0..4u32 {
-                        let raw = (word >> (jj * 8)) & 255u32;
-                        let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
-                        part += v * lo[(b * 32 + q * 4 + jj) as usize];
-                    }
+                for jj in 0..4u32 {
+                    let raw = (word >> (jj * 8)) & 255u32;
+                    let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
+                    part += v * lo[(wi * 4 + jj) as usize];
                 }
-                g += part * s[(row * nb + b) as usize];
+                g += part * s[(row * nb + wi / 8) as usize];
+                wi += 32u32;
             }
-            acc += xn[row as usize] / (1.0f32 + f32::exp(-g));
+            let gt = plane_sum(g);
+            acc += xn[row as usize] / (1.0f32 + f32::exp(-gt));
         }
-        out[(ooff + i) as usize] = acc / hcf;
+        if UNIT_POS_X == 0 {
+            out[(ooff + i) as usize] = acc / hcf;
+        }
     }
 }
 
@@ -276,7 +296,7 @@ impl Cube {
     }
     pub fn gate(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize) {
         let lr = up.cols;
-        unsafe { k_gate::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(128), 1, 1), CubeDim::new_1d(128),
+        unsafe { k_gate::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(xn.clone(), hc * d), BufferArg::from_raw_parts(dn.clone(), lr + hc), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, lr, hc as u32) }
     }
