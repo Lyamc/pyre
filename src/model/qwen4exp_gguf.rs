@@ -31,6 +31,8 @@ enum Mixer {
 struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, conv: Vec<f32> }
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
+/// GPU copy of one attention layer's KV cache: `len` positions valid, room for `cap`.
+pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64 }
 
 pub struct Model { xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
@@ -43,12 +45,14 @@ pub struct State {
     /// Vecs above are stale while `gdn_gpu` is set.
     gdn: Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>,
     gdn_gpu: bool,
+    kvg: Vec<Option<KvG>>,
     k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, // per attn layer [pos][n_kv*hd]
     ple_hist: Vec<Vec<f32>>, // per PLE layer: ring of past normalized values, [(conv_k-1)*dil][hc*d]
 }
 
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
 fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { x[i] *= s * w[i]; } }
+fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && std::env::var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 #[inline] fn silu(x: f32) -> f32 { x * sigm(x) }
 #[inline] fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { x.exp().ln_1p() } }
@@ -149,7 +153,8 @@ impl Model {
                     let mout = match &l.mix { Mixer::Attn { o, .. } => o, Mixer::Lin { out, .. } => out };
                     let gdn = match &l.mix { Mixer::Lin { conv, a, dt, norm, .. } if self.cfg.lin_dk == self.cfg.lin_dv && self.cfg.lin_dk % 32 == 0 =>
                         Some(super::qn_cube::GdnW { conv: cb.buf(conv), a: cb.buf(a), dt: cb.buf(dt), norm: cb.buf(norm) }), _ => None };
-                    let c = (|| Some(CLayer { gdn, hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
+                    let an = match &l.mix { Mixer::Attn { qn, kn, .. } => Some((cb.buf(qn), cb.buf(kn))), _ => None };
+                    let c = (|| Some(CLayer { an, gdn, hca: chc(&l.hc_a)?, min: cb.upload(&min, &[])?, mout: cb.upload(&[mout], &[])?, hcf: chc(&l.hc_f)?,
                         fin: cb.upload(&[&l.router, &l.sh_gate, &l.sh_up], &[&l.sh_gate_inp])?, sdown: cb.upload(&[&l.sh_down], &[])? }))();
                     if c.is_some() { on += 1 } else { off += 1 }
                     cl.push(c); gl.push(None);
@@ -271,6 +276,16 @@ impl Model {
             cb.conv(&proj, cl.min.rows, &gw.conv, cs, &co, ch, c.conv_k);
             cb.delta(&co, ch, &proj, cl.min.rows, gw, ss, &ob, nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
             cb.gemv(&cl.mout, &ob, nv * dk, 0, &o, d, 0);
+            q2 = std::time::Instant::now(); q3 = q2;
+        } else if let (Mixer::Attn { .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c)) {
+            let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let pos = start; let sp = &cl.min.splits;
+            self.kv_push(cb, *ai, st, pos + 1);
+            let g = st.kvg[*ai].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
+            let cs: Vec<f32> = (0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos()).chain((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())).collect();
+            let csb = cb.buf(&cs); let att = cb.empty(nh * hd);
+            cb.attn(&proj, cl.min.rows, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &att, nh, nkv, hd, half, pos, c.eps);
+            g.len = pos + 1; *ai += 1;
+            cb.gemv(&cl.mout, &att, nh * hd, 0, &o, d, 0);
             q2 = std::time::Instant::now(); q3 = q2;
         } else {
             let pv = cb.read(&proj);
@@ -419,7 +434,7 @@ impl Model {
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
-        let mut st = State { gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ple_hist: vec![] };
+        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ple_hist: vec![] };
         for l in &self.layers {
             match l.mix { Mixer::Lin { .. } => { st.conv.push(vec![0.0; (c.conv_k - 1) * ch]); st.ssm.push(vec![0.0; c.lin_nv * c.lin_dk * c.lin_dv]); }, Mixer::Attn { .. } => { st.k.push(vec![]); st.v.push(vec![]); } }
             if l.ple.is_some() { st.ple_hist.push(vec![0.0; (c.ple_conv_k - 1) * c.ple_ngram * c.hc * c.d]); }
@@ -519,8 +534,27 @@ impl Model {
     }
 
     /// Attention after the q/k/v projections; returns the gated heads before the output projection.
+    /// GPU KV ahead of the host copy (tokens decoded on the GPU): append them to st.k / st.v.
+    fn kv_pull(&self, ai: usize, st: &mut State) {
+        let row = self.cfg.n_kv * self.cfg.hd;
+        if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get(ai)) { let cl = st.k[ai].len() / row;
+            if g.len > cl { let (kk, vv) = (cb.read(&g.k), cb.read(&g.v)); st.k[ai].extend_from_slice(&kk[cl * row..g.len * row]); st.v[ai].extend_from_slice(&vv[cl * row..g.len * row]); } }
+    }
+    /// Make the GPU KV hold every host position, with room for `need`.
+    fn kv_push(&self, cb: &super::qn_cube::Cube, ai: usize, st: &mut State, need: usize) {
+        let row = self.cfg.n_kv * self.cfg.hd;
+        if st.kvg.len() <= ai { st.kvg.resize_with(ai + 1, || None); }
+        let cl = st.k[ai].len() / row;
+        if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
+        self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
+        let cap = need.max(cl).next_power_of_two().max(1024);
+        let mut kb = st.k[ai].clone(); kb.resize(cap * row, 0.0); let mut vb = st.v[ai].clone(); vb.resize(cap * row, 0.0);
+        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), cap, len: cl });
+    }
+
     fn attn_core(&self, l: &Layer, ai: usize, st: &mut State, proj: Vec<Vec<f32>>, start: usize, t: usize) -> Vec<f32> {
         let Mixer::Attn { qn, kn, .. } = &l.mix else { unreachable!() };
+        self.kv_pull(ai, st);
         let c = &self.cfg; let (nh, nkv, hd) = (c.n_head, c.n_kv, c.hd);
         let mut r = proj.into_iter(); let qf = r.next().unwrap(); let mut kf = r.next().unwrap(); let vf = r.next().unwrap();
         for ti in 0..t { for h in 0..nkv { let kh = &mut kf[ti * nkv * hd + h * hd..ti * nkv * hd + (h + 1) * hd]; rms_inplace(kh, kn, c.eps); self.rope(kh, start + ti); } }

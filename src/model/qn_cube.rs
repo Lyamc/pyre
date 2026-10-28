@@ -673,6 +673,102 @@ fn k_xdown_b(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: 
         }
     }
 }
+/// Full-attention prep for one token: q heads (cube < nh) get RMS norm + RoPE into q; k heads get
+/// norm + RoPE and, with v, are written to the KV cache at `pos`. cs = [cos(half), sin(half)].
+#[cube(launch_unchecked)]
+fn k_attn_prep(p: &[f32], qn: &[f32], kn: &[f32], cs: &[f32], q: &mut [f32], kc: &mut [f32], vc: &mut [f32], ko: u32, vo: u32, nh: u32, nkv: u32, hd: u32, half: u32, pos: u32, eps: f32) {
+    let h = CUBE_POS_X;
+    let lane = UNIT_POS_X;
+    let mut base = h * 2 * hd;
+    let mut dst = h * hd;
+    if h >= nh {
+        base = ko + (h - nh) * hd;
+        dst = (pos * nkv + h - nh) * hd;
+    }
+    let mut ss = 0.0f32;
+    let mut i = lane;
+    while i < hd {
+        let v = p[(base + i) as usize];
+        ss += v * v;
+        i += 32u32;
+    }
+    let s = 1.0f32 / f32::sqrt(plane_sum(ss) / f32::cast_from(hd) + eps);
+    i = lane;
+    while i < hd {
+        let mut wi = 0.0f32;
+        let mut wj = 0.0f32;
+        let mut j = i;
+        if i < half {
+            j = i + half;
+        } else if i < 2 * half {
+            j = i - half;
+        }
+        if h < nh {
+            wi = qn[i as usize];
+            wj = qn[j as usize];
+        } else {
+            wi = kn[i as usize];
+            wj = kn[j as usize];
+        }
+        let ni = p[(base + i) as usize] * (s * wi);
+        let nj = p[(base + j) as usize] * (s * wj);
+        let mut o = ni;
+        if i < half {
+            o = ni * cs[i as usize] - nj * cs[(half + i) as usize];
+        } else if i < 2 * half {
+            o = ni * cs[j as usize] + nj * cs[(half + j) as usize];
+        }
+        if h < nh {
+            q[(dst + i) as usize] = o;
+        } else {
+            kc[(dst + i) as usize] = o;
+            vc[(dst + i) as usize] = p[(vo + (h - nh) * hd + i) as usize];
+        }
+        i += 32u32;
+    }
+}
+
+/// One query head per cube (one plane): softmax(q.K^T * scale) V over n positions, times sigmoid(gate).
+#[cube(launch_unchecked)]
+fn k_attn(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mut [f32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, scale: f32) {
+    let h = CUBE_POS_X;
+    let lane = UNIT_POS_X;
+    let kvh = h / (nh / nkv);
+    let mut mx = scale * -3.0e30f32;
+    let mut pp = lane;
+    while pp < n {
+        let kb = (pp * nkv + kvh) * hd;
+        let mut dd = 0.0f32;
+        for i in 0..hd {
+            dd += q[(h * hd + i) as usize] * kc[(kb + i) as usize];
+        }
+        let v = dd * scale;
+        sc[(h * cap + pp) as usize] = v;
+        mx = f32::max(mx, v);
+        pp += 32u32;
+    }
+    let m = plane_max(mx);
+    let mut sum = 0.0f32;
+    pp = lane;
+    while pp < n {
+        let e = f32::exp(sc[(h * cap + pp) as usize] - m);
+        sc[(h * cap + pp) as usize] = e;
+        sum += e;
+        pp += 32u32;
+    }
+    let inv = 1.0f32 / plane_sum(sum);
+    sync_cube();
+    let mut i = lane;
+    while i < hd {
+        let mut acc = 0.0f32;
+        for t in 0..n {
+            acc += sc[(h * cap + t) as usize] * inv * vc[((t * nkv + kvh) * hd + i) as usize];
+        }
+        let g = p[(h * 2 * hd + hd + i) as usize];
+        o[(h * hd + i) as usize] = acc * (1.0f32 / (1.0f32 + f32::exp(-g)));
+        i += 32u32;
+    }
+}
 /// Grid tables for the expert kernels.
 pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle }
 /// One cached expert: raw GGUF bytes of its gate, up and down rows.
@@ -766,7 +862,18 @@ impl Cube {
             BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), nv * dk * dk), BufferArg::from_raw_parts(out.clone(), nv * dk),
             nk as u32, nv as u32, zoff as u32, boff as u32, aoff as u32, eps, dk as u32) }
     }
-    pub fn xtabs(&self) -> XTabs {
+    /// Decode attention for one token (see k_attn_prep / k_attn); `p` = the fused q|k|v projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn(&self, p: &Handle, pn: usize, ko: usize, vo: usize, qn: &Handle, kn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, out: &Handle, nh: usize, nkv: usize, hd: usize, half: usize, pos: usize, eps: f32) {
+        let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
+        let q = self.empty(nh * hd); let sc = self.empty(nh * cap);
+        unsafe {
+            k_attn_prep::launch_unchecked(&self.client, CubeCount::Static((nh + nkv) as u32, 1, 1), CubeDim::new_1d(32),
+                a(p, pn), a(qn, hd), a(kn, hd), a(cs, 2 * half), a(&q, nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), ko as u32, vo as u32, nh as u32, nkv as u32, hd as u32, half as u32, pos as u32, eps);
+            k_attn::launch_unchecked(&self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(32),
+                a(&q, nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), a(p, pn), a(&sc, nh * cap), a(out, nh * hd), nh as u32, nkv as u32, hd as u32, (pos + 1) as u32, cap as u32, (hd as f32).sqrt().recip());
+        }
+    }    pub fn xtabs(&self) -> XTabs {
         use super::iq_tables::*;
         let w64 = |t: &[u64]| -> Vec<u32> { t.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect() };
         let ks: Vec<u32> = KSIGNS_IQ2XS.iter().map(|&v| v as u32).collect();
@@ -816,4 +923,4 @@ impl Cube {
 pub struct CHc { pub norm: Handle, pub di: CMat, pub up: CMat }
 /// One layer's dense half (see `Model::layer_cube`). `fin` = router | shared gate | shared up | shared-gate row.
 pub struct GdnW { pub conv: Handle, pub a: Handle, pub dt: Handle, pub norm: Handle }
-pub struct CLayer { pub gdn: Option<GdnW>, pub hca: CHc, pub min: CMat, pub mout: CMat, pub hcf: CHc, pub fin: CMat, pub sdown: CMat }
+pub struct CLayer { pub an: Option<(Handle, Handle)>, pub gdn: Option<GdnW>, pub hca: CHc, pub min: CMat, pub mout: CMat, pub hcf: CHc, pub fin: CMat, pub sdown: CMat }
