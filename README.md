@@ -299,10 +299,10 @@ the n-gram table sit on the CPU device (Strata's split). Verified against transf
 config (`scripts/qwen_next_ref.py`). Not yet: QSA indexer (exact only up to 2048 tokens), MTP drafting,
 GGUF/quantized experts, server/engine integration.
 
-### Real weights: GGUF on the CPU (IQ2_XS)
+### Real weights: GGUF, dense on the GPU and experts on the CPU (IQ2_XS)
 
-    pyre serve ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF -b cpu      # OpenAI API + web chat
-    pyre qwen-next <dir-with-gguf> --prompt "..." -n 32 [--chat] [--peek TENSOR:ROW]
+    pyre serve -m ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF -b cuda   # OpenAI API + web chat
+    pyre qwen-next <dir-with-gguf> --prompt "..." -n 32 [--chat] [-b cuda|cpu] [--peek TENSOR:ROW]
 
 `src/model/qwen4exp_gguf.rs` runs the `qwen4exp` GGUF arch straight from mmapped, still-quantized shards
 (`src/model/gguf_q.rs`): IQ1_M, IQ2_XXS, IQ2_S, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q6_K, Q8_0, BF16, F16, F32 are
@@ -310,12 +310,54 @@ checked bit-for-bit against gguf-py; Q3_K/Q4_K/Q5_K/IQ2_XS decoders exist but no
 The tokenizer and chat template come from the `Qwen/Qwen3.8-Flash-Next` base repo in the HF cache.
 `<think>...</think>` goes to `reasoning_content` (`PYRE_REASONING=none` turns that off).
 
-Env: `PYRE_QN_QUANT` (default IQ2_XS), `PYRE_QN_THREADS` (16), `PYRE_PREFILL_CHUNK` (256),
-`PYRE_QN_TOKENIZER`, `PYRE_QN_PROFILE`, `PYRE_QN_DEBUG`, `PYRE_QN_BENCH`.
-RAM: about 0.4 GB private plus about 24 GB of evictable mapped file pages. VRAM: none. Speed on a
-16-core desktop: decode about 3 tok/s, prefill about 5-10 tok/s. Context is capped at 2048 tokens.
+With `-b cuda` (`src/model/qn_gpu.rs`), every non-routed weight is requantized to Q8_0 and uploaded as Burn
+packed Q8 tensors within pyre's VRAM reserve (NVML free - reserve - 1.5 GiB). That covers the
+hyper-connection mixers, the attention/DeltaNet in/out projections, routers, the shared expert, the PLE
+projections and the head. The residual stays on the device, with two reads per layer (mixer projections;
+then the FFN input plus router logits). The DeltaNet/attention recurrences and the 512 routed experts run on
+the CPU. The shared expert is queued on the GPU while the CPU pool runs the routed experts. Chunks larger
+than `PYRE_QN_GPU_TMAX` tokens (default 8) take the CPU SGEMM path, which is faster for prefill here.
 
-Attribution: the graph follows llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py`; the
-i-quant grids in `src/model/iq_tables.rs` come from ggml `ggml-common.h`. Both are MIT, (c) the ggml
-authors. The CPU-expert split mirrors Strata. Strata's refusal-direction ("speed projection") vector is
+The CPU expert kernels (`src/model/qdot.rs`) quantize activations to Q8 blocks of 32 and run integer AVX2
+dots against IQ2_S / IQ2_XXS / IQ1_M / Q2_0 rows. Q2_0 and IQ1_M offsets are applied as corrections from
+per-8 activation sums. A row shared by more than 2 tokens is decoded once. When a prefill gives an expert
+8 or more tokens, it uses a dequantized SGEMM.
+
+Env: `PYRE_QN_QUANT` (default IQ2_XS), `PYRE_QN_THREADS` (16), `PYRE_PREFILL_CHUNK` (256),
+`PYRE_QN_GPU_DTYPE` (f32), `PYRE_QN_GPU_TMAX` (8), `PYRE_QN_GPU_HC` (1; 0 = hybrid with the HC mixers on the
+CPU), `PYRE_QN_HC_Q8` (1), `PYRE_QN_QDOT` (1), `PYRE_QN_BLK`/`PYRE_QN_DBLK` (64/128),
+`PYRE_QN_GEMM_MIN` (8), `PYRE_QN_PREFAULT` (1), `PYRE_QN_GPUBENCH`, `PYRE_QN_TOKENIZER`,
+`PYRE_QN_PROFILE`, `PYRE_QN_DEBUG`, `PYRE_QN_BENCH`. Context is capped at 2048 tokens.
+
+Measured on a 16-core desktop with a 12 GB RTX card (Windows/WDDM). Prompt B is a 64-token chat prompt:
+
+| | decode tok/s | prefill tok/s (64 tok) | VRAM |
+|---|---|---|---|
+| pyre CPU, start of this work | 2.8 | 13 (noisy) / 6 | 0 |
+| pyre CPU now | 3.4 | 9.8 | 0 |
+| pyre `-b cuda` now | 4.3-4.9 | 9.1-9.9 | ~5 GB |
+| Strata 0.1.48 (same GGUF) | 15.4 (B), 25.9 (short prompt) | 80 | 10.9 GB |
+
+Greedy output matches between the pyre CPU and GPU paths. It also matches Strata token for token on a
+32-token run. On a 42-token run, the outputs diverge at one near-tie logit after token 32.
+
+Ideas taken from Strata (github.com/Niko1221/Strata, MIT). These are pyre's own implementations and
+contain no Strata code:
+- Dense/non-routed weights on the GPU, routed experts on the CPU (decode 3.1 -> 4.5 tok/s).
+- llama.cpp-style integer i-quant dot products with Q8-quantized activations on the CPU pool
+  (routed experts 75 -> 44 ms per token).
+- One pool worker per core with coarse row blocks per expert phase.
+- Experts kept resident (prefault of the mapped GGUF, no copy). This removed about 11k page faults per
+  token but did not change the speed.
+- The shared expert overlapped with the CPU expert pass.
+- Large prefill chunks with batched dense work and per-head DeltaNet threading (CPU prefill on a
+  720-token prompt went from 8.3 to 16.7 tok/s).
+
+Not adopted yet: the GPU expert cache, CUDA graphs and fused kernels (the main gap; each Burn op costs tens
+of µs on WDDM), MTP/prompt-lookup drafting (this GGUF has no MTP tensors), the QSA indexer beyond 2048
+tokens, and GPU expert streaming for prefill. Strata's refusal-direction ("speed projection") vector is
 deliberately not ported.
+
+Attribution: the graph follows llama.cpp `src/models/qwen4exp.cpp` and `conversion/qwen4exp.py`. The
+i-quant grids in `src/model/iq_tables.rs` and the vec_dot activation-quantization scheme come from ggml
+(MIT, (c) the ggml authors).
