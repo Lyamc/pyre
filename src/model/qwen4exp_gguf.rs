@@ -169,7 +169,7 @@ impl Model {
                 if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(c0)) = cl.iter().find(|x| x.is_some()) {
                     let x = cb.buf(&vec![0.01f32; hc * d]); let xn = cb.empty(hc * d); let o = cb.empty(20000); let dn = cb.buf(&vec![0.01f32; 400]);
                     let bench = |name: &str, f: &dyn Fn()| { f(); cb.read(&o); let t0 = std::time::Instant::now(); for _ in 0..50 { f(); } cb.read(&o); eprintln!("cubebench {name}: {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / 50.0); };
-                    bench("nothing", &|| {});
+                    bench("nothing", &|| {}); let v40 = vec![0f32; 40]; bench("upload 40 floats", &|| { let _ = cb.buf(&v40); }); let pw = cb.buf(&v40); bench("write + rms", &|| { cb.client.write(&pw, burn_cubecl::cubecl::bytes::Bytes::from_elems(v40.clone())); cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6); }); bench("upload + rms", &|| { let _ = cb.buf(&v40); cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6); });
                     bench(&format!("gemv min {}x{} ({:.1} MB)", c0.min.rows, c0.min.cols, (c0.min.rows * c0.min.cols) as f64 / 1e6), &|| cb.gemv(&c0.min, &x, hc * d, 0, &o, 20000, 0));
                     bench(&format!("gemv hc down {}x{}", c0.hca.di.rows, c0.hca.di.cols), &|| cb.gemv(&c0.hca.di, &x, hc * d, 0, &o, 20000, 0));
                     bench(&format!("gemv fin {}x{}", c0.fin.rows, c0.fin.cols), &|| cb.gemv(&c0.fin, &x, hc * d, 0, &o, 20000, 0));
@@ -186,7 +186,7 @@ impl Model {
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
-                    let nslot = budget / slot; let per = ((1usize << 30) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
+                    let nslot = budget / slot; let per = ((env_usize("PYRE_QN_ARENA_MB").unwrap_or(1024) << 20) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0 })); }
                 self.cube = Some(cb);
             }
@@ -385,8 +385,9 @@ impl Model {
             let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
             let xb = cb.buf(&vec![0.01f32; d]); let y0 = cb.buf(&vec![0f32; d]); let hx = cb.empty(ff);
             let _ = rbs; cb.xrun_b(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &[(ent, 0.1)], &xb, d, ff, tys, &hx, &y0); cb.read(&y0);
-            let t1 = std::time::Instant::now(); for _ in 0..50 { cb.xrun_b(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &[(ent, 0.1)], &xb, d, ff, tys, &hx, &y0); } let tq = t1.elapsed().as_secs_f64(); cb.read(&y0); eprintln!("cubebench expert enqueue {:.1} us", tq * 1e6 / 50.0);
-            eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB): {:.1} us", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6, t1.elapsed().as_secs_f64() * 1e6 / 50.0);
+            let mh = cb.client.create_from_slice(&[ent.off[0], ent.off[1], ent.off[2], 0.1f32.to_bits()].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()); if let Some(Some(c0)) = self.cl.iter().find(|x| x.is_some()) { let xx = cb.buf(&vec![0.01f32; 4 * d]); let oo = cb.empty(20000); cb.gemv(&c0.fin, &xx, 4 * d, 0, &oo, 20000, 0); cb.read(&oo); let t1 = std::time::Instant::now(); for _ in 0..200 { cb.gemv(&c0.fin, &xx, 4 * d, 0, &oo, 20000, 0); } cb.read(&oo); eprintln!("cubebench (late) gemv fin: {:.1} us", t1.elapsed().as_secs_f64() * 1e6 / 200.0); }
+            for sk in [0u32, 6, 5, 3] { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); cb.read(&y0); let t1 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); } cb.read(&y0); eprintln!("cubebench expert skip {sk}: {:.1} us", t1.elapsed().as_secs_f64() * 1e6 / 200.0); }
+            eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB)", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6);
         } }
         if n > 0 && std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }

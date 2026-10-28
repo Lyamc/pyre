@@ -990,13 +990,22 @@ impl Cube {
         let ne = ents.len();
         let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
         let mh = self.client.create_from_slice(u32::as_bytes(&meta));
+        self.xrun_m(tb, ar, ar_bytes, &mh, ne, x, d, ff, tys, h, y, 0);
+    }
+    /// xrun_b with the per-expert meta already on the GPU; skip bits 1/2/4 drop gate-up / q8 / down (benchmarks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_m(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, mh: &Handle, ne: usize, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle, skip: u32) {
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let ml = ne * 4;
         let aw = ar_bytes / 4;
+        static RPC: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); let rpc = *RPC.get_or_init(|| std::env::var("PYRE_QN_XRPC").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
         unsafe {
-            k_xgu_b::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), ne as u32, 1), CubeDim::new_2d(32, 8),
-                a(x, d), a(ar, aw), a(&mh, meta.len()), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1);
-            k_q8sim::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ne * ff), (ne * ff) as u32);
-            k_xdown_b::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
-                a(h, ne * ff), a(ar, aw), a(&mh, meta.len()), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2);
+            if skip & 1 == 0 { k_xgu_b::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
+                a(x, d), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); }
+            if skip & 2 == 0 { k_q8sim::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ne * ff), (ne * ff) as u32); }
+            if skip & 4 == 0 { k_xdown_b::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
+                a(h, ne * ff), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2); }
         }
     }    /// dst = Q8-grid copy of src[soff..soff+n]; z[..n] = 0.
     pub fn q8copy(&self, src: &Handle, sn: usize, soff: usize, dst: &Handle, z: &Handle, n: usize) {
