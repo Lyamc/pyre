@@ -1,4 +1,4 @@
-﻿//! Hand-written CubeCL kernels for the qwen4exp decode step (one token): the dense half of every
+//! Hand-written CubeCL kernels for the qwen4exp decode step (one token): the dense half of every
 //! layer runs as ~14 launches on one stream with two readbacks, instead of ~60 small Burn ops.
 //! Idea (fused per-layer GPU step, routed experts on the CPU) from Strata (MIT,
 //! github.com/Niko1221/Strata); the kernels and layout here are pyre's own.
@@ -404,6 +404,129 @@ fn subdot(w: &[u32], rb: u32, sb: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
     acc
 }
 
+
+/// Like `subdot` but for 8 values only (`q` = index of the 8-group: sub-block q/4, part q%4), so
+/// neighbouring lanes read neighbouring activations (the 32-per-lane layout made every x load a
+/// 32-way bank conflict / uncoalesced access).
+#[cube]
+fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], #[comptime] ty: u32) -> f32 {
+    let mut acc = 0.0f32;
+    let sb = q / 4;
+    let l = q % 4;
+    let xb = xo + q * 8;
+    if comptime!(ty == 0) {
+        let blk = rb + (sb / 8) * 21;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let sg = w[(blk + 9 + ib) as usize];
+        let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+        let s8 = (sg >> (8 * l)) & 255u32;
+        let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
+        if l >= 2 {
+            scl = 0.5f32 + f32::cast_from(sc >> 4);
+        }
+        let ga = g2s[(idx * 2) as usize];
+        let gb = g2s[(idx * 2 + 1) as usize];
+        #[unroll]
+        for j in 0..8u32 {
+            let mut gw = ga;
+            if j >= 4 {
+                gw = gb;
+            }
+            let mut v = f32::cast_from((gw >> ((j % 4) * 8)) & 255u32) * x[(xb + j) as usize];
+            if (s8 >> j) & 1u32 == 1u32 {
+                v = -v;
+            }
+            acc += v;
+        }
+        acc *= d * scl;
+    }
+    if comptime!(ty == 1) {
+        let blk = rb + (sb / 8) * 17;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qw = w[(blk + 1 + 2 * ib) as usize];
+        let a1 = w[(blk + 2 + 2 * ib) as usize];
+        let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
+        let idx = (qw >> (8 * l)) & 255u32;
+        let sg = ks[((a1 >> (7 * l)) & 127u32) as usize];
+        let ga = g2x[(idx * 2) as usize];
+        let gb = g2x[(idx * 2 + 1) as usize];
+        #[unroll]
+        for j in 0..8u32 {
+            let mut gw = ga;
+            if j >= 4 {
+                gw = gb;
+            }
+            let mut v = f32::cast_from((gw >> ((j % 4) * 8)) & 255u32) * x[(xb + j) as usize];
+            if (sg >> j) & 1u32 == 1u32 {
+                v = -v;
+            }
+            acc += v;
+        }
+        acc *= db;
+    }
+    if comptime!(ty == 2) {
+        let blk = rb + (sb / 8) * 15;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let hw = (w[(blk + 9 + ib / 2) as usize] >> ((ib % 2) * 16)) & 65535u32;
+        let scw = (w[(blk + 13 + ib / 4) as usize] >> (((ib / 2) % 2) * 16)) & 65535u32;
+        let mut sh = 6 * (ib % 2);
+        if l >= 2 {
+            sh += 3;
+        }
+        let sl = d * f32::cast_from(2 * ((scw >> sh) & 7u32) + 1);
+        let qb = (qs >> (8 * l)) & 255u32;
+        let hh = (hw >> (8 * (l / 2))) & 255u32;
+        let mut idx = qb | ((hh << 8) & 1792u32);
+        let mut dbit = hh & 8u32;
+        if l % 2 == 1 {
+            idx = qb | ((hh << 4) & 1792u32);
+            dbit = hh & 128u32;
+        }
+        let mut delta = 0.125f32;
+        if dbit != 0 {
+            delta = -0.125f32;
+        }
+        let ga = g1[(idx * 2) as usize];
+        let gb2 = g1[(idx * 2 + 1) as usize];
+        #[unroll]
+        for j in 0..8u32 {
+            let mut gw = ga;
+            if j >= 4 {
+                gw = gb2;
+            }
+            let gb = (gw >> ((j % 4) * 8)) & 255u32;
+            let mut gv = f32::cast_from(gb);
+            if gb >= 128 {
+                gv = gv - 256.0f32;
+            }
+            acc += (gv + delta) * x[(xb + j) as usize];
+        }
+        acc *= sl;
+    }
+    if comptime!(ty == 3) {
+        let blk = rb + (sb / 2) * 5;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qw = w[(blk + 1 + 2 * (sb % 2) + l / 2) as usize];
+        let half = (qw >> (16 * (l % 2))) & 65535u32;
+        #[unroll]
+        for k in 0..2u32 {
+            let b = (half >> (8 * k)) & 255u32;
+            #[unroll]
+            for j in 0..4u32 {
+                acc += (f32::cast_from((b >> (2 * j)) & 3u32) - 1.0f32) * x[(xb + 4 * k + j) as usize];
+            }
+        }
+        acc *= d;
+    }
+    acc
+}
 /// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
     let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
@@ -427,13 +550,13 @@ fn k_xgu(x: &[f32], wg: &[u32], wu: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32]
     #[comptime] tg: u32, #[comptime] tu: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
     if row < rows {
-        let nsb = cols / 32;
+        let nsb = cols / 8;
         let mut gs = 0.0f32;
         let mut us = 0.0f32;
         let mut sb = UNIT_POS_X;
         while sb < nsb {
-            gs += subdot(wg, row * rbg, sb, x, 0u32, g2s, g2x, ks, g1, tg);
-            us += subdot(wu, row * rbu, sb, x, 0u32, g2s, g2x, ks, g1, tu);
+            gs += subdot8(wg, row * rbg, sb, x, 0u32, g2s, g2x, ks, g1, tg);
+            us += subdot8(wu, row * rbu, sb, x, 0u32, g2s, g2x, ks, g1, tu);
             sb += 32u32;
         }
         let g = plane_sum(gs);
@@ -484,11 +607,11 @@ fn k_q8copy(src: &[f32], dst: &mut [f32], z: &mut [f32], soff: u32, n: u32) {
 fn k_xdown(h: &[f32], wd: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], hoff: u32, rows: u32, cols: u32, rbd: u32, wgt: f32, #[comptime] td: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
     if row < rows {
-        let nsb = cols / 32;
+        let nsb = cols / 8;
         let mut s = 0.0f32;
         let mut sb = UNIT_POS_X;
         while sb < nsb {
-            s += subdot(wd, row * rbd, sb, h, hoff, g2s, g2x, ks, g1, td);
+            s += subdot8(wd, row * rbd, sb, h, hoff, g2s, g2x, ks, g1, td);
             sb += 32u32;
         }
         let t = plane_sum(s);
