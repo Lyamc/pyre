@@ -213,7 +213,7 @@ unsafe fn dot_i8_avx2(g: &[u8], s: &[u8], scl: &[f32], a: &Q8Act) -> f32 {
 
 /// An owned Q8_0 matrix (ggml block layout: f16 scale + 32 x i8), for small dense weights the CPU
 /// multiplies every token (the hyper-connection projections, stored as BF16 in the GGUF).
-pub struct Q8Mat { pub rows: usize, pub cols: usize, data: Vec<u8> }
+pub struct Q8Mat { pub rows: usize, pub cols: usize, data: Vec<u8>, sc: Vec<f32> }
 
 impl Q8Mat {
     pub fn from_rows(ms: &[&super::gguf_q::QMat]) -> Self {
@@ -228,7 +228,8 @@ impl Q8Mat {
                 o[b * 34..b * 34 + 2].copy_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
                 for j in 0..32 { o[b * 34 + 2 + j] = ((x[j] * id).round().clamp(-127.0, 127.0) as i8) as u8; } }
         });
-        Q8Mat { rows: rows.len(), cols, data }
+        let sc = (0..data.len() / 34).map(|b| h2f(&data, b * 34)).collect();
+        Q8Mat { rows: rows.len(), cols, data, sc }
     }
     pub fn bytes(&self) -> usize { self.data.len() }
     /// y[t][rows] = x[t][cols] W^T with int8 dots; rows split across the rayon pool.
@@ -239,31 +240,31 @@ impl Q8Mat {
         let ch = (rows / (rayon::current_num_threads() * 2)).max(8);
         let outs: Vec<(usize, Vec<f32>)> = (0..rows.div_ceil(ch)).into_par_iter().map(|ci| {
             let r0 = ci * ch; let r1 = (r0 + ch).min(rows); let mut o = vec![0f32; (r1 - r0) * t];
-            for r in r0..r1 { let row = &self.data[r * rb..(r + 1) * rb]; for ti in 0..t { o[ti * (r1 - r0) + r - r0] = dot_q8(row, &acts[ti]); } }
+            for r in r0..r1 { let row = &self.data[r * rb..(r + 1) * rb]; for ti in 0..t { o[ti * (r1 - r0) + r - r0] = dot_q8(row, &self.sc[r * (cols / 32)..(r + 1) * (cols / 32)], &acts[ti]); } }
             (r0, o)
         }).collect();
         for (r0, o) in outs { let n = o.len() / t; for ti in 0..t { y[ti * rows + r0..ti * rows + r0 + n].copy_from_slice(&o[ti * n..(ti + 1) * n]); } }
     }
 }
 
-fn dot_q8(row: &[u8], a: &Q8Act) -> f32 {
+fn dot_q8(row: &[u8], sc: &[f32], a: &Q8Act) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    { if avx2() { return unsafe { dot_q8_avx2(row, a) }; } }
+    { if avx2() { return unsafe { dot_q8_avx2(row, sc, a) }; } }
     let mut r = 0f32;
-    for b in 0..a.q.len() / 32 { let d = h2f(row, b * 34); let mut s = 0i32; for j in 0..32 { s += (row[b * 34 + 2 + j] as i8) as i32 * a.q[b * 32 + j] as i32; } r += s as f32 * d * a.d[b]; }
+    for b in 0..a.q.len() / 32 { let d = sc[b]; let mut s = 0i32; for j in 0..32 { s += (row[b * 34 + 2 + j] as i8) as i32 * a.q[b * 32 + j] as i32; } r += s as f32 * d * a.d[b]; }
     r
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_q8_avx2(row: &[u8], a: &Q8Act) -> f32 {
+unsafe fn dot_q8_avx2(row: &[u8], sc: &[f32], a: &Q8Act) -> f32 {
     use std::arch::x86_64::*;
     let mut acc = _mm256_setzero_ps(); let ones = _mm256_set1_epi16(1);
     for b in 0..a.q.len() / 32 {
         let w = _mm256_loadu_si256(row.as_ptr().add(b * 34 + 2) as *const __m256i);
         let x = _mm256_loadu_si256(a.q.as_ptr().add(b * 32) as *const __m256i);
         let p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones);
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(h2f(row, b * 34) * *a.d.get_unchecked(b)), acc);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(*sc.get_unchecked(b) * *a.d.get_unchecked(b)), acc);
     }
     k::hsum(acc)
 }

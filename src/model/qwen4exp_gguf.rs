@@ -200,13 +200,19 @@ impl Model {
     fn layer_hyb(&self, l: &Layer, gl: &super::qn_gpu::GLayer, x: &mut Vec<f32>, st: &mut State, ai: &mut usize, li: &mut usize, start: usize, t: usize) {
         use burn::tensor::activation::{sigmoid, silu};
         let g = self.gpu.as_ref().unwrap(); let c = &self.cfg; let (d, ne) = (c.d, c.n_exp);
+        let q0 = std::time::Instant::now();
         let (mixed, inj_a) = self.hc_mix(&l.hc_a, x, t);
+        let q1 = std::time::Instant::now();
         let mi = g.read(gl.min.fwd(g.up(&mixed, [t, d])));
+        let q2 = std::time::Instant::now();
         let proj = gl.min.split_host(&mi, t);
         let core = match l.mix { Mixer::Attn { .. } => { let o = self.attn_core(l, *ai, st, proj, start, t); *ai += 1; o }, Mixer::Lin { .. } => { let o = self.linear_core(l, *li, st, proj, t); *li += 1; o } };
+        let q3 = std::time::Instant::now();
         let o = g.read(gl.mout.fwd(g.up(&core, [t, core.len() / t])));
+        let q4 = std::time::Instant::now();
         self.hc_combine(x, &o, &inj_a, t);
         let (mf, inj_f) = self.hc_mix(&l.hc_f, x, t);
+        let q5 = std::time::Instant::now();
         let mfd = g.up(&mf, [t, d]);
         let fi = gl.fin.fwd(mfd.clone()); let sf = l.sh_gate.rows;
         let sh = gl.sdown.fwd(silu(fi.clone().slice([0..t, ne..ne + sf])) * fi.clone().slice([0..t, ne + sf..ne + 2 * sf])) * sigmoid(mfd.matmul(gl.sgw.clone()));
@@ -216,6 +222,8 @@ impl Model {
         self.routed(l, &mf, &lgc, t, &mut yr, false);
         for ti in 0..t { for i in 0..d { yr[ti * d + i] += both[ti * w + ne + i]; } }
         self.hc_combine(x, &yr, &inj_f, t);
+        let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
+        HY[0].fetch_add(ns(q0, q1) + ns(q4, q5), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q3, q4), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, std::time::Instant::now()), Relaxed);
     }
 
     /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
@@ -245,14 +253,15 @@ impl Model {
         let mut xn = vec![0f32; t * w];
         xn.par_chunks_mut(d).enumerate().for_each(|(i, o)| { let s = i % hc; rms(&x[i * d..(i + 1) * d], &h.norm[s * d..(s + 1) * d], self.cfg.eps, o); });
         let mut grp = vec![&h.down]; if let Some(i) = &h.inject { grp.push(i); }
-        if let Some((di, up)) = &h.q8 {
+        if let (Some((di, up)), true) = (&h.q8, t < 16) {
             // int8 path: down+inject in one pass, then up
-            let nr = di.rows; let lr = h.down.rows; let mut o = vec![0f32; t * nr]; di.matmul(&xn, t, &mut o);
+            let z0 = std::time::Instant::now(); let nr = di.rows; let lr = h.down.rows; let mut o = vec![0f32; t * nr]; di.matmul(&xn, t, &mut o); let z1 = std::time::Instant::now();
             let mut lo = vec![0f32; t * lr]; let mut inj = vec![0f32; t * hc];
             for ti in 0..t { for i in 0..lr { lo[ti * lr + i] = silu(o[ti * nr + i] / hc as f32); } if h.inject.is_some() { for s in 0..hc { inj[ti * hc + s] = o[ti * nr + lr + s] / hc as f32; } } }
-            let mut gate = vec![0f32; t * w]; up.matmul(&lo, t, &mut gate);
+            let mut gate = vec![0f32; t * w]; up.matmul(&lo, t, &mut gate); let z2 = std::time::Instant::now();
             let mut mixed = vec![0f32; t * d];
             for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
+            HY[4].fetch_add((z1 - z0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             return (mixed, inj);
         }
         let mut r = self.mm(&grp, &xn, t).into_iter();
@@ -523,13 +532,14 @@ impl Model {
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
+        let gpu_tmax = env_usize("PYRE_QN_GPU_TMAX").unwrap_or(8);
         let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(true);
         let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
             if xd.is_some() && (l.ple.is_some() || !matches!(self.gl.get(il), Some(Some(_)))) { x = self.gpu.as_ref().unwrap().read(xd.take().unwrap()); }
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
-            if let Some(Some(gl)) = self.gl.get(il) {
+            if let (Some(Some(gl)), true) = (self.gl.get(il), t <= gpu_tmax) {
                 let g = self.gpu.as_ref().unwrap();
                 if hyb { self.layer_hyb(l, gl, &mut x, st, &mut ai, &mut li, start, t); if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); } continue; }
                 let xin = match xd.take() { Some(v) => v, None => g.up(&x, [t, hc * d]) };
@@ -554,11 +564,12 @@ impl Model {
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
         let lg = self.mm(&[&self.out], &h, 1).pop().unwrap();
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(4), f(5), f(6), f(1), f(2), f(3)); } eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 }
 
+static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
