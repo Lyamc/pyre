@@ -266,83 +266,91 @@ fn hf(h: u32) -> f32 {
     v
 }
 
-/// Dot of the 32 weights of sub-block `sb` of the row starting at byte `rb` with x[xo + sb*32 ..].
+/// Dot of the 32 weights of sub-block `sb` of a row (starting at word `rb`, repacked by `repack`)
+/// with x[xo + sb*32 ..].
 #[cube]
 fn subdot(w: &[u32], rb: u32, sb: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], #[comptime] ty: u32) -> f32 {
     let mut acc = 0.0f32;
     let xb = xo + sb * 32;
     if comptime!(ty == 0) {
-        let blk = rb + (sb / 8) * 82;
+        let blk = rb + (sb / 8) * 21;
         let ib = sb % 8;
-        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8)) * 0.25f32;
-        let qh = byte(w, blk + 66 + ib);
-        let sc = byte(w, blk + 74 + ib);
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let sg = w[(blk + 9 + ib) as usize];
+        let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
         #[unroll]
         for l in 0..4u32 {
-            let idx = byte(w, blk + 2 + 4 * ib + l) | ((qh << (8 - 2 * l)) & 768u32);
-            let sg = byte(w, blk + 34 + 4 * ib + l);
+            let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+            let s8 = (sg >> (8 * l)) & 255u32;
             let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
             if l >= 2 {
                 scl = 0.5f32 + f32::cast_from(sc >> 4);
             }
+            let ga = g2s[(idx * 2) as usize];
+            let gb = g2s[(idx * 2 + 1) as usize];
             let mut part = 0.0f32;
             #[unroll]
             for j in 0..8u32 {
-                let gv = f32::cast_from((g2s[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32);
-                let mut v = gv * x[(xb + 8 * l + j) as usize];
-                if (sg >> j) & 1u32 == 1u32 {
+                let mut gw = ga;
+                if j >= 4 {
+                    gw = gb;
+                }
+                let mut v = f32::cast_from((gw >> ((j % 4) * 8)) & 255u32) * x[(xb + 8 * l + j) as usize];
+                if (s8 >> j) & 1u32 == 1u32 {
                     v = -v;
                 }
                 part += v;
             }
-            acc += part * scl * d;
+            acc += part * scl;
         }
+        acc *= d;
     }
     if comptime!(ty == 1) {
-        let blk = rb + (sb / 8) * 66;
+        let blk = rb + (sb / 8) * 17;
         let ib = sb % 8;
-        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8)) * 0.25f32;
-        let q = blk + 2 + 8 * ib;
-        let a1 = byte(w, q + 4) | (byte(w, q + 5) << 8) | (byte(w, q + 6) << 16) | (byte(w, q + 7) << 24);
+        let d = f32::reinterpret(w[blk as usize]);
+        let q = w[(blk + 1 + 2 * ib) as usize];
+        let a1 = w[(blk + 2 + 2 * ib) as usize];
         let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
         #[unroll]
         for l in 0..4u32 {
-            let idx = byte(w, q + l);
+            let idx = (q >> (8 * l)) & 255u32;
             let sg = ks[((a1 >> (7 * l)) & 127u32) as usize];
+            let ga = g2x[(idx * 2) as usize];
+            let gb = g2x[(idx * 2 + 1) as usize];
             let mut part = 0.0f32;
             #[unroll]
             for j in 0..8u32 {
-                let gv = f32::cast_from((g2x[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32);
-                let mut v = gv * x[(xb + 8 * l + j) as usize];
+                let mut gw = ga;
+                if j >= 4 {
+                    gw = gb;
+                }
+                let mut v = f32::cast_from((gw >> ((j % 4) * 8)) & 255u32) * x[(xb + 8 * l + j) as usize];
                 if (sg >> j) & 1u32 == 1u32 {
                     v = -v;
                 }
                 part += v;
             }
-            acc += part * db;
+            acc += part;
         }
+        acc *= db;
     }
     if comptime!(ty == 2) {
-        let blk = rb + (sb / 8) * 56;
+        let blk = rb + (sb / 8) * 15;
         let ib = sb % 8;
-        let s0 = byte(w, blk + 48) | (byte(w, blk + 49) << 8);
-        let s1 = byte(w, blk + 50) | (byte(w, blk + 51) << 8);
-        let s2 = byte(w, blk + 52) | (byte(w, blk + 53) << 8);
-        let s3 = byte(w, blk + 54) | (byte(w, blk + 55) << 8);
-        let d = hf((s0 >> 12) | ((s1 >> 8) & 240u32) | ((s2 >> 4) & 3840u32) | (s3 & 61440u32));
-        let scw = byte(w, blk + 48 + 2 * (ib / 2)) | (byte(w, blk + 49 + 2 * (ib / 2)) << 8);
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let hw = (w[(blk + 9 + ib / 2) as usize] >> ((ib % 2) * 16)) & 65535u32;
+        let scw = (w[(blk + 13 + ib / 4) as usize] >> (((ib / 2) % 2) * 16)) & 65535u32;
         let sh = 6 * (ib % 2);
         let dl1 = d * f32::cast_from(2 * ((scw >> sh) & 7u32) + 1);
         let dl2 = d * f32::cast_from(2 * ((scw >> (sh + 3)) & 7u32) + 1);
-        let h0 = byte(w, blk + 32 + 2 * ib);
-        let h1 = byte(w, blk + 33 + 2 * ib);
         #[unroll]
         for l in 0..4u32 {
-            let qb = byte(w, blk + 4 * ib + l);
-            let mut hh = h0;
-            if l >= 2 {
-                hh = h1;
-            }
+            let qb = (qs >> (8 * l)) & 255u32;
+            let hh = (hw >> (8 * (l / 2))) & 255u32;
             let mut idx = qb | ((hh << 8) & 1792u32);
             let mut dbit = hh & 8u32;
             if l % 2 == 1 {
@@ -357,10 +365,16 @@ fn subdot(w: &[u32], rb: u32, sb: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
             if l >= 2 {
                 sl = dl2;
             }
+            let ga = g1[(idx * 2) as usize];
+            let gb2 = g1[(idx * 2 + 1) as usize];
             let mut part = 0.0f32;
             #[unroll]
             for j in 0..8u32 {
-                let gb = (g1[(idx * 2 + j / 4) as usize] >> ((j % 4) * 8)) & 255u32;
+                let mut gw = ga;
+                if j >= 4 {
+                    gw = gb2;
+                }
+                let gb = (gw >> ((j % 4) * 8)) & 255u32;
                 let mut gv = f32::cast_from(gb);
                 if gb >= 128 {
                     gv = gv - 256.0f32;
@@ -371,21 +385,41 @@ fn subdot(w: &[u32], rb: u32, sb: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
         }
     }
     if comptime!(ty == 3) {
-        let blk = rb + (sb / 2) * 18;
-        let d = hf(byte(w, blk) | (byte(w, blk + 1) << 8));
-        let q = blk + 2 + 8 * (sb % 2);
+        let blk = rb + (sb / 2) * 5;
+        let d = f32::reinterpret(w[blk as usize]);
         #[unroll]
-        for k in 0..8u32 {
-            let b = byte(w, q + k);
+        for k2 in 0..2u32 {
+            let qw = w[(blk + 1 + 2 * (sb % 2) + k2) as usize];
             #[unroll]
-            for j in 0..4u32 {
-                acc += (f32::cast_from((b >> (2 * j)) & 3u32) - 1.0f32) * x[(xb + 4 * k + j) as usize];
+            for k in 0..4u32 {
+                let b = (qw >> (8 * k)) & 255u32;
+                #[unroll]
+                for j in 0..4u32 {
+                    acc += (f32::cast_from((b >> (2 * j)) & 3u32) - 1.0f32) * x[(xb + 16 * k2 + 4 * k + j) as usize];
+                }
             }
         }
         acc *= d;
     }
     acc
 }
+
+/// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
+pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
+    let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
+    let wd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut out = vec![];
+    match ty {
+        0 => for b in raw.chunks_exact(82) { out.push((f(b, 0) * 0.25).to_bits()); for o in (2..82).step_by(4) { out.push(wd(b, o)); } },
+        1 => for b in raw.chunks_exact(66) { out.push((f(b, 0) * 0.25).to_bits()); for o in (2..66).step_by(4) { out.push(wd(b, o)); } },
+        2 => for b in raw.chunks_exact(56) { let s = |k: usize| u16::from_le_bytes([b[48 + 2 * k], b[49 + 2 * k]]);
+            let d = half::f16::from_bits((s(0) >> 12) | ((s(1) >> 8) & 0x00f0) | ((s(2) >> 4) & 0x0f00) | (s(3) & 0xf000)).to_f32();
+            out.push(d.to_bits()); for o in (0..56).step_by(4) { out.push(wd(b, o)); } },
+        _ => for b in raw.chunks_exact(18) { out.push(f(b, 0).to_bits()); for o in (2..18).step_by(4) { out.push(wd(b, o)); } },
+    }
+    out
+}
+pub fn block_words(ty: u32) -> (usize, usize) { match ty { 0 => (256, 21), 1 => (256, 17), 2 => (256, 15), _ => (64, 5) } }
 
 /// h[row] = silu(gate_row . x) * (up_row . x) for one cached expert; one plane per row.
 #[cube(launch_unchecked)]
@@ -561,14 +595,17 @@ impl Cube {
         XTabs { g2s: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2XXS_GRID))),
             ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))) }
     }
-    pub fn xupload(&self, g: &[u8], u: &[u8], d: &[u8]) -> XEnt {
-        XEnt { g: self.client.create_from_slice(g), u: self.client.create_from_slice(u), d: self.client.create_from_slice(d), bytes: g.len() + u.len() + d.len() }
+    pub fn xupload(&self, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
+        let (g, u, d) = (repack(tys.0, g), repack(tys.1, u), repack(tys.2, d));
+        XEnt { g: self.client.create_from_slice(u32::as_bytes(&g)), u: self.client.create_from_slice(u32::as_bytes(&u)), d: self.client.create_from_slice(u32::as_bytes(&d)), bytes: 4 * (g.len() + u.len() + d.len()) }
     }
     /// One cached expert: h = silu(G x) * (U x) -> Q8 grid -> y += wgt * D h.
     #[allow(clippy::too_many_arguments)]
-    pub fn xrun(&self, tb: &XTabs, e: &XEnt, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), rbs: (usize, usize, usize), h: &Handle, y: &Handle, wgt: f32) {
+    pub fn xrun(&self, tb: &XTabs, e: &XEnt, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), rbs_in: (usize, usize, usize), h: &Handle, y: &Handle, wgt: f32) {
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
-        let (gw, uw, dw) = (ff * rbs.0 / 4, ff * rbs.1 / 4, d * rbs.2 / 4);
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let _ = rbs_in;
+        let (gw, uw, dw) = (ff * rbs.0, ff * rbs.1, d * rbs.2);
         unsafe {
             k_xgu::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
                 a(x, d), a(&e.g, gw), a(&e.u, uw), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ff), 0u32, ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1);

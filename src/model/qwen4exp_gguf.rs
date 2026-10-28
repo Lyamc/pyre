@@ -356,7 +356,8 @@ impl Model {
             let l = &self.layers[il];
             while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; } }, None => break } }
             if xc.used + size(l) > xc.budget { break; }
-            let ent = cb.xupload(l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d));
+            let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+            let ent = cb.xupload(l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d), tys);
             xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
         }
         if std::env::var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
