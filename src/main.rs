@@ -116,7 +116,7 @@ pub struct ServeArgs {
     /// Max GPU duty cycle in percent (default 90; 100 or 0 disables). Env PYRE_GPU_UTIL_MAX
     #[arg(long = "gpu-util-max")]
     pub gpu_util_max: Option<u32>,
-    /// Speculative decoding draft length for qwen-next (0 = off; default 3, config `spec`, env PYRE_SPEC)
+    /// Speculative decoding draft length for qwen-next (0 = off, the default; config `spec`, env PYRE_SPEC)
     #[arg(long = "spec")]
     pub spec: Option<usize>,
     /// Residency-biased expert routing strength for qwen-next (0 = off, the default; changes outputs; config `route_prior`, env PYRE_ROUTE_PRIOR)
