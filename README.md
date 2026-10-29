@@ -726,3 +726,19 @@ integer sums, so identical output; `PYRE_QN_VNNI=0` turns it off). The expert po
 each E-core after the P-cores (`PYRE_QN_ECORES=0` restores P-cores only). On an i9-13900K + RTX 3060 these took plain
 decode from ~20.3 to ~22.3 tok/s, greedy-identical. `PYRE_QN_GATHER=1` (vpgatherdq grid decode, also after Strata)
 is opt-in: no measurable gain here.
+
+### Host expert arena, PCIe share, refills and draft head
+
+- Strata keeps missed experts pre-packed in the GPU layout in a host arena (pinned in 1 GiB steps above a RAM reserve) and
+  sends a 15-20% share of each verify window's distinct misses over PCIe to run beside the CPU pool. pyre has the same as
+  opt-in: `PYRE_QN_XARENA_GB=<GiB>` fills a pre-packed host arena at load, hottest first by the routing profile, and stops
+  while less than `PYRE_QN_RAM_RESERVE_GB` (default 16) would stay free; `PYRE_QN_XSHARE=<0..1>` sends that share of the
+  misses (T=1: the lowest-weight ones; verify: the distinct experts most tokens use, uploaded once per window) to the GPU;
+  `PYRE_QN_XPIN=1` stages uploads through CubeCL's page-locked pool. On an RTX 3060 + i9-13900K this is slower
+  (22 -> 15-17 tok/s): CubeCL uses one stream, so every upload is serialized with compute, and the host copy per
+  expert costs more than the 24-worker CPU pool needs for it. The GPU math also changes the output, so it stays opt-in.
+- Expert cache refills repack their experts in parallel (the same experts and slots as before, so the same output).
+- `k_gemv4r` (verify GEMV) compiles per column count, so T=2/3 windows no longer compute a padded 4th column, and
+  decodes bytes with the 2^23 mantissa trick (exact).
+- The MTP draft head runs on the GPU over the draft vocabulary (~100 MB VRAM, 2.2 -> 0.75 ms per draft; same drafts).
+  `PYRE_MTP_HEAD_GPU=0` turns it off.
