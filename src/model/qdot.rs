@@ -441,3 +441,47 @@ pub fn kbench() {
         }
     }
 }
+
+/// `row_dot_k` of one row against several activations (`out[j]` = row . acts[j]), decoding each 256-block's
+/// grid and signs once for all of them. Integer sums and float steps are the same as `row_dot_k`, so the
+/// results are bit-identical; only the decode work is shared (prompt chunks / verify windows).
+pub fn row_dot_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    { if avx2() && matches!(t, QType::IQ2S | QType::IQ2XXS) && acts.len() <= 16 { unsafe { iq2_k_multi(t, row, acts, out) }; return; } }
+    for (j, a) in acts.iter().enumerate() { out[j] = row_dot_k(t, row, a); }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq2_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let na = acts.len(); let n = acts[0].q.len(); let rp = row.as_ptr();
+    let mut acc = [_mm256_setzero_ps(); 16];
+    let mut g = [_mm256_setzero_si256(); 8]; let mut sg = [_mm256_setzero_si256(); 8]; let mut sc = [_mm256_setzero_si256(); 8];
+    let s8 = sign8();
+    for i in 0..n / 256 {
+        let dw = match t {
+            QType::IQ2S => { let b = rp.add(i * 82); let (qs, sgp, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
+                for ib in 0..8 { let h = *qh.add(ib) as usize;
+                    let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
+                    g[ib] = _mm256_set_epi64x(q(3), q(2), q(1), q(0));
+                    sg[ib] = kk::signs((sgp.add(4 * ib) as *const u32).read_unaligned());
+                    let sbv = *sb.add(ib); sc[ib] = kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1); }
+                f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() }
+            _ => { let b = rp.add(i * 66); let qs = b.add(2);
+                for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
+                    let gq = |l: usize| *IQ2XXS_GRID.get_unchecked(*qs.add(8 * ib + l) as usize) as i64;
+                    g[ib] = _mm256_set_epi64x(gq(3), gq(2), gq(1), gq(0));
+                    let sl = |l: u32| *s8.get_unchecked(*KSIGNS_IQ2XS.get_unchecked(((a1 >> (7 * l)) & 127) as usize) as usize) as i64;
+                    sg[ib] = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+                    let s = 2 * (a1 >> 28) as i32 + 1; sc[ib] = kk::sc2(s, s); }
+                f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() }
+        };
+        for j in 0..na { let a = acts[j]; let xq = a.q.as_ptr();
+            let mut ia = _mm256_setzero_si256();
+            for ib in 0..8 { ia = kk::istep(ia, g[ib], sg[ib], xq.add(i * 256 + ib * 32), sc[ib]); }
+            let d = dw * 0.125 * *a.d.get_unchecked(i);
+            acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc[j]); }
+    }
+    for j in 0..na { out[j] = k::hsum(acc[j]); }
+}
