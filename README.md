@@ -574,3 +574,15 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   Asking for 5-6 GiB tripped the VRAM watchdog at 612 MiB free.
   So the extra experts do not pay for the slower table-lookup kernel. A 4-bit kernel as fast as Q8 (byte-permute
   decode) would turn this into a win: it gives the bytes and the VRAM. It is the next step.
+### Exact-output experiments after the Strata study (quiet GPU, graphs on, 96 tokens; story pA / code pB)
+
+- **byte_perm intrinsic:** local cubecl branch `pyre-byte-perm` (worktree `../cubecl-bperm`, commit 33495479). It adds a
+  `math.byte_perm` op: CUDA `__byte_perm`, with a portable polyfill on every other backend. A kernel built on it,
+  k_gemv_iq4p (IQ4_XS, f32 x in shared memory, levels decoded by prmt instead of table reads), took 70 us per call
+  against 56 us for the table version and 47 us for Q8_0. Greedy output also changed, so the kernel has a bug or a
+  numerics difference. It is reverted and pyre still builds against the clean fork. The real limit of the 4-bit
+  kernels looks like the shared-memory reads of x, not the level lookup.
+- **Expert-ranking profile** (`PYRE_QN_XPROFILE=<file>`, opt-in; build one with `PYRE_QN_XPROFILE_SAVE=<file>`):
+  counts from two other prompts (story and Python), weighted as 256 tokens of routing, seed and steer the cache.
+  It changes placement only, and greedy output is identical. Result: story 17.1-17.3 vs 18.3-19.3, code 17.0-17.5
+  vs 17.6, so it is off by default. A lighter prior, or seeding only the very first (pre-prefill) fill, are untested.

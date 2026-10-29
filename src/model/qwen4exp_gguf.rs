@@ -37,6 +37,36 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
+/// Expert-ranking profile (PYRE_QN_XPROFILE=<file>): per-layer routing counts saved from earlier runs
+/// (PYRE_QN_XPROFILE_SAVE=<file>; u32 n_layers, u32 n_exp, then n_layers*n_exp u32 counts, little endian).
+/// Strata ships a similar profile; this one is pyre's own, built from our routing on our prompts. It only
+/// changes which experts are cached (and so where they run), never which experts are used.
+fn xprofile() -> &'static Option<Vec<Vec<f64>>> {
+    static P: std::sync::OnceLock<Option<Vec<Vec<f64>>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let pth = std::env::var("PYRE_QN_XPROFILE").ok()?; let b = std::fs::read(&pth).ok()?;
+        let u = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+        if b.len() < 8 { return None; } let (nl, ne) = (u(0) as usize, u(1) as usize); if b.len() != 8 + 4 * nl * ne { return None; }
+        // scaled so the whole profile weighs as much as PYRE_QN_XPRIOR_TOK (default 256) tokens of top-k routing
+        let tot: f64 = (0..nl * ne).map(|i| u(2 + i) as f64).sum::<f64>().max(1.0);
+        let k = env_usize("PYRE_QN_XPRIOR_TOK").unwrap_or(256) as f64 * 10.0 * nl as f64 / tot;
+        eprintln!("xcache: expert profile {pth} ({nl} layers x {ne} experts, {:.0} routings)", tot);
+        Some((0..nl).map(|l| (0..ne).map(|e| u(2 + l * ne + e) as f64 * k).collect()).collect())
+    })
+}
+/// Cache rank of an expert: routing count in this conversation plus the profile prior (x1000, integer
+/// so ties break the same way every run).
+fn xscore(xc: &XCache, il: usize, e: usize) -> u64 {
+    let pr = xprofile().as_ref().and_then(|p| p.get(il)).and_then(|r| r.get(e)).copied().unwrap_or(0.0);
+    xc.cnt[il][e] as u64 * 1000 + (pr * 1000.0) as u64
+}
+fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
+    let (nl, ne) = (cnt.len(), cnt.first().map_or(0, |r| r.len()));
+    let mut b = Vec::with_capacity(8 + 4 * nl * ne); b.extend((nl as u32).to_le_bytes()); b.extend((ne as u32).to_le_bytes());
+    for r in cnt { for &c in r { b.extend(c.to_le_bytes()); } }
+    let _ = std::fs::write(pth, b);
+}
+
 /// Per-layer persistent buffers and the captured CUDA graph of a DeltaNet layer's dense part (PYRE_QN_GRAPH=1).
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
@@ -456,16 +486,17 @@ impl Model {
         if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { return; }
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
         let slot = xc.slot; let size = |_: &Layer| slot;
-        let mut cand: Vec<(u32, usize, usize)> = vec![];
+        if let Ok(pth) = std::env::var("PYRE_QN_XPROFILE_SAVE") { save_xprofile(&pth, &xc.cnt); }
+        let mut cand: Vec<(u64, usize, usize)> = vec![];
         for (il, l) in self.layers.iter().enumerate() {
             if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
-            for e in 0..self.cfg.n_exp { if xc.cnt[il][e] > 0 { cand.push((xc.cnt[il][e], il, e)); } }
+            for e in 0..self.cfg.n_exp { let sc = xscore(xc, il, e); if sc > 0 { cand.push((sc, il, e)); } }
         }
         cand.sort_by(|a, b| b.0.cmp(&a.0));
         let mut want = std::collections::HashSet::new(); let mut tot = 0usize;
         for &(_, il, e) in &cand { let s = size(&self.layers[il]); if tot + s > xc.budget { break; } tot += s; want.insert((il, e)); }
         // eviction order: resident experts that fell out of the wanted set, least used first
-        let mut evict: Vec<(u32, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xc.cnt[il][e], il, e)).collect();
+        let mut evict: Vec<(u64, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xscore(xc, il, e), il, e)).collect();
         // full tie-break: HashMap key order is random per process, and the slot an expert lands in decides the GPU summation order (run-to-run identical output)
         evict.sort_by(|a, b| b.0.cmp(&a.0).then((b.1, b.2).cmp(&(a.1, a.2))));
         let max_new = if xc.calls == 1 || xc.map.is_empty() { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
