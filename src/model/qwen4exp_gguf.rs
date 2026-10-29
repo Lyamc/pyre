@@ -44,7 +44,7 @@ pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl:
 fn xprofile() -> &'static Option<Vec<Vec<f64>>> {
     static P: std::sync::OnceLock<Option<Vec<Vec<f64>>>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
-        let pth = std::env::var("PYRE_QN_XPROFILE").ok()?; let b = std::fs::read(&pth).ok()?;
+        let pth = env_var("PYRE_QN_XPROFILE").ok()?; let b = std::fs::read(&pth).ok()?;
         let u = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
         if b.len() < 8 { return None; } let (nl, ne) = (u(0) as usize, u(1) as usize); if b.len() != 8 + 4 * nl * ne { return None; }
         // scaled so the whole profile weighs as much as PYRE_QN_XPRIOR_TOK (default 256) tokens of top-k routing
@@ -71,7 +71,7 @@ fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| std::env::var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
+fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct Model { xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
@@ -99,9 +99,9 @@ fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v
 fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { x[i] *= s * w[i]; } }
 /// Submit queued GPU work before the CPU expert pass (WDDM otherwise holds it until the next read). PYRE_QN_KICK=1 on (no measurable effect on HYTE, so off).
 /// One-arena low-overhead expert path (PYRE_QN_XFAST=0 off).
-fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XFAST").map(|v| v != "0").unwrap_or(true)) }
-fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
-fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && std::env::var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
+fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XFAST").map(|v| v != "0").unwrap_or(true)) }
+fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
+fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 #[inline] fn silu(x: f32) -> f32 { x * sigm(x) }
 #[inline] fn softplus(x: f32) -> f32 { if x > 20.0 { x } else { x.exp().ln_1p() } }
@@ -161,7 +161,7 @@ impl Model {
         let half = cfg.n_rot / 2;
         let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
         let mut layers = layers; let mut head = head;
-        if std::env::var("PYRE_QN_HC_Q8").map(|v| v == "1").unwrap_or(false) {
+        if env_var("PYRE_QN_HC_Q8").map(|v| v == "1").unwrap_or(false) {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
@@ -175,7 +175,7 @@ impl Model {
     /// it, each decode step soft-faults on ~10k first-touched 4 KiB pages. Skipped when free RAM is
     /// short (keeps 16 GiB spare); `PYRE_QN_PREFAULT=0` turns it off. Returns GiB touched.
     pub fn prefault_experts(&self) -> f64 {
-        if std::env::var("PYRE_QN_PREFAULT").map(|v| v == "0").unwrap_or(false) { return 0.0; }
+        if env_var("PYRE_QN_PREFAULT").map(|v| v == "0").unwrap_or(false) { return 0.0; }
         let mats: Vec<&QMat> = self.layers.iter().flat_map(|l| [&l.gate_e, &l.up_e, &l.down_e]).collect();
         let total: usize = mats.iter().map(|m| m.bytes().len()).sum();
         let mut sys = sysinfo::System::new(); sys.refresh_memory();
@@ -200,7 +200,7 @@ impl Model {
         };
         let (mut on, mut off) = (0, 0); let b0 = g.budget_left();
         let mut gl = vec![];
-        if std::env::var("PYRE_QN_CUBE").map(|v| v != "0").unwrap_or(true) {
+        if env_var("PYRE_QN_CUBE").map(|v| v != "0").unwrap_or(true) {
             if let Ok(cb) = super::qn_cube::Cube::new() {
                 use super::qn_cube::{CHc, CLayer};
                 let cb0 = cb.budget.load(std::sync::atomic::Ordering::Relaxed);
@@ -219,12 +219,12 @@ impl Model {
                 }
                 let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
                 g.budget.fetch_sub(used, std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("PYRE_QN_TYPES").is_ok() { for (i, l) in self.layers.iter().enumerate().take(4) {
+                if env_var("PYRE_QN_TYPES").is_ok() { for (i, l) in self.layers.iter().enumerate().take(4) {
                     let mut v: Vec<(&str, &QMat)> = vec![("hca.down", &l.hc_a.down), ("hca.up", &l.hc_a.up), ("router", &l.router), ("sh_gate", &l.sh_gate), ("sh_up", &l.sh_up), ("sh_down", &l.sh_down)];
                     match &l.mix { Mixer::Attn { q, k, v: vv, o, .. } => { v.push(("q", q)); v.push(("k", k)); v.push(("v", vv)); v.push(("o", o)); }, Mixer::Lin { qkv, z, beta, alpha, out, .. } => { v.push(("qkv", qkv)); v.push(("z", z)); v.push(("beta", beta)); v.push(("alpha", alpha)); v.push(("out", out)); } }
                     eprintln!("types L{i}: {}", v.iter().map(|(n, m)| format!("{n}={:?}[{}x{}]", m.ty, m.rows, m.cols)).collect::<Vec<_>>().join(" "));
                 } eprintln!("types out={:?} embd={:?}", self.out.ty, self.embd.ty); }
-                if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(c0)) = cl.iter().find(|x| x.is_some()) {
+                if env_var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(c0)) = cl.iter().find(|x| x.is_some()) {
                     let x = cb.buf(&vec![0.01f32; hc * d]); let xn = cb.empty(hc * d); let o = cb.empty(20000); let dn = cb.buf(&vec![0.01f32; 400]);
                     let bench = |name: &str, f: &dyn Fn()| { f(); cb.read(&o); let t0 = std::time::Instant::now(); for _ in 0..50 { f(); } cb.read(&o); eprintln!("cubebench {name}: {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / 50.0); };
                     bench("nothing", &|| {}); let v40 = vec![0f32; 40]; bench("upload 40 floats", &|| { let _ = cb.buf(&v40); }); let pw = cb.buf(&v40); bench("write + rms", &|| { cb.client.write(&pw, burn_cubecl::cubecl::bytes::Bytes::from_elems(v40.clone())); cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6); }); bench("upload + rms", &|| { let _ = cb.buf(&v40); cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6); });
@@ -238,10 +238,10 @@ impl Model {
                 } }
                 self.cl = cl;
                 // LM head on the GPU (opt-in PYRE_QN_GPUHEAD=1: only ~+0.3 tok/s, and as Q8 it costs VRAM
-                if std::env::var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(false) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
+                if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(false) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
-                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
+                let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
@@ -273,7 +273,7 @@ impl Model {
         extra.push(vec![&self.head.down]); extra.push(vec![&self.head.up]); extra.push(vec![&self.out]);
         for grp in extra { if let Some(gm) = g.upload(&grp)? { m.insert(grp[0].key(), gm); } }
         let gb = (b0 - g.budget_left()) as f64 / (1u64 << 30) as f64;
-        if std::env::var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(l0)) = gl.iter().find(|x| x.is_some()) {
+        if env_var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(l0)) = gl.iter().find(|x| x.is_some()) {
             let x1 = vec![0.01f32; d]; let xh = vec![0.01f32; hc * d];
             let b = |name: &str, f: &dyn Fn() -> usize| { for _ in 0..3 { f(); } let t0 = std::time::Instant::now(); let mut n = 0; for _ in 0..20 { n = f(); } eprintln!("gpubench {name}: {:.3} ms ({n} out)", t0.elapsed().as_secs_f64() * 50.0); };
             b("readback only (upload+read 2560)", &|| g.read(g.up(&x1, [1, d])).len());
@@ -468,7 +468,7 @@ impl Model {
             // warmup run executes this token; the recorded run that follows does not execute
             if cb.client.graph_prepare().is_ok() { seg(b);
                 match cb.client.start_capture() {
-                    Ok(()) => { seg(b); match cb.client.stop_capture() { Ok(g) => { if std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("graph: captured layer {il}"); } b.g = Some(g); b.key = key; b.keep = vec![cs.clone(), ss.clone(), x.clone()]; }
+                    Ok(()) => { seg(b); match cb.client.stop_capture() { Ok(g) => { if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("graph: captured layer {il}"); } b.g = Some(g); b.key = key; b.keep = vec![cs.clone(), ss.clone(), x.clone()]; }
                         Err(e) => { eprintln!("graph: layer {il} capture failed, graphs off: {e:?}"); GRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
                     Err(e) => { eprintln!("graph: layer {il} start failed, graphs off: {e:?}"); GRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
             } else { seg(b); }
@@ -486,7 +486,7 @@ impl Model {
         if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { return; }
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
         let slot = xc.slot; let size = |_: &Layer| slot;
-        if let Ok(pth) = std::env::var("PYRE_QN_XPROFILE_SAVE") { save_xprofile(&pth, &xc.cnt); }
+        if let Ok(pth) = env_var("PYRE_QN_XPROFILE_SAVE") { save_xprofile(&pth, &xc.cnt); }
         let mut cand: Vec<(u64, usize, usize)> = vec![];
         for (il, l) in self.layers.iter().enumerate() {
             if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
@@ -511,7 +511,7 @@ impl Model {
             let sl = xc.free.pop().unwrap(); let mut ent = cb.xupload(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d), tys);
             ent.arena = sl / xc.per; ent.slot = sl; xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
         }
-        if std::env::var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
+        if env_var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
             let l = &self.layers[*il]; let _ = e;
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
             let rbs = (l.gate_e.row_bytes(), l.up_e.row_bytes(), l.down_e.row_bytes());
@@ -521,7 +521,7 @@ impl Model {
             for sk in [0u32, 6, 5, 3] { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); cb.read(&y0); let t1 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); } cb.read(&y0); eprintln!("cubebench expert skip {sk}: {:.1} us", t1.elapsed().as_secs_f64() * 1e6 / 200.0); }
             eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB)", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6);
         } }
-        if n > 0 && std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
+        if n > 0 && env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }
 
     /// Hybrid layer: hyper-connection mixes + residual on the CPU (int8), big projections on the GPU.
@@ -715,7 +715,7 @@ impl Model {
                 rms_inplace(&mut pk, ikn, c.eps); self.rope(&mut pk, b * ir);
                 st.ib[ai].extend_from_slice(&pk);
             }
-            if start + t > self.dense_n() && std::env::var("PYRE_QN_DENSE").is_err() {
+            if start + t > self.dense_n() && env_var("PYRE_QN_DENSE").is_err() {
                 iqs = iqf; let inh = c.idx_nh;
                 for ti in 0..t { for h in 0..inh { let qh = &mut iqs[(ti * inh + h) * ihd..(ti * inh + h + 1) * ihd]; rms_inplace(qh, iqn, c.eps); self.rope(qh, start + ti); } }
             }
@@ -865,8 +865,8 @@ impl Model {
             { let rns = t_r.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             return;
         }
-        if t <= 4 && std::env::var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
-            && std::env::var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true) {
+        if t <= 4 && env_var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
+            && env_var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true) {
             self.routed_pool(l, x, &work, t, y, &mut || {});
             { let rns = t_r.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             return;
@@ -874,7 +874,7 @@ impl Model {
         // one task per (expert, block of rows): keeps all cores busy for decode (10 experts) and prefill alike
         let blk: usize = env_usize("PYRE_QN_BLK").unwrap_or(if t == 1 { 64 } else { 64 });
         use super::qdot;
-        let qon = std::env::var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true);
+        let qon = env_var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true);
         let qgu = qon && qdot::supports(l.gate_e.ty) && qdot::supports(l.up_e.ty);
         let qdn = qon && qdot::supports(l.down_e.ty);
         let acts: Vec<qdot::Q8Act> = if qgu { (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect() } else { vec![] }; let acts = &acts;
@@ -932,7 +932,7 @@ impl Model {
         let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
         let pool = qn_pool(); let z0 = std::time::Instant::now();
         let acts: Vec<qdot::Q8Act> = (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect();
-        let usek = qdot::supports_k(l.gate_e.ty) && qdot::supports_k(l.up_e.ty) && std::env::var("PYRE_QN_Q8K").map(|v| v != "0").unwrap_or(true);
+        let usek = qdot::supports_k(l.gate_e.ty) && qdot::supports_k(l.up_e.ty) && env_var("PYRE_QN_Q8K").map(|v| v != "0").unwrap_or(true);
         let actk: Vec<qdot::Q8K> = if usek { (0..t).map(|ti| { let mut a = qdot::Q8K::default(); qdot::quantize_k_into(&x[ti * d..(ti + 1) * d], &mut a); a }).collect() } else { vec![] };
         let blk = env_usize("PYRE_QN_SBLK").unwrap_or(32); let nb = ff.div_ceil(blk);
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
@@ -951,7 +951,7 @@ impl Model {
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         }, side);
         let z1 = std::time::Instant::now();
-        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && std::env::var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
+        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
         let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
         let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
@@ -993,17 +993,17 @@ impl Model {
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xd: Option<burn::tensor::Tensor<2>> = None;
         let mut xc: Option<burn_cubecl::cubecl::server::Handle> = None;
-        let gdn_ok = t == 1 && self.cube.is_some() && std::env::var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
+        let gdn_ok = t == 1 && self.cube.is_some() && env_var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })));
         if let (Some(cb), Some(xm), 1) = (&self.cube, &self.xc, t) { let mut g = xm.lock().unwrap(); if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } }
         if let Some(cb) = &self.cube {
             if gdn_ok && !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
             if !gdn_ok && st.gdn_gpu { for (i, (a, b)) in st.gdn.iter().enumerate() { st.conv[i] = cb.read(a); st.ssm[i] = cb.read(b); } st.gdn.clear(); st.gdn_gpu = false; }
         }
-        let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
+        let dbg = env_var("PYRE_QN_DEBUG").is_ok();
         let gpu_tmax = env_usize("PYRE_QN_GPU_TMAX").unwrap_or(8);
-        let hyb = std::env::var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(false);
-        let prof = std::env::var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
+        let hyb = env_var("PYRE_QN_GPU_HC").map(|v| v == "0").unwrap_or(false);
+        let prof = env_var("PYRE_QN_PROFILE").is_ok(); let mut prof_acc = [0f64; 5]; let t_all = std::time::Instant::now();
         for (il, l) in self.layers.iter().enumerate() {
             let tt = std::time::Instant::now();
             if let Some(h) = &xc { if l.ple.is_some() || !matches!(self.cl.get(il), Some(Some(_))) { x = self.cube.as_ref().unwrap().read(h); xc = None; } }
@@ -1074,7 +1074,7 @@ impl Model {
 
     /// True when `forward_multi` can run: every layer on the CubeCL decode path with DeltaNet on the GPU.
     pub fn multi_ok(&self) -> bool {
-        self.cube.is_some() && std::env::var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
+        self.cube.is_some() && env_var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })))
     }
 
@@ -1122,7 +1122,7 @@ impl Model {
         }
         let hs = xs.unwrap();
         let lg: Vec<Vec<f32>> = hs.iter().map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.head_logits(&hh) }).collect();
-        if std::env::var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
+        if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }
@@ -1318,11 +1318,19 @@ fn qn_pool() -> &'static super::spin_pool::Pool {
     P.get_or_init(|| {
         // default: one worker per fast physical core, pinned (PYRE_QN_PIN="0,2,..." overrides, "none" disables)
         let auto = super::spin_pool::fast_cores();
-        let pin: Vec<usize> = match std::env::var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
+        let pin: Vec<usize> = match env_var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
         let n = env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(if pin.len() >= 4 { pin.len() } else { rayon::current_num_threads() });
         eprintln!("expert pool: {n} workers, pinned to {:?}", pin);
         super::spin_pool::Pool::new_pinned(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin)
     })
 }
 
-fn env_usize(k: &str) -> Option<usize> { std::env::var(k).ok().and_then(|v| v.parse().ok()) }
+fn env_usize(k: &str) -> Option<usize> { env_var(k).ok().and_then(|v| v.parse().ok()) }
+/// `std::env::var` from a snapshot of the PYRE_* variables taken on first use. The decode path reads
+/// settings per layer and per pool task; the real call takes the process environment lock (8 pool
+/// threads contended on it) and a syscall on Windows.
+fn env_var(k: &str) -> Result<String, std::env::VarError> {
+    static ENV: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    if !k.starts_with("PYRE_") { return std::env::var(k); }
+    ENV.get_or_init(|| std::env::vars().filter(|(k, _)| k.starts_with("PYRE_")).collect()).get(k).cloned().ok_or(std::env::VarError::NotPresent)
+}
