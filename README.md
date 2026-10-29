@@ -437,3 +437,23 @@ i-quant grids in `src/model/iq_tables.rs` and the vec_dot activation-quantizatio
 - Native IQ4_XS dense GEMV exists but is opt-in (PYRE_QN_NATIVE=1); it is not faster than Q8_0 on an RTX 3060 yet.
 - Int8 HC mix is opt-in (PYRE_QN_HC_Q8=1): it changed greedy output on a short prompt.
 - Steady decode about 12-14 tok/s (prompt A) and 12-13 tok/s (prompt B), vs Strata 25.9 / 15.4 tok/s.
+
+### Qwen-Next: speculative decoding, 128k context, route prior (Oct 29)
+Ideas borrowed from Strata (github.com/Niko1221/Strata, MIT); pyre's own implementations, no Strata code.
+- `--spec N` / config `spec` / per-request `spec` or `speculative: {draft_len}`: speculative decoding
+  (`src/spec.rs`). This GGUF has no MTP/NextN tensors, so the drafter is prompt lookup (n-gram); the MTP
+  hook (`mtp_draft`) is there for GGUFs that carry an MTP layer. Drafts are verified in one multi-token
+  pass that shares the CPU expert reads; the state is rolled back past the first rejection. Draft length
+  adapts online to measured verify cost and acceptance. Rejected drafts are uncounted from the expert-cache
+  statistics and windows never straddle a cache refresh, so the cache schedule matches plain decode.
+  Off by default: on the RTX 3060 it is not faster (verify cost grows almost linearly with the window
+  because routed experts run on the CPU), and on a 400-token code-edit run greedy output still diverged
+  from plain decode at token 294 (64-token story/code runs are identical).
+- 128k context: `PYRE_QN_CTX` (default 131072, capped at the GGUF's 262144). The dense attention range
+  (indexer top-k, 2048) stays on the GPU; past it the KV lives in host RAM and the QSA indexer picks the
+  attended positions. A 3072-token prompt used the same ~8.1 GB VRAM as a short one.
+- Route prior (`--route-prior X` / `PYRE_ROUTE_PRIOR` / config `route_prior`): residency-biased routing
+  toward GPU-cached experts. It changes outputs, so it is off (0) by default.
+- `/api/status` reports `speculative` (draft len, rounds, drafted, accepted, acceptance), `route_prior`
+  and `context` (used / max); the dashboard metrics hooks (`crate::metrics`) are fed from the Qwen-Next
+  expert path (CPU expert ns, GPU read ns, expert-cache hits/misses).
