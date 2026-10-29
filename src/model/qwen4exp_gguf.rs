@@ -56,6 +56,8 @@ pub struct State {
     /// forward, per linear layer, on the GPU; PLE ring after each token. Used by `spec_keep` to roll back.
     ck: Vec<Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>>,
     ple_ck: Vec<Vec<Vec<f32>>>,
+    /// (layer, expert) picks of each token of the last `forward_multi`, so `spec_keep` can uncount rejected drafts
+    spec_sel: Vec<Vec<(usize, usize)>>,
 }
 
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
@@ -456,7 +458,7 @@ impl Model {
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
-        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![] };
+        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![], spec_sel: vec![] };
         for l in &self.layers {
             match l.mix { Mixer::Lin { .. } => { st.conv.push(vec![0.0; (c.conv_k - 1) * ch]); st.ssm.push(vec![0.0; c.lin_nv * c.lin_dk * c.lin_dv]); }, Mixer::Attn { .. } => { st.k.push(vec![]); st.v.push(vec![]); st.ik.push(vec![]); st.ib.push(vec![]); } }
             if l.ple.is_some() { st.ple_hist.push(vec![0.0; (c.ple_conv_k - 1) * c.ple_ngram * c.hc * c.d]); }
@@ -975,6 +977,7 @@ impl Model {
         let c = &self.cfg; let (d, hc) = (c.d, c.hc); let start = st.tokens.len(); let t_m = std::time::Instant::now();
         let cb = self.cube.as_ref().unwrap();
         st.tokens.extend_from_slice(ids);
+        st.spec_sel = vec![vec![]; t];
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); for _ in 0..t { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } }
         if !st.gdn_gpu { st.gdn = st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect(); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
@@ -1008,9 +1011,20 @@ impl Model {
 
     /// After `forward_multi` of `t` tokens, keep only the first `keep` (1..=t) of them: restores DeltaNet
     /// and PLE state from the checkpoints and truncates the attention KV (GPU and host) and the token list.
+    /// Longest verify window that does not straddle an expert-cache refresh (plain decode refreshes
+    /// before call k when k % PYRE_QN_XREFILL == 0; a window may only refresh at its first token).
+    pub fn spec_max_window(&self) -> usize {
+        let Some(xm) = &self.xc else { return usize::MAX };
+        let c = xm.lock().unwrap().calls; let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16).max(1);
+        (2..=every + 1).find(|j| (c + j) % every == 0).map(|j| j - 1).unwrap_or(every)
+    }
+
     pub fn spec_keep(&self, st: &mut State, t: usize, keep: usize) {
         if keep >= t || t < 2 { return; }
         let keep = keep.max(1); let c = &self.cfg;
+        // rejected drafts must not shift the expert-cache schedule or usage counts (greedy identity)
+        if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); g.calls = g.calls.saturating_sub(t - keep);
+            for ti in keep..t { if let Some(v) = st.spec_sel.get(ti) { for &(il, e) in v { g.cnt[il][e] = g.cnt[il][e].saturating_sub(1); } } } }
         let n = st.tokens.len() - t + keep;
         st.tokens.truncate(n);
         if let Some(cb) = &self.cube { if st.gdn_gpu {
@@ -1097,9 +1111,9 @@ impl Model {
         if let Some(xm) = &self.xc {
             let mut xcg = xm.lock().unwrap();
             let (mut ons, mut offs) = (Vec::with_capacity(t), Vec::with_capacity(t));
-            for rv in &rvs {
+            for (ti, rv) in rvs.iter().enumerate() {
                 let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg));
-                for &(e, _) in &sel { xcg.cnt[il][e] += 1; }
+                for &(e, _) in &sel { xcg.cnt[il][e] += 1; if let Some(v) = st.spec_sel.get_mut(ti) { v.push((il, e)); } }
                 xcg.total += sel.len() as u64;
                 let (on, off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
                 xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64); ons.push(on); offs.push(off);

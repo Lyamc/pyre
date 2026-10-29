@@ -97,5 +97,6 @@ impl crate::spec::Target for QnTarget<'_> {
     fn verify(&mut self, toks: &[u32]) -> Vec<Vec<f32>> { self.m.forward_multi(toks, self.st) }
     fn keep(&mut self, t: usize, keep: usize) { self.m.spec_keep(self.st, t, keep) }
     fn can_verify(&self) -> bool { self.m.multi_ok() }
+    fn max_window(&self) -> usize { self.m.spec_max_window() }
     fn draft(&mut self, history: &[u32], k: usize, s: Option<&mut Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> { self.m.mtp_draft(self.st, history, k, s) }
 }

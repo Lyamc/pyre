@@ -70,6 +70,8 @@ pub trait Target {
     fn keep(&mut self, t: usize, keep: usize);
     /// Whether `verify` + `keep` are available (else plain decode).
     fn can_verify(&self) -> bool;
+    /// Longest window `verify` may take right now while staying identical to plain decode.
+    fn max_window(&self) -> usize { usize::MAX }
     /// Model drafter (MTP): up to `k` tokens following `history` (whose last token is not yet fed),
     /// each with its draft distribution when sampling (None = greedy / point mass).
     fn draft(&mut self, _history: &[u32], _k: usize, _sample: Option<&mut Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> { None }
@@ -115,7 +117,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         history.push(pending); produced += 1;
         if !emit(pending) || produced >= max_new { break; }
         let left = max_new - produced; // tokens we may still emit
-        let kk = k.min(left.saturating_sub(1)).min(8);
+        let kk = k.min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
         let mut drafts: Vec<(u32, Option<Vec<(u32, f32)>>)> = vec![];
         if kk > 0 && target.can_verify() {
             if mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; } }
