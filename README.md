@@ -472,3 +472,17 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
 - Verify cost: a 4-token verify pass costs ~3.2 single steps, because consecutive tokens pick mostly
   different experts, so the expert union saves little CPU work (CPU experts ~108 ms for 4 tokens vs ~27 ms
   for one). Spec decoding stays off by default.
+
+### Qwen-Next GPU experts, phase 3 (Oct 29)
+- Batched GPU expert kernels rewritten around int8 `dp4a`: activations are packed to the CPU's Q8 grid
+  (per-32 scales), the IQ2_S / IQ2_XXS grid sits in shared memory, sign masks and the IQ2_XXS sign parity
+  are computed instead of looked up, Q2_0 down weights expand through a 256-entry byte table, and the
+  down pass spreads all of a row's (expert, group) pairs across the lanes. `PYRE_QN_XBENCH=1 pyre` times
+  them: 10 experts of a layer 225 -> ~122 us (58 -> ~107 GB/s). IQ1_M layers keep the f32 kernels.
+  `PYRE_QN_XQ=0` restores the f32 kernels.
+- With them the opt-in expert cache (`PYRE_QN_XCACHE_GB=3`) is now break-even with the CPU-only default
+  (~14.5-15 tok/s steady either way); the cache path still pays ~5 ms/token of host enqueue work.
+- `PYRE_QN_KICK=1` submits queued GPU work before the CPU expert pass (stream query; local cubecl branch
+  `pyre-wddm-kick`). No measurable effect on HYTE, so it is off.
+- Same-machine Strata 0.1.48 on this IQ2_XS GGUF (Oct 27, with its --spec 2): 25.9 tok/s (short prompt),
+  15.4 (chat prompt B). Strata's published 46-62 tok/s are v0.2.7 on IQ3_XXS with MTP drafting.

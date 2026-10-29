@@ -62,6 +62,8 @@ pub struct State {
 
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
 fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { x[i] *= s * w[i]; } }
+/// Submit queued GPU work before the CPU expert pass (WDDM otherwise holds it until the next read). PYRE_QN_KICK=1 on (no measurable effect on HYTE, so off).
+fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && std::env::var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 #[inline] fn silu(x: f32) -> f32 { x * sigm(x) }
@@ -351,6 +353,7 @@ impl Model {
                 }
                 cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
                 cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+                if kick() { let _ = cb.client.flush(); }
             };
             if !off.is_empty() {
                 let lists: Vec<(usize, Vec<(usize, f32)>)> = off.iter().map(|&(e, w)| (e, vec![(0usize, w)])).collect();
@@ -363,6 +366,7 @@ impl Model {
         } else {
             cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
             cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+            if kick() { let _ = cb.client.flush(); }
             self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
         }
         let q6 = std::time::Instant::now();
@@ -1136,6 +1140,7 @@ impl Model {
                 }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                 for ti in 0..t { shs.push(at(&sh_all, ti * d)); }
+                if kick() { let _ = cb.client.flush(); }
             };
             // union of the missed experts; each token keeps its own order for the accumulation
             let mut lists: Vec<(usize, Vec<(usize, f32)>)> = vec![]; let mut pos_of: std::collections::HashMap<usize, usize> = Default::default();
