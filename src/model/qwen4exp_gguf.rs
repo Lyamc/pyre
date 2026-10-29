@@ -389,7 +389,8 @@ impl Model {
         for &(_, il, e) in &cand { let s = size(&self.layers[il]); if tot + s > xc.budget { break; } tot += s; want.insert((il, e)); }
         // eviction order: resident experts that fell out of the wanted set, least used first
         let mut evict: Vec<(u32, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xc.cnt[il][e], il, e)).collect();
-        evict.sort_by(|a, b| b.0.cmp(&a.0));
+        // full tie-break: HashMap key order is random per process, and the slot an expert lands in decides the GPU summation order (run-to-run identical output)
+        evict.sort_by(|a, b| b.0.cmp(&a.0).then((b.1, b.2).cmp(&(a.1, a.2))));
         let max_new = if xc.calls == 1 { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
         let t0 = std::time::Instant::now(); let mut n = 0;
         for &(_, il, e) in &cand {

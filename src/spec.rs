@@ -166,7 +166,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         p_acc = 0.7 * p_acc + 0.3 * (acc as f64 / drafts.len() as f64);
         out.rounds += 1; out.drafted += drafts.len(); out.accepted += acc;
         ROUNDS.fetch_add(1, Relaxed); DRAFTED.fetch_add(drafts.len() as u64, Relaxed); ACCEPTED.fetch_add(acc as u64, Relaxed);
-        if std::env::var("PYRE_SPEC_DEBUG").is_ok() { eprintln!("spec: drafted {} accepted {acc} {:?}", drafts.len(), drafts.iter().map(|d| d.0).collect::<Vec<_>>()); }
+        if std::env::var("PYRE_SPEC_DEBUG").is_ok() { eprintln!("spec: at {produced} drafted {} accepted {acc} {:?}", drafts.len(), drafts.iter().map(|d| d.0).collect::<Vec<_>>()); }
         let mut stop = false;
         for (dt, _) in &drafts[..acc] { history.push(*dt); produced += 1; if !emit(*dt) || produced >= max_new { stop = true; break; } }
         if stop { break; }
