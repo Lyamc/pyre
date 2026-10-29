@@ -457,3 +457,18 @@ Ideas borrowed from Strata (github.com/Niko1221/Strata, MIT); pyre's own impleme
 - `/api/status` reports `speculative` (draft len, rounds, drafted, accepted, acceptance), `route_prior`
   and `context` (used / max); the dashboard metrics hooks (`crate::metrics`) are fed from the Qwen-Next
   expert path (CPU expert ns, GPU read ns, expert-cache hits/misses).
+
+### Qwen-Next decode profile and fixes (Oct 29, later)
+Per-token profile (RTX 3060, `PYRE_QN_PROFILE=1` + nsys): ~1300 kernel launches and 54 readbacks per token;
+GPU kernels ~27 ms (Q8 dense GEMVs ~12 ms at ~325 GB/s, i.e. bandwidth-bound; GPU cached experts ~6.6 ms;
+DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU waits for the CPU
+(routing + CPU experts). The GPU is busy ~45% of the time.
+- The GPU routed-expert cache is now opt-in (`PYRE_QN_XCACHE_GB=<GiB>`). Its batched expert kernels reach
+  only ~15-70 GB/s and sit on the critical path, so decode is faster without it (interleaved A/B, steady
+  tok/s: story 15.3-15.5 vs 14.1, code 14.2-15.3 vs 13.4-13.7) and VRAM use drops from ~8.1 to ~5.4 GB.
+- Expert-cache eviction is deterministic (HashMap order used to decide slots and therefore the GPU
+  summation order, so outputs could vary run to run). With that, speculative output is greedy-identical
+  to plain decode on a 400-token code-edit run, with and without the cache.
+- Verify cost: a 4-token verify pass costs ~3.2 single steps, because consecutive tokens pick mostly
+  different experts, so the expert union saves little CPU work (CPU experts ~108 ms for 4 tokens vs ~27 ms
+  for one). Spec decoding stays off by default.
