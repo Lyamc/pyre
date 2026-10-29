@@ -1024,7 +1024,9 @@ impl Model {
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
         let mut hid = vec![0f32; hoff[work.len()]]; let hp = SyncPtr(hid.as_mut_ptr());
         thread_local! { static SC: std::cell::RefCell<(super::qdot::Scratch, super::qdot::Scratch)> = std::cell::RefCell::new(Default::default()); }
-        pool.run_side(work.len() * nb, &|k| {
+        let (t_first, t_last) = (std::sync::atomic::AtomicU64::new(u64::MAX), std::sync::atomic::AtomicU64::new(0)); let zp = std::time::Instant::now();
+        pool.run_side(work.len() * nb, &|k| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
             let (wi, b) = (k / nb, k % nb); let (e, toks) = work[wi];
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
@@ -1043,7 +1045,7 @@ impl Model {
                         let v = if usek { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         }, &mut || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); });
-        let z1 = std::time::Instant::now();
+        let z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
         let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
@@ -1155,7 +1157,7 @@ impl Model {
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
         let lg = self.head_logits(&h);
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("xupload repack {:.4} write {:.4} | ", super::qn_cube::XUP_NS[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, super::qn_cube::XUP_NS[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("side(gpu enqueue) {:.4} | ", SIDE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("cpu misses {} gpu hits {} | ", MISS[3].swap(0, std::sync::atomic::Ordering::Relaxed), MISS[4].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("xupload repack {:.4} write {:.4} | ", super::qn_cube::XUP_NS[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, super::qn_cube::XUP_NS[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("side(gpu enqueue) {:.4} gu-busy {:.4} tasks {} first {:.4} last {:.4} wall {:.4} | ", SIDE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, BUSY.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, BUSYN.swap(0, std::sync::atomic::Ordering::Relaxed), TL[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, TL[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, TL[2].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("cpu misses {} gpu hits {} | ", MISS[3].swap(0, std::sync::atomic::Ordering::Relaxed), MISS[4].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 
@@ -1561,6 +1563,9 @@ fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
     let cut = ws[r - 1]; // keep experts strictly above the rank-(r-1) weight or equal to it
     off.retain(|x| x.1 >= cut);
 }
+static BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUSYN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static SIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MISS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

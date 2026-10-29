@@ -1222,6 +1222,7 @@ fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
 }
 /// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
 pub fn hpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_HPIN").map(|v| v == "1").unwrap_or(false)) }
+pub fn xs2() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XS2").map(|v| v == "1").unwrap_or(false)) }
 pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
     let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
@@ -2096,7 +2097,17 @@ impl Cube {
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         // pinned staging (CubeCL's page-locked pool) so the copy is a real async DMA, like Strata's staging memcpyAsync
         let mut by = cubecl::bytes::Bytes::from_elems(v.to_vec()); if xpin() { self.client.staging(std::iter::once(&mut by), false); }
-        self.client.write(&hd, by);
+        if xs2() {
+            // PYRE_QN_XS2=1: issue the copy from a dedicated thread, which CubeCL gives its own CUDA stream, so the
+            // transfer overlaps the compute stream (Strata copies on a separate stream); CubeCL orders the later
+            // kernel that reads the slot after it. This thread waits only until the copy is enqueued.
+            type Job = (Handle, cubecl::bytes::Bytes, std::sync::mpsc::Sender<()>);
+            static TX: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+            let tx = TX.get_or_init(|| { let (tx, rx) = std::sync::mpsc::channel::<Job>(); let cl = self.client.clone();
+                std::thread::Builder::new().name("pyre-xup".into()).spawn(move || { for (h, b, ack) in rx { cl.write(&h, b); let _ = cl.flush(); let _ = ack.send(()); } }).expect("upload thread");
+                std::sync::Mutex::new(tx) });
+            let (at, ar_) = std::sync::mpsc::channel(); tx.lock().unwrap().send((hd, by, at)).expect("upload thread gone"); let _ = ar_.recv();
+        } else { self.client.write(&hd, by); }
         XUP_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
         XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }

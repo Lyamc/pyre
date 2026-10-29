@@ -744,3 +744,4 @@ is opt-in: no measurable gain here.
   `PYRE_MTP_HEAD_GPU=0` turns it off.
 - The drafter's CPU matmuls run on their own 8-thread rayon pool (`PYRE_MTP_THREADS`, 0 = global pool): ~2-3 ms less per 3-draft round. GPU calls stay on the main thread (a CubeCL call from another thread opens a second stream and ~200 MB memory pool).
 - `PYRE_QN_HPIN=1` (opt-in): small host-to-device buffers go through CubeCL's page-locked staging pool; within noise here (~+0.3 tok/s).
+- `PYRE_QN_XS2=1` (opt-in): PCIe-share uploads are issued from a dedicated thread (CubeCL gives it its own CUDA stream). Same output as the single-stream share, no faster here: the host-side copy (pageable staging of each 1.4 MB expert) is what costs, and it still sits on the enqueue thread.
