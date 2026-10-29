@@ -1,8 +1,9 @@
 //! pyre-gui: a native GPUI (Lyamc fork) desktop front end for a pyre server.
 //! It talks to pyre only over HTTP (OpenAI-compatible + `/api/*`) and never links Burn.
 //!
-//! Pages: Chat (streaming), Models (HF cache + store, pull/import/alias/remove, load/unload),
+//! Pages: Dashboard (live /api/metrics), Chat (streaming), Models (HF cache + store, pull/import/alias/remove, load/unload),
 //! Images (txt2img), Audio (transcribe a file, TTS playback), Status.
+mod dash;
 mod net;
 
 use base64::Engine as _;
@@ -26,7 +27,7 @@ const MUTED: u32 = 0x9aa0aa;
 const DANGER: u32 = 0xe05a5a;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Page { Chat, Models, Images, Audio, Status }
+enum Page { Dashboard, Chat, Models, Images, Audio, Status }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Field { Server, Chat, Pull, Import, AliasName, AliasTo, LoadRef, Prompt, Steps, AudioPath, Tts }
@@ -59,6 +60,10 @@ struct PyreGui {
     image_info: String,
     transcript: String,
     log: Vec<String>,
+    metrics: Value,
+    hist_decode: std::collections::VecDeque<f64>,
+    hist_gpu: std::collections::VecDeque<f64>,
+    hist_vram: std::collections::VecDeque<f64>,
 }
 
 impl PyreGui {
@@ -76,7 +81,8 @@ impl PyreGui {
             prompt: "a lighthouse on a cliff at sunset, oil painting".into(), steps: "20".into(),
             audio_path: String::new(), tts_text: "Hello from pyre.".into(),
             models: Value::Null, status: Value::Null, health: "?".into(), image: None, image_info: String::new(),
-            transcript: String::new(), log: vec![],
+            transcript: String::new(), log: vec![], metrics: Value::Null,
+            hist_decode: Default::default(), hist_gpu: Default::default(), hist_vram: Default::default(),
         };
         // Drain worker results on the UI thread.
         cx.spawn(async move |this, cx| loop {
@@ -90,10 +96,16 @@ impl PyreGui {
             cx.background_executor().timer(Duration::from_secs(3)).await;
         })
         .detach();
+        // Dashboard metrics every second.
+        cx.spawn(async move |this, cx| loop {
+            if this.update(cx, |this, _| net::get(this.base(), "/api/metrics", "metrics", this.tx.clone())).is_err() { break; }
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+        })
+        .detach();
         me.refresh_models();
-        // Scripted start for demos/screenshots: PYRE_GUI_PAGE=chat|models|images|audio|status, PYRE_GUI_SEND=<chat text>.
+        // Scripted start for demos/screenshots: PYRE_GUI_PAGE=dashboard|chat|models|images|audio|status, PYRE_GUI_SEND=<chat text>.
         me.page = match std::env::var("PYRE_GUI_PAGE").unwrap_or_default().as_str() {
-            "models" => Page::Models, "images" => Page::Images, "audio" => Page::Audio, "status" => Page::Status, _ => Page::Chat,
+            "models" => Page::Models, "images" => Page::Images, "audio" => Page::Audio, "status" => Page::Status, "chat" => Page::Chat, _ => Page::Dashboard,
         };
         if let Ok(s) = std::env::var("PYRE_GUI_SEND") { me.chat_input = s; me.send_chat(); }
         if let Ok(s) = std::env::var("PYRE_GUI_TTS") { me.page = Page::Audio; me.tts_text = s; me.do_tts(); }
@@ -134,6 +146,8 @@ impl PyreGui {
                     Err(e) => self.note(format!("{tag}: {e}")),
                 },
                 Msg::Json(tag, r) => match (tag, r) {
+                    ("metrics", Ok(v)) => { self.push_hist(&v); self.metrics = v; }
+                    ("metrics", Err(_)) => self.metrics = Value::Null,
                     ("status", Ok(v)) => self.status = v,
                     ("status", Err(_)) => self.status = Value::Null,
                     ("health", Ok(v)) => self.health = v["status"].as_str().unwrap_or("ok").to_string(),
@@ -273,7 +287,7 @@ impl PyreGui {
             .child(label.to_string())
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.page = p;
-                this.field = match p { Page::Chat => Field::Chat, Page::Models => Field::LoadRef, Page::Images => Field::Prompt, Page::Audio => Field::AudioPath, Page::Status => Field::Server };
+                this.field = match p { Page::Chat => Field::Chat, Page::Models => Field::LoadRef, Page::Images => Field::Prompt, Page::Audio => Field::AudioPath, Page::Status | Page::Dashboard => Field::Server };
                 if p == Page::Models { this.refresh_models(); }
                 cx.notify();
             }))
@@ -407,6 +421,7 @@ impl Render for PyreGui {
             Page::Images => self.images_page(cx),
             Page::Audio => self.audio_page(cx),
             Page::Status => self.status_page(cx),
+            Page::Dashboard => self.dashboard_page(cx),
         };
         let loaded = self.status["models"].as_array().map(|a| a.iter().map(|m| format!("{} ({})", m["id"].as_str().unwrap_or(""), m["kind"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
         let mut log = div().flex().flex_col().text_xs().text_color(rgb(MUTED));
@@ -417,7 +432,7 @@ impl Render for PyreGui {
             .bg(rgb(BG)).text_color(rgb(TEXT)).text_size(px(15.))
             .child(div().flex().items_center().gap(px(6.)).px(px(12.)).py(px(8.)).bg(rgb(PANEL))
                 .child(div().text_color(rgb(ACCENT)).text_size(px(20.)).pr(px(12.)).child("pyre"))
-                .child(self.nav(Page::Chat, "Chat", cx)).child(self.nav(Page::Models, "Models", cx)).child(self.nav(Page::Images, "Images", cx))
+                .child(self.nav(Page::Dashboard, "Dashboard", cx)).child(self.nav(Page::Chat, "Chat", cx)).child(self.nav(Page::Models, "Models", cx)).child(self.nav(Page::Images, "Images", cx))
                 .child(self.nav(Page::Audio, "Audio", cx)).child(self.nav(Page::Status, "Status", cx))
                 .child(div().flex_1())
                 .child(div().text_sm().text_color(rgb(if self.health == "ok" { 0x7bd88f } else { DANGER })).child(format!("{}  {}", self.server, self.health))))
@@ -430,7 +445,7 @@ impl Render for PyreGui {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(880.)), cx);
         cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), app_id: Some("pyre-gui".into()), ..Default::default() },
             |window, cx| cx.new(|cx| PyreGui::new(window, cx)),

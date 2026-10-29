@@ -160,9 +160,26 @@ impl Gen {
 }
 
 fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> {
-    let (tx, rx) = unbounded_channel();
+    let (tx, mut rx_in) = unbounded_channel();
+    let (tx_out, rx) = unbounded_channel();
     let max_tokens = g.max(st, prompt.len());
+    let mid = crate::metrics::begin(&st.model_id, prompt.len(), st.n_ctx, max_tokens);
     st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx }));
+    // Forward engine events to the handler while recording live metrics (/api/metrics).
+    // Dropping `rx_in` when the client goes away still cancels the job as before.
+    tokio::spawn(async move {
+        let mut done = false;
+        while let Some(e) = rx_in.recv().await {
+            match &e {
+                Event::Token(_) => crate::metrics::token(mid),
+                Event::Done { timings, .. } => { crate::metrics::finish(mid, "ok", Some(timings)); done = true; }
+                Event::Error(_) => { crate::metrics::finish(mid, "error", None); done = true; }
+                _ => {}
+            }
+            if tx_out.send(e).is_err() { break; }
+        }
+        if !done { crate::metrics::finish(mid, "cancelled", None); }
+    });
     rx
 }
 

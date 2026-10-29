@@ -25,6 +25,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/models/rm", post(rm))
         .route("/api/pull", post(pull))
         .route("/api/status", get(status))
+        .route("/api/metrics", get(metrics))
         .route("/api/logs", get(logs))
         .route("/v1/images/generations", post(images))
         .route("/sdapi/v1/txt2img", post(txt2img))
@@ -179,8 +180,42 @@ async fn status(State(app): S) -> Json<Value> {
         "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>(),
         "store_root": app.storage.store.root, "hf_cache": app.storage.hf_cache,
         "limits": crate::limits::status(),
+        "metrics": crate::metrics::snapshot(),
         "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
     }))
+}
+
+static SYS: std::sync::Mutex<Option<sysinfo::System>> = std::sync::Mutex::new(None);
+
+/// Primary LAN address (no packets sent: a UDP connect only picks the route).
+fn lan_ip() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:80").ok()?;
+    s.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+/// Live dashboard metrics: requests (active/recent, prefill/decode tok/s, context), VRAM vs
+/// reserve, GPU util, RAM, CPU, expert compute split and cache hit rate. See `crate::metrics`.
+async fn metrics(State(app): S) -> Json<Value> {
+    let (cpu, used, total, rss, limits) = tokio::task::spawn_blocking(|| {
+        let mut g = SYS.lock().unwrap();
+        let sys = g.get_or_insert_with(sysinfo::System::new);
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        let pid = sysinfo::get_current_pid().ok();
+        if let Some(p) = pid { sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true); }
+        let rss = pid.and_then(|p| sys.process(p)).map(|p| p.memory()).unwrap_or(0);
+        (sys.global_cpu_usage(), sys.used_memory(), sys.total_memory(), rss, crate::limits::status())
+    }).await.unwrap_or((0.0, 0, 0, 0, json!({})));
+    let mut v = crate::metrics::snapshot();
+    v["version"] = json!(env!("CARGO_PKG_VERSION"));
+    v["uptime_s"] = json!(app.started.elapsed().as_secs());
+    v["lan_ip"] = json!(lan_ip());
+    v["limits"] = limits;
+    v["cpu_pct"] = json!(cpu);
+    v["ram"] = json!({"used": used, "total": total, "process_rss": rss});
+    v["models"] = json!(app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>());
+    Json(v)
 }
 
 async fn logs() -> Json<Value> { Json(json!({"lines": crate::logbuf::tail(200)})) }

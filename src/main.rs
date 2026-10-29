@@ -15,6 +15,7 @@ mod model;
 mod sampler;
 mod server;
 mod limits;
+mod metrics;
 mod template;
 mod qn_cli;
 mod apps;
