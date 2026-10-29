@@ -1480,7 +1480,10 @@ impl Cube {
     /// One layer's cached experts from one arena: x is read straight from `src` (its first d values),
     /// y = sum_e w_e D_e silu(G_e x)*(U_e x) is written to scr.y. Four launches, one small upload.
     #[allow(clippy::too_many_arguments)]
-    pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool) -> bool {
+    pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool) -> bool { self.xrun_fast_to(tb, ar, ar_bytes, ents, src, sn, d, ff, tys, scr, acc, &scr.y) }
+    /// xrun_fast into a caller-owned output (multi-token verify keeps one y per token; scratch is reused in stream order).
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_fast_to(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool, yo: &Handle) -> bool {
         let ne = ents.len();
         if ne == 0 || ne > scr.max_ne || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
@@ -1495,7 +1498,7 @@ impl Cube {
                 a(&scr.xq, d / 4), a(&scr.xs, d / 32), a(ar, aw), a(&mh, ml), a(gsrc, gn as usize), a(&scr.h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0);
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&scr.h, ne * ff), a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
             k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
-                a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), a(ar, aw), a(&mh, ml), a(&tb.q2l, 256), a(&scr.y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, acc as u32);
+                a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), a(ar, aw), a(&mh, ml), a(&tb.q2l, 256), a(yo, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, acc as u32);
         }
         true
     }

@@ -1137,7 +1137,15 @@ impl Model {
             let mut gpu = || {
                 for ti in 0..t {
                     let (rd, on) = (&rds[ti], &ons[ti]);
-                    if !on.is_empty() {
+                    let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
+                    let fast = !on.is_empty() && xfast() && tyf.0 == tyf.1 && tyf.0 <= 1 && tyf.2 == 3 && {
+                        let y0 = cb.empty(d);
+                        let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect();
+                        let mut first = true; let mut ok = true;
+                        for ar in 0..xcr.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ar).cloned().collect(); if grp.is_empty() { continue; }
+                            ok &= cb.xrun_fast_to(&xcr.tabs, &xcr.arena[ar], xcr.ar_bytes, &grp, rd, rn, d, c.ff_exp, tyf, &xcr.scr, !first, &y0); first = false; }
+                        if ok { ygs[ti] = Some(y0); } ok };
+                    if !on.is_empty() && !fast {
                         let xb = cb.empty(d); let y0 = cb.empty(d);
                         cb.q8copy(rd, rn, 0, &xb, &y0, d);
                         let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
