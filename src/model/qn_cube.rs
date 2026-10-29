@@ -1098,7 +1098,7 @@ fn gdot8s(w: &[u32], rb: u32, q: u32, x0: i32, x1: i32, xsc: f32, grid: &Shared<
 
 /// Gate/up (both of type ty) with the grid table staged in shared memory; one row per warp.
 #[cube(launch_unchecked)]
-fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32,
+fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32,
     #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
     let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
     let mut i = UNIT_POS;
@@ -1108,7 +1108,9 @@ fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &m
     let lane = UNIT_POS_X;
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
     if row < rows {
-        let go = meta[(e * 4) as usize] + row * rbg;
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let go = (m0 & 2147483647u32) + row * rbg;
         let uo = meta[(e * 4 + 1) as usize] + row * rbu;
         let mut gs = 0.0f32;
         let mut us = 0.0f32;
@@ -1118,8 +1120,13 @@ fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &m
             let x0 = i32::cast_from(xq[(q * 2) as usize]);
             let x1 = i32::cast_from(xq[(q * 2 + 1) as usize]);
             let xsc = xs[(q / 4) as usize];
-            gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
-            us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+            if sel == 0u32 {
+                gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+            } else {
+                gs += gdot8s(ar1, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar1, uo, q, x0, x1, xsc, &grid, ty);
+            }
         }
         let g = plane_sum(gs);
         let u = plane_sum(us);
@@ -1132,7 +1139,7 @@ fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &m
 /// Batched cached experts, Q2_0 down with int8 h and dp4a; (expert, group) flattened over the lanes.
 /// q2l[b] = the four 2-bit fields of byte b as bytes.
 #[cube(launch_unchecked)]
-fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, acc: u32) {
+fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, acc: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
     if row < rows {
         let nsb = cols / 8;
@@ -1144,9 +1151,12 @@ fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &
             let q = j - e * nsb;
             let sb = q / 4;
             let l = q % 4;
-            let blk = meta[(e * 4 + 2) as usize] + row * rbd + (sb / 2) * 5;
-            let d = f32::reinterpret(ar[blk as usize]);
-            let qw = ar[(blk + 1 + 2 * (sb % 2) + l / 2) as usize];
+            let m2 = meta[(e * 4 + 2) as usize];
+            let blk = (m2 & 2147483647u32) + row * rbd + (sb / 2) * 5;
+            let wi = blk + 1 + 2 * (sb % 2) + l / 2;
+            let mut d = 0.0f32;
+            let mut qw = 0u32;
+            if (m2 >> 31) == 0u32 { d = f32::reinterpret(ar[blk as usize]); qw = ar[wi as usize]; } else { d = f32::reinterpret(ar1[blk as usize]); qw = ar1[wi as usize]; }
             let half = (qw >> (16 * (l % 2))) & 65535u32;
             let xw = e * cols / 4 + q * 2;
             let x0 = i32::cast_from(hq[xw as usize]);
@@ -1519,14 +1529,14 @@ impl Cube {
             if st & 1 != 0 { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((d as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(x, d), a(&xq, d / 4), a(&xs, d / 32), 0, (d / 32) as u32);
             if d % 256 == 0 && tys.0 == tys.1 && xsh() { let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
                 k_xgu_s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
-                a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(gsrc, gn as usize), a(h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0); }
+                a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(ar, aw), a(mh, ml), a(gsrc, gn as usize), a(h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0); }
             else if d % 256 == 0 && xrw() > 0 { let rw = xrw(); let nw = (ff as u32).div_ceil(rw); k_xgu_q4::launch_unchecked(&self.client, CubeCount::Static(nw.div_ceil(4), ne as u32, 1), CubeDim::new_2d(32, 4),
                 a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.sm, 512), a(h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, rw, tys.0, tys.1); }
             else { k_xgu_q::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
                 a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.sm, 512), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); } }
             if st & 4 != 0 { k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32); }
             if st & 2 != 0 { k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
-                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(mh, ml), a(&tb.q2l, 256), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, 1u32); }
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar, aw), a(mh, ml), a(&tb.q2l, 256), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, 1u32); }
         }
         true
     }
@@ -1536,25 +1546,29 @@ impl Cube {
     /// One layer's cached experts from one arena: x is read straight from `src` (its first d values),
     /// y = sum_e w_e D_e silu(G_e x)*(U_e x) is written to scr.y. Four launches, one small upload.
     #[allow(clippy::too_many_arguments)]
-    pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool) -> bool { self.xrun_fast_to(tb, ar, ar_bytes, ents, src, sn, d, ff, tys, scr, acc, &scr.y) }
+    pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool) -> bool { self.xrun_fast_to(tb, std::slice::from_ref(ar), ar_bytes, ents, src, sn, d, ff, tys, scr, acc, &scr.y) }
     /// xrun_fast into a caller-owned output (multi-token verify keeps one y per token; scratch is reused in stream order).
     #[allow(clippy::too_many_arguments)]
-    pub fn xrun_fast_to(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool, yo: &Handle) -> bool {
+    pub fn xrun_fast_to(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool, yo: &Handle) -> bool {
         let ne = ents.len();
         if ne == 0 || ne > scr.max_ne || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
         let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
         let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32;
-        let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
+        // up to two arenas in one launch: bit 31 of the gate and down offsets selects the second (with one arena, all go to it)
+        if ars.is_empty() || ars.len() > 2 { return false; }
+        let fl = |e: &XEnt| if ars.len() == 2 && e.arena == 1 { 1u32 << 31 } else { 0 };
+        let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0] | fl(e), e.off[1], e.off[2] | fl(e), w.to_bits()]).collect();
         let mh = self.client.create_from_slice(u32::as_bytes(&meta)); let ml = ne * 4;
         let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+        let (ar, ar1) = (&ars[0], ars.last().unwrap());
         unsafe {
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static((d as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(src, sn), a(&scr.xq, d / 4), a(&scr.xs, d / 32), 0, (d / 32) as u32);
             k_xgu_s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
-                a(&scr.xq, d / 4), a(&scr.xs, d / 32), a(ar, aw), a(&mh, ml), a(gsrc, gn as usize), a(&scr.h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0);
+                a(&scr.xq, d / 4), a(&scr.xs, d / 32), a(ar, aw), a(ar1, aw), a(&mh, ml), a(gsrc, gn as usize), a(&scr.h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0);
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&scr.h, ne * ff), a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
             k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
-                a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), a(ar, aw), a(&mh, ml), a(&tb.q2l, 256), a(yo, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, acc as u32);
+                a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(&mh, ml), a(&tb.q2l, 256), a(yo, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, acc as u32);
         }
         true
     }

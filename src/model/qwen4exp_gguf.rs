@@ -349,10 +349,11 @@ impl Model {
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
                 let fast = !on.is_empty() && xfast() && tys.0 == tys.1 && tys.0 <= 1 && tys.2 == 3 && {
                     let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
+                    if xcg.arena.len() <= 2 { cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &ents, &rd, rn, d, c.ff_exp, tys, &xcg.scr, false, &xcg.scr.y) } else {
                     let mut first = true; let mut ok = true;
                     for ai in 0..xcg.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ai).cloned().collect(); if grp.is_empty() { continue; }
                         ok &= cb.xrun_fast(&xcg.tabs, &xcg.arena[ai], xcg.ar_bytes, &grp, &rd, rn, d, c.ff_exp, tys, &xcg.scr, !first); first = false; }
-                    ok };
+                    ok } };
                 if fast { yg = Some(xcg.scr.y.clone()); }
                 if !on.is_empty() && !fast {
                     let xb = cb.empty(d); let y0 = cb.empty(d);
@@ -1149,8 +1150,9 @@ impl Model {
                         let y0 = cb.empty(d);
                         let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect();
                         let mut first = true; let mut ok = true;
+                        if xcr.arena.len() <= 2 { ok = cb.xrun_fast_to(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &ents, rd, rn, d, c.ff_exp, tyf, &xcr.scr, false, &y0); } else {
                         for ar in 0..xcr.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ar).cloned().collect(); if grp.is_empty() { continue; }
-                            ok &= cb.xrun_fast_to(&xcr.tabs, &xcr.arena[ar], xcr.ar_bytes, &grp, rd, rn, d, c.ff_exp, tyf, &xcr.scr, !first, &y0); first = false; }
+                            ok &= cb.xrun_fast_to(&xcr.tabs, std::slice::from_ref(&xcr.arena[ar]), xcr.ar_bytes, &grp, rd, rn, d, c.ff_exp, tyf, &xcr.scr, !first, &y0); first = false; } }
                         if ok { ygs[ti] = Some(y0); } ok };
                     if !on.is_empty() && !fast {
                         let xb = cb.empty(d); let y0 = cb.empty(d);
