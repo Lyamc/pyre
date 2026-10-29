@@ -509,4 +509,18 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   at 17-25 us each (3-4.6 ms), ~100 event syncs; GPU kernel time ~23 ms (dense Q8 GEMV ~12 ms of it,
   ~10 ms with the native IQ4 kernel). Host and GPU mostly take turns, so the next steps are fewer launches and
   uploads (CUDA graph replay of the dense part, fused per-layer kernels, one upload per layer) rather than
-  faster kernels.
+  faster kernels.- `PYRE_QN_GRAPH=1` (opt-in): the dense part of each DeltaNet layer (36 of 48; ~12 launches each) is
+  captured once into a CUDA graph with cubecl's own capture API and replayed on later tokens. Its buffers,
+  the DeltaNet state and the residual are persistent (the residual is rewritten in place).
+  Nsight: kernel launches 36,176 -> 20,216 over the same 40-token run, plus 36 graph launches per token.
+  Decode ~19.2 -> ~19.9 story, ~17.2 -> ~18.2 code; greedy output unchanged. It costs ~2.7 GB more VRAM
+  (pages a sealed graph touched stay guarded), leaving ~1.6 GB free, so it is opt-in for now.
+  The attention layers (position-dependent arguments) are not captured yet.
+- `PYRE_QN_NATIVE=3`: the IQ4_XS dp4a GEMV with x quantised inside each cube. Every cube re-quantises
+  x, so it is slower (~17 tok/s); kept as an experiment.
+- Speculative decoding on a no-thinking copy task (1,247-token prompt, 232 tokens out): steady 15.0 tok/s
+  plain, 16.9 with `--spec 4`, 17.8 with `--spec 8`; greedy output identical. It uses ~2.5 GB more VRAM.
+- Prefill is slow: ~10.7 tok/s at 931-1,247 prompt tokens (116 s for 1,247). The likely cause is that the
+  expert cache is empty during the first prefill (it fills afterwards) and the routed experts for the
+  prompt run on the CPU. To look at later: fill the cache from the first prompt chunk, and use GPU
+  batched expert GEMMs for prefill.
