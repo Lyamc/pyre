@@ -563,3 +563,14 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
 - **Biggest levers for pyre, in order:** (1) the MTP draft layer (needs the separate MTP file; the user's call),
   (2) a CPU expert kernel ~2x faster, (3) more experts on the GPU by keeping dense weights 4-bit, plus streaming
   some misses over PCIe, (4) the opt-in, output-changing tricks (tail skip, route prior).
+### After the Strata study (quiet GPU, graphs on, 96 tokens, two runs each; story pA / code pB)
+
+- **CPU kernel is not the gap.** `PYRE_QN_KBENCH=1` times the IQ2_S gate+up kernel alone: 190 us per expert on one
+  thread, 32 us on 8 threads, the same cache-hot or streamed (compute-bound). That is already Strata's 32-37 us. In
+  the model the per-layer jobs are small, so the measured ~50 us per miss is pool and sync overhead, not SIMD unpacking.
+- **Pool spin** (`PYRE_QN_SPIN_US` 100 / 1000 / 5000 us): steady 19.1-19.8 / 17.3-18.1, within noise. Left at 100.
+- **4-bit dense to free VRAM for experts:** `PYRE_QN_NATIVE=3` saves ~1.3 GiB. With the cache at 4 GiB, VRAM matches
+  the default (~1.37 GB free): 17.3-17.6 / 17.0-17.1, against the baseline 19.2 / 17.6 (cache 2.5 GiB, Q8).
+  Asking for 5-6 GiB tripped the VRAM watchdog at 612 MiB free.
+  So the extra experts do not pay for the slower table-lookup kernel. A 4-bit kernel as fast as Q8 (byte-permute
+  decode) would turn this into a win: it gives the bytes and the VRAM. It is the next step.
