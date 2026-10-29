@@ -387,6 +387,7 @@ impl Model {
             for &(e, _) in &sel { xcg.cnt[il][e] += 1; }
             xcg.total += sel.len() as u64;
             let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
+            tail_skip(&mut off, &on);
             // Strata-style PCIe share: the first few misses are copied into the stream slots and run on the GPU
             // with the cached ones, while the CPU pool takes the rest
             let tys0 = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
@@ -1126,14 +1127,15 @@ impl Model {
         let mut e = vec![0f32; d];
         for j in 0..k {
             self.embd.row(tok as usize, &mut e);
-            let (s, r2) = m.step(&mut kv, &r, &e, n - 1 + j);
+            let (s, r2) = m.step(&mut kv, &r, &e, n - 1 + j); let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
             let (id, p) = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
+            HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             if j > 0 && p < min_p { break; }
             out.push((id, None)); r = r2; tok = id;
         }
         kv.truncate(n, row); st.mtp_kv = kv;
-        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: catch-up {:.1} ms, {} drafts {:.1} ms | {:?}", (t1 - t0).as_secs_f64() * 1e3, out.len(), t1.elapsed().as_secs_f64() * 1e3, super::mtp::TM.iter().map(|a| (a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e5).round() / 10.0).collect::<Vec<_>>()); }
+        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: head {:.1} ms catch-up {:.1} ms, {} drafts {:.1} ms | {:?}", HEAD_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, (t1 - t0).as_secs_f64() * 1e3, out.len(), t1.elapsed().as_secs_f64() * 1e3, super::mtp::TM.iter().map(|a| (a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e5).round() / 10.0).collect::<Vec<_>>()); }
         Some(out)
     }
     fn mtp_keep_r(&self, st: &mut State, pos: usize, x: &[f32]) {
@@ -1382,6 +1384,7 @@ impl Model {
                 for &(e, _) in &sel { xcg.cnt[il][e] += 1; if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
                 xcg.total += sel.len() as u64;
                 let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
+            tail_skip(&mut off, &on);
             // Strata-style PCIe share: the first few misses are copied into the stream slots and run on the GPU
             // with the cached ones, while the CPU pool takes the rest
             let tys0 = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
@@ -1449,6 +1452,22 @@ impl Model {
     }
 }
 
+
+/// PYRE_QN_TAIL_SKIP=R (opt-in, changes outputs; 0 = off, the default): a routed expert that missed the GPU cache
+/// and ranks R or lower (0-based, by routing weight among the token's top-k) is not computed. Per token, so a
+/// verify window decides exactly as plain decode does. Idea from Strata's STRATA_ROUTE_TAIL_SKIP (rank 7 there,
+/// applied per verify window).
+fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let r = *R.get_or_init(|| env_usize("PYRE_QN_TAIL_SKIP").unwrap_or(0));
+    if r == 0 || off.is_empty() { return; }
+    let mut ws: Vec<f32> = on.iter().chain(off.iter()).map(|x| x.1).collect();
+    if r >= ws.len() { return; }
+    ws.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let cut = ws[r - 1]; // keep experts strictly above the rank-(r-1) weight or equal to it
+    off.retain(|x| x.1 >= cut);
+}
+static HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WV: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];

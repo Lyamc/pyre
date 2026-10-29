@@ -43,13 +43,19 @@ impl St {
     /// a 1-D norm weight, Gemma-style: 1 + w
     fn norm(&self, n: &str) -> Result<Vec<f32>> { let (s, b) = self.raw(n)?; let mut y = vec![0f32; s[0]]; Self::row(b, 0, s[0], &mut y); for v in y.iter_mut() { *v += 1.0; } Ok(y) }
     fn vec(&self, n: &str) -> Result<Vec<f32>> { let (s, b) = self.raw(n)?; let c = s.iter().product(); let mut y = vec![0f32; c]; Self::row(b, 0, c, &mut y); Ok(y) }
-    fn q8(&self, n: &str) -> Result<Q8Mat> { let (s, b) = self.raw(n)?; let (r, c) = (s[0], s[1]); Ok(Q8Mat::from_fn(r, c, |i, y| Self::row(b, i, c, y))) }
+    fn q8(&self, n: &str) -> Result<Q8Mat> { self.q8s(&[n]) }
+    /// several matrices with the same input, stacked by rows (one pass over the activation)
+    fn q8s(&self, ns: &[&str]) -> Result<Q8Mat> {
+        let ms: Vec<(&[usize], &[u8])> = ns.iter().map(|n| self.raw(n)).collect::<Result<_>>()?; let c = ms[0].0[1];
+        let idx: Vec<(usize, usize)> = ms.iter().enumerate().flat_map(|(k, m)| (0..m.0[0]).map(move |r| (k, r))).collect();
+        Ok(Q8Mat::from_fn(idx.len(), c, |i, y| { let (k, r) = idx[i]; Self::row(ms[k].1, r, c, y) }))
+    }
 }
 
 /// PYRE_MTP_DEBUG timers (ns): input, attn-hc+kv, q+attention, o+combine, mlp-hc, shared, experts, mixer
 pub static TM: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 fn tick(i: usize, t: &mut std::time::Instant) { let n = t.elapsed().as_nanos() as u64; TM[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed); *t = std::time::Instant::now(); }
-struct Hc { norm: Vec<f32>, down: Q8Mat, up: Q8Mat, inject: Option<Q8Mat> }
+struct Hc { norm: Vec<f32>, down: Q8Mat, up: Q8Mat, inject: Option<Q8Mat>, lr: usize }
 fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 fn silu(x: f32) -> f32 { x * sigm(x) }
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
@@ -67,7 +73,7 @@ pub struct Mtp {
     d: usize, hc: usize, nh: usize, nkv: usize, hd: usize, n_rot: usize, eps: f32, top_k: usize, ff: usize, rope_inv: Vec<f32>,
     pre_e: Vec<f32>, pre_h: Vec<f32>, fc_e: Q8Mat, fc_h: Q8Mat, hca: Hc, hcf: Hc, mix: Hc,
     q: Q8Mat, k: Q8Mat, v: Q8Mat, o: Q8Mat, qn: Vec<f32>, kn: Vec<f32>,
-    router: Q8Mat, sg: Q8Mat, su: Q8Mat, sd: Q8Mat, sgate: Vec<f32>,
+    rsu: Q8Mat, sd: Q8Mat, sgate: Vec<f32>, ne: usize,
     st: St, ex: Vec<OnceLock<(Q8Mat, Q8Mat)>>,
     head: Q8Mat, ids: Vec<u32>, pub window: usize,
 }
@@ -78,8 +84,8 @@ impl Mtp {
     /// `head_row(token, out)`: a row of the main model's output matrix; `ids`: the draft vocabulary.
     pub fn load(p: &std::path::Path, g: &Geo, ids: Vec<u32>, head_row: impl Fn(usize, &mut [f32]) + Sync) -> Result<Self> {
         let st = St::open(p)?;
-        let hcm = |p: &str, inj: bool| -> Result<Hc> { Ok(Hc { norm: st.norm(&format!("{p}.hc_norm.weight"))?, down: st.q8(&format!("{p}.input_mix_weight_down.weight"))?, up: st.q8(&format!("{p}.input_mix_weight_up.weight"))?,
-            inject: if inj { Some(st.q8(&format!("{p}.block_inject_weight.weight"))?) } else { None } }) };
+        let hcm = |p: &str, inj: bool| -> Result<Hc> { let (dn, ij) = (format!("{p}.input_mix_weight_down.weight"), format!("{p}.block_inject_weight.weight"));
+            Ok(Hc { norm: st.norm(&format!("{p}.hc_norm.weight"))?, lr: st.raw(&dn)?.0[0], down: if inj { st.q8s(&[&dn, &ij])? } else { st.q8(&dn)? }, up: st.q8(&format!("{p}.input_mix_weight_up.weight"))?, inject: None }) };
         let (ne, ff) = { let (s, _) = st.raw("mlp.experts.down_proj")?; (s[0], s[2]) };
         let half = g.n_rot / 2;
         let head = Q8Mat::from_fn(ids.len(), g.d, |r, y| head_row(ids[r] as usize, y));
@@ -89,7 +95,7 @@ impl Mtp {
             hca: hcm("attn_hyper_connection", true)?, hcf: hcm("mlp_hyper_connection", true)?, mix: hcm("hyper_connection_mixer", false)?,
             q: st.q8("self_attn.q_proj.weight")?, k: st.q8("self_attn.k_proj.weight")?, v: st.q8("self_attn.v_proj.weight")?, o: st.q8("self_attn.o_proj.weight")?,
             qn: st.norm("self_attn.q_norm.weight")?, kn: st.norm("self_attn.k_norm.weight")?,
-            router: st.q8("mlp.gate.weight")?, sg: st.q8("mlp.shared_expert.gate_proj.weight")?, su: st.q8("mlp.shared_expert.up_proj.weight")?, sd: st.q8("mlp.shared_expert.down_proj.weight")?,
+            rsu: st.q8s(&["mlp.gate.weight", "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight"])?, ne, sd: st.q8("mlp.shared_expert.down_proj.weight")?,
             sgate: st.vec("mlp.shared_expert_gate.weight")?, ex: (0..ne).map(|_| OnceLock::new()).collect(), st, head, ids,
             window: std::env::var("PYRE_MTP_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(256) })
     }
@@ -115,8 +121,9 @@ impl Mtp {
         let (d, hc) = (self.d, self.hc); let w = hc * d;
         let mut xn = vec![0f32; t * w];
         xn.par_chunks_mut(d).enumerate().for_each(|(i, o)| { let s = i % hc; rms(&x[i * d..(i + 1) * d], &h.norm[s * d..(s + 1) * d], self.eps, o); });
-        let mut lo = mm(&h.down, &xn, t); for v in lo.iter_mut() { *v = silu(*v / hc as f32); }
-        let inj = match &h.inject { Some(m) => { let mut v = mm(m, &xn, t); for x in v.iter_mut() { *x /= hc as f32; } v }, None => vec![0f32; t * hc] };
+        let o = mm(&h.down, &xn, t); let nr = h.down.rows; let lr = h.lr; let _ = &h.inject;
+        let mut lo = vec![0f32; t * lr]; let mut inj = vec![0f32; t * hc];
+        for ti in 0..t { for i in 0..lr { lo[ti * lr + i] = silu(o[ti * nr + i] / hc as f32); } if nr > lr { for s in 0..hc { inj[ti * hc + s] = o[ti * nr + lr + s] / hc as f32; } } }
         let gate = mm(&h.up, &lo, t);
         let mut mixed = vec![0f32; t * d];
         for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
@@ -183,12 +190,12 @@ impl Mtp {
         tick(3, &mut tt);
         let (m2, inj2) = self.hc_mix(&self.hcf, &rr, 1); tick(4, &mut tt);
         // MoE: router top-k (softmax over the picked), gated shared expert
-        let lg = mm(&self.router, &m2, 1);
+        let rsu = mm(&self.rsu, &m2, 1); let lg = &rsu[..self.ne];
         let mut idx: Vec<usize> = (0..lg.len()).collect();
         idx.select_nth_unstable_by(self.top_k, |a, b| lg[*b].partial_cmp(&lg[*a]).unwrap_or(std::cmp::Ordering::Equal));
         let top = &idx[..self.top_k]; let mx = top.iter().map(|&e| lg[e]).fold(f32::NEG_INFINITY, f32::max);
         let ws: Vec<f32> = top.iter().map(|&e| (lg[e] - mx).exp()).collect(); let wsum: f32 = ws.iter().sum();
-        let mut gs = mm(&self.sg, &m2, 1); let us = mm(&self.su, &m2, 1); for i in 0..gs.len() { gs[i] = silu(gs[i]) * us[i]; }
+        let sf = (rsu.len() - self.ne) / 2; let mut gs: Vec<f32> = (0..sf).map(|i| silu(rsu[self.ne + i]) * rsu[self.ne + sf + i]).collect();
         let mut y = mm(&self.sd, &gs, 1);
         let sgv = sigm(self.sgate.iter().zip(&m2).map(|(a, b)| a * b).sum::<f32>()); for v in y.iter_mut() { *v *= sgv; }
         let ff = self.ff; tick(5, &mut tt);

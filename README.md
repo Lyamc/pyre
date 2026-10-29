@@ -659,3 +659,61 @@ staging and pieces of several thousand tokens, as in Strata, to amortize.
   (18.1 / 15.6).
 - So PF_MULTI stays opt-in (default 0). Making it the default first needs the decode cache-fill and rounding
   sensitivity sorted out.
+### MTP drafting and multi-row verify GEMV (Oct 29, after reading Strata's source)
+
+Strata (github.com/Niko1221/Strata, MIT) source was read for this round. The files whose design follows it say
+so in their headers; Strata's draft-vocabulary files are copied under `data/` (see THIRD_PARTY_NOTICES). No Strata
+C++/CUDA is linked or vendored.
+
+* **MTP weights.** The GSQ-RCO GGUF has no MTP head. Like Strata's `tools/mtp_fetch.py`, `scripts/mtp_fetch.py`
+  range-reads only the 31 `mtp.*` tensors (5.21 GB, BF16, SHA256 of each checked against Strata's pinned list) from
+  `Qwen/Qwen3.8-Flash-Next@de4b8e4d` into one file in the HF cache:
+  `~/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d.../mtp.safetensors`.
+  pyre finds it there (or `PYRE_MTP=<file>`, `PYRE_MTP=0` off).
+* **Drafter** (`src/model/mtp.rs`, CPU). It is Strata's MTP layer: cell i pairs the main model's final 4-stream
+  residual R_i with token i+1 at rope position i. The path is fc_embedding / fc_hidden ? attention
+  hyper-connection ? gated attention over the drafter's own K/V (dense, sliding window `PYRE_MTP_WINDOW`, default
+  256) ? MLP hyper-connection ? MoE (512 experts, top-10, gated shared expert) ? final mixer ? the main head. The
+  drafter's residual feeds the next draft step, and K/V catch-up for verified cells runs batched.
+  * Weights are converted to int8 at load (1.4 s; all 512 experts up front, `PYRE_MTP_LAZY=1` on first use).
+  * The draft head is the main GPU head (full vocabulary). `PYRE_MTP_HEAD_CPU=1` uses a CPU head over a token
+    subset (`PYRE_MTP_DRAFT_VOCAB=en` default | `cjk` | `full` | file, Strata's lists).
+  * `PYRE_MTP_MIN_P` stops a chain below a draft probability (Strata's `--spec-min-p`, default 0).
+  * About 7 ms per draft step.
+  * Acceptance of greedy drafts: 68–77% on story and code (Strata reports 0.85–0.89 with its GPU drafter).
+* **Greedy identity.** With `--spec 2/3/4` the output matches plain decode token for token on every run
+  (96 tokens story, the full code answer). Wave mode and tail skip match too.
+* **Verify GEMV** (`k_gemv4r`, default; `PYRE_QN_GEMV4R=0` gives the old kernel). Nsight showed the multi-token
+  verify's 4-column GEMV costing 3.6× a single GEMV, limited by activation loads, not by weights. Each warp now
+  takes 4 rows, so each activation value is loaded once for 4 rows, with every (row, column) summed in exactly
+  `k_gemv`'s order.
+  * GEMV time per T=4 verify: 43 ? 27 ms.
+  * T=4 verify: ~147 ? ~120 ms.
+  * 8 rows per warp (`PYRE_QN_GEMV4R=8`) is slower because of register pressure.
+* **`PYRE_QN_WAVE=1`** (opt-in): the verify window in two token groups, pipelined so the GPU runs one group's dense
+  half while the CPU runs the other's experts. It is greedy-identical but no faster: the GPU wait fell 69 ? 40 ms
+  while CPU expert time rose 52 ? 80 ms because the expert work is no longer shared across the whole window.
+
+Measurements: quiet GPU, graphs on, 96 tokens, steady tok/s. VRAM is unchanged, with ~1.4 GB free.
+
+| | story (pA) | code (pB) | output |
+|---|---|---|---|
+| plain decode | 18.6–20.8 | 16.7–19.0 | reference |
+| `--spec 2` (MTP) | 18.1–19.3 (77% accepted) | 17.4 (75%) | identical |
+| `--spec 3` (MTP) | 18.4–18.7 (69%) | 15.8 (75%) | identical |
+| `--spec 4` (MTP) | 16.3 (66%) | – | identical |
+| `PYRE_QN_TAIL_SKIP=7` | 23.0 | 20.7 | story same 96 tokens; code differs from token 4 |
+| tail skip 7 + `--spec 2` | 21.7 (80%) | – | identical to tail skip alone |
+| `PYRE_ROUTE_PRIOR=1.5` | 23.3 | – | differs from token 40 |
+
+So MTP speculation is correct but **not faster here**, and it stays opt-in (`--spec`, default 0). The reason is
+how verify scales on this machine. A window of T tokens costs about T plain steps:
+* the CPU experts scale with the distinct experts in the window (~3.3× for T=4);
+* DeltaNet and the per-token kernels run T times.
+
+A round with 2.5–2.9 accepted tokens therefore costs about as much as the tokens it saves. Strata gets its MTP
+speedup with a larger share of the experts on the GPU and the whole drafter on the GPU.
+
+`PYRE_QN_TAIL_SKIP=R` (opt-in, changes outputs, default off) is new. It skips an expert that missed the GPU cache
+when the expert ranks R or lower among that token's top-k. Strata turns its version (rank 7, per verify window)
+on by default on CUDA, which accounts for part of the gap between its decode speed and our exact decode.
