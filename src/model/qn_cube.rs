@@ -1576,10 +1576,13 @@ impl Cube {
     /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
     #[allow(clippy::too_many_arguments)]
     pub fn xupload(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
+        let t0 = std::time::Instant::now();
         let mut v = repack(tys.0, g); let uo = v.len(); v.extend(repack(tys.1, u)); let dof = v.len(); v.extend(repack(tys.2, d));
+        let t1 = std::time::Instant::now();
         let base = slot * slot_bytes; let len = v.len() * 4; assert!(len <= slot_bytes && base + len <= ar_bytes);
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         self.client.write(&hd, cubecl::bytes::Bytes::from_elems(v));
+        XUP_NS[0].fetch_add((t1 - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XUP_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
         XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
     }
@@ -1742,3 +1745,6 @@ pub fn xbench() -> anyhow::Result<()> {
     } }
     Ok(())
 }
+
+/// xupload time split: [repack on the host, client.write] in ns.
+pub static XUP_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
