@@ -570,7 +570,7 @@ impl Model {
         // full tie-break: HashMap key order is random per process, and the slot an expert lands in decides the GPU summation order (run-to-run identical output)
         evict.sort_by(|a, b| b.0.cmp(&a.0).then((b.1, b.2).cmp(&(a.1, a.2))));
         let max_new = if xc.calls == 1 || xc.map.is_empty() { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
-        let t0 = std::time::Instant::now(); let mut n = 0;
+        let t0 = std::time::Instant::now(); let mut n = 0; let mut jobs: Vec<(usize, usize, usize, (u32, u32, u32))> = vec![];
         for &(_, il, e) in &cand {
             if n >= max_new { break; }
             if !want.contains(&(il, e)) || xc.map.contains_key(&(il, e)) { continue; }
@@ -578,9 +578,15 @@ impl Model {
             while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; xc.free.push(v.slot); } }, None => break } }
             if xc.used + size(l) > xc.budget || xc.free.is_empty() { break; }
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
-            let sl = xc.free.pop().unwrap(); let mut ent = cb.xupload(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, l.gate_e.raw_rows(e * ff, ff), l.up_e.raw_rows(e * ff, ff), l.down_e.raw_rows(e * d, d), tys);
-            ent.arena = sl / xc.per; ent.slot = sl; xc.used += ent.bytes; xc.map.insert((il, e), ent); n += 1;
+            let sl = xc.free.pop().unwrap(); xc.used += xc.slot; jobs.push((il, e, sl, tys)); n += 1;
         }
+        // the repacks of a refill run in parallel (they were ~1 ms each on this thread, up to PYRE_QN_XSWAP per refill);
+        // the slots and the experts are the ones the serial loop picked, so the cache contents are unchanged
+        { use rayon::prelude::*; let _ = (ff, d);
+            let pks: Vec<_> = jobs.par_iter().map(|&(il, e, _, tys)| self.xpacked(il, e, tys)).collect();
+            for (&(il, e, sl, _), pk) in jobs.iter().zip(pks.iter()) {
+                let mut ent = cb.xupload_pk(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, &pk.0, pk.1, pk.2);
+                ent.arena = sl / xc.per; ent.slot = sl; xc.map.insert((il, e), ent); } }
         if env_var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
             let l = &self.layers[*il]; let _ = e;
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());

@@ -1207,7 +1207,7 @@ fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
     acc
 }
 /// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
-pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v != "0").unwrap_or(true)) }
+pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
     let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
     let wd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
