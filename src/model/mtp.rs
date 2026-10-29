@@ -167,6 +167,8 @@ impl Mtp {
     /// Build every routed expert's int8 copy now (else on first use, which stalls drafting).
     pub fn warm(&self) { (0..self.ex.len()).into_par_iter().for_each(|e| { self.expert(e); }); }
     /// The draft head on the CPU over the draft vocabulary: (token, probability).
+    pub fn head_q8(&self) -> &Q8Mat { &self.head }
+    pub fn head_ids(&self) -> &[u32] { &self.ids }
     pub fn head_cpu(&self, s: &[f32]) -> (u32, f32) { let lg = mm(&self.head, s, 1); let (i, p) = best(&lg); (self.ids[i], p) }
     /// One full draft step at cell `pos`: returns (the final mixer's output for the head, the drafter's residual).
     pub fn step(&self, kv: &mut Kv, r: &[f32], emb: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>) {

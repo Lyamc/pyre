@@ -1888,6 +1888,13 @@ impl Cube {
     /// Like `upload`, but IQ4_XS matrices stay in their own format (half the bytes of Q8_0);
     /// the rest are packed as Q8_0 as before. Opt-in (PYRE_QN_NATIVE=1): on the RTX 3060 this kernel is
     /// still ALU/LSU-bound (mout 2560x6144: 65 us vs 59 us for Q8_0), so it is not a win yet.
+    /// A matrix already in Q8_0 blocks (34 bytes per 32 values, rows in order), e.g. the drafter's draft-vocabulary head.
+    pub fn upload_q8(&self, rows: usize, cols: usize, q: &[u8]) -> Option<CMat> {
+        if !self.take(rows * cols + rows * cols / 8) { return None; }
+        let mut words: Vec<u32> = Vec::with_capacity(rows * cols / 4); let mut sc: Vec<f32> = Vec::with_capacity(rows * cols / 32);
+        for blk in q.chunks_exact(34) { sc.push(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32()); for c in blk[2..].chunks_exact(4) { words.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } }
+        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows, cols, splits: vec![0, rows], nat: vec![], qseg: vec![], kv: None })
+    }
     pub fn upload_mix(&self, ms: &[&QMat], extra: &[&[f32]]) -> Option<CMat> {
         use super::gguf_q::QType;
         let cols = ms[0].cols;

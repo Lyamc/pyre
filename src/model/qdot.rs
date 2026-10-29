@@ -217,6 +217,8 @@ unsafe fn dot_i8_avx2(g: &[u8], s: &[u8], scl: &[f32], a: &Q8Act) -> f32 {
 pub struct Q8Mat { pub rows: usize, pub cols: usize, data: Vec<u8>, sc: Vec<f32> }
 
 impl Q8Mat {
+    /// The Q8_0 blocks (34 bytes: f16 scale, 32 i8) row after row.
+    pub fn blocks(&self) -> &[u8] { &self.data }
     pub fn from_rows(ms: &[&super::gguf_q::QMat]) -> Self {
         use rayon::prelude::*;
         let cols = ms[0].cols; let nb = cols / 32; let rb = nb * 34;
