@@ -937,6 +937,77 @@ fn k_delta(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mu
     let _ = nv;
 }
 
+/// k_delta for `nt` consecutive tokens of a verify window in one launch: each thread keeps its state column in
+/// registers across the tokens (one state read and one write instead of two reads and a write per token, and the
+/// rollback checkpoints written from registers instead of a separate copy). Per token the arithmetic and its order
+/// are k_delta's, so the results are the same.
+#[cube(launch_unchecked)]
+fn k_delta_m(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32], c0: &mut [f32], c1: &mut [f32], c2: &mut [f32],
+    nk: u32, ch: u32, pn: u32, ostr: u32, ckm: u32, zoff: u32, boff: u32, aoff: u32, eps: f32, #[comptime] dk: u32, #[comptime] nt: u32) {
+    let h = CUBE_POS_X;
+    let j = UNIT_POS_X;
+    let kh = h % nk;
+    let mut qs = Shared::<[f32]>::new_slice(dk as usize);
+    let mut ks = Shared::<[f32]>::new_slice(dk as usize);
+    let mut red = Shared::<[f32]>::new_slice(comptime!((dk / 32) as usize));
+    let base = h * dk * dk;
+    let mut st = Array::<f32>::new(comptime!(dk as usize));
+    #[unroll]
+    for i in 0..dk {
+        st[i as usize] = s[(base + i * dk + j) as usize];
+    }
+    #[unroll]
+    for t in 0..nt {
+        let cbs = t * ch;
+        let pb = t * pn;
+        let qj = co[(cbs + kh * dk + j) as usize];
+        let kj = co[(cbs + nk * dk + kh * dk + j) as usize];
+        let sq = cube_sum(qj * qj, &mut red, comptime!(dk / 32));
+        let sk = cube_sum(kj * kj, &mut red, comptime!(dk / 32));
+        qs[j as usize] = qj / f32::sqrt(sq + 1e-6f32) / f32::sqrt(f32::cast_from(dk));
+        ks[j as usize] = kj / f32::sqrt(sk + 1e-6f32);
+        sync_cube();
+        let vj = co[(cbs + 2 * nk * dk + h * dk + j) as usize];
+        let x = proj[(pb + aoff + h) as usize] + dt[h as usize];
+        let mut sp = x;
+        if x <= 20.0f32 {
+            sp = f32::ln(1.0f32 + f32::exp(x));
+        }
+        let g = f32::exp(sp * a[h as usize]);
+        let b = 1.0f32 / (1.0f32 + f32::exp(-proj[(pb + boff + h) as usize]));
+        let mut mem = 0.0f32;
+        #[unroll]
+        for i in 0..dk {
+            mem += st[i as usize] * ks[i as usize];
+        }
+        mem *= g;
+        let delta = (vj - mem) * b;
+        let mut o = 0.0f32;
+        #[unroll]
+        for i in 0..dk {
+            let v = st[i as usize] * g + ks[i as usize] * delta;
+            st[i as usize] = v;
+            o += v * qs[i as usize];
+        }
+        if ((ckm >> t) & 1u32) == 1u32 {
+            #[unroll]
+            for i in 0..dk {
+                let idx = (base + i * dk + j) as usize;
+                if t == 0u32 { c0[idx] = st[i as usize]; } else if t == 1u32 { c1[idx] = st[i as usize]; } else { c2[idx] = st[i as usize]; }
+            }
+        }
+        let so = cube_sum(o * o, &mut red, comptime!(dk / 32));
+        let r = 1.0f32 / f32::sqrt(so / f32::cast_from(dk) + eps);
+        let z = proj[(pb + zoff + h * dk + j) as usize];
+        out[(t * ostr + h * dk + j) as usize] = o * r * norm[j as usize] / (1.0f32 + f32::exp(-z));
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..dk {
+        s[(base + i * dk + j) as usize] = st[i as usize];
+    }
+}
+
 // ---- routed experts cached on the GPU in their native GGUF formats (Strata's expert cache idea) ----
 // type codes: 0 = IQ2_S, 1 = IQ2_XXS, 2 = IQ1_M, 3 = Q2_0
 
@@ -2054,6 +2125,18 @@ impl Cube {
             BufferArg::from_raw_parts(co.clone(), ch), BufferArg::from_raw_parts(proj.clone(), pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
             BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), nv * dk * dk), BufferArg::from_raw_parts(out.clone(), nv * dk),
             nk as u32, nv as u32, zoff as u32, boff as u32, aoff as u32, eps, dk as u32) }
+    }
+    /// `delta` for nt (1..=4) tokens: co/proj/out at strides ch/pn/ostr; checkpoint t (< 3) written to cks[t] when bit t of ckm is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_m(&self, co: &Handle, ch: usize, proj: &Handle, pn: usize, w: &GdnW, s: &Handle, out: &Handle, ostr: usize, cks: &[Option<Handle>], ckm: u32, nk: usize, nv: usize, dk: usize, zoff: usize, boff: usize, aoff: usize, eps: f32, nt: usize) {
+        let sn = nv * dk * dk; let dummy = self.empty(1);
+        let ck = |i: usize| match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => (h.clone(), sn), _ => (dummy.clone(), 1) };
+        let (k0, k1, k2) = (ck(0), ck(1), ck(2));
+        unsafe { k_delta_m::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
+            BufferArg::from_raw_parts(co.clone(), nt * ch), BufferArg::from_raw_parts(proj.clone(), nt * pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
+            BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), sn), BufferArg::from_raw_parts(out.clone(), nt * ostr),
+            BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1),
+            nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
     }
     /// Decode attention for one token (see k_attn_prep / k_attn); `p` = the fused q|k|v projection.
     #[allow(clippy::too_many_arguments)]

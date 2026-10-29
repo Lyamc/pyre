@@ -1397,9 +1397,23 @@ impl Model {
         // the mixer, token by token (recurrent / causal state)
         let core_n = match l.mix { Mixer::Attn { .. } => c.n_head * c.hd, Mixer::Lin { .. } => c.lin_nv * c.lin_dk };
         let core = cb.empty(t * core_n);
+        // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
+        // and their state checkpoints stay per token, in the same order)
+        let mut dm_done = false;
+        if let (Mixer::Lin { .. }, Some(gw), true) = (&l.mix, &cl.gdn, st.gdn_gpu) { if t >= 2 && t <= 4 && c.lin_dk == c.lin_dv && env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) {
+            let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
+            let (cs, ss) = st.gdn[li0].clone(); let co_all = cb.empty(t * ch);
+            let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv);
+            let (mut cks, mut ckm) = (vec![], 0u32);
+            for ti in 0..t { let pj = at(&proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&co_all, ti * ch), ch, c.conv_k);
+                if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 3 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
+            cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
+            dm_done = true;
+        } }
         for ti in 0..t {
             let pos = start + ti; let pj = at(&proj, ti * pr);
-            if let (Some(gw), true) = (&cl.gdn, st.gdn_gpu) {
+            if dm_done { let _ = (pos, pj); }
+            else if let (Some(gw), true) = (&cl.gdn, st.gdn_gpu) {
                 let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
                 let (cs, ss) = st.gdn[li0].clone();
                 let co = cb.empty(ch);

@@ -745,3 +745,10 @@ is opt-in: no measurable gain here.
 - The drafter's CPU matmuls run on their own 8-thread rayon pool (`PYRE_MTP_THREADS`, 0 = global pool): ~2-3 ms less per 3-draft round. GPU calls stay on the main thread (a CubeCL call from another thread opens a second stream and ~200 MB memory pool).
 - `PYRE_QN_HPIN=1` (opt-in): small host-to-device buffers go through CubeCL's page-locked staging pool; within noise here (~+0.3 tok/s).
 - `PYRE_QN_XS2=1` (opt-in): PCIe-share uploads are issued from a dedicated thread (CubeCL gives it its own CUDA stream). Same output as the single-stream share, no faster here: the host-side copy (pageable staging of each 1.4 MB expert) is what costs, and it still sits on the enqueue thread.
+
+
+### Fused DeltaNet verify recurrence (PYRE_QN_DELTAM, default on)
+During speculative verify (2-4 tokens), each GDN layer runs one k_delta_m launch that keeps the
+state column in registers across the window and writes the per-token checkpoints, instead of one
+k_delta launch per token. Greedy-identical (same per-token arithmetic). Measured on RTX 3060:
+spec2 pA 22.9 -> 24.2 tok/s, spec3 pA 21.2 -> 22.3, spec2 pB 18.8 -> 20.0. PYRE_QN_DELTAM=0 disables.
