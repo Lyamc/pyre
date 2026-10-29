@@ -211,6 +211,7 @@ impl Model {
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
                     let nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); }
+                { let ns = super::qn_cube::NATIVE_STAT.load(std::sync::atomic::Ordering::Relaxed); if ns > 0 { eprintln!("gpu: dense native IQ4_XS {:.0} M weights, Q8_0 {:.0} M (mixed mats)", (ns & ((1u64 << 40) - 1)) as f64 / 1e6, (ns >> 40) as f64 / 1e6); } }
                 self.cube = Some(cb);
             }
         }

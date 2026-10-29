@@ -9,6 +9,9 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 const ROWS_PER_CUBE: u32 = 8;
+/// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations)
+pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cube]
 fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
@@ -96,6 +99,46 @@ fn k_gemv4(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u3
             if nt > 1 { out[(ooff + ost + row) as usize] = t1; }
             if nt > 2 { out[(ooff + 2 * ost + row) as usize] = t2; }
             if nt > 3 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
+/// IQ4_XS GEMV with int8 activations (x packed by k_q8pack) and dp4a. t2[b] = IQ4_NL level of the low
+/// nibble of byte b in bits 0..8 and of the high nibble in bits 8..16, so one lookup per weight byte.
+#[cube(launch_unchecked)]
+fn k_gemv_iq4d(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nb = cols / 256;
+        let rw = nb * 35;
+        let ib = UNIT_POS_X / 4;
+        let k = UNIT_POS_X % 4;
+        let mut acc = 0.0f32;
+        let mut blk = 0u32;
+        while blk < nb {
+            let b0 = row * rw + blk * 35;
+            let d = f32::reinterpret(w[b0 as usize]);
+            let sh = w[(b0 + 1) as usize];
+            let sl = w[(b0 + 2) as usize];
+            let q = w[(b0 + 3 + UNIT_POS_X) as usize];
+            let xw = blk * 64 + ib * 8 + k;
+            let xa = i32::cast_from(xq[xw as usize]);
+            let xb = i32::cast_from(xq[(xw + 4) as usize]);
+            let xsc = xs[(blk * 8 + ib) as usize];
+            let ls = i32::cast_from(((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4)) - 32i32;
+            let u0 = t2[(q & 255u32) as usize];
+            let u1 = t2[((q >> 8) & 255u32) as usize];
+            let u2 = t2[((q >> 16) & 255u32) as usize];
+            let u3 = t2[(q >> 24) as usize];
+            let lo = (u0 & 255u32) | ((u1 & 255u32) << 8) | ((u2 & 255u32) << 16) | ((u3 & 255u32) << 24);
+            let hi = ((u0 >> 8) & 255u32) | (u1 & 65280u32) | (((u2 >> 8) & 255u32) << 16) | (((u3 >> 8) & 255u32) << 24);
+            let p = dp4a(i32::cast_from(hi), xb, dp4a(i32::cast_from(lo), xa, 0i32));
+            acc += d * f32::cast_from(ls) * xsc * f32::cast_from(p);
+            blk += 1u32;
+        }
+        let t = plane_sum(acc);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t;
         }
     }
 }
@@ -1311,7 +1354,7 @@ impl Cube {
         use super::gguf_q::QType;
         let cols = ms[0].cols;
         let native = |m: &QMat| m.ty == QType::IQ4XS && cols % 256 == 0 && cols <= 6144;
-        if std::env::var("PYRE_QN_NATIVE").map(|v| v != "1").unwrap_or(true) || !ms.iter().any(|m| native(m)) { return self.upload(ms, extra); }
+        if native_mode() == 0 || !ms.iter().any(|m| native(m)) { return self.upload(ms, extra); }
         let q8: Vec<&QMat> = ms.iter().copied().filter(|m| !native(m)).collect();
         let nq8 = q8.iter().map(|m| m.rows).sum::<usize>() + extra.len();
         let nnat: usize = ms.iter().filter(|m| native(m)).map(|m| m.rows).sum();
@@ -1336,7 +1379,9 @@ impl Cube {
         for _ in extra { match qseg.last_mut() { Some((a, n, _)) if *a + *n == r0 => *n += 1, _ => qseg.push((r0, 1, qb)) } qb += 1; r0 += 1; }
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); } for _ in extra { splits.push(splits.last().unwrap() + 1); }
         let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect();
-        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(self.client.create_from_slice(f32::as_bytes(&kv))) })
+        let kvh = if native_mode() == 2 { let kb = |i: usize| (super::iq_tables::KVALUES_IQ4NL[i] as i32 as u32) & 255; let t2: Vec<u32> = (0..256).map(|b| kb(b & 15) | (kb(b >> 4) << 8)).collect(); self.client.create_from_slice(u32::as_bytes(&t2)) } else { self.client.create_from_slice(f32::as_bytes(&kv)) };
+        NATIVE_STAT.fetch_add((nnat * cols) as u64, std::sync::atomic::Ordering::Relaxed); NATIVE_STAT.fetch_add(((nq8 * cols) as u64) << 40, std::sync::atomic::Ordering::Relaxed);
+        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
     }    pub fn buf(&self, v: &[f32]) -> Handle { self.client.create_from_slice(f32::as_bytes(v)) }
     pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
     pub fn read(&self, h: &Handle) -> Vec<f32> {
@@ -1348,6 +1393,17 @@ impl Cube {
     }
     /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
     pub fn gemv(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, out: &Handle, on: usize, ooff: usize) {
+        if !m.nat.is_empty() && native_mode() == 2 {
+            let nb = m.cols / 32; let xq = self.empty(m.cols / 4); let xs = self.empty(nb);
+            unsafe { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), xoff as u32, nb as u32) }
+            for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4d::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32) } }
+            for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, (ooff + r0) as u32) } }
+            return;
+        }
         if !m.nat.is_empty() {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 16),
