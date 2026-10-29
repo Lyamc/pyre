@@ -418,3 +418,26 @@ unsafe fn q2_0_d_avx2(row: &[u8], a: &Q8D) -> f32 {
         corr -= dd * *a.s.get_unchecked(i) as f32; }
     corr + k::hsum(acc)
 }
+
+/// PYRE_QN_KBENCH: CPU IQ2_S row-dot speed, one expert (cache-hot) vs many (streamed), 1 and 8 threads.
+pub fn kbench() {
+    let (d, rows) = (2560usize, 1280usize); let rb = d / 256 * 82;
+    let mut x = vec![0f32; d]; for i in 0..d { x[i] = ((i * 7919 % 1000) as f32 - 500.0) / 300.0; }
+    let mut a = Q8K::default(); quantize_k_into(&x, &mut a);
+    let mk = |ne: usize| { let mut v = vec![0u8; ne * rows * rb]; let mut s = 0x9e3779b97f4a7c15u64;
+        for b in v.iter_mut() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; *b = s as u8; }
+        for r in 0..ne * rows * d / 256 { v[r * 82] = 0x00; v[r * 82 + 1] = 0x1c; } v };
+    let pool = super::spin_pool::Pool::new(8, std::time::Duration::from_micros(2000));
+    for &(ne, label) in &[(1usize, "hot 1 expert"), (300, "stream 300 experts")] {
+        let w = mk(ne); let nrow = ne * rows; let reps = if ne == 1 { 200 } else { 2 };
+        for &th in &[1usize, 8] {
+            let t0 = std::time::Instant::now(); let sink = std::sync::atomic::AtomicU32::new(0);
+            for _ in 0..reps {
+                if th == 1 { let mut s = 0f32; for r in 0..nrow { s += row_dot_k(QType::IQ2S, &w[r * rb..(r + 1) * rb], &a); } sink.fetch_add(s.to_bits() & 1, std::sync::atomic::Ordering::Relaxed); }
+                else { let nt = nrow.div_ceil(32); pool.run_side(nt, &|t| { let mut s = 0f32; for r in t * 32..((t + 1) * 32).min(nrow) { s += row_dot_k(QType::IQ2S, &w[r * rb..(r + 1) * rb], &a); } sink.fetch_add(s.to_bits() & 1, std::sync::atomic::Ordering::Relaxed); }, &mut || {}); }
+            }
+            let el = t0.elapsed().as_secs_f64(); let per = el / (reps * ne) as f64;
+            eprintln!("kbench {label} threads={th}: {:.1} us per expert gate+up, {:.1} GB/s, {:.1} ns per superblock-thread", per * 1e6, (rb * rows) as f64 / per / 1e9, el * 1e9 * th as f64 / (reps * nrow * d / 256) as f64);
+        }
+    }
+}
