@@ -758,3 +758,12 @@ spec2 pA 22.9 -> 24.2 tok/s, spec3 pA 21.2 -> 22.3, spec2 pB 18.8 -> 20.0. PYRE_
 `qwen-next` and the server now default to speculative decoding with draft length 2 (MTP drafter) when
 the MTP file is found and multi-token verify can run; otherwise they fall back to plain decode. Greedy
 output is identical. `--spec 0` (or PYRE_SPEC=0 / config `spec: 0`) disables; `--spec N` sets the length.
+
+
+### Opt-in experiments (greedy-identical, no measured gain yet)
+- PYRE_QN_ETAIL=N: the last N tasks of each expert-pool job go to P-core workers only (E-cores are ~2.3x
+  slower and would finish last). Default 0; N=8/16 measured within noise of off.
+- PYRE_QN_GEMV4R=v: k_gemv4v, the multi-column verify gemv with 16-byte vector activation loads (same
+  lane mapping and summation order as k_gemv4r). Same output; no clear speedup in a noisy session.
+- Measured and not kept: 32 pool workers incl. P-core hyper-threads (-5%), longer pool spin (3 ms) and
+  4/16/24 MTP drafter threads (8 stays best).

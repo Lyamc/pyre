@@ -1612,7 +1612,10 @@ fn qn_pool() -> &'static super::spin_pool::Pool {
         let pin: Vec<usize> = match env_var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
         let n = env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(if pin.len() >= 4 { pin.len() } else { rayon::current_num_threads() });
         eprintln!("expert pool: {n} workers, pinned to {:?}", pin);
-        super::spin_pool::Pool::new_pinned(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin)
+        { // PYRE_QN_ETAIL: a job's last N tasks go to P-core workers only (E-cores ~2.3x slower would finish last)
+            let nf = if pin == auto { super::spin_pool::n_fast() } else { usize::MAX }; let et = env_usize("PYRE_QN_ETAIL").unwrap_or(0);
+            eprintln!("expert pool: {} fast workers, E-core tail reserve {et}", nf.min(n));
+            super::spin_pool::Pool::new_hybrid(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin, nf, et) }
     })
 }
 

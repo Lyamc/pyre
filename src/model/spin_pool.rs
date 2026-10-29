@@ -17,6 +17,8 @@ struct Shared {
     lock: Mutex<()>,
     cv: Condvar,
     spin: Duration,
+    /// the last `etail` tasks of a job are left to the fast workers (slow cores would finish last)
+    etail: usize,
 }
 
 pub struct Pool { sh: Arc<Shared>, pub threads: usize }
@@ -24,12 +26,14 @@ pub struct Pool { sh: Arc<Shared>, pub threads: usize }
 impl Pool {
     /// `pin`: logical CPU per worker (index 0 is the caller and is not pinned).
     pub fn new(threads: usize, spin: Duration) -> Self { Self::new_pinned(threads, spin, &[]) }
-    pub fn new_pinned(threads: usize, spin: Duration, pin: &[usize]) -> Self {
+    pub fn new_pinned(threads: usize, spin: Duration, pin: &[usize]) -> Self { Self::new_hybrid(threads, spin, pin, usize::MAX, 0) }
+    /// Workers with index >= `n_fast` are slow (E-cores): they skip a job's last `etail` tasks.
+    pub fn new_hybrid(threads: usize, spin: Duration, pin: &[usize], n_fast: usize, etail: usize) -> Self {
         let sh = Arc::new(Shared { gen: AtomicU64::new(0), ticket: AtomicU64::new(0), job: AtomicPtr::new(std::ptr::null_mut()), done: AtomicUsize::new(0), n: AtomicUsize::new(0),
-            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin });
+            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail });
         for i in 1..threads.max(1) {
             let sh = sh.clone(); let cpu = pin.get(i).copied();
-            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { if let Some(c) = cpu { pin_to(c); } worker(&sh) }).expect("spawn pool worker");
+            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { if let Some(c) = cpu { pin_to(c); } worker(&sh, i >= n_fast) }).expect("spawn pool worker");
         }
         Pool { sh, threads: threads.max(1) }
     }
@@ -49,25 +53,26 @@ impl Pool {
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
         side();
-        work(sh, g, &job);
+        work(sh, g, &job, false);
         while sh.done.load(Acquire) < n { std::hint::spin_loop(); }
     }
 }
 
-fn work(sh: &Shared, g: u64, job: &Job) {
+fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
     loop {
         let t = sh.ticket.load(Acquire);
         if t >> 32 != g { return; }
         let i = (t & 0xffff_ffff) as usize;
         // n comes from the shared slot, not the job: the job may already be gone once all tasks are done
-        if i >= sh.n.load(Acquire) { return; }
+        let n = sh.n.load(Acquire);
+        if i >= n || (slow && i + sh.etail >= n) { return; }
         if sh.ticket.compare_exchange_weak(t, t + 1, AcqRel, Relaxed).is_err() { continue; }
         (job.f)(i);
         sh.done.fetch_add(1, Release);
     }
 }
 
-fn worker(sh: &Shared) {
+fn worker(sh: &Shared, slow: bool) {
     let mut seen = 0u64;
     let mut idle = Instant::now();
     loop {
@@ -76,7 +81,7 @@ fn worker(sh: &Shared) {
             seen = g;
             let p = sh.job.load(Relaxed);
             // only runs tasks whose ticket still carries generation g, so a stale pointer is never called
-            if !p.is_null() { work(sh, g, unsafe { &*p }); }
+            if !p.is_null() { work(sh, g, unsafe { &*p }, slow); }
             idle = Instant::now();
             continue;
         }
@@ -106,6 +111,9 @@ fn pin_to(_cpu: usize) {}
 
 /// One logical CPU per physical core of the fastest efficiency class (P-cores on a hybrid Intel
 /// part), or empty when that cannot be read. Strata likewise runs one pool worker per physical core.
+/// Number of leading entries of fast_cores() that are fast (P) cores.
+pub fn n_fast() -> usize { FASTN.load(Relaxed) }
+static FASTN: AtomicUsize = AtomicUsize::new(usize::MAX);
 #[cfg(windows)]
 pub fn fast_cores() -> Vec<usize> {
     use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
@@ -124,7 +132,7 @@ pub fn fast_cores() -> Vec<usize> {
         if p.Size == 0 { break; }
     }
     let best = cores.iter().map(|c| c.0).max().unwrap_or(0);
-    let mut v: Vec<usize> = cores.iter().filter(|c| c.0 == best).map(|c| c.1).collect();
+    let mut v: Vec<usize> = cores.iter().filter(|c| c.0 == best).map(|c| c.1).collect(); FASTN.store(v.len(), Relaxed);
     // PYRE_QN_ECORES (default on): also one worker per slower physical core (hybrid CPUs' E-cores) after the fast ones.
     // Measured on an i9-13900K: 8 P + 16 E workers decode ~5% faster than 8 P alone; same results.
     if std::env::var("PYRE_QN_ECORES").map(|x| x != "0").unwrap_or(true) { v.extend(cores.iter().filter(|c| c.0 != best).map(|c| c.1)); }
