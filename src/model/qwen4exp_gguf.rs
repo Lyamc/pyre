@@ -37,7 +37,12 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
-pub struct Model { headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+/// Per-layer persistent buffers and the captured CUDA graph of a DeltaNet layer's dense part (PYRE_QN_GRAPH=1).
+pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
+type H = burn_cubecl::cubecl::server::Handle;
+static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| std::env::var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
+pub struct Model { xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -130,7 +135,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -284,6 +289,8 @@ impl Model {
     fn layer_cube(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
         let q0 = std::time::Instant::now();
+        let gfast = graph_on() && st.gdn_gpu && cl.gdn.is_some() && super::qn_cube::native_mode() == 0;
+        let (rd, df, rn, lrf, q1, q2, q3) = if gfast { self.gdn_graph(il, cl, x, st, li) } else {
         let xn = cb.empty(w);
         let lra = cl.hca.up.cols; let da = cb.empty(cl.hca.di.rows);
         cb.rms(x, &cl.hca.norm, &xn, hc, d, c.eps);
@@ -330,6 +337,7 @@ impl Model {
         let rn = d + cl.fin.rows; let rd = cb.empty(rn);
         cb.gate(&xn, &df, &cl.hcf.up, &rd, rn, 0, hc, d);
         cb.gemv(&cl.fin, &rd, rn, 0, &rd, rn, d);
+        (rd, df, rn, lrf, q1, q2, q3) };
         let q4 = std::time::Instant::now();
         let rv = cb.read(&rd);
         let q5 = std::time::Instant::now();
@@ -388,6 +396,55 @@ impl Model {
         cb.comb3(x, &sh, Some(&yb), yg.as_ref(), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
         HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed); crate::metrics::add_gpu_ns(ns(q1, q2) + ns(q4, q5));
+    }
+
+    fn gdn_bufs(&self, st: &State) -> Vec<(H, H)> {
+        let cb = self.cube.as_ref().unwrap();
+        let mk = |_: ()| st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect::<Vec<_>>();
+        if graph_on() { cb.client.memory_persistent_allocation((), mk) } else { mk(()) }
+    }
+    /// DeltaNet layer dense part (hc mix, in-proj, conv, delta, out-proj, hc combine, ffn hc mix, router/shared
+    /// projections) on persistent buffers: captured once into a CUDA graph and replayed on later tokens, so its
+    /// ~12 launches cost one. Recaptured when the state or residual buffers change (a new request).
+    #[allow(clippy::type_complexity)]
+    fn gdn_graph(&self, il: usize, cl: &super::qn_cube::CLayer, x: &H, st: &mut State, li: &mut usize) -> (H, H, usize, usize, std::time::Instant, std::time::Instant, std::time::Instant) {
+        let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc) = (c.d, c.hc); let w = hc * d;
+        let gw = cl.gdn.as_ref().unwrap();
+        let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
+        let (cs, ss) = st.gdn[*li].clone(); *li += 1;
+        let rn = d + cl.fin.rows; let lra = cl.hca.up.cols; let lrf = cl.hcf.up.cols;
+        let mut gm = self.lg.lock().unwrap();
+        // persistent pool: a sealed graph guards the pages it touched, so its buffers must not share pages with per-token temporaries
+        let b = gm.entry(il).or_insert_with(|| cb.client.memory_persistent_allocation((), |_| LGraph { xn: cb.empty(w), da: cb.empty(cl.hca.di.rows), mixed: cb.empty(d), proj: cb.empty(cl.min.rows), o: cb.empty(d), co: cb.empty(ch), ob: cb.empty(nv * dk),
+            df: cb.empty(cl.hcf.di.rows), rd: cb.empty(rn), g: None, key: String::new(), keep: vec![] }));
+        let seg = |b: &LGraph| {
+            cb.rms(x, &cl.hca.norm, &b.xn, hc, d, c.eps);
+            cb.gemv(&cl.hca.di, &b.xn, w, 0, &b.da, cl.hca.di.rows, 0);
+            cb.gate(&b.xn, &b.da, &cl.hca.up, &b.mixed, d, 0, hc, d);
+            cb.gemv(&cl.min, &b.mixed, d, 0, &b.proj, cl.min.rows, 0);
+            cb.conv(&b.proj, cl.min.rows, &gw.conv, &cs, &b.co, ch, c.conv_k);
+            cb.delta(&b.co, ch, &b.proj, cl.min.rows, gw, &ss, &b.ob, nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
+            cb.gemv(&cl.mout, &b.ob, nv * dk, 0, &b.o, d, 0);
+            cb.comb(x, &b.o, None, None, &b.da, lra, hc, d);
+            cb.rms(x, &cl.hcf.norm, &b.xn, hc, d, c.eps);
+            cb.gemv(&cl.hcf.di, &b.xn, w, 0, &b.df, cl.hcf.di.rows, 0);
+            cb.gate(&b.xn, &b.df, &cl.hcf.up, &b.rd, rn, 0, hc, d);
+            cb.gemv(&cl.fin, &b.rd, rn, 0, &b.rd, rn, d);
+        };
+        let key = format!("{:?}{:?}{:?}", cs, ss, x);
+        if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); }
+        else {
+            b.g = None;
+            // warmup run executes this token; the recorded run that follows does not execute
+            if cb.client.graph_prepare().is_ok() { seg(b);
+                match cb.client.start_capture() {
+                    Ok(()) => { seg(b); match cb.client.stop_capture() { Ok(g) => { if std::env::var("PYRE_QN_XDEBUG").is_ok() { eprintln!("graph: captured layer {il}"); } b.g = Some(g); b.key = key; b.keep = vec![cs.clone(), ss.clone(), x.clone()]; }
+                        Err(e) => { eprintln!("graph: layer {il} capture failed, graphs off: {e:?}"); GRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
+                    Err(e) => { eprintln!("graph: layer {il} start failed, graphs off: {e:?}"); GRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
+            } else { seg(b); }
+        }
+        let t = std::time::Instant::now();
+        (b.rd.clone(), b.df.clone(), rn, lrf, t, t, t)
     }
 
     /// Keep the most-routed experts (by count so far) resident on the GPU, within the cache budget.
@@ -909,7 +966,7 @@ impl Model {
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })));
         if let (Some(cb), Some(xm), 1) = (&self.cube, &self.xc, t) { let mut g = xm.lock().unwrap(); if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } }
         if let Some(cb) = &self.cube {
-            if gdn_ok && !st.gdn_gpu { st.gdn = st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect(); st.gdn_gpu = true; }
+            if gdn_ok && !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
             if !gdn_ok && st.gdn_gpu { for (i, (a, b)) in st.gdn.iter().enumerate() { st.conv[i] = cb.read(a); st.ssm[i] = cb.read(b); } st.gdn.clear(); st.gdn_gpu = false; }
         }
         let dbg = std::env::var("PYRE_QN_DEBUG").is_ok();
@@ -923,7 +980,12 @@ impl Model {
             if let Some(p) = &l.ple { let mut h = std::mem::take(&mut st.ple_hist[pi]); self.ple(p, &mut h, emb.as_ref().unwrap(), &mut x, t); st.ple_hist[pi] = h; pi += 1; }
             if let (Some(Some(cl)), 1) = (self.cl.get(il), t) {
                 let cb = self.cube.as_ref().unwrap();
-                if xc.is_none() { xc = Some(cb.buf(&x)); }
+                if xc.is_none() { xc = Some(if graph_on() {
+                    // one persistent residual buffer, rewritten in place, so captured graphs keep pointing at it
+                    let mut g = self.xper.lock().unwrap(); let n = x.len();
+                    let h = g.get_or_insert_with(|| cb.client.memory_persistent_allocation(n, |n| cb.client.empty(n * 4))).clone();
+                    cb.client.write(&h, burn_cubecl::cubecl::bytes::Bytes::from_elems(x.clone())); h
+                } else { cb.buf(&x) }); }
                 self.layer_cube(il, l, cl, xc.as_ref().unwrap(), st, &mut ai, &mut li, start);
                 if prof { prof_acc[3] += tt.elapsed().as_secs_f64(); }
                 continue;
@@ -1004,7 +1066,7 @@ impl Model {
         st.tokens.extend_from_slice(ids);
         st.spec_sel = vec![vec![]; t];
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); for _ in 0..t { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } }
-        if !st.gdn_gpu { st.gdn = st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect(); st.gdn_gpu = true; }
+        if !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
         let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv; let (cn, sn) = ((c.conv_k - 1) * ch, c.lin_nv * c.lin_dk * c.lin_dv);
         while st.ck.len() < t - 1 { st.ck.push((0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect()); }
