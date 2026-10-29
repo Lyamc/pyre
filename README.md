@@ -523,4 +523,18 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
 - Prefill is slow: ~10.7 tok/s at 931-1,247 prompt tokens (116 s for 1,247). The likely cause is that the
   expert cache is empty during the first prefill (it fills afterwards) and the routed experts for the
   prompt run on the CPU. To look at later: fill the cache from the first prompt chunk, and use GPU
-  batched expert GEMMs for prefill.
+  batched expert GEMMs for prefill.- Dense GEMV experiments (Nsight with `--cuda-graph-trace=node`, graphs on). Per decode token: ~21.7 ms GPU
+  kernel time, ~11.6 ms host CUDA API time, ~505 launches + 34 graph launches, ~106 syncs.
+  - Q8_0 `k_gemv` ~43 us/call, ~12 ms/token at ~325 GB/s, close to the RTX 3060's ~360 GB/s.
+  - Native IQ4_XS dp4a (`NATIVE=2`) moves half the bytes but runs ~34-44 us/call (~210 GB/s effective):
+    each 4 weight bytes need ~11 loads, 4 of them IQ4_NL table lookups. An unrolled x4 version and a
+    shared-memory table were no faster, so neither was kept. Without a byte-permute intrinsic (CUDA
+    `__byte_perm`, not exposed by CubeCL) the table lookup bounds a 4-bit kernel here.
+  - Q8_0 with int8 activations and dp4a: slower (~56 us/call) and changed greedy output on one prompt.
+    Not kept.
+- CPU experts: 8 pinned P-cores is best (story / code steady tok/s): 18.3 / 16.8 with 8 P-cores, 18.2 / 16.8
+  with 16 P-core threads, 17.7 / 16.5 with 8 P + 8 E, 15.7 / 13.8 with 8 P + 16 E.
+  Gate/up on IQ2_S dominates (~12 ms/token at ~17 GB/s), so it is decode-bound, not memory-bound.
+- CPU experts already overlap the GPU experts and the shared expert (`run_side`). The next layer's dense
+  part needs this layer's full MoE output, so there is no further GPU work to hide them under without
+  changing the math.
