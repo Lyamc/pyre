@@ -93,6 +93,8 @@ pub struct State {
     ple_ck: Vec<Vec<Vec<f32>>>,
     /// (layer, expert) picks of each token of the last `forward_multi`, so `spec_keep` can uncount rejected drafts
     spec_sel: Vec<Vec<(usize, usize)>>,
+    /// set while a prompt runs through the verify path (PYRE_QN_PF_MULTI): no rollback checkpoints
+    pf: bool,
 }
 
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
@@ -577,7 +579,7 @@ impl Model {
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
-        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![], spec_sel: vec![] };
+        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![], spec_sel: vec![], pf: false };
         for l in &self.layers {
             match l.mix { Mixer::Lin { .. } => { st.conv.push(vec![0.0; (c.conv_k - 1) * ch]); st.ssm.push(vec![0.0; c.lin_nv * c.lin_dk * c.lin_dv]); }, Mixer::Attn { .. } => { st.k.push(vec![]); st.v.push(vec![]); st.ik.push(vec![]); st.ib.push(vec![]); } }
             if l.ple.is_some() { st.ple_hist.push(vec![0.0; (c.ple_conv_k - 1) * c.ple_ngram * c.hc * c.d]); }
@@ -1003,7 +1005,7 @@ impl Model {
         if k > 1 && ids.len() > 1 && self.multi_ok() {
             let mut last = vec![];
             for c in ids.chunks(k) {
-                last = if c.len() == 1 { self.forward_inner(c, st) } else { self.forward_multi_x(c, st, true).pop().unwrap() };
+                last = if c.len() == 1 { self.forward_inner(c, st) } else { st.pf = true; let v = self.forward_multi_x(c, st, true).pop().unwrap(); st.pf = false; v };
                 if let (Some(cb), Some(xm)) = (&self.cube, &self.xc) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
             }
             return last;
@@ -1134,7 +1136,7 @@ impl Model {
         if !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
         let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv; let (cn, sn) = ((c.conv_k - 1) * ch, c.lin_nv * c.lin_dk * c.lin_dv);
-        while st.ck.len() < t - 1 { st.ck.push((0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect()); }
+        while !st.pf && st.ck.len() < t - 1 { st.ck.push((0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect()); }
         let mut xh: Vec<Vec<f32>> = vec![vec![0f32; hc * d]; t];
         let mut e = vec![0f32; d];
         for (ti, &id) in ids.iter().enumerate() { self.embd.row(id as usize, &mut e); for s in 0..hc { xh[ti][s * d..(s + 1) * d].copy_from_slice(&e); } }
@@ -1147,7 +1149,7 @@ impl Model {
             if let Some(p) = &l.ple {
                 if let Some(hs) = xs.take() { xh = hs.iter().map(|h| cb.read(h)).collect(); }
                 let mut h = std::mem::take(&mut st.ple_hist[pi]);
-                for ti in 0..t { self.ple(p, &mut h, &emb.as_ref().unwrap()[ti * ew..(ti + 1) * ew], &mut xh[ti], 1); if ti + 1 < t { st.ple_ck[pi].push(h.clone()); } }
+                for ti in 0..t { self.ple(p, &mut h, &emb.as_ref().unwrap()[ti * ew..(ti + 1) * ew], &mut xh[ti], 1); if ti + 1 < t && !st.pf { st.ple_ck[pi].push(h.clone()); } }
                 st.ple_hist[pi] = h; pi += 1;
             }
             let cl = self.cl[il].as_ref().unwrap();
@@ -1221,7 +1223,7 @@ impl Model {
                 let co = cb.empty(ch);
                 cb.conv(&pj, pr, &gw.conv, &cs, &co, ch, c.conv_k);
                 cb.delta(&co, ch, &pj, pr, gw, &ss, &at(&core, ti * core_n), nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
-                if ti + 1 < t { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
+                if ti + 1 < t && !st.pf { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
                     let (a, b) = &st.ck[ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
             } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && pos + 1 <= self.dense_n()) {
                 let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
