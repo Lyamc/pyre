@@ -8,3 +8,4 @@ pub mod iq_tables;
 pub mod qwen4exp_gguf;
 pub mod qn_gpu; pub mod qn_cube; pub mod spin_pool;
 pub mod qdot;
+pub mod mtp;

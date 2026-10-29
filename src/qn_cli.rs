@@ -127,6 +127,7 @@ fn run_gguf(a: QnArgs) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut m = crate::model::qwen4exp_gguf::Model::load(&f)?;
     crate::qn_attach_gpu(&mut m, &a.backend)?;
+    if a.spec > 0 { m.load_mtp()?; }
     let tp = std::time::Instant::now(); let gb = m.prefault_experts(); eprintln!("experts resident: {gb:.1} GiB in {:.1}s", tp.elapsed().as_secs_f64());
     eprintln!("mapped {} ({:.1} GB) in {:.1}s, {} threads", f.display(), m.g.file_bytes() as f64 / 1e9, t0.elapsed().as_secs_f64(), rayon::current_num_threads());
     let (tok, tmpl, eos) = crate::qn_text_parts(&f, &m)?;

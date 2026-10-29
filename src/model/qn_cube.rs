@@ -25,6 +25,21 @@ fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
     part
 }
 
+#[cube]
+fn dec(word: u32, j: u32) -> f32 {
+    let raw = (word >> (j * 8)) & 255u32;
+    f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8)
+}
+#[cube]
+fn dotv(v0: f32, v1: f32, v2: f32, v3: f32, x: &[f32], base: u32) -> f32 {
+    let mut part = 0.0f32;
+    part += v0 * x[base as usize];
+    part += v1 * x[(base + 1) as usize];
+    part += v2 * x[(base + 2) as usize];
+    part += v3 * x[(base + 3) as usize];
+    part
+}
+
 #[cube(launch_unchecked)]
 fn k_gemv(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, ooff: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
@@ -78,10 +93,15 @@ fn k_gemv4(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u3
             let w3 = w[(wb + wi + 96) as usize];
             let k = wi * 4;
             let s0 = s[(sb + k / 32) as usize]; let s1 = s[(sb + k / 32 + 4) as usize]; let s2 = s[(sb + k / 32 + 8) as usize]; let s3 = s[(sb + k / 32 + 12) as usize];
-            a0 += dot4(w0, x, xoff + k) * s0; a0 += dot4(w1, x, xoff + k + 128) * s1; a0 += dot4(w2, x, xoff + k + 256) * s2; a0 += dot4(w3, x, xoff + k + 384) * s3;
-            if nt > 1 { a1 += dot4(w0, x, x1 + k) * s0; a1 += dot4(w1, x, x1 + k + 128) * s1; a1 += dot4(w2, x, x1 + k + 256) * s2; a1 += dot4(w3, x, x1 + k + 384) * s3; }
-            if nt > 2 { a2 += dot4(w0, x, x2 + k) * s0; a2 += dot4(w1, x, x2 + k + 128) * s1; a2 += dot4(w2, x, x2 + k + 256) * s2; a2 += dot4(w3, x, x2 + k + 384) * s3; }
-            if nt > 3 { a3 += dot4(w0, x, x3 + k) * s0; a3 += dot4(w1, x, x3 + k + 128) * s1; a3 += dot4(w2, x, x3 + k + 256) * s2; a3 += dot4(w3, x, x3 + k + 384) * s3; }
+            // each weight byte decoded once for all columns (same values and summation order as dot4)
+            let (p0, p1, p2, p3) = (dec(w0, 0u32), dec(w0, 1u32), dec(w0, 2u32), dec(w0, 3u32));
+            let (q0, q1, q2, q3) = (dec(w1, 0u32), dec(w1, 1u32), dec(w1, 2u32), dec(w1, 3u32));
+            let (r0, r1, r2, r3) = (dec(w2, 0u32), dec(w2, 1u32), dec(w2, 2u32), dec(w2, 3u32));
+            let (u0, u1, u2, u3) = (dec(w3, 0u32), dec(w3, 1u32), dec(w3, 2u32), dec(w3, 3u32));
+            a0 += dotv(p0, p1, p2, p3, x, xoff + k) * s0; a0 += dotv(q0, q1, q2, q3, x, xoff + k + 128) * s1; a0 += dotv(r0, r1, r2, r3, x, xoff + k + 256) * s2; a0 += dotv(u0, u1, u2, u3, x, xoff + k + 384) * s3;
+            if nt > 1 { a1 += dotv(p0, p1, p2, p3, x, x1 + k) * s0; a1 += dotv(q0, q1, q2, q3, x, x1 + k + 128) * s1; a1 += dotv(r0, r1, r2, r3, x, x1 + k + 256) * s2; a1 += dotv(u0, u1, u2, u3, x, x1 + k + 384) * s3; }
+            if nt > 2 { a2 += dotv(p0, p1, p2, p3, x, x2 + k) * s0; a2 += dotv(q0, q1, q2, q3, x, x2 + k + 128) * s1; a2 += dotv(r0, r1, r2, r3, x, x2 + k + 256) * s2; a2 += dotv(u0, u1, u2, u3, x, x2 + k + 384) * s3; }
+            if nt > 3 { a3 += dotv(p0, p1, p2, p3, x, x3 + k) * s0; a3 += dotv(q0, q1, q2, q3, x, x3 + k + 128) * s1; a3 += dotv(r0, r1, r2, r3, x, x3 + k + 256) * s2; a3 += dotv(u0, u1, u2, u3, x, x3 + k + 384) * s3; }
             wi += 128;
         }
         while wi < words {
@@ -99,6 +119,429 @@ fn k_gemv4(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u3
             if nt > 1 { out[(ooff + ost + row) as usize] = t1; }
             if nt > 2 { out[(ooff + 2 * ost + row) as usize] = t2; }
             if nt > 3 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
+/// k_gemv4 with each warp on 4 consecutive rows: the activations are loaded once per k-step for all rows
+/// (a quarter of k_gemv4's loads per weight word). Each (row, column) still accumulates in exactly k_gemv's order.
+#[cube(launch_unchecked)]
+fn k_gemv4r(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, xst: u32, ooff: u32, ost: u32, nt: u32) {
+    let row0 = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) * 4u32;
+    if row0 < rows {
+        let words = cols / 4; let nb = cols / 32;
+        let mut rr0 = row0 + 0u32; if rr0 >= rows { rr0 = rows - 1u32; } let wb0 = rr0 * words; let sb0 = rr0 * nb;
+        let mut rr1 = row0 + 1u32; if rr1 >= rows { rr1 = rows - 1u32; } let wb1 = rr1 * words; let sb1 = rr1 * nb;
+        let mut rr2 = row0 + 2u32; if rr2 >= rows { rr2 = rows - 1u32; } let wb2 = rr2 * words; let sb2 = rr2 * nb;
+        let mut rr3 = row0 + 3u32; if rr3 >= rows { rr3 = rows - 1u32; } let wb3 = rr3 * words; let sb3 = rr3 * nb;
+        let mut cc0 = 0u32; if cc0 >= nt { cc0 = nt - 1u32; } let xb0 = xoff + cc0 * xst;
+        let mut cc1 = 1u32; if cc1 >= nt { cc1 = nt - 1u32; } let xb1 = xoff + cc1 * xst;
+        let mut cc2 = 2u32; if cc2 >= nt { cc2 = nt - 1u32; } let xb2 = xoff + cc2 * xst;
+        let mut cc3 = 3u32; if cc3 >= nt { cc3 = nt - 1u32; } let xb3 = xoff + cc3 * xst;
+        let mut a0_0 = 0.0f32; let mut a0_1 = 0.0f32; let mut a0_2 = 0.0f32; let mut a0_3 = 0.0f32;
+        let mut a1_0 = 0.0f32; let mut a1_1 = 0.0f32; let mut a1_2 = 0.0f32; let mut a1_3 = 0.0f32;
+        let mut a2_0 = 0.0f32; let mut a2_1 = 0.0f32; let mut a2_2 = 0.0f32; let mut a2_3 = 0.0f32;
+        let mut a3_0 = 0.0f32; let mut a3_1 = 0.0f32; let mut a3_2 = 0.0f32; let mut a3_3 = 0.0f32;
+        let mut wi = UNIT_POS_X;
+        while wi + 96 < words {
+            let k = wi * 4;
+            let x0_0_0 = x[(xb0 + k + 0u32) as usize]; let x0_0_1 = x[(xb0 + k + 1u32) as usize]; let x0_0_2 = x[(xb0 + k + 2u32) as usize]; let x0_0_3 = x[(xb0 + k + 3u32) as usize];
+            let x1_0_0 = x[(xb1 + k + 0u32) as usize]; let x1_0_1 = x[(xb1 + k + 1u32) as usize]; let x1_0_2 = x[(xb1 + k + 2u32) as usize]; let x1_0_3 = x[(xb1 + k + 3u32) as usize];
+            let x2_0_0 = x[(xb2 + k + 0u32) as usize]; let x2_0_1 = x[(xb2 + k + 1u32) as usize]; let x2_0_2 = x[(xb2 + k + 2u32) as usize]; let x2_0_3 = x[(xb2 + k + 3u32) as usize];
+            let x3_0_0 = x[(xb3 + k + 0u32) as usize]; let x3_0_1 = x[(xb3 + k + 1u32) as usize]; let x3_0_2 = x[(xb3 + k + 2u32) as usize]; let x3_0_3 = x[(xb3 + k + 3u32) as usize];
+            let x0_1_0 = x[(xb0 + k + 128u32) as usize]; let x0_1_1 = x[(xb0 + k + 129u32) as usize]; let x0_1_2 = x[(xb0 + k + 130u32) as usize]; let x0_1_3 = x[(xb0 + k + 131u32) as usize];
+            let x1_1_0 = x[(xb1 + k + 128u32) as usize]; let x1_1_1 = x[(xb1 + k + 129u32) as usize]; let x1_1_2 = x[(xb1 + k + 130u32) as usize]; let x1_1_3 = x[(xb1 + k + 131u32) as usize];
+            let x2_1_0 = x[(xb2 + k + 128u32) as usize]; let x2_1_1 = x[(xb2 + k + 129u32) as usize]; let x2_1_2 = x[(xb2 + k + 130u32) as usize]; let x2_1_3 = x[(xb2 + k + 131u32) as usize];
+            let x3_1_0 = x[(xb3 + k + 128u32) as usize]; let x3_1_1 = x[(xb3 + k + 129u32) as usize]; let x3_1_2 = x[(xb3 + k + 130u32) as usize]; let x3_1_3 = x[(xb3 + k + 131u32) as usize];
+            let x0_2_0 = x[(xb0 + k + 256u32) as usize]; let x0_2_1 = x[(xb0 + k + 257u32) as usize]; let x0_2_2 = x[(xb0 + k + 258u32) as usize]; let x0_2_3 = x[(xb0 + k + 259u32) as usize];
+            let x1_2_0 = x[(xb1 + k + 256u32) as usize]; let x1_2_1 = x[(xb1 + k + 257u32) as usize]; let x1_2_2 = x[(xb1 + k + 258u32) as usize]; let x1_2_3 = x[(xb1 + k + 259u32) as usize];
+            let x2_2_0 = x[(xb2 + k + 256u32) as usize]; let x2_2_1 = x[(xb2 + k + 257u32) as usize]; let x2_2_2 = x[(xb2 + k + 258u32) as usize]; let x2_2_3 = x[(xb2 + k + 259u32) as usize];
+            let x3_2_0 = x[(xb3 + k + 256u32) as usize]; let x3_2_1 = x[(xb3 + k + 257u32) as usize]; let x3_2_2 = x[(xb3 + k + 258u32) as usize]; let x3_2_3 = x[(xb3 + k + 259u32) as usize];
+            let x0_3_0 = x[(xb0 + k + 384u32) as usize]; let x0_3_1 = x[(xb0 + k + 385u32) as usize]; let x0_3_2 = x[(xb0 + k + 386u32) as usize]; let x0_3_3 = x[(xb0 + k + 387u32) as usize];
+            let x1_3_0 = x[(xb1 + k + 384u32) as usize]; let x1_3_1 = x[(xb1 + k + 385u32) as usize]; let x1_3_2 = x[(xb1 + k + 386u32) as usize]; let x1_3_3 = x[(xb1 + k + 387u32) as usize];
+            let x2_3_0 = x[(xb2 + k + 384u32) as usize]; let x2_3_1 = x[(xb2 + k + 385u32) as usize]; let x2_3_2 = x[(xb2 + k + 386u32) as usize]; let x2_3_3 = x[(xb2 + k + 387u32) as usize];
+            let x3_3_0 = x[(xb3 + k + 384u32) as usize]; let x3_3_1 = x[(xb3 + k + 385u32) as usize]; let x3_3_2 = x[(xb3 + k + 386u32) as usize]; let x3_3_3 = x[(xb3 + k + 387u32) as usize];
+            let w0_0 = w[(wb0 + wi + 0u32) as usize]; let s0_0 = s[(sb0 + k / 32 + 0u32) as usize];
+            let v0_0_0 = dec(w0_0, 0u32); let v0_0_1 = dec(w0_0, 1u32); let v0_0_2 = dec(w0_0, 2u32); let v0_0_3 = dec(w0_0, 3u32);
+            let w0_1 = w[(wb0 + wi + 32u32) as usize]; let s0_1 = s[(sb0 + k / 32 + 4u32) as usize];
+            let v0_1_0 = dec(w0_1, 0u32); let v0_1_1 = dec(w0_1, 1u32); let v0_1_2 = dec(w0_1, 2u32); let v0_1_3 = dec(w0_1, 3u32);
+            let w0_2 = w[(wb0 + wi + 64u32) as usize]; let s0_2 = s[(sb0 + k / 32 + 8u32) as usize];
+            let v0_2_0 = dec(w0_2, 0u32); let v0_2_1 = dec(w0_2, 1u32); let v0_2_2 = dec(w0_2, 2u32); let v0_2_3 = dec(w0_2, 3u32);
+            let w0_3 = w[(wb0 + wi + 96u32) as usize]; let s0_3 = s[(sb0 + k / 32 + 12u32) as usize];
+            let v0_3_0 = dec(w0_3, 0u32); let v0_3_1 = dec(w0_3, 1u32); let v0_3_2 = dec(w0_3, 2u32); let v0_3_3 = dec(w0_3, 3u32);
+            a0_0 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s0_0; a0_0 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s0_1; a0_0 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s0_2; a0_0 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s0_3;
+            a0_1 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s0_0; a0_1 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s0_1; a0_1 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s0_2; a0_1 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s0_3;
+            a0_2 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s0_0; a0_2 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s0_1; a0_2 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s0_2; a0_2 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s0_3;
+            a0_3 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s0_0; a0_3 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s0_1; a0_3 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s0_2; a0_3 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s0_3;
+            let w1_0 = w[(wb1 + wi + 0u32) as usize]; let s1_0 = s[(sb1 + k / 32 + 0u32) as usize];
+            let v1_0_0 = dec(w1_0, 0u32); let v1_0_1 = dec(w1_0, 1u32); let v1_0_2 = dec(w1_0, 2u32); let v1_0_3 = dec(w1_0, 3u32);
+            let w1_1 = w[(wb1 + wi + 32u32) as usize]; let s1_1 = s[(sb1 + k / 32 + 4u32) as usize];
+            let v1_1_0 = dec(w1_1, 0u32); let v1_1_1 = dec(w1_1, 1u32); let v1_1_2 = dec(w1_1, 2u32); let v1_1_3 = dec(w1_1, 3u32);
+            let w1_2 = w[(wb1 + wi + 64u32) as usize]; let s1_2 = s[(sb1 + k / 32 + 8u32) as usize];
+            let v1_2_0 = dec(w1_2, 0u32); let v1_2_1 = dec(w1_2, 1u32); let v1_2_2 = dec(w1_2, 2u32); let v1_2_3 = dec(w1_2, 3u32);
+            let w1_3 = w[(wb1 + wi + 96u32) as usize]; let s1_3 = s[(sb1 + k / 32 + 12u32) as usize];
+            let v1_3_0 = dec(w1_3, 0u32); let v1_3_1 = dec(w1_3, 1u32); let v1_3_2 = dec(w1_3, 2u32); let v1_3_3 = dec(w1_3, 3u32);
+            a1_0 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s1_0; a1_0 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s1_1; a1_0 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s1_2; a1_0 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s1_3;
+            a1_1 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s1_0; a1_1 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s1_1; a1_1 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s1_2; a1_1 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s1_3;
+            a1_2 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s1_0; a1_2 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s1_1; a1_2 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s1_2; a1_2 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s1_3;
+            a1_3 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s1_0; a1_3 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s1_1; a1_3 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s1_2; a1_3 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s1_3;
+            let w2_0 = w[(wb2 + wi + 0u32) as usize]; let s2_0 = s[(sb2 + k / 32 + 0u32) as usize];
+            let v2_0_0 = dec(w2_0, 0u32); let v2_0_1 = dec(w2_0, 1u32); let v2_0_2 = dec(w2_0, 2u32); let v2_0_3 = dec(w2_0, 3u32);
+            let w2_1 = w[(wb2 + wi + 32u32) as usize]; let s2_1 = s[(sb2 + k / 32 + 4u32) as usize];
+            let v2_1_0 = dec(w2_1, 0u32); let v2_1_1 = dec(w2_1, 1u32); let v2_1_2 = dec(w2_1, 2u32); let v2_1_3 = dec(w2_1, 3u32);
+            let w2_2 = w[(wb2 + wi + 64u32) as usize]; let s2_2 = s[(sb2 + k / 32 + 8u32) as usize];
+            let v2_2_0 = dec(w2_2, 0u32); let v2_2_1 = dec(w2_2, 1u32); let v2_2_2 = dec(w2_2, 2u32); let v2_2_3 = dec(w2_2, 3u32);
+            let w2_3 = w[(wb2 + wi + 96u32) as usize]; let s2_3 = s[(sb2 + k / 32 + 12u32) as usize];
+            let v2_3_0 = dec(w2_3, 0u32); let v2_3_1 = dec(w2_3, 1u32); let v2_3_2 = dec(w2_3, 2u32); let v2_3_3 = dec(w2_3, 3u32);
+            a2_0 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s2_0; a2_0 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s2_1; a2_0 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s2_2; a2_0 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s2_3;
+            a2_1 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s2_0; a2_1 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s2_1; a2_1 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s2_2; a2_1 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s2_3;
+            a2_2 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s2_0; a2_2 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s2_1; a2_2 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s2_2; a2_2 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s2_3;
+            a2_3 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s2_0; a2_3 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s2_1; a2_3 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s2_2; a2_3 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s2_3;
+            let w3_0 = w[(wb3 + wi + 0u32) as usize]; let s3_0 = s[(sb3 + k / 32 + 0u32) as usize];
+            let v3_0_0 = dec(w3_0, 0u32); let v3_0_1 = dec(w3_0, 1u32); let v3_0_2 = dec(w3_0, 2u32); let v3_0_3 = dec(w3_0, 3u32);
+            let w3_1 = w[(wb3 + wi + 32u32) as usize]; let s3_1 = s[(sb3 + k / 32 + 4u32) as usize];
+            let v3_1_0 = dec(w3_1, 0u32); let v3_1_1 = dec(w3_1, 1u32); let v3_1_2 = dec(w3_1, 2u32); let v3_1_3 = dec(w3_1, 3u32);
+            let w3_2 = w[(wb3 + wi + 64u32) as usize]; let s3_2 = s[(sb3 + k / 32 + 8u32) as usize];
+            let v3_2_0 = dec(w3_2, 0u32); let v3_2_1 = dec(w3_2, 1u32); let v3_2_2 = dec(w3_2, 2u32); let v3_2_3 = dec(w3_2, 3u32);
+            let w3_3 = w[(wb3 + wi + 96u32) as usize]; let s3_3 = s[(sb3 + k / 32 + 12u32) as usize];
+            let v3_3_0 = dec(w3_3, 0u32); let v3_3_1 = dec(w3_3, 1u32); let v3_3_2 = dec(w3_3, 2u32); let v3_3_3 = dec(w3_3, 3u32);
+            a3_0 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s3_0; a3_0 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s3_1; a3_0 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s3_2; a3_0 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s3_3;
+            a3_1 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s3_0; a3_1 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s3_1; a3_1 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s3_2; a3_1 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s3_3;
+            a3_2 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s3_0; a3_2 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s3_1; a3_2 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s3_2; a3_2 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s3_3;
+            a3_3 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s3_0; a3_3 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s3_1; a3_3 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s3_2; a3_3 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s3_3;
+            wi += 128;
+        }
+        while wi < words {
+            let k = wi * 4;
+            let x0_0_0 = x[(xb0 + k + 0u32) as usize]; let x0_0_1 = x[(xb0 + k + 1u32) as usize]; let x0_0_2 = x[(xb0 + k + 2u32) as usize]; let x0_0_3 = x[(xb0 + k + 3u32) as usize];
+            let x1_0_0 = x[(xb1 + k + 0u32) as usize]; let x1_0_1 = x[(xb1 + k + 1u32) as usize]; let x1_0_2 = x[(xb1 + k + 2u32) as usize]; let x1_0_3 = x[(xb1 + k + 3u32) as usize];
+            let x2_0_0 = x[(xb2 + k + 0u32) as usize]; let x2_0_1 = x[(xb2 + k + 1u32) as usize]; let x2_0_2 = x[(xb2 + k + 2u32) as usize]; let x2_0_3 = x[(xb2 + k + 3u32) as usize];
+            let x3_0_0 = x[(xb3 + k + 0u32) as usize]; let x3_0_1 = x[(xb3 + k + 1u32) as usize]; let x3_0_2 = x[(xb3 + k + 2u32) as usize]; let x3_0_3 = x[(xb3 + k + 3u32) as usize];
+            let w0_0 = w[(wb0 + wi + 0u32) as usize]; let s0_0 = s[(sb0 + k / 32 + 0u32) as usize];
+            let v0_0_0 = dec(w0_0, 0u32); let v0_0_1 = dec(w0_0, 1u32); let v0_0_2 = dec(w0_0, 2u32); let v0_0_3 = dec(w0_0, 3u32);
+            a0_0 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s0_0;
+            a0_1 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s0_0;
+            a0_2 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s0_0;
+            a0_3 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s0_0;
+            let w1_0 = w[(wb1 + wi + 0u32) as usize]; let s1_0 = s[(sb1 + k / 32 + 0u32) as usize];
+            let v1_0_0 = dec(w1_0, 0u32); let v1_0_1 = dec(w1_0, 1u32); let v1_0_2 = dec(w1_0, 2u32); let v1_0_3 = dec(w1_0, 3u32);
+            a1_0 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s1_0;
+            a1_1 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s1_0;
+            a1_2 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s1_0;
+            a1_3 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s1_0;
+            let w2_0 = w[(wb2 + wi + 0u32) as usize]; let s2_0 = s[(sb2 + k / 32 + 0u32) as usize];
+            let v2_0_0 = dec(w2_0, 0u32); let v2_0_1 = dec(w2_0, 1u32); let v2_0_2 = dec(w2_0, 2u32); let v2_0_3 = dec(w2_0, 3u32);
+            a2_0 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s2_0;
+            a2_1 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s2_0;
+            a2_2 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s2_0;
+            a2_3 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s2_0;
+            let w3_0 = w[(wb3 + wi + 0u32) as usize]; let s3_0 = s[(sb3 + k / 32 + 0u32) as usize];
+            let v3_0_0 = dec(w3_0, 0u32); let v3_0_1 = dec(w3_0, 1u32); let v3_0_2 = dec(w3_0, 2u32); let v3_0_3 = dec(w3_0, 3u32);
+            a3_0 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s3_0;
+            a3_1 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s3_0;
+            a3_2 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s3_0;
+            a3_3 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s3_0;
+            wi += 32;
+        }
+        let t0_0 = plane_sum(a0_0); let t0_1 = plane_sum(a0_1); let t0_2 = plane_sum(a0_2); let t0_3 = plane_sum(a0_3);
+        let t1_0 = plane_sum(a1_0); let t1_1 = plane_sum(a1_1); let t1_2 = plane_sum(a1_2); let t1_3 = plane_sum(a1_3);
+        let t2_0 = plane_sum(a2_0); let t2_1 = plane_sum(a2_1); let t2_2 = plane_sum(a2_2); let t2_3 = plane_sum(a2_3);
+        let t3_0 = plane_sum(a3_0); let t3_1 = plane_sum(a3_1); let t3_2 = plane_sum(a3_2); let t3_3 = plane_sum(a3_3);
+        if UNIT_POS_X == 0 {
+            if row0 + 0u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 0u32) as usize] = t0_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 0u32) as usize] = t0_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 0u32) as usize] = t0_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 0u32) as usize] = t0_3; }
+            }
+            if row0 + 1u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 1u32) as usize] = t1_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 1u32) as usize] = t1_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 1u32) as usize] = t1_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 1u32) as usize] = t1_3; }
+            }
+            if row0 + 2u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 2u32) as usize] = t2_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 2u32) as usize] = t2_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 2u32) as usize] = t2_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 2u32) as usize] = t2_3; }
+            }
+            if row0 + 3u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 3u32) as usize] = t3_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 3u32) as usize] = t3_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 3u32) as usize] = t3_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 3u32) as usize] = t3_3; }
+            }
+        }
+    }
+}
+
+#[cube]
+fn dotx(v0: f32, v1: f32, v2: f32, v3: f32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
+    let mut part = 0.0f32;
+    part += v0 * x0;
+    part += v1 * x1;
+    part += v2 * x2;
+    part += v3 * x3;
+    part
+}
+
+/// k_gemv4r with 8 rows per warp (PYRE_QN_GEMV4R=8).
+#[cube(launch_unchecked)]
+fn k_gemv4r8(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, xst: u32, ooff: u32, ost: u32, nt: u32) {
+    let row0 = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) * 8u32;
+    if row0 < rows {
+        let words = cols / 4; let nb = cols / 32;
+        let mut rr0 = row0 + 0u32; if rr0 >= rows { rr0 = rows - 1u32; } let wb0 = rr0 * words; let sb0 = rr0 * nb;
+        let mut rr1 = row0 + 1u32; if rr1 >= rows { rr1 = rows - 1u32; } let wb1 = rr1 * words; let sb1 = rr1 * nb;
+        let mut rr2 = row0 + 2u32; if rr2 >= rows { rr2 = rows - 1u32; } let wb2 = rr2 * words; let sb2 = rr2 * nb;
+        let mut rr3 = row0 + 3u32; if rr3 >= rows { rr3 = rows - 1u32; } let wb3 = rr3 * words; let sb3 = rr3 * nb;
+        let mut rr4 = row0 + 4u32; if rr4 >= rows { rr4 = rows - 1u32; } let wb4 = rr4 * words; let sb4 = rr4 * nb;
+        let mut rr5 = row0 + 5u32; if rr5 >= rows { rr5 = rows - 1u32; } let wb5 = rr5 * words; let sb5 = rr5 * nb;
+        let mut rr6 = row0 + 6u32; if rr6 >= rows { rr6 = rows - 1u32; } let wb6 = rr6 * words; let sb6 = rr6 * nb;
+        let mut rr7 = row0 + 7u32; if rr7 >= rows { rr7 = rows - 1u32; } let wb7 = rr7 * words; let sb7 = rr7 * nb;
+        let mut cc0 = 0u32; if cc0 >= nt { cc0 = nt - 1u32; } let xb0 = xoff + cc0 * xst;
+        let mut cc1 = 1u32; if cc1 >= nt { cc1 = nt - 1u32; } let xb1 = xoff + cc1 * xst;
+        let mut cc2 = 2u32; if cc2 >= nt { cc2 = nt - 1u32; } let xb2 = xoff + cc2 * xst;
+        let mut cc3 = 3u32; if cc3 >= nt { cc3 = nt - 1u32; } let xb3 = xoff + cc3 * xst;
+        let mut a0_0 = 0.0f32; let mut a0_1 = 0.0f32; let mut a0_2 = 0.0f32; let mut a0_3 = 0.0f32;
+        let mut a1_0 = 0.0f32; let mut a1_1 = 0.0f32; let mut a1_2 = 0.0f32; let mut a1_3 = 0.0f32;
+        let mut a2_0 = 0.0f32; let mut a2_1 = 0.0f32; let mut a2_2 = 0.0f32; let mut a2_3 = 0.0f32;
+        let mut a3_0 = 0.0f32; let mut a3_1 = 0.0f32; let mut a3_2 = 0.0f32; let mut a3_3 = 0.0f32;
+        let mut a4_0 = 0.0f32; let mut a4_1 = 0.0f32; let mut a4_2 = 0.0f32; let mut a4_3 = 0.0f32;
+        let mut a5_0 = 0.0f32; let mut a5_1 = 0.0f32; let mut a5_2 = 0.0f32; let mut a5_3 = 0.0f32;
+        let mut a6_0 = 0.0f32; let mut a6_1 = 0.0f32; let mut a6_2 = 0.0f32; let mut a6_3 = 0.0f32;
+        let mut a7_0 = 0.0f32; let mut a7_1 = 0.0f32; let mut a7_2 = 0.0f32; let mut a7_3 = 0.0f32;
+        let mut wi = UNIT_POS_X;
+        while wi + 96 < words {
+            let k = wi * 4;
+            let x0_0_0 = x[(xb0 + k + 0u32) as usize]; let x0_0_1 = x[(xb0 + k + 1u32) as usize]; let x0_0_2 = x[(xb0 + k + 2u32) as usize]; let x0_0_3 = x[(xb0 + k + 3u32) as usize];
+            let x1_0_0 = x[(xb1 + k + 0u32) as usize]; let x1_0_1 = x[(xb1 + k + 1u32) as usize]; let x1_0_2 = x[(xb1 + k + 2u32) as usize]; let x1_0_3 = x[(xb1 + k + 3u32) as usize];
+            let x2_0_0 = x[(xb2 + k + 0u32) as usize]; let x2_0_1 = x[(xb2 + k + 1u32) as usize]; let x2_0_2 = x[(xb2 + k + 2u32) as usize]; let x2_0_3 = x[(xb2 + k + 3u32) as usize];
+            let x3_0_0 = x[(xb3 + k + 0u32) as usize]; let x3_0_1 = x[(xb3 + k + 1u32) as usize]; let x3_0_2 = x[(xb3 + k + 2u32) as usize]; let x3_0_3 = x[(xb3 + k + 3u32) as usize];
+            let x0_1_0 = x[(xb0 + k + 128u32) as usize]; let x0_1_1 = x[(xb0 + k + 129u32) as usize]; let x0_1_2 = x[(xb0 + k + 130u32) as usize]; let x0_1_3 = x[(xb0 + k + 131u32) as usize];
+            let x1_1_0 = x[(xb1 + k + 128u32) as usize]; let x1_1_1 = x[(xb1 + k + 129u32) as usize]; let x1_1_2 = x[(xb1 + k + 130u32) as usize]; let x1_1_3 = x[(xb1 + k + 131u32) as usize];
+            let x2_1_0 = x[(xb2 + k + 128u32) as usize]; let x2_1_1 = x[(xb2 + k + 129u32) as usize]; let x2_1_2 = x[(xb2 + k + 130u32) as usize]; let x2_1_3 = x[(xb2 + k + 131u32) as usize];
+            let x3_1_0 = x[(xb3 + k + 128u32) as usize]; let x3_1_1 = x[(xb3 + k + 129u32) as usize]; let x3_1_2 = x[(xb3 + k + 130u32) as usize]; let x3_1_3 = x[(xb3 + k + 131u32) as usize];
+            let x0_2_0 = x[(xb0 + k + 256u32) as usize]; let x0_2_1 = x[(xb0 + k + 257u32) as usize]; let x0_2_2 = x[(xb0 + k + 258u32) as usize]; let x0_2_3 = x[(xb0 + k + 259u32) as usize];
+            let x1_2_0 = x[(xb1 + k + 256u32) as usize]; let x1_2_1 = x[(xb1 + k + 257u32) as usize]; let x1_2_2 = x[(xb1 + k + 258u32) as usize]; let x1_2_3 = x[(xb1 + k + 259u32) as usize];
+            let x2_2_0 = x[(xb2 + k + 256u32) as usize]; let x2_2_1 = x[(xb2 + k + 257u32) as usize]; let x2_2_2 = x[(xb2 + k + 258u32) as usize]; let x2_2_3 = x[(xb2 + k + 259u32) as usize];
+            let x3_2_0 = x[(xb3 + k + 256u32) as usize]; let x3_2_1 = x[(xb3 + k + 257u32) as usize]; let x3_2_2 = x[(xb3 + k + 258u32) as usize]; let x3_2_3 = x[(xb3 + k + 259u32) as usize];
+            let x0_3_0 = x[(xb0 + k + 384u32) as usize]; let x0_3_1 = x[(xb0 + k + 385u32) as usize]; let x0_3_2 = x[(xb0 + k + 386u32) as usize]; let x0_3_3 = x[(xb0 + k + 387u32) as usize];
+            let x1_3_0 = x[(xb1 + k + 384u32) as usize]; let x1_3_1 = x[(xb1 + k + 385u32) as usize]; let x1_3_2 = x[(xb1 + k + 386u32) as usize]; let x1_3_3 = x[(xb1 + k + 387u32) as usize];
+            let x2_3_0 = x[(xb2 + k + 384u32) as usize]; let x2_3_1 = x[(xb2 + k + 385u32) as usize]; let x2_3_2 = x[(xb2 + k + 386u32) as usize]; let x2_3_3 = x[(xb2 + k + 387u32) as usize];
+            let x3_3_0 = x[(xb3 + k + 384u32) as usize]; let x3_3_1 = x[(xb3 + k + 385u32) as usize]; let x3_3_2 = x[(xb3 + k + 386u32) as usize]; let x3_3_3 = x[(xb3 + k + 387u32) as usize];
+            let w0_0 = w[(wb0 + wi + 0u32) as usize]; let s0_0 = s[(sb0 + k / 32 + 0u32) as usize];
+            let v0_0_0 = dec(w0_0, 0u32); let v0_0_1 = dec(w0_0, 1u32); let v0_0_2 = dec(w0_0, 2u32); let v0_0_3 = dec(w0_0, 3u32);
+            let w0_1 = w[(wb0 + wi + 32u32) as usize]; let s0_1 = s[(sb0 + k / 32 + 4u32) as usize];
+            let v0_1_0 = dec(w0_1, 0u32); let v0_1_1 = dec(w0_1, 1u32); let v0_1_2 = dec(w0_1, 2u32); let v0_1_3 = dec(w0_1, 3u32);
+            let w0_2 = w[(wb0 + wi + 64u32) as usize]; let s0_2 = s[(sb0 + k / 32 + 8u32) as usize];
+            let v0_2_0 = dec(w0_2, 0u32); let v0_2_1 = dec(w0_2, 1u32); let v0_2_2 = dec(w0_2, 2u32); let v0_2_3 = dec(w0_2, 3u32);
+            let w0_3 = w[(wb0 + wi + 96u32) as usize]; let s0_3 = s[(sb0 + k / 32 + 12u32) as usize];
+            let v0_3_0 = dec(w0_3, 0u32); let v0_3_1 = dec(w0_3, 1u32); let v0_3_2 = dec(w0_3, 2u32); let v0_3_3 = dec(w0_3, 3u32);
+            a0_0 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s0_0; a0_0 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s0_1; a0_0 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s0_2; a0_0 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s0_3;
+            a0_1 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s0_0; a0_1 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s0_1; a0_1 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s0_2; a0_1 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s0_3;
+            a0_2 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s0_0; a0_2 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s0_1; a0_2 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s0_2; a0_2 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s0_3;
+            a0_3 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s0_0; a0_3 += dotx(v0_1_0, v0_1_1, v0_1_2, v0_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s0_1; a0_3 += dotx(v0_2_0, v0_2_1, v0_2_2, v0_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s0_2; a0_3 += dotx(v0_3_0, v0_3_1, v0_3_2, v0_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s0_3;
+            let w1_0 = w[(wb1 + wi + 0u32) as usize]; let s1_0 = s[(sb1 + k / 32 + 0u32) as usize];
+            let v1_0_0 = dec(w1_0, 0u32); let v1_0_1 = dec(w1_0, 1u32); let v1_0_2 = dec(w1_0, 2u32); let v1_0_3 = dec(w1_0, 3u32);
+            let w1_1 = w[(wb1 + wi + 32u32) as usize]; let s1_1 = s[(sb1 + k / 32 + 4u32) as usize];
+            let v1_1_0 = dec(w1_1, 0u32); let v1_1_1 = dec(w1_1, 1u32); let v1_1_2 = dec(w1_1, 2u32); let v1_1_3 = dec(w1_1, 3u32);
+            let w1_2 = w[(wb1 + wi + 64u32) as usize]; let s1_2 = s[(sb1 + k / 32 + 8u32) as usize];
+            let v1_2_0 = dec(w1_2, 0u32); let v1_2_1 = dec(w1_2, 1u32); let v1_2_2 = dec(w1_2, 2u32); let v1_2_3 = dec(w1_2, 3u32);
+            let w1_3 = w[(wb1 + wi + 96u32) as usize]; let s1_3 = s[(sb1 + k / 32 + 12u32) as usize];
+            let v1_3_0 = dec(w1_3, 0u32); let v1_3_1 = dec(w1_3, 1u32); let v1_3_2 = dec(w1_3, 2u32); let v1_3_3 = dec(w1_3, 3u32);
+            a1_0 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s1_0; a1_0 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s1_1; a1_0 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s1_2; a1_0 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s1_3;
+            a1_1 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s1_0; a1_1 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s1_1; a1_1 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s1_2; a1_1 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s1_3;
+            a1_2 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s1_0; a1_2 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s1_1; a1_2 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s1_2; a1_2 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s1_3;
+            a1_3 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s1_0; a1_3 += dotx(v1_1_0, v1_1_1, v1_1_2, v1_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s1_1; a1_3 += dotx(v1_2_0, v1_2_1, v1_2_2, v1_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s1_2; a1_3 += dotx(v1_3_0, v1_3_1, v1_3_2, v1_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s1_3;
+            let w2_0 = w[(wb2 + wi + 0u32) as usize]; let s2_0 = s[(sb2 + k / 32 + 0u32) as usize];
+            let v2_0_0 = dec(w2_0, 0u32); let v2_0_1 = dec(w2_0, 1u32); let v2_0_2 = dec(w2_0, 2u32); let v2_0_3 = dec(w2_0, 3u32);
+            let w2_1 = w[(wb2 + wi + 32u32) as usize]; let s2_1 = s[(sb2 + k / 32 + 4u32) as usize];
+            let v2_1_0 = dec(w2_1, 0u32); let v2_1_1 = dec(w2_1, 1u32); let v2_1_2 = dec(w2_1, 2u32); let v2_1_3 = dec(w2_1, 3u32);
+            let w2_2 = w[(wb2 + wi + 64u32) as usize]; let s2_2 = s[(sb2 + k / 32 + 8u32) as usize];
+            let v2_2_0 = dec(w2_2, 0u32); let v2_2_1 = dec(w2_2, 1u32); let v2_2_2 = dec(w2_2, 2u32); let v2_2_3 = dec(w2_2, 3u32);
+            let w2_3 = w[(wb2 + wi + 96u32) as usize]; let s2_3 = s[(sb2 + k / 32 + 12u32) as usize];
+            let v2_3_0 = dec(w2_3, 0u32); let v2_3_1 = dec(w2_3, 1u32); let v2_3_2 = dec(w2_3, 2u32); let v2_3_3 = dec(w2_3, 3u32);
+            a2_0 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s2_0; a2_0 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s2_1; a2_0 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s2_2; a2_0 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s2_3;
+            a2_1 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s2_0; a2_1 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s2_1; a2_1 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s2_2; a2_1 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s2_3;
+            a2_2 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s2_0; a2_2 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s2_1; a2_2 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s2_2; a2_2 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s2_3;
+            a2_3 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s2_0; a2_3 += dotx(v2_1_0, v2_1_1, v2_1_2, v2_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s2_1; a2_3 += dotx(v2_2_0, v2_2_1, v2_2_2, v2_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s2_2; a2_3 += dotx(v2_3_0, v2_3_1, v2_3_2, v2_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s2_3;
+            let w3_0 = w[(wb3 + wi + 0u32) as usize]; let s3_0 = s[(sb3 + k / 32 + 0u32) as usize];
+            let v3_0_0 = dec(w3_0, 0u32); let v3_0_1 = dec(w3_0, 1u32); let v3_0_2 = dec(w3_0, 2u32); let v3_0_3 = dec(w3_0, 3u32);
+            let w3_1 = w[(wb3 + wi + 32u32) as usize]; let s3_1 = s[(sb3 + k / 32 + 4u32) as usize];
+            let v3_1_0 = dec(w3_1, 0u32); let v3_1_1 = dec(w3_1, 1u32); let v3_1_2 = dec(w3_1, 2u32); let v3_1_3 = dec(w3_1, 3u32);
+            let w3_2 = w[(wb3 + wi + 64u32) as usize]; let s3_2 = s[(sb3 + k / 32 + 8u32) as usize];
+            let v3_2_0 = dec(w3_2, 0u32); let v3_2_1 = dec(w3_2, 1u32); let v3_2_2 = dec(w3_2, 2u32); let v3_2_3 = dec(w3_2, 3u32);
+            let w3_3 = w[(wb3 + wi + 96u32) as usize]; let s3_3 = s[(sb3 + k / 32 + 12u32) as usize];
+            let v3_3_0 = dec(w3_3, 0u32); let v3_3_1 = dec(w3_3, 1u32); let v3_3_2 = dec(w3_3, 2u32); let v3_3_3 = dec(w3_3, 3u32);
+            a3_0 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s3_0; a3_0 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s3_1; a3_0 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s3_2; a3_0 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s3_3;
+            a3_1 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s3_0; a3_1 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s3_1; a3_1 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s3_2; a3_1 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s3_3;
+            a3_2 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s3_0; a3_2 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s3_1; a3_2 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s3_2; a3_2 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s3_3;
+            a3_3 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s3_0; a3_3 += dotx(v3_1_0, v3_1_1, v3_1_2, v3_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s3_1; a3_3 += dotx(v3_2_0, v3_2_1, v3_2_2, v3_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s3_2; a3_3 += dotx(v3_3_0, v3_3_1, v3_3_2, v3_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s3_3;
+            let w4_0 = w[(wb4 + wi + 0u32) as usize]; let s4_0 = s[(sb4 + k / 32 + 0u32) as usize];
+            let v4_0_0 = dec(w4_0, 0u32); let v4_0_1 = dec(w4_0, 1u32); let v4_0_2 = dec(w4_0, 2u32); let v4_0_3 = dec(w4_0, 3u32);
+            let w4_1 = w[(wb4 + wi + 32u32) as usize]; let s4_1 = s[(sb4 + k / 32 + 4u32) as usize];
+            let v4_1_0 = dec(w4_1, 0u32); let v4_1_1 = dec(w4_1, 1u32); let v4_1_2 = dec(w4_1, 2u32); let v4_1_3 = dec(w4_1, 3u32);
+            let w4_2 = w[(wb4 + wi + 64u32) as usize]; let s4_2 = s[(sb4 + k / 32 + 8u32) as usize];
+            let v4_2_0 = dec(w4_2, 0u32); let v4_2_1 = dec(w4_2, 1u32); let v4_2_2 = dec(w4_2, 2u32); let v4_2_3 = dec(w4_2, 3u32);
+            let w4_3 = w[(wb4 + wi + 96u32) as usize]; let s4_3 = s[(sb4 + k / 32 + 12u32) as usize];
+            let v4_3_0 = dec(w4_3, 0u32); let v4_3_1 = dec(w4_3, 1u32); let v4_3_2 = dec(w4_3, 2u32); let v4_3_3 = dec(w4_3, 3u32);
+            a4_0 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s4_0; a4_0 += dotx(v4_1_0, v4_1_1, v4_1_2, v4_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s4_1; a4_0 += dotx(v4_2_0, v4_2_1, v4_2_2, v4_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s4_2; a4_0 += dotx(v4_3_0, v4_3_1, v4_3_2, v4_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s4_3;
+            a4_1 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s4_0; a4_1 += dotx(v4_1_0, v4_1_1, v4_1_2, v4_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s4_1; a4_1 += dotx(v4_2_0, v4_2_1, v4_2_2, v4_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s4_2; a4_1 += dotx(v4_3_0, v4_3_1, v4_3_2, v4_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s4_3;
+            a4_2 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s4_0; a4_2 += dotx(v4_1_0, v4_1_1, v4_1_2, v4_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s4_1; a4_2 += dotx(v4_2_0, v4_2_1, v4_2_2, v4_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s4_2; a4_2 += dotx(v4_3_0, v4_3_1, v4_3_2, v4_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s4_3;
+            a4_3 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s4_0; a4_3 += dotx(v4_1_0, v4_1_1, v4_1_2, v4_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s4_1; a4_3 += dotx(v4_2_0, v4_2_1, v4_2_2, v4_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s4_2; a4_3 += dotx(v4_3_0, v4_3_1, v4_3_2, v4_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s4_3;
+            let w5_0 = w[(wb5 + wi + 0u32) as usize]; let s5_0 = s[(sb5 + k / 32 + 0u32) as usize];
+            let v5_0_0 = dec(w5_0, 0u32); let v5_0_1 = dec(w5_0, 1u32); let v5_0_2 = dec(w5_0, 2u32); let v5_0_3 = dec(w5_0, 3u32);
+            let w5_1 = w[(wb5 + wi + 32u32) as usize]; let s5_1 = s[(sb5 + k / 32 + 4u32) as usize];
+            let v5_1_0 = dec(w5_1, 0u32); let v5_1_1 = dec(w5_1, 1u32); let v5_1_2 = dec(w5_1, 2u32); let v5_1_3 = dec(w5_1, 3u32);
+            let w5_2 = w[(wb5 + wi + 64u32) as usize]; let s5_2 = s[(sb5 + k / 32 + 8u32) as usize];
+            let v5_2_0 = dec(w5_2, 0u32); let v5_2_1 = dec(w5_2, 1u32); let v5_2_2 = dec(w5_2, 2u32); let v5_2_3 = dec(w5_2, 3u32);
+            let w5_3 = w[(wb5 + wi + 96u32) as usize]; let s5_3 = s[(sb5 + k / 32 + 12u32) as usize];
+            let v5_3_0 = dec(w5_3, 0u32); let v5_3_1 = dec(w5_3, 1u32); let v5_3_2 = dec(w5_3, 2u32); let v5_3_3 = dec(w5_3, 3u32);
+            a5_0 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s5_0; a5_0 += dotx(v5_1_0, v5_1_1, v5_1_2, v5_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s5_1; a5_0 += dotx(v5_2_0, v5_2_1, v5_2_2, v5_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s5_2; a5_0 += dotx(v5_3_0, v5_3_1, v5_3_2, v5_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s5_3;
+            a5_1 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s5_0; a5_1 += dotx(v5_1_0, v5_1_1, v5_1_2, v5_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s5_1; a5_1 += dotx(v5_2_0, v5_2_1, v5_2_2, v5_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s5_2; a5_1 += dotx(v5_3_0, v5_3_1, v5_3_2, v5_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s5_3;
+            a5_2 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s5_0; a5_2 += dotx(v5_1_0, v5_1_1, v5_1_2, v5_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s5_1; a5_2 += dotx(v5_2_0, v5_2_1, v5_2_2, v5_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s5_2; a5_2 += dotx(v5_3_0, v5_3_1, v5_3_2, v5_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s5_3;
+            a5_3 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s5_0; a5_3 += dotx(v5_1_0, v5_1_1, v5_1_2, v5_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s5_1; a5_3 += dotx(v5_2_0, v5_2_1, v5_2_2, v5_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s5_2; a5_3 += dotx(v5_3_0, v5_3_1, v5_3_2, v5_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s5_3;
+            let w6_0 = w[(wb6 + wi + 0u32) as usize]; let s6_0 = s[(sb6 + k / 32 + 0u32) as usize];
+            let v6_0_0 = dec(w6_0, 0u32); let v6_0_1 = dec(w6_0, 1u32); let v6_0_2 = dec(w6_0, 2u32); let v6_0_3 = dec(w6_0, 3u32);
+            let w6_1 = w[(wb6 + wi + 32u32) as usize]; let s6_1 = s[(sb6 + k / 32 + 4u32) as usize];
+            let v6_1_0 = dec(w6_1, 0u32); let v6_1_1 = dec(w6_1, 1u32); let v6_1_2 = dec(w6_1, 2u32); let v6_1_3 = dec(w6_1, 3u32);
+            let w6_2 = w[(wb6 + wi + 64u32) as usize]; let s6_2 = s[(sb6 + k / 32 + 8u32) as usize];
+            let v6_2_0 = dec(w6_2, 0u32); let v6_2_1 = dec(w6_2, 1u32); let v6_2_2 = dec(w6_2, 2u32); let v6_2_3 = dec(w6_2, 3u32);
+            let w6_3 = w[(wb6 + wi + 96u32) as usize]; let s6_3 = s[(sb6 + k / 32 + 12u32) as usize];
+            let v6_3_0 = dec(w6_3, 0u32); let v6_3_1 = dec(w6_3, 1u32); let v6_3_2 = dec(w6_3, 2u32); let v6_3_3 = dec(w6_3, 3u32);
+            a6_0 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s6_0; a6_0 += dotx(v6_1_0, v6_1_1, v6_1_2, v6_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s6_1; a6_0 += dotx(v6_2_0, v6_2_1, v6_2_2, v6_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s6_2; a6_0 += dotx(v6_3_0, v6_3_1, v6_3_2, v6_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s6_3;
+            a6_1 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s6_0; a6_1 += dotx(v6_1_0, v6_1_1, v6_1_2, v6_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s6_1; a6_1 += dotx(v6_2_0, v6_2_1, v6_2_2, v6_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s6_2; a6_1 += dotx(v6_3_0, v6_3_1, v6_3_2, v6_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s6_3;
+            a6_2 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s6_0; a6_2 += dotx(v6_1_0, v6_1_1, v6_1_2, v6_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s6_1; a6_2 += dotx(v6_2_0, v6_2_1, v6_2_2, v6_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s6_2; a6_2 += dotx(v6_3_0, v6_3_1, v6_3_2, v6_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s6_3;
+            a6_3 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s6_0; a6_3 += dotx(v6_1_0, v6_1_1, v6_1_2, v6_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s6_1; a6_3 += dotx(v6_2_0, v6_2_1, v6_2_2, v6_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s6_2; a6_3 += dotx(v6_3_0, v6_3_1, v6_3_2, v6_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s6_3;
+            let w7_0 = w[(wb7 + wi + 0u32) as usize]; let s7_0 = s[(sb7 + k / 32 + 0u32) as usize];
+            let v7_0_0 = dec(w7_0, 0u32); let v7_0_1 = dec(w7_0, 1u32); let v7_0_2 = dec(w7_0, 2u32); let v7_0_3 = dec(w7_0, 3u32);
+            let w7_1 = w[(wb7 + wi + 32u32) as usize]; let s7_1 = s[(sb7 + k / 32 + 4u32) as usize];
+            let v7_1_0 = dec(w7_1, 0u32); let v7_1_1 = dec(w7_1, 1u32); let v7_1_2 = dec(w7_1, 2u32); let v7_1_3 = dec(w7_1, 3u32);
+            let w7_2 = w[(wb7 + wi + 64u32) as usize]; let s7_2 = s[(sb7 + k / 32 + 8u32) as usize];
+            let v7_2_0 = dec(w7_2, 0u32); let v7_2_1 = dec(w7_2, 1u32); let v7_2_2 = dec(w7_2, 2u32); let v7_2_3 = dec(w7_2, 3u32);
+            let w7_3 = w[(wb7 + wi + 96u32) as usize]; let s7_3 = s[(sb7 + k / 32 + 12u32) as usize];
+            let v7_3_0 = dec(w7_3, 0u32); let v7_3_1 = dec(w7_3, 1u32); let v7_3_2 = dec(w7_3, 2u32); let v7_3_3 = dec(w7_3, 3u32);
+            a7_0 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s7_0; a7_0 += dotx(v7_1_0, v7_1_1, v7_1_2, v7_1_3, x0_1_0, x0_1_1, x0_1_2, x0_1_3) * s7_1; a7_0 += dotx(v7_2_0, v7_2_1, v7_2_2, v7_2_3, x0_2_0, x0_2_1, x0_2_2, x0_2_3) * s7_2; a7_0 += dotx(v7_3_0, v7_3_1, v7_3_2, v7_3_3, x0_3_0, x0_3_1, x0_3_2, x0_3_3) * s7_3;
+            a7_1 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s7_0; a7_1 += dotx(v7_1_0, v7_1_1, v7_1_2, v7_1_3, x1_1_0, x1_1_1, x1_1_2, x1_1_3) * s7_1; a7_1 += dotx(v7_2_0, v7_2_1, v7_2_2, v7_2_3, x1_2_0, x1_2_1, x1_2_2, x1_2_3) * s7_2; a7_1 += dotx(v7_3_0, v7_3_1, v7_3_2, v7_3_3, x1_3_0, x1_3_1, x1_3_2, x1_3_3) * s7_3;
+            a7_2 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s7_0; a7_2 += dotx(v7_1_0, v7_1_1, v7_1_2, v7_1_3, x2_1_0, x2_1_1, x2_1_2, x2_1_3) * s7_1; a7_2 += dotx(v7_2_0, v7_2_1, v7_2_2, v7_2_3, x2_2_0, x2_2_1, x2_2_2, x2_2_3) * s7_2; a7_2 += dotx(v7_3_0, v7_3_1, v7_3_2, v7_3_3, x2_3_0, x2_3_1, x2_3_2, x2_3_3) * s7_3;
+            a7_3 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s7_0; a7_3 += dotx(v7_1_0, v7_1_1, v7_1_2, v7_1_3, x3_1_0, x3_1_1, x3_1_2, x3_1_3) * s7_1; a7_3 += dotx(v7_2_0, v7_2_1, v7_2_2, v7_2_3, x3_2_0, x3_2_1, x3_2_2, x3_2_3) * s7_2; a7_3 += dotx(v7_3_0, v7_3_1, v7_3_2, v7_3_3, x3_3_0, x3_3_1, x3_3_2, x3_3_3) * s7_3;
+            wi += 128;
+        }
+        while wi < words {
+            let k = wi * 4;
+            let x0_0_0 = x[(xb0 + k + 0u32) as usize]; let x0_0_1 = x[(xb0 + k + 1u32) as usize]; let x0_0_2 = x[(xb0 + k + 2u32) as usize]; let x0_0_3 = x[(xb0 + k + 3u32) as usize];
+            let x1_0_0 = x[(xb1 + k + 0u32) as usize]; let x1_0_1 = x[(xb1 + k + 1u32) as usize]; let x1_0_2 = x[(xb1 + k + 2u32) as usize]; let x1_0_3 = x[(xb1 + k + 3u32) as usize];
+            let x2_0_0 = x[(xb2 + k + 0u32) as usize]; let x2_0_1 = x[(xb2 + k + 1u32) as usize]; let x2_0_2 = x[(xb2 + k + 2u32) as usize]; let x2_0_3 = x[(xb2 + k + 3u32) as usize];
+            let x3_0_0 = x[(xb3 + k + 0u32) as usize]; let x3_0_1 = x[(xb3 + k + 1u32) as usize]; let x3_0_2 = x[(xb3 + k + 2u32) as usize]; let x3_0_3 = x[(xb3 + k + 3u32) as usize];
+            let w0_0 = w[(wb0 + wi + 0u32) as usize]; let s0_0 = s[(sb0 + k / 32 + 0u32) as usize];
+            let v0_0_0 = dec(w0_0, 0u32); let v0_0_1 = dec(w0_0, 1u32); let v0_0_2 = dec(w0_0, 2u32); let v0_0_3 = dec(w0_0, 3u32);
+            a0_0 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s0_0;
+            a0_1 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s0_0;
+            a0_2 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s0_0;
+            a0_3 += dotx(v0_0_0, v0_0_1, v0_0_2, v0_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s0_0;
+            let w1_0 = w[(wb1 + wi + 0u32) as usize]; let s1_0 = s[(sb1 + k / 32 + 0u32) as usize];
+            let v1_0_0 = dec(w1_0, 0u32); let v1_0_1 = dec(w1_0, 1u32); let v1_0_2 = dec(w1_0, 2u32); let v1_0_3 = dec(w1_0, 3u32);
+            a1_0 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s1_0;
+            a1_1 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s1_0;
+            a1_2 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s1_0;
+            a1_3 += dotx(v1_0_0, v1_0_1, v1_0_2, v1_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s1_0;
+            let w2_0 = w[(wb2 + wi + 0u32) as usize]; let s2_0 = s[(sb2 + k / 32 + 0u32) as usize];
+            let v2_0_0 = dec(w2_0, 0u32); let v2_0_1 = dec(w2_0, 1u32); let v2_0_2 = dec(w2_0, 2u32); let v2_0_3 = dec(w2_0, 3u32);
+            a2_0 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s2_0;
+            a2_1 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s2_0;
+            a2_2 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s2_0;
+            a2_3 += dotx(v2_0_0, v2_0_1, v2_0_2, v2_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s2_0;
+            let w3_0 = w[(wb3 + wi + 0u32) as usize]; let s3_0 = s[(sb3 + k / 32 + 0u32) as usize];
+            let v3_0_0 = dec(w3_0, 0u32); let v3_0_1 = dec(w3_0, 1u32); let v3_0_2 = dec(w3_0, 2u32); let v3_0_3 = dec(w3_0, 3u32);
+            a3_0 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s3_0;
+            a3_1 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s3_0;
+            a3_2 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s3_0;
+            a3_3 += dotx(v3_0_0, v3_0_1, v3_0_2, v3_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s3_0;
+            let w4_0 = w[(wb4 + wi + 0u32) as usize]; let s4_0 = s[(sb4 + k / 32 + 0u32) as usize];
+            let v4_0_0 = dec(w4_0, 0u32); let v4_0_1 = dec(w4_0, 1u32); let v4_0_2 = dec(w4_0, 2u32); let v4_0_3 = dec(w4_0, 3u32);
+            a4_0 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s4_0;
+            a4_1 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s4_0;
+            a4_2 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s4_0;
+            a4_3 += dotx(v4_0_0, v4_0_1, v4_0_2, v4_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s4_0;
+            let w5_0 = w[(wb5 + wi + 0u32) as usize]; let s5_0 = s[(sb5 + k / 32 + 0u32) as usize];
+            let v5_0_0 = dec(w5_0, 0u32); let v5_0_1 = dec(w5_0, 1u32); let v5_0_2 = dec(w5_0, 2u32); let v5_0_3 = dec(w5_0, 3u32);
+            a5_0 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s5_0;
+            a5_1 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s5_0;
+            a5_2 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s5_0;
+            a5_3 += dotx(v5_0_0, v5_0_1, v5_0_2, v5_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s5_0;
+            let w6_0 = w[(wb6 + wi + 0u32) as usize]; let s6_0 = s[(sb6 + k / 32 + 0u32) as usize];
+            let v6_0_0 = dec(w6_0, 0u32); let v6_0_1 = dec(w6_0, 1u32); let v6_0_2 = dec(w6_0, 2u32); let v6_0_3 = dec(w6_0, 3u32);
+            a6_0 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s6_0;
+            a6_1 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s6_0;
+            a6_2 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s6_0;
+            a6_3 += dotx(v6_0_0, v6_0_1, v6_0_2, v6_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s6_0;
+            let w7_0 = w[(wb7 + wi + 0u32) as usize]; let s7_0 = s[(sb7 + k / 32 + 0u32) as usize];
+            let v7_0_0 = dec(w7_0, 0u32); let v7_0_1 = dec(w7_0, 1u32); let v7_0_2 = dec(w7_0, 2u32); let v7_0_3 = dec(w7_0, 3u32);
+            a7_0 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x0_0_0, x0_0_1, x0_0_2, x0_0_3) * s7_0;
+            a7_1 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x1_0_0, x1_0_1, x1_0_2, x1_0_3) * s7_0;
+            a7_2 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x2_0_0, x2_0_1, x2_0_2, x2_0_3) * s7_0;
+            a7_3 += dotx(v7_0_0, v7_0_1, v7_0_2, v7_0_3, x3_0_0, x3_0_1, x3_0_2, x3_0_3) * s7_0;
+            wi += 32;
+        }
+        let t0_0 = plane_sum(a0_0); let t0_1 = plane_sum(a0_1); let t0_2 = plane_sum(a0_2); let t0_3 = plane_sum(a0_3);
+        let t1_0 = plane_sum(a1_0); let t1_1 = plane_sum(a1_1); let t1_2 = plane_sum(a1_2); let t1_3 = plane_sum(a1_3);
+        let t2_0 = plane_sum(a2_0); let t2_1 = plane_sum(a2_1); let t2_2 = plane_sum(a2_2); let t2_3 = plane_sum(a2_3);
+        let t3_0 = plane_sum(a3_0); let t3_1 = plane_sum(a3_1); let t3_2 = plane_sum(a3_2); let t3_3 = plane_sum(a3_3);
+        let t4_0 = plane_sum(a4_0); let t4_1 = plane_sum(a4_1); let t4_2 = plane_sum(a4_2); let t4_3 = plane_sum(a4_3);
+        let t5_0 = plane_sum(a5_0); let t5_1 = plane_sum(a5_1); let t5_2 = plane_sum(a5_2); let t5_3 = plane_sum(a5_3);
+        let t6_0 = plane_sum(a6_0); let t6_1 = plane_sum(a6_1); let t6_2 = plane_sum(a6_2); let t6_3 = plane_sum(a6_3);
+        let t7_0 = plane_sum(a7_0); let t7_1 = plane_sum(a7_1); let t7_2 = plane_sum(a7_2); let t7_3 = plane_sum(a7_3);
+        if UNIT_POS_X == 0 {
+            if row0 + 0u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 0u32) as usize] = t0_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 0u32) as usize] = t0_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 0u32) as usize] = t0_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 0u32) as usize] = t0_3; }
+            }
+            if row0 + 1u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 1u32) as usize] = t1_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 1u32) as usize] = t1_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 1u32) as usize] = t1_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 1u32) as usize] = t1_3; }
+            }
+            if row0 + 2u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 2u32) as usize] = t2_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 2u32) as usize] = t2_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 2u32) as usize] = t2_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 2u32) as usize] = t2_3; }
+            }
+            if row0 + 3u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 3u32) as usize] = t3_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 3u32) as usize] = t3_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 3u32) as usize] = t3_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 3u32) as usize] = t3_3; }
+            }
+            if row0 + 4u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 4u32) as usize] = t4_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 4u32) as usize] = t4_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 4u32) as usize] = t4_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 4u32) as usize] = t4_3; }
+            }
+            if row0 + 5u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 5u32) as usize] = t5_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 5u32) as usize] = t5_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 5u32) as usize] = t5_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 5u32) as usize] = t5_3; }
+            }
+            if row0 + 6u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 6u32) as usize] = t6_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 6u32) as usize] = t6_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 6u32) as usize] = t6_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 6u32) as usize] = t6_3; }
+            }
+            if row0 + 7u32 < rows {
+                if nt > 0u32 { out[(ooff + 0u32 * ost + row0 + 7u32) as usize] = t7_0; }
+                if nt > 1u32 { out[(ooff + 1u32 * ost + row0 + 7u32) as usize] = t7_1; }
+                if nt > 2u32 { out[(ooff + 2u32 * ost + row0 + 7u32) as usize] = t7_2; }
+                if nt > 3u32 { out[(ooff + 3u32 * ost + row0 + 7u32) as usize] = t7_3; }
+            }
         }
     }
 }
@@ -1464,6 +1907,19 @@ impl Cube {
         Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
     }    pub fn buf(&self, v: &[f32]) -> Handle { self.client.create_from_slice(f32::as_bytes(v)) }
     pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
+    /// Start a readback now (its fence follows the work enqueued so far) and finish it later with `read_finish`,
+    /// so work enqueued in between does not delay it (the verify wavefront).
+    pub fn read_start(&self, h: &Handle) -> impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>> + Send + '_ { self.client.read_async(vec![h.clone()]) }
+    pub fn read_finish(&self, f: impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>>) -> Vec<f32> {
+        let t0 = std::time::Instant::now();
+        struct W(std::thread::Thread); impl std::task::Wake for W { fn wake(self: std::sync::Arc<Self>) { self.0.unpark(); } }
+        let wk = std::task::Waker::from(std::sync::Arc::new(W(std::thread::current()))); let mut cx = std::task::Context::from_waker(&wk);
+        let mut f = std::pin::pin!(f);
+        let b = loop { if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) { break v.expect("gpu readback").remove(0); } std::thread::park(); };
+        let v = f32::from_bytes(&b).to_vec();
+        super::qn_gpu::GPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); super::qn_gpu::GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        v
+    }
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         let b = self.client.read_one(h.clone()).expect("gpu readback");
@@ -1514,6 +1970,23 @@ impl Cube {
             return;
         }
         let mut c0 = 0;
+        // PYRE_QN_GEMV4R=0: the one-row-per-warp k_gemv4
+        if std::env::var("PYRE_QN_GEMV4R").map(|v| v == "8").unwrap_or(false) {
+            while c0 < nt { let n = (nt - c0).min(4);
+                unsafe { k_gemv4r8::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE * 8), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                    BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+                    BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
+                c0 += n; }
+            return;
+        }
+        if std::env::var("PYRE_QN_GEMV4R").map(|v| v != "0").unwrap_or(true) {
+            while c0 < nt { let n = (nt - c0).min(4);
+                unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE * 4), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                    BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+                    BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
+                c0 += n; }
+            return;
+        }
         while c0 < nt { let n = (nt - c0).min(4);
             unsafe { k_gemv4::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),

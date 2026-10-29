@@ -72,7 +72,7 @@ pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, 
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct Model { xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -95,6 +95,8 @@ pub struct State {
     spec_sel: Vec<Vec<(usize, usize)>>,
     /// set while a prompt runs through the verify path (PYRE_QN_PF_MULTI): no rollback checkpoints
     pf: bool,
+    /// MTP drafter: main-model final residuals by position (recent window) and the drafter's own K/V
+    mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, mtp_kv: super::mtp::Kv,
 }
 
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
@@ -167,7 +169,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -579,7 +581,7 @@ impl Model {
 
     pub fn new_state(&self) -> State {
         let c = &self.cfg; let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv;
-        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![], spec_sel: vec![], pf: false };
+        let mut st = State { kvg: vec![], gdn: vec![], gdn_gpu: false, tokens: vec![], conv: vec![], ssm: vec![], k: vec![], v: vec![], ik: vec![], ib: vec![], ple_hist: vec![], ck: vec![], ple_ck: vec![], spec_sel: vec![], pf: false, mtp_r: Default::default(), mtp_kv: Default::default() };
         for l in &self.layers {
             match l.mix { Mixer::Lin { .. } => { st.conv.push(vec![0.0; (c.conv_k - 1) * ch]); st.ssm.push(vec![0.0; c.lin_nv * c.lin_dk * c.lin_dv]); }, Mixer::Attn { .. } => { st.k.push(vec![]); st.v.push(vec![]); st.ik.push(vec![]); st.ib.push(vec![]); } }
             if l.ple.is_some() { st.ple_hist.push(vec![0.0; (c.ple_conv_k - 1) * c.ple_ngram * c.hc * c.d]); }
@@ -1076,7 +1078,10 @@ impl Model {
             if dbg { eprintln!("layer {il}: x[0,:4] = {:?}", &x[(t - 1) * hc * d..(t - 1) * hc * d + 4]); }
         }
         if let Some(h) = xc.take() { x = self.cube.as_ref().unwrap().read(&h); }
-        if let Some(v) = xd.take() { let r = self.gpu.as_ref().unwrap().read(v.slice([t - 1..t, 0..hc * d])); x[(t - 1) * hc * d..t * hc * d].copy_from_slice(&r); }
+        let gpu_rows = xd.is_some();
+        let t0 = if self.mtp.is_some() { t.saturating_sub(self.mtp.as_ref().unwrap().window) } else { t - 1 };
+        if let Some(v) = xd.take() { let r = self.gpu.as_ref().unwrap().read(v.slice([t0..t, 0..hc * d])); x[t0 * hc * d..t * hc * d].copy_from_slice(&r); }
+        let _ = gpu_rows; if self.mtp.is_some() { for ti in t0..t { self.mtp_keep_r(st, start + ti, &x[ti * hc * d..(ti + 1) * hc * d]); } }
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
@@ -1102,7 +1107,56 @@ impl Model {
     }
 
     /// MTP drafter (see `mtp`); None when no MTP layer is loaded.
-    pub fn mtp_draft(&self, _st: &mut State, _history: &[u32], _k: usize, _s: Option<&mut crate::sampler::Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> { None }
+    pub fn mtp_draft(&self, st: &mut State, history: &[u32], k: usize, _s: Option<&mut crate::sampler::Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> {
+        let m = self.mtp.as_ref()?; let n = st.tokens.len(); let pending = *history.last()?;
+        if n == 0 || k == 0 { return None; }
+        let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
+        let mut kv = std::mem::take(&mut st.mtp_kv); kv.truncate(n - 1, row);
+        // catch-up: cells i < n-1 whose residual is known (token i+1 is committed)
+        let first = st.mtp_r.front().map(|r| r.0).unwrap_or(n);
+        let lo = if kv.n > 0 && kv.end() >= first { kv.end() } else { first.max((n - 1).saturating_sub(m.window)) };
+        if lo < n - 1 {
+            let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
+            for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
+            if ok { m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo); } else { kv = Default::default(); }
+        }
+        let t1 = std::time::Instant::now();
+        let mut r = self.mtp_r_get(st, n - 1)?.to_vec(); let mut tok = pending; let mut out = vec![];
+        let min_p: f32 = env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let mut e = vec![0f32; d];
+        for j in 0..k {
+            self.embd.row(tok as usize, &mut e);
+            let (s, r2) = m.step(&mut kv, &r, &e, n - 1 + j);
+            // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
+            let (id, p) = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
+            if j > 0 && p < min_p { break; }
+            out.push((id, None)); r = r2; tok = id;
+        }
+        kv.truncate(n, row); st.mtp_kv = kv;
+        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: catch-up {:.1} ms, {} drafts {:.1} ms | {:?}", (t1 - t0).as_secs_f64() * 1e3, out.len(), t1.elapsed().as_secs_f64() * 1e3, super::mtp::TM.iter().map(|a| (a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e5).round() / 10.0).collect::<Vec<_>>()); }
+        Some(out)
+    }
+    fn mtp_keep_r(&self, st: &mut State, pos: usize, x: &[f32]) {
+        let Some(m) = &self.mtp else { return };
+        while st.mtp_r.back().is_some_and(|r| r.0 >= pos) { st.mtp_r.pop_back(); }
+        if st.mtp_r.back().is_some_and(|r| r.0 + 1 != pos) { st.mtp_r.clear(); }
+        st.mtp_r.push_back((pos, x.to_vec()));
+        while st.mtp_r.len() > m.window + 16 { st.mtp_r.pop_front(); }
+    }
+    fn mtp_r_get<'a>(&self, st: &'a State, pos: usize) -> Option<&'a [f32]> { let f = st.mtp_r.front()?.0; st.mtp_r.get(pos.checked_sub(f)?).filter(|r| r.0 == pos).map(|r| r.1.as_slice()) }
+    /// Load the MTP drafter (scripts/mtp_fetch.py's file) when speculative MTP drafting is enabled.
+    pub fn load_mtp(&mut self) -> Result<()> {
+        if !crate::spec::mtp_on() { return Ok(()); }
+        let Some(p) = super::mtp::find() else { return Ok(()) };
+        let c = &self.cfg; let t = std::time::Instant::now();
+        let geo = super::mtp::Geo { d: c.d, hc: c.hc, nh: c.n_head, nkv: c.n_kv, hd: c.hd, n_rot: c.n_rot, eps: c.eps, top_k: c.top_k, rope_base: c.rope_base };
+        let ids = super::mtp::draft_vocab(self.out.rows); let out = &self.out;
+        let ids = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { vec![] } else { ids };
+        let m = super::mtp::Mtp::load(&p, &geo, ids, |r, y| out.row(r, y))?;
+        if env_var("PYRE_MTP_LAZY").is_err() { m.warm(); }
+        eprintln!("mtp: drafter {} loaded in {:.1} s", p.display(), t.elapsed().as_secs_f64());
+        self.mtp = Some(m); Ok(())
+    }
 
     // ---- speculative decoding: multi-token verify on the decode (CubeCL) path, with rollback ----
 
@@ -1145,6 +1199,41 @@ impl Model {
         st.ple_ck = vec![vec![]; st.ple_hist.len()];
         let (mut li, mut ai, mut pi) = (0, 0, 0);
         let mut xs: Option<Vec<burn_cubecl::cubecl::server::Handle>> = None;
+        // PYRE_QN_WAVE=1: the window in two token groups, pipelined so the GPU runs one group's dense part while
+        // the CPU runs the other's routed experts (each token's arithmetic is unchanged; Strata overlaps the
+        // same two phases across its batch groups)
+        if t >= 2 && env_var("PYRE_QN_WAVE").map(|v| v != "0").unwrap_or(false) {
+            let ta = t.div_ceil(2); let grp = [(0usize, ta), (ta, t)];
+            let mut ctr = vec![]; { let (mut a, mut b) = (0, 0); for l in &self.layers { ctr.push((a, b)); match l.mix { Mixer::Attn { .. } => a += 1, Mixer::Lin { .. } => b += 1 } } }
+            let stages: Vec<(usize, usize)> = (0..self.layers.len()).flat_map(|il| [(il, 0usize), (il, 1usize)]).collect();
+            let mut dq: [Option<(H, H, H)>; 2] = [None, None];
+            for (i, &(il, g)) in stages.iter().enumerate() {
+                let l = &self.layers[il]; let cl = self.cl[il].as_ref().unwrap(); let (o0, o1) = grp[g];
+                if dq[g].is_none() {
+                    if g == 0 { if let Some(p) = &l.ple {
+                        if let Some(hs) = xs.take() { xh = hs.iter().map(|h| cb.read(h)).collect(); }
+                        let mut h = std::mem::take(&mut st.ple_hist[pi]);
+                        for ti in 0..t { self.ple(p, &mut h, &emb.as_ref().unwrap()[ti * ew..(ti + 1) * ew], &mut xh[ti], 1); if ti + 1 < t && !st.pf { st.ple_ck[pi].push(h.clone()); } }
+                        st.ple_hist[pi] = h; pi += 1;
+                    } }
+                    if xs.is_none() { xs = Some(xh.iter().map(|v| cb.buf(v)).collect()); }
+                    dq[g] = Some(self.lcm_dense(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, ctr[il].0, ctr[il].1, start + o0, o0, t));
+                }
+                let dd = dq[g].take().unwrap();
+                let q4 = std::time::Instant::now();
+                let fut = cb.read_start(&dd.0);
+                if let Some(&(nl, ng)) = stages.get(i + 1) { if !(ng == 0 && self.layers[nl].ple.is_some()) {
+                    let (n0, n1) = grp[ng];
+                    dq[ng] = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xs.as_ref().unwrap()[n0..n1], st, ctr[nl].0, ctr[nl].1, start + n0, n0, t));
+                    let _ = cb.client.flush();
+                } }
+                let q4b = std::time::Instant::now();
+                let rall = cb.read_finish(fut);
+                HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                WV[g].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); WV[2].fetch_add((q4b - q4).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0);
+            }
+        } else {
         for (il, l) in self.layers.iter().enumerate() {
             if let Some(p) = &l.ple {
                 if let Some(hs) = xs.take() { xh = hs.iter().map(|h| cb.read(h)).collect(); }
@@ -1156,9 +1245,12 @@ impl Model {
             if xs.is_none() { xs = Some(xh.iter().map(|v| cb.buf(v)).collect()); }
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
+        }
         let hs = xs.unwrap();
-        let lg: Vec<Vec<f32>> = hs.iter().skip(if last_only { t - 1 } else { 0 }).map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.head_logits(&hh) }).collect();
+        let mut lg: Vec<Vec<f32>> = vec![];
+        for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); lg.push(self.head_logits(&hh)); }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
+            eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }
@@ -1198,13 +1290,24 @@ impl Model {
     /// then one routing pass where the CPU pool reads every missed expert once for all of its tokens.
     #[allow(clippy::too_many_arguments)]
     fn layer_cube_multi(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
-        type H = burn_cubecl::cubecl::server::Handle;
-        let t = xs.len();
-        let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
         let (ai0, li0) = (*ai, *li);
-        let lra = cl.hca.up.cols; let lrf = cl.hcf.up.cols; let rn = d + cl.fin.rows; let pr = cl.min.rows;
+        let dd = self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len());
+        match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
+        let q4 = std::time::Instant::now(); let rall = self.cube.as_ref().unwrap().read(&dd.0);
+        HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
+    }
+    /// The dense (GPU) half of a verify layer for tokens xs (window offset `off` of `ttot`, at positions start..):
+    /// everything up to the router / shared-expert projection `rd`, enqueued only. Returns (rd, df, da).
+    fn lcm_dense(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai0: usize, li0: usize, start: usize, off: usize, ttot: usize) -> (H, H, H) {
+        type H = burn_cubecl::cubecl::server::Handle;
+        let t = xs.len(); let _ = il;
+        let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc) = (c.d, c.hc); let w = hc * d;
+        let lra = cl.hca.up.cols; let rn = d + cl.fin.rows; let pr = cl.min.rows;
         let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
         let q0 = std::time::Instant::now();
+        let lra = cl.hca.up.cols; let lrf = cl.hcf.up.cols; let rn = d + cl.fin.rows; let pr = cl.min.rows;
+        let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
         // attention hyper-connection read + mixer input projection, the big GEMVs batched over the t tokens
         let (dar, dfr) = (cl.hca.di.rows, cl.hcf.di.rows);
         let xn = cb.empty(t * w); let da = cb.empty(t * dar); let mixed = cb.empty(t * d); let proj = cb.empty(t * pr);
@@ -1223,8 +1326,8 @@ impl Model {
                 let co = cb.empty(ch);
                 cb.conv(&pj, pr, &gw.conv, &cs, &co, ch, c.conv_k);
                 cb.delta(&co, ch, &pj, pr, gw, &ss, &at(&core, ti * core_n), nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
-                if ti + 1 < t && !st.pf { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
-                    let (a, b) = &st.ck[ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
+                if off + ti + 1 < ttot && !st.pf { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
+                    let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
             } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && pos + 1 <= self.dense_n()) {
                 let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
                 self.kv_push(cb, ai0, st, pos + 1);
@@ -1241,7 +1344,6 @@ impl Model {
                 let cbuf = cb.buf(&cv); cb.copy(&cbuf, core_n, 0, &core, t * core_n, ti * core_n, core_n);
             }
         }
-        match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
         let o = cb.empty(t * d);
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
@@ -1250,8 +1352,18 @@ impl Model {
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);
-        let q4 = std::time::Instant::now();
-        let rall = cb.read(&rd);
+        HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        (rd, df, da)
+    }
+    /// The expert half of a verify layer: routing from `rall` (rd read back), cached experts on the GPU beside the
+    /// CPU misses, and the residual update of xs.
+    fn lcm_moe(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, dd: (H, H, H), rall: Vec<f32>, off: usize) {
+        type H = burn_cubecl::cubecl::server::Handle;
+        let t = xs.len();
+        let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp);
+        let lrf = cl.hcf.up.cols; let rn = d + cl.fin.rows; let dfr = cl.hcf.di.rows;
+        let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
+        let (rd, df, _da) = dd;
         let rvs: Vec<Vec<f32>> = (0..t).map(|ti| rall[ti * rn..(ti + 1) * rn].to_vec()).collect();
         let dfs: Vec<H> = (0..t).map(|ti| at(&df, ti * dfr)).collect();
         let rds: Vec<H> = (0..t).map(|ti| at(&rd, ti * rn)).collect();
@@ -1267,7 +1379,7 @@ impl Model {
             let (mut ons, mut offs) = (Vec::with_capacity(t), Vec::with_capacity(t));
             for (ti, rv) in rvs.iter().enumerate() {
                 let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg));
-                for &(e, _) in &sel { xcg.cnt[il][e] += 1; if let Some(v) = st.spec_sel.get_mut(ti) { v.push((il, e)); } }
+                for &(e, _) in &sel { xcg.cnt[il][e] += 1; if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
                 xcg.total += sel.len() as u64;
                 let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             // Strata-style PCIe share: the first few misses are copied into the stream slots and run on the GPU
@@ -1333,10 +1445,11 @@ impl Model {
             cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d);
         }
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
-        HY[0].fetch_add(ns(q0, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q4, q5), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
+        HY[0].fetch_add(ns(q6, std::time::Instant::now()), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
     }
 }
 
+static WV: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
