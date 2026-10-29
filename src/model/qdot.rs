@@ -1,3 +1,4 @@
+//! (AVX-VNNI row copies and the gathered IQ2_S decode follow Strata's iq_avx2 CPU kernels, MIT.)
 //! Integer dot products of i-quant / Q2_0 weight rows against Q8-quantized activations, for the
 //! routed experts on the CPU. The approach is ggml's `vec_dot_*_q8_K` idea (and Strata's CPU
 //! expert pool, which uses ggml's kernels): never expand weights to floats; quantize the activation
@@ -301,6 +302,8 @@ pub fn quantize_k_into(x: &[f32], a: &mut Q8K) {
     for k in 0..n / 8 { a.s8[k] = a.q[8 * k..8 * k + 8].iter().map(|&v| v as i32).sum(); }
 }
 /// AVX-VNNI present (Alder Lake and later) and not disabled with PYRE_QN_VNNI=0.
+/// PYRE_QN_GATHER=1: IQ2_S grid lookups with vpgatherdq (opt-in until measured).
+pub fn gather() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_GATHER").map(|v| v == "1").unwrap_or(false)) }
 pub fn vnni() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| { #[cfg(target_arch = "x86_64")] { std::env::var("PYRE_QN_VNNI").map(|v| v != "0").unwrap_or(true) && is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") } #[cfg(not(target_arch = "x86_64"))] { false } }) }
 pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M) }
 pub fn row_dot_k(t: QType, row: &[u8], a: &Q8K) -> f32 {
@@ -322,6 +325,13 @@ mod kk {
         let xv = _mm256_loadu_si256(x as *const __m256i);
         let p = _mm256_maddubs_epi16(g, _mm256_sign_epi8(xv, s));
         if V { _mm256_dpwssd_avx_epi32(acc, p, sc) } else { _mm256_add_epi32(acc, _mm256_madd_epi16(p, sc)) }
+    }
+    /// IQ2_S grid words for one 32-value chunk with one vpgatherdq (the indices built in a register: Strata's
+    /// gathered decode, iq_avx2.cpp). Same words in the same lanes as the scalar loads.
+    #[inline(always)] pub unsafe fn g2s(qs: *const u8, h: usize) -> __m256i {
+        let q = _mm_cvtepu8_epi32(_mm_cvtsi32_si128((qs as *const i32).read_unaligned()));
+        let hi = _mm_and_si128(_mm_sllv_epi32(_mm_set1_epi32(h as i32), _mm_setr_epi32(8, 6, 4, 2)), _mm_set1_epi32(0x300));
+        _mm256_i32gather_epi64::<8>(super::IQ2S_GRID.as_ptr() as *const i64, _mm_or_si128(q, hi))
     }
     #[inline(always)] pub unsafe fn sc2(lo: i32, hi: i32) -> __m256i { _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)) }
     /// 32 sign bytes (+1/-1) from 32 bits
@@ -350,7 +360,7 @@ unsafe fn iq2s_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
         let mut ia = _mm256_setzero_si256();
         for ib in 0..8 { let h = *qh.add(ib) as usize;
             let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
-            let g = _mm256_set_epi64x(q(3), q(2), q(1), q(0));
+            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
             ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
@@ -508,8 +518,9 @@ unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out:
         let dw = match t {
             QType::IQ2S => { let b = rp.add(i * 82); let (qs, sgp, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
                 for ib in 0..8 { let h = *qh.add(ib) as usize;
+                    if gather() { g[ib] = kk::g2s(qs.add(4 * ib), h); } else {
                     let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
-                    g[ib] = _mm256_set_epi64x(q(3), q(2), q(1), q(0));
+                    g[ib] = _mm256_set_epi64x(q(3), q(2), q(1), q(0)); }
                     sg[ib] = kk::signs((sgp.add(4 * ib) as *const u32).read_unaligned());
                     let sbv = *sb.add(ib); sc[ib] = kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1); }
                 f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() }

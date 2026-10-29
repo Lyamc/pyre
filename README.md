@@ -717,3 +717,12 @@ speedup with a larger share of the experts on the GPU and the whole drafter on t
 `PYRE_QN_TAIL_SKIP=R` (opt-in, changes outputs, default off) is new. It skips an expert that missed the GPU cache
 when the expert ranks R or lower among that token's top-k. Strata turns its version (rank 7, per verify window)
 on by default on CUDA, which accounts for part of the gap between its decode speed and our exact decode.
+
+### CPU expert rows: AVX-VNNI and hybrid-core workers
+
+Following Strata's AVX2 i-quant expert kernels (iq_avx2), which take an AVX-VNNI copy of the row loops on Alder Lake and
+later, pyre's IQ2_S / IQ2_XXS / IQ1_M Q8_K rows use `vpdpwssd` for each madd + add where the CPU has AVX-VNNI (the same
+integer sums, so identical output; `PYRE_QN_VNNI=0` turns it off). The expert pool now also puts one pinned worker on
+each E-core after the P-cores (`PYRE_QN_ECORES=0` restores P-cores only). On an i9-13900K + RTX 3060 these took plain
+decode from ~20.3 to ~22.3 tok/s, greedy-identical. `PYRE_QN_GATHER=1` (vpgatherdq grid decode, also after Strata)
+is opt-in: no measurable gain here.
