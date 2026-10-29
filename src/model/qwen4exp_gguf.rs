@@ -202,14 +202,14 @@ impl Model {
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
                 self.cl = cl;
-                // routed-expert cache (opt-in, PYRE_QN_XCACHE_GB=<GiB>): up to that much of the VRAM left above the reserve
+                // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
-                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(0); // off by default: on the RTX 3060 decode is faster without it (CPU experts 15.3 vs 13.9 tok/s story), and it frees ~2.7 GB VRAM
+                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(8usize << 30); // default on: with the one-arena fast path it wins ~19.5 vs ~14.7 tok/s; the real size is set by XHEAD_MB (2048 keeps ~2 GB free, smaller heads page and get slower)
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
-                    let nslot = budget / slot; let per = (env_usize("PYRE_QN_ARENA_MB").map(|m| m << 20).unwrap_or(budget) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
+                    let nslot = budget / slot; let per = (env_usize("PYRE_QN_ARENA_MB").map(|m| m << 20).unwrap_or(budget.min(2560 << 20)) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); }
                 self.cube = Some(cb);
             }
@@ -344,9 +344,12 @@ impl Model {
             // CPU workers start on the missed experts while this thread enqueues the GPU side
             let mut gpu = || {
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
-                let fast = !on.is_empty() && xcg.arena.len() == 1 && xfast() && {
+                let fast = !on.is_empty() && xfast() && tys.0 == tys.1 && tys.0 <= 1 && tys.2 == 3 && {
                     let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
-                    cb.xrun_fast(&xcg.tabs, &xcg.arena[0], xcg.ar_bytes, &ents, &rd, rn, d, c.ff_exp, tys, &xcg.scr) };
+                    let mut first = true; let mut ok = true;
+                    for ai in 0..xcg.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ai).cloned().collect(); if grp.is_empty() { continue; }
+                        ok &= cb.xrun_fast(&xcg.tabs, &xcg.arena[ai], xcg.ar_bytes, &grp, &rd, rn, d, c.ff_exp, tys, &xcg.scr, !first); first = false; }
+                    ok };
                 if fast { yg = Some(xcg.scr.y.clone()); }
                 if !on.is_empty() && !fast {
                     let xb = cb.empty(d); let y0 = cb.empty(d);
