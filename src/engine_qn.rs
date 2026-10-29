@@ -51,7 +51,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     for c in prompt[cached..].chunks(chunk) { logits = m.forward(c, &mut st); }
     tm.prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
     tm.prompt_per_second = tm.prompt_n as f64 / (tm.prompt_ms / 1e3);
-    let k = r.params.spec.unwrap_or_else(crate::spec::draft_len).min(8);
+    let k = r.params.spec.or_else(crate::spec::draft_len_explicit).unwrap_or_else(|| m.spec_default()).min(8);
     let mut sampler = Sampler::new(r.params);
     let max_stop = r.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     let (mut out, mut history) = (Vec::<u32>::new(), prompt.clone());

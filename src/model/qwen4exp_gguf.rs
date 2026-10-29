@@ -1223,6 +1223,9 @@ impl Model {
     }
     fn mtp_r_get<'a>(&self, st: &'a State, pos: usize) -> Option<&'a [f32]> { let f = st.mtp_r.front()?.0; st.mtp_r.get(pos.checked_sub(f)?).filter(|r| r.0 == pos).map(|r| r.1.as_slice()) }
     /// Load the MTP drafter (scripts/mtp_fetch.py's file) when speculative MTP drafting is enabled.
+    /// Default draft length: 2 (MTP spec2, greedy-identical and measured faster) when the MTP drafter
+    /// loaded and multi-token verify can run; otherwise 0 (plain decode).
+    pub fn spec_default(&self) -> usize { if self.mtp.is_some() && self.multi_ok() { 2 } else { 0 } }
     pub fn load_mtp(&mut self) -> Result<()> {
         if !crate::spec::mtp_on() { return Ok(()); }
         let Some(p) = super::mtp::find() else { return Ok(()) };

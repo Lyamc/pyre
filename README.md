@@ -752,3 +752,9 @@ During speculative verify (2-4 tokens), each GDN layer runs one k_delta_m launch
 state column in registers across the window and writes the per-token checkpoints, instead of one
 k_delta launch per token. Greedy-identical (same per-token arithmetic). Measured on RTX 3060:
 spec2 pA 22.9 -> 24.2 tok/s, spec3 pA 21.2 -> 22.3, spec2 pB 18.8 -> 20.0. PYRE_QN_DELTAM=0 disables.
+
+
+### MTP spec2 is the default
+`qwen-next` and the server now default to speculative decoding with draft length 2 (MTP drafter) when
+the MTP file is found and multi-token verify can run; otherwise they fall back to plain decode. Greedy
+output is identical. `--spec 0` (or PYRE_SPEC=0 / config `spec: 0`) disables; `--spec N` sets the length.

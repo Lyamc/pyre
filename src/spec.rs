@@ -22,6 +22,12 @@ pub fn draft_len() -> usize {
     let d = std::env::var("PYRE_SPEC").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
     DRAFT.store(d, Relaxed); d
 }
+/// Draft length set explicitly (set_draft_len or PYRE_SPEC); None = let the model pick its default.
+pub fn draft_len_explicit() -> Option<usize> {
+    let v = DRAFT.load(Relaxed);
+    if v != usize::MAX { return Some(v); }
+    std::env::var("PYRE_SPEC").ok().and_then(|s| s.parse().ok())
+}
 pub fn set_draft_len(n: usize) { DRAFT.store(n.min(8), Relaxed); }
 pub fn ngram_on() -> bool { NGRAM.load(Relaxed) && std::env::var("PYRE_SPEC_NGRAM").map(|v| v != "0").unwrap_or(true) }
 pub fn set_ngram(on: bool) { NGRAM.store(on, Relaxed); }
