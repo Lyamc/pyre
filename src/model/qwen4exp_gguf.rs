@@ -37,7 +37,7 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
-pub struct Model { xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
+pub struct Model { headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -130,7 +130,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
+        Ok(Model { headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -202,6 +202,8 @@ impl Model {
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
                 self.cl = cl;
+                // LM head on the GPU (PYRE_QN_GPUHEAD=0 keeps it on the CPU): ~3 ms/token on the host otherwise
+                if std::env::var("PYRE_QN_GPUHEAD").map(|v| v != "0").unwrap_or(true) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
                 let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
@@ -948,7 +950,7 @@ impl Model {
         let last = &x[(t - 1) * hc * d..t * hc * d];
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
-        let lg = self.mm(&[&self.out], &h, 1).pop().unwrap();
+        let lg = self.head_logits(&h);
         if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
@@ -984,6 +986,10 @@ impl Model {
     /// Every token goes through exactly the kernels of one-token decode (so greedy output is identical);
     /// what is shared is the CPU expert work: each routed expert's weights are read once for all tokens
     /// that picked it. Checkpoints the recurrent state after every token so `spec_keep` can roll back.
+    fn head_logits(&self, h: &[f32]) -> Vec<f32> {
+        if let (Some(hm), Some(cb)) = (&self.headc, &self.cube) { let xb = cb.buf(h); let o = cb.empty(hm.rows); cb.gemv(hm, &xb, h.len(), 0, &o, hm.rows, 0); return cb.read(&o); }
+        self.mm(&[&self.out], h, 1).pop().unwrap()
+    }
     pub fn forward_multi(&self, ids: &[u32], st: &mut State) -> Vec<Vec<f32>> {
         let t = ids.len();
         if t == 1 || !self.multi_ok() {
@@ -1019,7 +1025,7 @@ impl Model {
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
         let hs = xs.unwrap();
-        let lg: Vec<Vec<f32>> = hs.iter().map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.mm(&[&self.out], &hh, 1).pop().unwrap() }).collect();
+        let lg: Vec<Vec<f32>> = hs.iter().map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.head_logits(&hh) }).collect();
         if std::env::var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
