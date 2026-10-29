@@ -19,6 +19,8 @@ struct Shared {
     spin: Duration,
     /// the last `etail` tasks of a job are left to the fast workers (slow cores would finish last)
     etail: usize,
+    /// bumped by prewake(): spinning workers restart their spin window, parked ones wake and spin
+    kick: AtomicU64,
 }
 
 pub struct Pool { sh: Arc<Shared>, pub threads: usize }
@@ -30,7 +32,7 @@ impl Pool {
     /// Workers with index >= `n_fast` are slow (E-cores): they skip a job's last `etail` tasks.
     pub fn new_hybrid(threads: usize, spin: Duration, pin: &[usize], n_fast: usize, etail: usize) -> Self {
         let sh = Arc::new(Shared { gen: AtomicU64::new(0), ticket: AtomicU64::new(0), job: AtomicPtr::new(std::ptr::null_mut()), done: AtomicUsize::new(0), n: AtomicUsize::new(0),
-            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail });
+            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail, kick: AtomicU64::new(0) });
         for i in 1..threads.max(1) {
             let sh = sh.clone(); let cpu = pin.get(i).copied();
             std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { if let Some(c) = cpu { pin_to(c); } worker(&sh, i >= n_fast) }).expect("spawn pool worker");
@@ -38,6 +40,12 @@ impl Pool {
         Pool { sh, threads: threads.max(1) }
     }
 
+    /// Wake parked workers and restart every worker's spin window now, so they are already spinning when the
+    /// next job arrives (call just before blocking on the GPU readback that precedes a job).
+    pub fn prewake(&self) {
+        let sh = &*self.sh; sh.kick.fetch_add(1, Release);
+        if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
+    }
     /// Run f(0..n) across the pool (the caller works too) and return when all are done.
     pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) { self.run_side(n, f, &mut || {}) }
     /// Like `run`, but the caller first does `side` (e.g. enqueueing GPU work) while the workers start.
@@ -73,7 +81,7 @@ fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
 }
 
 fn worker(sh: &Shared, slow: bool) {
-    let mut seen = 0u64;
+    let mut seen = 0u64; let mut kseen = sh.kick.load(Relaxed);
     let mut idle = Instant::now();
     loop {
         let g = sh.gen.load(Acquire);
@@ -85,10 +93,11 @@ fn worker(sh: &Shared, slow: bool) {
             idle = Instant::now();
             continue;
         }
+        let kk = sh.kick.load(Acquire); if kk != kseen { kseen = kk; idle = Instant::now(); continue; }
         if idle.elapsed() < sh.spin { for _ in 0..64 { std::hint::spin_loop(); } continue; }
         sh.sleepers.fetch_add(1, AcqRel);
         let mut l = sh.lock.lock().unwrap();
-        while sh.gen.load(Acquire) == seen { l = sh.cv.wait_timeout(l, Duration::from_millis(50)).unwrap().0; }
+        while sh.gen.load(Acquire) == seen && sh.kick.load(Acquire) == kseen { l = sh.cv.wait_timeout(l, Duration::from_millis(50)).unwrap().0; }
         drop(l);
         sh.sleepers.fetch_sub(1, AcqRel);
     }

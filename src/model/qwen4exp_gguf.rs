@@ -392,6 +392,7 @@ impl Model {
         cb.gemv(&cl.fin, &rd, rn, 0, &rd, rn, d);
         (rd, df, rn, lrf, q1, q2, q3) };
         let q4 = std::time::Instant::now();
+        if prewake() { qn_pool().prewake(); }
         let rv = cb.read(&rd);
         let q5 = std::time::Instant::now();
         let sf = l.sh_gate.rows; let hb = cb.empty(sf); let sh = cb.empty(d);
@@ -1309,6 +1310,7 @@ impl Model {
                     let _ = cb.client.flush();
                 } }
                 let q4b = std::time::Instant::now();
+                if prewake() { qn_pool().prewake(); }
                 let rall = cb.read_finish(fut);
                 HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 WV[g].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); WV[2].fetch_add((q4b - q4).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1375,7 +1377,7 @@ impl Model {
         let (ai0, li0) = (*ai, *li);
         let dd = self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len());
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
-        let q4 = std::time::Instant::now(); let rall = self.cube.as_ref().unwrap().read(&dd.0);
+        let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
     }
@@ -1604,6 +1606,8 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
     top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()
 }
 
+/// PYRE_QN_PREWAKE=1 (opt-in until measured): wake the expert pool just before each layer's router readback.
+fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(false)) }
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
     P.get_or_init(|| {
