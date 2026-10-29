@@ -300,10 +300,13 @@ pub fn quantize_k_into(x: &[f32], a: &mut Q8K) {
     }
     for k in 0..n / 8 { a.s8[k] = a.q[8 * k..8 * k + 8].iter().map(|&v| v as i32).sum(); }
 }
+/// AVX-VNNI present (Alder Lake and later) and not disabled with PYRE_QN_VNNI=0.
+pub fn vnni() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| { #[cfg(target_arch = "x86_64")] { std::env::var("PYRE_QN_VNNI").map(|v| v != "0").unwrap_or(true) && is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") } #[cfg(not(target_arch = "x86_64"))] { false } }) }
 pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M) }
 pub fn row_dot_k(t: QType, row: &[u8], a: &Q8K) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    { if avx2() { return unsafe { match t { QType::IQ2S => iq2s_k(row, a), QType::IQ2XXS => iq2xxs_k(row, a), QType::IQ1M => iq1m_k(row, a), _ => unreachable!() } }; } }
+    { if vnni() { return unsafe { match t { QType::IQ2S => iq2s_k_v(row, a), QType::IQ2XXS => iq2xxs_k_v(row, a), QType::IQ1M => iq1m_k_v(row, a), _ => unreachable!() } }; }
+      if avx2() { return unsafe { match t { QType::IQ2S => iq2s_k(row, a), QType::IQ2XXS => iq2xxs_k(row, a), QType::IQ1M => iq1m_k(row, a), _ => unreachable!() } }; } }
     // scalar fallback through the float decoder
     let mut v = vec![0f32; a.q.len()]; super::gguf_q::dequant(t, row, &mut v);
     let mut s = 0f32; for b in 0..a.d.len() { let mut si = 0f32; for j in 0..256 { si += v[b * 256 + j] * a.q[b * 256 + j] as f32; } s += si * a.d[b]; } s
@@ -313,9 +316,12 @@ pub fn row_dot_k(t: QType, row: &[u8], a: &Q8K) -> f32 {
 mod kk {
     use std::arch::x86_64::*;
     /// int32 lanes += sum over 4-byte groups of g*sign(s)*x, weighted by (lo for bytes 0..16, hi for 16..32)
-    #[inline(always)] pub unsafe fn istep(acc: __m256i, g: __m256i, s: __m256i, x: *const i8, sc: __m256i) -> __m256i {
+    /// V: AVX-VNNI `vpdpwssd` does the madd and the add in one uop (the same integer sums; maddubs cannot
+    /// saturate here since |grid| <= 43). Using AVX-VNNI for the i-quant rows follows Strata's iq_avx2 kernels.
+    #[inline(always)] pub unsafe fn istep<const V: bool>(acc: __m256i, g: __m256i, s: __m256i, x: *const i8, sc: __m256i) -> __m256i {
         let xv = _mm256_loadu_si256(x as *const __m256i);
-        _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(g, _mm256_sign_epi8(xv, s)), sc))
+        let p = _mm256_maddubs_epi16(g, _mm256_sign_epi8(xv, s));
+        if V { _mm256_dpwssd_avx_epi32(acc, p, sc) } else { _mm256_add_epi32(acc, _mm256_madd_epi16(p, sc)) }
     }
     #[inline(always)] pub unsafe fn sc2(lo: i32, hi: i32) -> __m256i { _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)) }
     /// 32 sign bytes (+1/-1) from 32 bits
@@ -330,7 +336,13 @@ mod kk {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn iq2s_k(row: &[u8], a: &Q8K) -> f32 {
+unsafe fn iq2s_k(row: &[u8], a: &Q8K) -> f32 { iq2s_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq2s_k_v(row: &[u8], a: &Q8K) -> f32 { iq2s_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2s_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
     use std::arch::x86_64::*;
     let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
     for i in 0..n / 256 { let b = rp.add(i * 82); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
@@ -341,14 +353,20 @@ unsafe fn iq2s_k(row: &[u8], a: &Q8K) -> f32 {
             let g = _mm256_set_epi64x(q(3), q(2), q(1), q(0));
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
-            ia = kk::istep(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc); }
     k::hsum(acc)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn iq2xxs_k(row: &[u8], a: &Q8K) -> f32 {
+unsafe fn iq2xxs_k(row: &[u8], a: &Q8K) -> f32 { iq2xxs_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq2xxs_k_v(row: &[u8], a: &Q8K) -> f32 { iq2xxs_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2xxs_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
     use std::arch::x86_64::*;
     let s8 = sign8(); let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
     for i in 0..n / 256 { let b = rp.add(i * 66); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
@@ -359,14 +377,20 @@ unsafe fn iq2xxs_k(row: &[u8], a: &Q8K) -> f32 {
             let sl = |l: u32| *s8.get_unchecked(*KSIGNS_IQ2XS.get_unchecked(((a1 >> (7 * l)) & 127) as usize) as usize) as i64;
             let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
             let sc = 2 * (a1 >> 28) as i32 + 1;
-            ia = kk::istep(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(sc, sc)); }
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(sc, sc)); }
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc); }
     k::hsum(acc)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn iq1m_k(row: &[u8], a: &Q8K) -> f32 {
+unsafe fn iq1m_k(row: &[u8], a: &Q8K) -> f32 { iq1m_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq1m_k_v(row: &[u8], a: &Q8K) -> f32 { iq1m_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq1m_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
     use std::arch::x86_64::*;
     let mut tot = 0f32; let n = a.q.len(); const M: u64 = 0x0101010101010101; let xq = a.q.as_ptr();
     for i in 0..n / 256 { let b = &row[i * 56..i * 56 + 56]; let (qs, qh, sb) = (&b[0..32], &b[32..48], &b[48..56]);
@@ -380,7 +404,7 @@ unsafe fn iq1m_k(row: &[u8], a: &Q8K) -> f32 {
             let g = _mm256_set_epi64x((w[3] & M) as i64, (w[2] & M) as i64, (w[1] & M) as i64, (w[0] & M) as i64);
             let sg = |v: u64| (M | (((v >> 7) & M) * 0xFE)) as i64;
             let s = _mm256_set_epi64x(sg(w[3]), sg(w[2]), sg(w[1]), sg(w[0]));
-            ia = kk::istep(ia, g, s, xq.add(o), kk::sc2(dl[0], dl[1]));
+            ia = kk::istep::<V>(ia, g, s, xq.add(o), kk::sc2(dl[0], dl[1]));
             let del = |m: u8| if m != 0 { -1i32 } else { 1 };
             let s8 = &a.s8[o / 8..o / 8 + 4];
             corr += dl[0] * (del(h2[0] & 0x08) * s8[0] + del(h2[0] & 0x80) * s8[1]) + dl[1] * (del(h2[1] & 0x08) * s8[2] + del(h2[1] & 0x80) * s8[3]); }
@@ -462,13 +486,19 @@ pub fn kbench() {
 /// results are bit-identical; only the decode work is shared (prompt chunks / verify windows).
 pub fn row_dot_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
-    { if avx2() && matches!(t, QType::IQ2S | QType::IQ2XXS) && acts.len() <= 16 { unsafe { iq2_k_multi(t, row, acts, out) }; return; } }
+    { if avx2() && matches!(t, QType::IQ2S | QType::IQ2XXS) && acts.len() <= 16 { unsafe { if vnni() { iq2_k_multi_v(t, row, acts, out) } else { iq2_k_multi(t, row, acts, out) } }; return; } }
     for (j, a) in acts.iter().enumerate() { out[j] = row_dot_k(t, row, a); }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn iq2_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
+unsafe fn iq2_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) { iq2_k_multi_b::<false>(t, row, acts, out) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq2_k_multi_v(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) { iq2_k_multi_b::<true>(t, row, acts, out) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
     use std::arch::x86_64::*;
     let na = acts.len(); let n = acts[0].q.len(); let rp = row.as_ptr();
     let mut acc = [_mm256_setzero_ps(); 16];
@@ -494,7 +524,7 @@ unsafe fn iq2_k_multi(t: QType, row: &[u8], acts: &[&Q8K], out: &mut [f32]) {
         };
         for j in 0..na { let a = acts[j]; let xq = a.q.as_ptr();
             let mut ia = _mm256_setzero_si256();
-            for ib in 0..8 { ia = kk::istep(ia, g[ib], sg[ib], xq.add(i * 256 + ib * 32), sc[ib]); }
+            for ib in 0..8 { ia = kk::istep::<V>(ia, g[ib], sg[ib], xq.add(i * 256 + ib * 32), sc[ib]); }
             let d = dw * 0.125 * *a.d.get_unchecked(i);
             acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc[j]); }
     }

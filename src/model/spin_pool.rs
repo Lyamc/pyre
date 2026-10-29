@@ -124,7 +124,11 @@ pub fn fast_cores() -> Vec<usize> {
         if p.Size == 0 { break; }
     }
     let best = cores.iter().map(|c| c.0).max().unwrap_or(0);
-    cores.iter().filter(|c| c.0 == best).map(|c| c.1).collect()
+    let mut v: Vec<usize> = cores.iter().filter(|c| c.0 == best).map(|c| c.1).collect();
+    // PYRE_QN_ECORES (default on): also one worker per slower physical core (hybrid CPUs' E-cores) after the fast ones.
+    // Measured on an i9-13900K: 8 P + 16 E workers decode ~5% faster than 8 P alone; same results.
+    if std::env::var("PYRE_QN_ECORES").map(|x| x != "0").unwrap_or(true) { v.extend(cores.iter().filter(|c| c.0 != best).map(|c| c.1)); }
+    v
 }
 #[cfg(not(windows))]
 pub fn fast_cores() -> Vec<usize> { vec![] }

@@ -422,6 +422,7 @@ impl Model {
                 cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
                 if kick() { let _ = cb.client.flush(); }
             };
+            MISS[3].fetch_add(off.len() as u64, std::sync::atomic::Ordering::Relaxed); MISS[4].fetch_add(on.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if !off.is_empty() {
                 let lists: Vec<(usize, Vec<(usize, f32)>)> = off.iter().map(|&(e, w)| (e, vec![(0usize, w)])).collect();
                 let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
@@ -1087,7 +1088,7 @@ impl Model {
         let (h, _) = self.hc_mix(&self.head, last, 1);
         let th = std::time::Instant::now();
         let lg = self.head_logits(&h);
-        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("xupload repack {:.4} write {:.4} | ", super::qn_cube::XUP_NS[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, super::qn_cube::XUP_NS[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
+        if prof { prof_acc[4] = th.elapsed().as_secs_f64(); let (gn, gs) = super::qn_gpu::take_stats(); let rs = ROUTED_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; { let f = |i: usize| HY[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9; eprint!("[cube: enqueue {:.3} reads {:.3} core {:.3} sh+routed {:.3}] hyb hc {:.3} (down {:.3} up {:.3} mix {:.3}) rt12 {:.3} core {:.3} ffn {:.3} | ", f(0), f(1), f(2), f(3), 0.0, f(4), f(5), f(6), 0.0, 0.0, 0.0); } eprint!("xupload repack {:.4} write {:.4} | ", super::qn_cube::XUP_NS[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, super::qn_cube::XUP_NS[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("routed {rs:.3}s (gate/up {:.3}) ", PH[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9); eprint!("cpu misses {} gpu hits {} | ", MISS[3].swap(0, std::sync::atomic::Ordering::Relaxed), MISS[4].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("prof T={t} total {:.3}s | hc {:.3} attn {:.3} gdn {:.3} ffn {:.3} head {:.3} | gpu {gn} calls {gs:.3}s", t_all.elapsed().as_secs_f64(), prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4]); }
         lg
     }
 
@@ -1252,6 +1253,7 @@ impl Model {
         let mut lg: Vec<Vec<f32>> = vec![];
         for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); lg.push(self.head_logits(&hh)); }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
+            eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
@@ -1428,6 +1430,8 @@ impl Model {
                 ord[ti].push((wi, lists[wi].1.len())); lists[wi].1.push((ti, wt)); } }
             if !lists.is_empty() {
                 let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
+                MISS[0].fetch_add(lists.len() as u64, std::sync::atomic::Ordering::Relaxed); MISS[1].fetch_add(lists.iter().map(|x| x.1.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
+                MISS[2].fetch_add(ons.iter().map(|o| o.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
                 let tr = std::time::Instant::now();
                 self.routed_pool_ord(l, &xin, &work, t, &mut yr, &mut gpu, Some(&ord));
                 { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
@@ -1467,6 +1471,7 @@ fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
     let cut = ws[r - 1]; // keep experts strictly above the rank-(r-1) weight or equal to it
     off.retain(|x| x.1 >= cut);
 }
+static MISS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WV: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
