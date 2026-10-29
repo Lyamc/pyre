@@ -538,3 +538,28 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
 - CPU experts already overlap the GPU experts and the shared expert (`run_side`). The next layer's dense
   part needs this layer's full MoE output, so there is no further GPU work to hide them under without
   changing the math.
+### Strata comparison (from its public docs and v0.2.7 release notes; ideas only, no code)
+
+- **What "46.2 tok/s" is:** Strata v0.2.7, RTX 3060 12 GB, Qwen3.8-Flash-Next **IQ3_XXS** (ISTA-DASLab; 512 experts
+  x 48 layers = 24,576, top-10), story answer, route prior off. Same model family as ours, but its experts are 3-bit,
+  more bytes than our IQ2_XS. With the 12 GB route prior on by default, it reaches 53.1.
+- **It includes speculative decoding.** Setup passes `--mtp`: the model's own MTP draft layer (a separate ~6 GB
+  download, not in the GGUF we use) drafts up to 3 tokens, 2.4-3.2 tokens per verify pass, which Strata's docs put
+  at 1.6-1.8x. `STRATA_ROUTE_TAIL_SKIP` is also on by default: missed experts at rank 7 or lower in every token of
+  a window are skipped. It changes outputs (KL ~0.006) and gave +15.6% decode on a 3060. Strata's docs give no
+  no-MTP 3060 figure. From their own factors, plain exact decode is about 46.2 / 1.7 / 1.15, roughly
+  **~24 tok/s**, against our 19.9 (`PYRE_QN_GRAPH=1`).
+- **GPU vs CPU experts:**
+  - Placement: a shipped per-expert-pair profile ranks experts, an adaptive VRAM expert cache follows the
+    conversation, and all experts sit pinned in RAM.
+  - Missed experts on the CPU: AVX2/AVX-512 kernels (ggml's for the i-quants) at 32-37 us per expert on a 3060 PC,
+    against ~80 us for ours. Some misses are streamed over PCIe instead.
+  - Result: the CPU share falls from 0.55 to 0.20 of experts (x1.30 decode on a 3060).
+  - "Every extra GB of VRAM holds ~700 more experts". The dense weights run in the GGUF's own quants (IQ4_XS etc.),
+    not repacked to Q8, so far more VRAM is left for experts than our 7.1 GiB of Q8 dense weights allow.
+- **Other ideas named in 0.2.7:** residency-biased routing (route prior), the 28.8 GB per-token lookup table kept in
+  RAM, hyper-connection reads split over kernels (on only for RTX 50; slower on sm_86), int8 prompt attention,
+  tuned decode split, slots, layer-major prefill.
+- **Biggest levers for pyre, in order:** (1) the MTP draft layer (needs the separate MTP file; the user's call),
+  (2) a CPU expert kernel ~2x faster, (3) more experts on the GPU by keeping dense weights 4-bit, plus streaming
+  some misses over PCIe, (4) the opt-in, output-changing tricks (tail skip, route prior).
