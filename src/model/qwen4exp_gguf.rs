@@ -202,8 +202,8 @@ impl Model {
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
                 self.cl = cl;
-                // LM head on the GPU (PYRE_QN_GPUHEAD=0 keeps it on the CPU): ~3 ms/token on the host otherwise
-                if std::env::var("PYRE_QN_GPUHEAD").map(|v| v != "0").unwrap_or(true) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
+                // LM head on the GPU (opt-in PYRE_QN_GPUHEAD=1: only ~+0.3 tok/s, and as Q8 it costs VRAM
+                if std::env::var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(false) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
                 let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
