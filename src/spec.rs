@@ -15,11 +15,11 @@ static NGRAM: AtomicBool = AtomicBool::new(true);
 static MTP: AtomicBool = AtomicBool::new(true);
 static ROUTE_PRIOR: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Default draft length: PYRE_SPEC (0 = off), else 3.
+/// Default draft length: PYRE_SPEC, else 0 (off by default until measured faster on this model).
 pub fn draft_len() -> usize {
     let v = DRAFT.load(Relaxed);
     if v != usize::MAX { return v; }
-    let d = std::env::var("PYRE_SPEC").ok().and_then(|s| s.parse().ok()).unwrap_or(3usize);
+    let d = std::env::var("PYRE_SPEC").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
     DRAFT.store(d, Relaxed); d
 }
 pub fn set_draft_len(n: usize) { DRAFT.store(n.min(8), Relaxed); }
