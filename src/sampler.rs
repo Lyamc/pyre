@@ -14,6 +14,8 @@ pub struct SamplingParams {
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub seed: Option<u64>,
+    /// speculative draft length for this request (None = server default, 0 = off)
+    pub spec: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -28,6 +30,7 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             seed: None,
+            spec: None,
         }
     }
 }
@@ -106,6 +109,33 @@ impl Sampler {
             if r <= 0.0 { return cand[i].0; }
         }
         cand[n - 1].0
+    }
+
+    /// The distribution `sample` draws from (after penalties, temperature, top-k, min-p, top-p), normalised.
+    pub fn dist(&self, logits: &mut [f32], history: &[u32]) -> Vec<(u32, f32)> {
+        self.apply_penalties(logits, history);
+        let p = &self.params;
+        if p.temperature <= 0.0 || p.top_k == 1 { return vec![(argmax(logits), 1.0)]; }
+        let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
+        let k = if p.top_k == 0 { cand.len() } else { p.top_k.min(cand.len()) };
+        if k < cand.len() { cand.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1)); cand.truncate(k); }
+        cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let max = cand[0].1;
+        let mut probs: Vec<f32> = cand.iter().map(|c| ((c.1 - max) / p.temperature).exp()).collect();
+        let sum: f32 = probs.iter().sum(); probs.iter_mut().for_each(|x| *x /= sum);
+        let mut n = probs.len();
+        if p.min_p > 0.0 { let thr = probs[0] * p.min_p; n = probs.iter().take_while(|&&x| x >= thr).count().max(1); }
+        if p.top_p < 1.0 { let (mut acc, mut m) = (0.0, 0); for &x in &probs[..n] { acc += x; m += 1; if acc >= p.top_p { break; } } n = m.max(1); }
+        let total: f32 = probs[..n].iter().sum();
+        (0..n).map(|i| (cand[i].0, probs[i] / total)).collect()
+    }
+    pub fn uniform(&mut self) -> f32 { self.rng.random::<f32>() }
+    /// Draw from an (unnormalised) sparse distribution.
+    pub fn pick(&mut self, d: &[(u32, f32)]) -> u32 {
+        let total: f32 = d.iter().map(|x| x.1).sum();
+        let mut r = self.rng.random::<f32>() * total;
+        for &(t, p) in d { r -= p; if r <= 0.0 && p > 0.0 { return t; } }
+        d.iter().rev().find(|x| x.1 > 0.0).map(|x| x.0).unwrap_or(d[0].0)
     }
 }
 

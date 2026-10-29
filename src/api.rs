@@ -180,6 +180,7 @@ async fn status(State(app): S) -> Json<Value> {
         "store_root": app.storage.store.root, "hf_cache": app.storage.hf_cache,
         "limits": crate::limits::status(),
         "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
+        "speculative": crate::spec::status()["speculative"], "route_prior": crate::spec::status()["route_prior"], "context": crate::spec::status()["context"],
     }))
 }
 

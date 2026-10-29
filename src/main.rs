@@ -20,6 +20,7 @@ mod qn_cli;
 mod apps;
 mod engine_qn;
 mod qn_find;
+mod spec;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -114,6 +115,15 @@ pub struct ServeArgs {
     /// Max GPU duty cycle in percent (default 90; 100 or 0 disables). Env PYRE_GPU_UTIL_MAX
     #[arg(long = "gpu-util-max")]
     pub gpu_util_max: Option<u32>,
+    /// Speculative decoding draft length for qwen-next (0 = off; default 3, config `spec`, env PYRE_SPEC)
+    #[arg(long = "spec")]
+    pub spec: Option<usize>,
+    /// Residency-biased expert routing strength for qwen-next (0 = off, the default; changes outputs; config `route_prior`, env PYRE_ROUTE_PRIOR)
+    #[arg(long = "route-prior")]
+    pub route_prior: Option<f32>,
+    /// Disable the prompt-lookup (n-gram) drafter
+    #[arg(long = "no-ngram")]
+    pub no_ngram: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -244,6 +254,11 @@ fn load_llm_parts(dir: &std::path::Path, backend_name: &str, dtype: &str, ctx_si
 fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     use registry::{Kind, LoadReq};
     limits::init(args.vram_reserve.as_deref(), args.gpu_util_max);
+    { let cfg = store::store::load_config();
+      if let Some(n) = args.spec.or(cfg.spec) { spec::set_draft_len(n); }
+      if let Some(p) = args.route_prior.or(cfg.route_prior) { spec::set_route_prior(p); }
+      if args.no_ngram || cfg.spec_ngram == Some(false) { spec::set_ngram(false); }
+      if cfg.spec_mtp == Some(false) { spec::set_mtp(false); } }
     #[cfg(feature = "image")]
     let _ = pyre_sd::pipelines::stable_diffusion::STEP_HOOK.set(limits::pace);
     let defaults = registry::LoadDefaults { backend: args.backend.clone(), dtype: args.dtype.clone(), ctx_size: args.ctx_size, n_predict: args.n_predict };

@@ -56,6 +56,50 @@ fn k_gemv(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32
     }
 }
 
+/// k_gemv for up to 4 activation columns (x at xoff + c*xst, out at ooff + c*ost): each weight word is
+/// loaded once for all columns; every column accumulates in exactly k_gemv's order (same results).
+#[cube(launch_unchecked)]
+fn k_gemv4(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, xst: u32, ooff: u32, ost: u32, nt: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let words = cols / 4;
+        let wb = row * words;
+        let sb = row * (cols / 32);
+        let mut a0 = 0.0f32; let mut a1 = 0.0f32; let mut a2 = 0.0f32; let mut a3 = 0.0f32;
+        let (x1, x2, x3) = (xoff + xst, xoff + 2 * xst, xoff + 3 * xst);
+        let mut wi = UNIT_POS_X;
+        while wi + 96 < words {
+            let w0 = w[(wb + wi) as usize];
+            let w1 = w[(wb + wi + 32) as usize];
+            let w2 = w[(wb + wi + 64) as usize];
+            let w3 = w[(wb + wi + 96) as usize];
+            let k = wi * 4;
+            let s0 = s[(sb + k / 32) as usize]; let s1 = s[(sb + k / 32 + 4) as usize]; let s2 = s[(sb + k / 32 + 8) as usize]; let s3 = s[(sb + k / 32 + 12) as usize];
+            a0 += dot4(w0, x, xoff + k) * s0; a0 += dot4(w1, x, xoff + k + 128) * s1; a0 += dot4(w2, x, xoff + k + 256) * s2; a0 += dot4(w3, x, xoff + k + 384) * s3;
+            if nt > 1 { a1 += dot4(w0, x, x1 + k) * s0; a1 += dot4(w1, x, x1 + k + 128) * s1; a1 += dot4(w2, x, x1 + k + 256) * s2; a1 += dot4(w3, x, x1 + k + 384) * s3; }
+            if nt > 2 { a2 += dot4(w0, x, x2 + k) * s0; a2 += dot4(w1, x, x2 + k + 128) * s1; a2 += dot4(w2, x, x2 + k + 256) * s2; a2 += dot4(w3, x, x2 + k + 384) * s3; }
+            if nt > 3 { a3 += dot4(w0, x, x3 + k) * s0; a3 += dot4(w1, x, x3 + k + 128) * s1; a3 += dot4(w2, x, x3 + k + 256) * s2; a3 += dot4(w3, x, x3 + k + 384) * s3; }
+            wi += 128;
+        }
+        while wi < words {
+            let k = wi * 4;
+            let w0 = w[(wb + wi) as usize]; let s0 = s[(sb + k / 32) as usize];
+            a0 += dot4(w0, x, xoff + k) * s0;
+            if nt > 1 { a1 += dot4(w0, x, x1 + k) * s0; }
+            if nt > 2 { a2 += dot4(w0, x, x2 + k) * s0; }
+            if nt > 3 { a3 += dot4(w0, x, x3 + k) * s0; }
+            wi += 32;
+        }
+        let t0 = plane_sum(a0); let t1 = plane_sum(a1); let t2 = plane_sum(a2); let t3 = plane_sum(a3);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t0;
+            if nt > 1 { out[(ooff + ost + row) as usize] = t1; }
+            if nt > 2 { out[(ooff + 2 * ost + row) as usize] = t2; }
+            if nt > 3 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
 /// GEMV straight from IQ4_XS blocks (repacked: f32 d, scales_h, scales_l, 32 words of nibbles =
 /// 35 words per 256). Each lane takes one qs word: 4 low nibbles (x[32ib+4k..]) and 4 high
 /// nibbles (x[32ib+16+4k..]), so adjacent lanes read adjacent activations. kv = the 16 IQ4_NL levels.
@@ -220,6 +264,14 @@ fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], c: &[f32], gb: &[f32], dn: &[f32]
         }
         let inj = dn[(lr + st) as usize] / f32::cast_from(hc);
         x[k as usize] += o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+    }
+}
+
+#[cube(launch_unchecked)]
+fn k_copy(src: &[f32], dst: &mut [f32], so: u32, dof: u32, n: u32) {
+    let j = ABSOLUTE_POS as u32;
+    if j < n {
+        dst[(dof + j) as usize] = src[(so + j) as usize];
     }
 }
 
@@ -945,6 +997,20 @@ impl Cube {
             BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
             BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, xoff as u32, ooff as u32) }
     }
+    /// `gemv` for `nt` activation columns: x[c] at xoff + c*xst (xn = x buffer length), out[c] at ooff + c*ost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_m(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, xst: usize, out: &Handle, on: usize, ooff: usize, ost: usize, nt: usize) {
+        if !m.nat.is_empty() || nt == 1 || std::env::var("PYRE_QN_GEMV4").map(|v| v == "0").unwrap_or(false) {
+            for c in 0..nt { self.gemv(m, x, xn, xoff + c * xst, out, on, ooff + c * ost); }
+            return;
+        }
+        let mut c0 = 0;
+        while c0 < nt { let n = (nt - c0).min(4);
+            unsafe { k_gemv4::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+                BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
+            c0 += n; }
+    }
     pub fn rms(&self, x: &Handle, norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
         unsafe { k_rms::launch_unchecked(&self.client, CubeCount::Static(hc as u32, 1, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(norm.clone(), hc * d), BufferArg::from_raw_parts(xn.clone(), hc * d), d as u32, eps) }
@@ -1036,6 +1102,12 @@ impl Cube {
     pub fn q8copy(&self, src: &Handle, sn: usize, soff: usize, dst: &Handle, z: &Handle, n: usize) {
         unsafe { k_q8copy::launch_unchecked(&self.client, CubeCount::Static((n as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(src.clone(), sn), BufferArg::from_raw_parts(dst.clone(), n), BufferArg::from_raw_parts(z.clone(), n), soff as u32, n as u32) }
+    }
+    /// dst[dof..dof+n] = src[so..so+n] (srcn / dstn: buffer lengths in floats)
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy(&self, src: &Handle, srcn: usize, so: usize, dst: &Handle, dstn: usize, dof: usize, n: usize) {
+        unsafe { k_copy::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(src.clone(), srcn), BufferArg::from_raw_parts(dst.clone(), dstn), so as u32, dof as u32, n as u32) }
     }
     pub fn silu_mul(&self, f: &Handle, fnn: usize, og: usize, ou: usize, h: &Handle, n: usize) {
         unsafe { k_silu_mul::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),

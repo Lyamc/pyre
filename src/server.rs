@@ -123,6 +123,9 @@ struct Gen {
     #[serde(default)]
     stream: bool,
     stream_options: Option<Value>,
+    /// speculative decoding: draft length (0 = off); or `speculative: {"enabled": bool, "draft_len"|"n": k}`
+    spec: Option<usize>,
+    speculative: Option<Value>,
 }
 
 impl Gen {
@@ -138,6 +141,11 @@ impl Gen {
             presence_penalty: self.presence_penalty.unwrap_or(0.0),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
             seed: self.seed,
+            spec: self.spec.or_else(|| self.speculative.as_ref().and_then(|v| match v {
+                Value::Bool(false) => Some(0),
+                Value::Number(n) => n.as_u64().map(|n| n as usize),
+                Value::Object(o) => if o.get("enabled").and_then(|e| e.as_bool()) == Some(false) { Some(0) } else { o.get("draft_len").or(o.get("n")).and_then(|n| n.as_u64()).map(|n| n as usize) },
+                _ => None })),
         }
     }
     fn stops(&self) -> Vec<String> {

@@ -46,6 +46,12 @@ pub struct ConfigFile {
     pub models_dir: Option<PathBuf>,
     pub search_order: Option<Vec<String>>,
     pub offline: Option<bool>,
+    /// qwen-next speculative decoding draft length (0 = off)
+    pub spec: Option<usize>,
+    pub spec_ngram: Option<bool>,
+    pub spec_mtp: Option<bool>,
+    /// qwen-next residency-biased routing strength (0 = off)
+    pub route_prior: Option<f32>,
 }
 
 pub fn config_path() -> PathBuf {
