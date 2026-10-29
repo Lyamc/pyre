@@ -35,7 +35,7 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 
 /// GPU copy of one attention layer's KV cache: `len` positions valid, room for `cap`.
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
-pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64 }
+pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
 pub struct Model { xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32> }
 
@@ -63,6 +63,8 @@ pub struct State {
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
 fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { x[i] *= s * w[i]; } }
 /// Submit queued GPU work before the CPU expert pass (WDDM otherwise holds it until the next read). PYRE_QN_KICK=1 on (no measurable effect on HYTE, so off).
+/// One-arena low-overhead expert path (PYRE_QN_XFAST=0 off).
+fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XFAST").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && std::env::var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -207,8 +209,8 @@ impl Model {
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
-                    let nslot = budget / slot; let per = ((env_usize("PYRE_QN_ARENA_MB").unwrap_or(1024) << 20) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
-                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0 })); }
+                    let nslot = budget / slot; let per = (env_usize("PYRE_QN_ARENA_MB").map(|m| m << 20).unwrap_or(budget) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
+                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); }
                 self.cube = Some(cb);
             }
         }
@@ -341,7 +343,12 @@ impl Model {
             xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
             // CPU workers start on the missed experts while this thread enqueues the GPU side
             let mut gpu = || {
-                if !on.is_empty() {
+                let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
+                let fast = !on.is_empty() && xcg.arena.len() == 1 && xfast() && {
+                    let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).collect();
+                    cb.xrun_fast(&xcg.tabs, &xcg.arena[0], xcg.ar_bytes, &ents, &rd, rn, d, c.ff_exp, tys, &xcg.scr) };
+                if fast { yg = Some(xcg.scr.y.clone()); }
+                if !on.is_empty() && !fast {
                     let xb = cb.empty(d); let y0 = cb.empty(d);
                     cb.q8copy(&rd, rn, 0, &xb, &y0, d);
                     let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());

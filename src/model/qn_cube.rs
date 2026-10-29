@@ -1089,7 +1089,7 @@ fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &m
 /// Batched cached experts, Q2_0 down with int8 h and dp4a; (expert, group) flattened over the lanes.
 /// q2l[b] = the four 2-bit fields of byte b as bytes.
 #[cube(launch_unchecked)]
-fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32) {
+fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, acc: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
     if row < rows {
         let nsb = cols / 8;
@@ -1115,7 +1115,7 @@ fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &
         }
         let t = plane_sum(s);
         if UNIT_POS_X == 0 {
-            y[row as usize] += t;
+            if acc == 1u32 { y[row as usize] += t; } else { y[row as usize] = t; }
         }
     }
 }
@@ -1253,6 +1253,9 @@ pub fn xrw() -> u32 { std::env::var("PYRE_QN_XRW").ok().and_then(|v| v.parse().o
 /// shared-memory grid gate/up kernel (PYRE_QN_XSH=0 off) and its warps per cube (PYRE_QN_XSHR).
 pub fn xsh() -> bool { std::env::var("PYRE_QN_XSH").map(|v| v != "0").unwrap_or(true) }
 pub fn xshr() -> u32 { std::env::var("PYRE_QN_XSHR").ok().and_then(|v| v.parse().ok()).unwrap_or(8) }
+
+/// Reusable buffers of the one-arena expert path (one layer at a time on the stream).
+pub struct XScr { xq: Handle, xs: Handle, hq: Handle, hs: Handle, h: Handle, pub y: Handle, max_ne: usize }
 
 pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle, sm: Handle, q2l: Handle }
 /// One cached expert: raw GGUF bytes of its gate, up and down rows.
@@ -1467,7 +1470,32 @@ impl Cube {
                 a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.sm, 512), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); } }
             if st & 4 != 0 { k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32); }
             if st & 2 != 0 { k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
-                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(mh, ml), a(&tb.q2l, 256), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32); }
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(mh, ml), a(&tb.q2l, 256), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, 1u32); }
+        }
+        true
+    }
+    pub fn xscratch(&self, d: usize, ff: usize, max_ne: usize) -> XScr {
+        XScr { xq: self.client.empty(d), xs: self.client.empty(d / 8), hq: self.client.empty(max_ne * ff), hs: self.client.empty(max_ne * ff / 8), h: self.client.empty(4 * max_ne * ff), y: self.client.empty(4 * d), max_ne }
+    }
+    /// One layer's cached experts from one arena: x is read straight from `src` (its first d values),
+    /// y = sum_e w_e D_e silu(G_e x)*(U_e x) is written to scr.y. Four launches, one small upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr) -> bool {
+        let ne = ents.len();
+        if ne == 0 || ne > scr.max_ne || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32;
+        let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
+        let mh = self.client.create_from_slice(u32::as_bytes(&meta)); let ml = ne * 4;
+        let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+        unsafe {
+            k_q8pack::launch_unchecked(&self.client, CubeCount::Static((d as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(src, sn), a(&scr.xq, d / 4), a(&scr.xs, d / 32), 0, (d / 32) as u32);
+            k_xgu_s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
+                a(&scr.xq, d / 4), a(&scr.xs, d / 32), a(ar, aw), a(&mh, ml), a(gsrc, gn as usize), a(&scr.h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0);
+            k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&scr.h, ne * ff), a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
+            k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
+                a(&scr.hq, ne * ff / 4), a(&scr.hs, ne * ff / 32), a(ar, aw), a(&mh, ml), a(&tb.q2l, 256), a(&scr.y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, 0u32);
         }
         true
     }
