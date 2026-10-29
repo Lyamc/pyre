@@ -394,7 +394,9 @@ impl Model {
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
         xc.calls += 1;
         let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
-        if xc.calls != 1 && xc.calls % every != 0 { return; }
+        // an empty cache fills right away (the call before prefill has no routing counts yet, so the first
+        // real fill used to wait until call `every` and then add only XSWAP experts)
+        if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { return; }
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
         let slot = xc.slot; let size = |_: &Layer| slot;
         let mut cand: Vec<(u32, usize, usize)> = vec![];
@@ -409,7 +411,7 @@ impl Model {
         let mut evict: Vec<(u32, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xc.cnt[il][e], il, e)).collect();
         // full tie-break: HashMap key order is random per process, and the slot an expert lands in decides the GPU summation order (run-to-run identical output)
         evict.sort_by(|a, b| b.0.cmp(&a.0).then((b.1, b.2).cmp(&(a.1, a.2))));
-        let max_new = if xc.calls == 1 { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
+        let max_new = if xc.calls == 1 || xc.map.is_empty() { usize::MAX } else { env_usize("PYRE_QN_XSWAP").unwrap_or(64) };
         let t0 = std::time::Instant::now(); let mut n = 0;
         for &(_, il, e) in &cand {
             if n >= max_new { break; }
