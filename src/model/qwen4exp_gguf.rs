@@ -990,6 +990,17 @@ impl Model {
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
     pub fn forward(&self, ids: &[u32], st: &mut State) -> Vec<f32> {
+        // PYRE_QN_PF_MULTI=K (opt-in): prompt chunks go through the decode verify path K tokens at a time (dense
+        // on the GPU, decode numerics); the expert cache fills after the first piece instead of after the prompt
+        let k = env_usize("PYRE_QN_PF_MULTI").unwrap_or(0);
+        if k > 1 && ids.len() > 1 && self.multi_ok() {
+            let mut last = vec![];
+            for c in ids.chunks(k) {
+                last = if c.len() == 1 { self.forward_inner(c, st) } else { self.forward_multi_x(c, st, true).pop().unwrap() };
+                if let (Some(cb), Some(xm)) = (&self.cube, &self.xc) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
+            }
+            return last;
+        }
         let lg = self.forward_inner(ids, st);
         // first fill of the expert cache from the prompt's routing counts (part of prefill time)
         if let (Some(cb), Some(xm), true) = (&self.cube, &self.xc, ids.len() > 1) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
@@ -1100,7 +1111,9 @@ impl Model {
         if let (Some(hm), Some(cb)) = (&self.headc, &self.cube) { let xb = cb.buf(h); let o = cb.empty(hm.rows); cb.gemv(hm, &xb, h.len(), 0, &o, hm.rows, 0); return cb.read(&o); }
         self.mm(&[&self.out], h, 1).pop().unwrap()
     }
-    pub fn forward_multi(&self, ids: &[u32], st: &mut State) -> Vec<Vec<f32>> {
+    pub fn forward_multi(&self, ids: &[u32], st: &mut State) -> Vec<Vec<f32>> { self.forward_multi_x(ids, st, false) }
+    /// `last_only`: logits for the last token only (prompt chunks).
+    fn forward_multi_x(&self, ids: &[u32], st: &mut State, last_only: bool) -> Vec<Vec<f32>> {
         let t = ids.len();
         if t == 1 || !self.multi_ok() {
             // no verify path: plain sequential decode (no rollback checkpoints; callers check multi_ok)
@@ -1135,7 +1148,7 @@ impl Model {
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
         let hs = xs.unwrap();
-        let lg: Vec<Vec<f32>> = hs.iter().map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.head_logits(&hh) }).collect();
+        let lg: Vec<Vec<f32>> = hs.iter().skip(if last_only { t - 1 } else { 0 }).map(|h| { let x = cb.read(h); let (hh, _) = self.hc_mix(&self.head, &x, 1); self.head_logits(&hh) }).collect();
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
