@@ -463,7 +463,7 @@ Per-token profile (RTX 3060, `PYRE_QN_PROFILE=1` + nsys): ~1300 kernel launches 
 GPU kernels ~27 ms (Q8 dense GEMVs ~12 ms at ~325 GB/s, i.e. bandwidth-bound; GPU cached experts ~6.6 ms;
 DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU waits for the CPU
 (routing + CPU experts). The GPU is busy ~45% of the time.
-- The GPU routed-expert cache is now opt-in (`PYRE_QN_XCACHE_GB=<GiB>`). Its batched expert kernels reach
+- The GPU routed-expert cache was opt-in in phase 3 (it is default on again since phase 4, see below). Its batched expert kernels reach
   only ~15-70 GB/s and sit on the critical path, so decode is faster without it (interleaved A/B, steady
   tok/s: story 15.3-15.5 vs 14.1, code 14.2-15.3 vs 13.4-13.7) and VRAM use drops from ~8.1 to ~5.4 GB.
 - Expert-cache eviction is deterministic (HashMap order used to decide slots and therefore the GPU
@@ -486,3 +486,11 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   `pyre-wddm-kick`). No measurable effect on HYTE, so it is off.
 - Same-machine Strata 0.1.48 on this IQ2_XS GGUF (Oct 27, with its --spec 2): 25.9 tok/s (short prompt),
   15.4 (chat prompt B). Strata's published 46-62 tok/s are v0.2.7 on IQ3_XXS with MTP drafting.
+
+### Phase 4: low-overhead GPU expert path
+
+- One expert arena (split into even arenas of at most 2.5 GiB, since one buffer over ~3.1 GB fails to allocate),
+  4 launches per MoE layer, reused scratch buffers, router output read in place (`PYRE_QN_XFAST`, default on).
+- The routed-expert cache is **default on** with a 2.5 GiB budget (`PYRE_QN_XCACHE_GB`, 0 = off).
+  RTX 3060, quiet GPU, 96 tokens, greedy output unchanged: cache off ~14.4 story / ~14.7 code tok/s;
+  2.5 GiB ~19.5 / ~17.6 tok/s with >=2.6 GB VRAM still free. 3 GiB is slower (~17.3 / ~16.8).

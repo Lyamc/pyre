@@ -202,14 +202,14 @@ impl Model {
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
                 self.cl = cl;
-                // routed-expert cache (opt-in, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
+                // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
-                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(0); // opt-in again until re-measured; was default on: with the one-arena fast path it wins ~19.5 vs ~14.7 tok/s; the real size is set by XHEAD_MB (2048 keeps ~2 GB free, smaller heads page and get slower)
+                let cap = std::env::var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
-                    let nslot = budget / slot; let per = (env_usize("PYRE_QN_ARENA_MB").map(|m| m << 20).unwrap_or(budget.min(2560 << 20)) / slot).max(1).min(nslot.max(1)); let ar_bytes = per * slot; let narena = nslot.div_ceil(per);
+                    let nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| cb.xarena(ar_bytes)).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); }
                 self.cube = Some(cb);
             }
