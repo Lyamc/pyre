@@ -493,4 +493,12 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   4 launches per MoE layer, reused scratch buffers, router output read in place (`PYRE_QN_XFAST`, default on).
 - The routed-expert cache is **default on** with a 2.5 GiB budget (`PYRE_QN_XCACHE_GB`, 0 = off).
   RTX 3060, quiet GPU, 96 tokens, greedy output unchanged: cache off ~14.4 story / ~14.7 code tok/s;
-  2.5 GiB ~19.5 / ~17.6 tok/s with >=2.6 GB VRAM still free. 3 GiB is slower (~17.3 / ~16.8).
+  2.5 GiB ~19.5 / ~17.6 tok/s with >=2.6 GB VRAM still free. 3 GiB is slower (~17.3 / ~16.8).- Multi-token verify uses the same fast expert path; up to two arenas run in one launch (arena bit in the offsets).
+- `PYRE_QN_NATIVE=2`: dp4a IQ4_XS dense GEMV (int8 activations, ~2.3 G of the dense weights stay 4-bit).
+  Greedy output unchanged, but no decode gain on the RTX 3060 (~-0.2..+0.3 tok/s), so it stays opt-in.
+- `PYRE_QN_GPUHEAD=1`: LM head on the GPU, ~+0.3 tok/s; opt-in.
+- Larger caches (4-5 GiB) give at most +2% even over 400 tokens: the cache fills 64 experts per refill
+  and the hit rate stays ~59%.
+- Profile per token at ~19 tok/s: ~24 ms waiting on GPU readbacks (54 syncs, ~1,300 launches, while dense
+  bytes would take only ~8-10 ms), ~16 ms CPU routed experts, ~5 ms enqueue. The next wins are fewer
+  launches and syncs (kernel fusion, GPU-side routing), not dense bandwidth.
