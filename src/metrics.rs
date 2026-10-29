@@ -52,7 +52,7 @@ pub fn finish(id: u64, outcome: &str, t: Option<&crate::engine::Timings>) {
     let a = { let mut v = ACTIVE.lock().unwrap(); match v.iter().position(|a| a.id == id) { Some(i) => v.remove(i), None => return } };
     let total_ms = a.start.elapsed().as_secs_f64() * 1e3;
     let (pn, pms, pps, gn, gms, gps, cached) = match t {
-        Some(t) => (t.prompt_n, t.prompt_ms, t.prompt_per_second, t.predicted_n, t.predicted_ms, t.predicted_per_second, t.cached_n),
+        Some(t) => (t.prompt_n + t.cached_n, t.prompt_ms, t.prompt_per_second, t.predicted_n, t.predicted_ms, t.predicted_per_second, t.cached_n),
         None => {
             let pms = a.first.map(|f| (f - a.start).as_secs_f64() * 1e3).unwrap_or(total_ms);
             let gms = total_ms - pms;

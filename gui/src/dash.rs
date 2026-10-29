@@ -24,7 +24,7 @@ fn gauge(label: &str, frac: f64, text: String, mark: Option<f64>) -> impl IntoEl
     div().flex().items_center().gap(px(10.)).text_sm()
         .child(div().w(px(92.)).text_color(rgb(MUTED)).child(label.to_string()))
         .child(bar)
-        .child(div().w(px(230.)).child(text))
+        .child(div().w(px(300.)).child(text))
 }
 
 fn spark(title: String, h: &std::collections::VecDeque<f64>, col: u32) -> impl IntoElement {

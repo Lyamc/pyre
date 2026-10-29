@@ -254,6 +254,25 @@ Screenshots: `samples/gui-{chat,models,images,audio,status}.png`.
 
 Screenshot with TTS: `samples/gui-audio-tts.png` (`PYRE_GUI_TTS="text"` speaks at startup).
 
+### Dashboard (GPUI) and `/api/metrics`
+
+The GUI opens on a live **Dashboard** page (`PYRE_GUI_PAGE=dashboard`, the default; point it anywhere:
+`pyre-gui http://192.168.0.30:8099`). It polls `GET /api/metrics` once a second and shows: server and LAN
+URL, loaded models with kind and context size, decode/prefill tok/s (live for the running request, else
+the last one), active/queued/finished requests and token totals, context used / max, VRAM used/free with
+pyre's reserve marked, GPU util against the duty-cycle cap, RAM (system and pyre RSS), CPU, CPU-expert vs
+GPU time, expert-cache hit rate, sparklines (decode tok/s, GPU util, VRAM) and a recent-request table
+(prompt/cached/generated tokens, prefill and decode tok/s, outcome ok/error/cancelled).
+`/api/status` also carries the same request metrics under `metrics` (the web Status tab shows them).
+
+Model code can feed the backend-specific panels through `src/metrics.rs`:
+`metrics::add_cpu_expert_ns(ns)`, `metrics::add_gpu_ns(ns)`, `metrics::expert_cache(hits, misses)`.
+Until a backend calls them they read "n/a"/"no data" (the Qwen-Next path should call them; see `qwen-perf`).
+
+Layout idea (gauges + sparklines + request table at a glance) inspired by the TUI of
+[Strata](https://github.com/Niko1221/Strata); no code is shared.
+Screenshots: `samples/dashboard-live.png`, `samples/dashboard-requests.png`.
+
 ## GPU footprint limits (on by default)
 
 pyre leaves room for the desktop and other apps:
