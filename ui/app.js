@@ -311,13 +311,21 @@ function limitsText(l) {
   const u = l.gpu_util_max_pct >= 100 ? "no duty-cycle cap" : `GPU util cap ${l.gpu_util_max_pct}% (now ${l.gpu_util_now_pct ?? "?"}%, throttled ${l.throttled_s.toFixed(1)} s)`;
   return v + "<br>" + u + (l.low_priority ? " · low process priority" : "");
 }
+function metricsText(m) {
+  if (!m) return "n/a";
+  const act = m.active.map(a => `#${a.id} ${esc(a.model)} ${a.phase} ${a.ctx_used}/${a.n_ctx} ctx, ${a.decode_tps.toFixed(1)} tok/s`).join("<br>");
+  const rec = m.recent.slice(0, 5).map(r => `#${r.id} ${esc(r.model)} ${r.outcome}: ${r.prompt_n}+${r.gen_n} tok, prefill ${r.prefill_tps.toFixed(0)} tok/s, decode ${r.decode_tps.toFixed(1)} tok/s`).join("<br>");
+  const hr = m.expert_cache.hit_rate == null ? "n/a" : (m.expert_cache.hit_rate * 100).toFixed(1) + "%";
+  return `${m.active.length} active, ${m.totals.requests} done (${m.totals.prompt_tokens} prompt / ${m.totals.generated_tokens} generated tok) · expert cache ${hr} · CPU experts ${(m.compute.cpu_expert_ms / 1e3).toFixed(1)} s / GPU ${(m.compute.gpu_ms / 1e3).toFixed(1)} s`
+    + (act ? "<br>" + act : "") + (rec ? "<br><i>recent</i><br>" + rec : "");
+}
 async function loadStatus() {
   try {
     const s = await api("/api/status");
     const g = s.gpus.map(g => `${g.name} — ${g.memory_used_mib}/${g.memory_total_mib} MiB VRAM, ${g.utilization_pct}% util`).join("<br>") || "n/a";
     $("#statusBox").innerHTML = [["version", `pyre ${s.version} (Burn ${s.burn})`], ["default backend", s.default_backend], ["compiled backends", s.backends_compiled.join(", ")], ["GPU", g],
       ["RAM", `process ${human(s.ram.process_rss)} · system ${human(s.ram.used)} / ${human(s.ram.total)}`], ["uptime", s.uptime_s + " s"], ["auth", s.auth ? "API key required" : "open"],
-      ["store", s.store_root], ["HF cache", s.hf_cache], ["GPU limits", limitsText(s.limits)], ["batching", s.batching]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
+      ["store", s.store_root], ["HF cache", s.hf_cache], ["GPU limits", limitsText(s.limits)], ["batching", s.batching], ["requests", metricsText(s.metrics)]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
     $("#slotsTbl tbody").innerHTML = s.models.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${m.busy}</td><td>${m.queued}</td></tr>`).join("");
     const base = location.origin; const model = s.models.find(m => m.kind === "llm")?.id || "model"; const key = s.auth ? "$PYRE_API_KEY" : "none";
     $("#apiSnippet").textContent = `# curl
