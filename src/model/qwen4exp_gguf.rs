@@ -289,7 +289,7 @@ impl Model {
     fn layer_cube(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, x: &burn_cubecl::cubecl::server::Handle, st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp); let w = hc * d;
         let q0 = std::time::Instant::now();
-        let gfast = graph_on() && st.gdn_gpu && cl.gdn.is_some() && super::qn_cube::native_mode() == 0;
+        let gfast = graph_on() && st.gdn_gpu && cl.gdn.is_some() && matches!(super::qn_cube::native_mode(), 0 | 3); // modes 1/2 allocate scratch per GEMV
         let (rd, df, rn, lrf, q1, q2, q3) = if gfast { self.gdn_graph(il, cl, x, st, li) } else {
         let xn = cb.empty(w);
         let lra = cl.hca.up.cols; let da = cb.empty(cl.hca.di.rows);
