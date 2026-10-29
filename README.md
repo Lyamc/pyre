@@ -597,3 +597,55 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   decode path's int8 rounding instead of f32. Profile per 256-token chunk (~16 s): hyper-connections 3.3-4.0 s and
   DeltaNet 4.6 s still run on the CPU, routed experts 5.8 s (gate/up 4.0, down 1.25), attention 1.1 s. The next
   prefill steps are hc and DeltaNet on the GPU for chunks, then GPU experts streamed per layer (Strata's approach).
+### Decode timeline of one token (PYRE_QN_PROFILE=1, graphs on, story prompt, ~50 ms/token)
+
+Per layer the host does: enqueue the dense segment (graph replay or kernels), then **wait** for its readback
+(router logits + FFN input), then route. The pool runs the missed experts on the CPU while the same thread
+enqueues the cached experts and the shared expert on the GPU, then uploads the CPU sum and enqueues the combine.
+The next layer cannot start before that combine, so GPU and CPU alternate:
+
+| per token | ms |
+|---|---|
+| host enqueue (graph launches, attention layers' kernels, comb3, y upload) | ~4 |
+| waiting for the GPU dense segment (`reads`: ~18.5 ms dense kernels + ~2.5 ms sync/launch latency) | ~21 |
+| CPU experts (gate/up ~11, quantize ~1, down ~3.5-4) with GPU experts + shared expert overlapped (~5 ms GPU) | ~16 |
+| LM head on the CPU | ~3 |
+| PLE layer (1 of 48, host round trip) + embedding, sampling, final readback | ~5 |
+
+GPU kernel time per token (Nsight): k_gemv 13.1 ms, k_xgu_s 2.9, k_delta 2.2, k_gate 1.8 (94 launches),
+k_xdown_q 1.6, rms 0.5, attention 0.4, the rest < 0.3 each. So the ~15 ms of GPU idle time per token is the
+CPU expert phase (~11 ms of it, after the GPU experts finish) plus head and host gaps, and the CPU idles during
+the ~21 ms dense wait. That chain is a true data dependency (each layer's experts need its router output, and
+the next layer needs their sum), so it cannot overlap without changing the math. What can shrink it:
+fewer CPU misses, faster dense kernels, and faster CPU experts.
+
+Tried on that critical path (all greedy-identical):
+- **PCIe share** (`PYRE_QN_XSTREAM=K`, opt-in): K misses per layer are uploaded into reserved cache slots and run
+  with the GPU experts. 1/2/4 streamed experts per layer: 7.8 / 4.5 / 2.7 tok/s. The cost is the host repack in
+  `xupload`, 1.1 ms per expert (54 ms of repack per token at K=1), plus ~0.33 ms per expert of pageable PCIe
+  transfer (~4.5 GB/s). It needs experts kept pre-repacked in pinned memory to be viable; that does not fit next
+  to the 33 GB resident copy.
+- **Pool layout:** SBLK 16, SDBLK 32, 9 threads (caller plus 8 pinned workers): no gain (within noise).
+
+### Prefill on the GPU (`PYRE_QN_PF_MULTI=K`, opt-in)
+
+The prompt goes through the decode verify path K tokens at a time: hyper-connections, projections and
+DeltaNet run on the GPU, without rollback checkpoints, and the expert cache fills after the first piece.
+CPU gate/up for tokens that share an expert decode each row once (`qdot::row_dot_k_multi`, bit-identical
+to the one-token kernel). 931-token copy prompt:
+
+| setting | prefill tok/s | greedy vs default f32 prefill |
+|---|---|---|
+| default (CPU dense f32) | 10.8 | - |
+| PF_POOL=1 | 15.3 | identical |
+| PF_MULTI=4 | 16.7-17.9 | identical |
+| PF_MULTI=8 | 19.4-20.5 | differs at token 24 |
+| PF_MULTI=32 | 22.2 | differs |
+| PF_MULTI=128 | 23.9 | differs |
+
+K >= 8 diverges at a near-tie: the prompt's experts then run partly on the GPU (cache) with different rounding.
+The checkpoint-free path gives the same tokens as the checkpointed one. Per 128-token piece (~5 s): host
+enqueue 0.95 s (per-token kernel launches), dense wait 1.35 s, CPU experts 2.0 s (gate/up 1.4, down 0.45).
+Streaming a layer's experts to the GPU per piece is the next step, but at the current pageable ~4.5 GB/s plus
+1.1 ms host repack per expert (~770 MB per layer) it is slower than the CPU. It needs pinned, pre-repacked
+staging and pieces of several thousand tokens, as in Strata, to amortize.
