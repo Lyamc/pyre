@@ -3,11 +3,13 @@
 # Additive union, the same rules as monga (crates/monga-core/src/content.rs, branch content-tags):
 #  - a tag is on the book if ANY tagged page has it >= THR; the book keeps the max score and the pages that carry it;
 #  - warning categories come from content_categories.txt (model tags -> category, per-category threshold, restricted/open);
-#  - kid_friendly is derived: every page tagged AND no restricted category on any page. A partly tagged book
-#    (e.g. a sample) can be shown restricted but is never kid friendly: its rating is "unknown" until fully tagged.
+#  - indexes (Purity, Explicit, Gore; formula version) from content_index.py + content_weights.txt, shared with monga;
+#  - kid_friendly is derived: every page tagged AND within the kid limits (Purity >= 0.60, no sexual content, Gore <= 0.50,
+#    no strong sexual violence / sexualised minors / sexual content). A partly tagged book is "unknown" until fully tagged.
 # Page numbers in the output are 1-based ("page"), with the 0-based archive index alongside ("page_index").
 import json, os, csv, collections, sys
 import numpy as np
+import content_index as ci
 R = r"C:\Temp\kagami"; S = r"C:\Users\Lyam\.cache\huggingface\hub\models--Redstonexs--kagami-24k\snapshots\fbf04252c68c9cbf03c8b343e537e3cd7594c8a1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 THR = 0.37; STORE_THR = 0.2
@@ -58,9 +60,12 @@ def categories(page_probs, page_numbers):
     order = [c["id"] for c in CATS]
     return sorted(out.values(), key=lambda v: order.index(v["id"]))
 
-def rating(cats, tagged, total):
-    if any(c["restricted"] for c in cats): return "restricted"
-    return "kid_friendly" if total and tagged >= total else "unknown"
+def rating(cats, idx, tagged, total):
+    if not total or tagged < total: return "unknown"
+    return "restricted" if ci.kid_over(idx, cats) else "kid_friendly"
+
+def page_dict(probs):
+    return {tags[k]: float(probs[k]) for k in np.where(probs >= STORE_THR)[0]}
 
 if __name__ == "__main__":
     rows = [json.loads(l) for l in open(os.path.join(R, "results", "pages.jsonl"), encoding="utf-8")]
@@ -76,13 +81,17 @@ if __name__ == "__main__":
         numbers = [p["index"] + 1 for p in info]
         p = P[idx]; n = len(idx)
         cats = categories(p, numbers)
-        rt = rating(cats, n, b["total_pages"])
+        idx_ = ci.indexes([page_dict(P[i]) for i in idx])
+        rt = rating(cats, idx_, n, b["total_pages"])
+        indexes = {"version": idx_["version"], "purity": idx_["purity"], "explicit": idx_["explicit"], "gore": idx_["gore"],
+                   "sexual_pages": [numbers[i] for i in idx_["sexual_pages"]]}
         book = {
-            "schema": "pyre-tagger-book-rollup/2", "model": "Redstonexs/kagami-24k", "engine": "pyre (Burn, CUDA, f32)",
+            "schema": "pyre-tagger-book-rollup/3", "model": "Redstonexs/kagami-24k", "engine": "pyre (Burn, CUDA, f32)",
             "book": b["book"], "volume": b["volume"], "total_pages": b["total_pages"], "tagged_pages": n,
             "coverage": "complete" if n >= b["total_pages"] else f"partial {n}/{b['total_pages']}",
             "threshold": THR, "store_threshold": STORE_THR, "page_numbers": "1-based",
-            "rating": rt, "kid_friendly": rt == "kid_friendly",
+            "rating": rt, "kid_friendly": rt == "kid_friendly", "kid_limits_failed": ci.kid_over(idx_, cats),
+            "indexes": indexes,
             "categories": cats,
             "union_tags": union(p, numbers),
             "pages": [{"page": pi["index"] + 1, "page_index": pi["index"], "file": pi["file"], "cover": pi["cover"],
@@ -90,11 +99,12 @@ if __name__ == "__main__":
         }
         json.dump(book, open(os.path.join(R, "results", slug + ".json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
         summary.append({"book": b["book"], "volume": b["volume"], "slug": slug, "tagged": n, "total": b["total_pages"], "rating": rt,
-                        "kid_friendly": rt == "kid_friendly",
+                        "kid_friendly": rt == "kid_friendly", "indexes": indexes,
                         "categories": {c["id"]: {"pages": c["pages"], "max": c["max_score"]} for c in cats},
                         "top": [t["tag"] for t in book["union_tags"][:12]]})
     json.dump(summary, open(os.path.join(R, "results", "summary.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
     for s in summary:
         print(f"\n## {s['book']} ({s['volume']}) tagged {s['tagged']}/{s['total']} rating={s['rating']} kid_friendly={s['kid_friendly']}")
+        i = s["indexes"]; print(f"  purity {i['purity']:.3f} explicit {'none' if i['explicit'] is None else format(i['explicit'], '.3f')} gore {i['gore']:.3f}")
         for k, v in s["categories"].items(): print(f"  {k}: max {v['max']} pages {v['pages']}")
         print("  top:", ", ".join(s["top"]))
