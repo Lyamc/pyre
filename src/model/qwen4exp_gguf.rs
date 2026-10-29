@@ -860,12 +860,15 @@ impl Model {
             if let Some(xm) = &self.xc { if let Some(il) = self.layers.iter().position(|x| std::ptr::eq(x, l)) { let mut g = xm.lock().unwrap(); for &e in top { g.cnt[il][e] += 1; } } }
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
-        if t * c.top_k >= work.len() * env_usize("PYRE_QN_GEMM_MIN").unwrap_or(8) { // >= 8 tokens per expert on average
+        // PYRE_QN_PF_POOL=1: prompt chunks also take the int8 pool path below (decode numerics, opt-in: it
+        // changes the prompt's rounding against the f32 path, so greedy output can differ)
+        let pf_pool = env_var("PYRE_QN_PF_POOL").map(|v| v == "1").unwrap_or(false);
+        if !pf_pool && t * c.top_k >= work.len() * env_usize("PYRE_QN_GEMM_MIN").unwrap_or(8) { // >= 8 tokens per expert on average
             self.routed_gemm(l, x, &work, t, y);
             { let rns = t_r.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             return;
         }
-        if t <= 4 && env_var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
+        if (t <= 4 || pf_pool) && env_var("PYRE_QN_SPIN").map(|v| v != "0").unwrap_or(true) && super::qdot::supports(l.gate_e.ty) && super::qdot::supports(l.up_e.ty) && super::qdot::supports(l.down_e.ty)
             && env_var("PYRE_QN_QDOT").map(|v| v != "0").unwrap_or(true) {
             self.routed_pool(l, x, &work, t, y, &mut || {});
             { let rns = t_r.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }

@@ -585,4 +585,15 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
 - **Expert-ranking profile** (`PYRE_QN_XPROFILE=<file>`, opt-in; build one with `PYRE_QN_XPROFILE_SAVE=<file>`):
   counts from two other prompts (story and Python), weighted as 256 tokens of routing, seed and steer the cache.
   It changes placement only, and greedy output is identical. Result: story 17.1-17.3 vs 18.3-19.3, code 17.0-17.5
-  vs 17.6, so it is off by default. A lighter prior, or seeding only the very first (pre-prefill) fill, are untested.
+  vs 17.6, so it is off by default. A lighter prior, or seeding only the very first (pre-prefill) fill, are untested.- **Prompt-free 4-bit kernel, global-x variant** (k_gemv_iq4g: byte_perm, x from L1 like k_gemv): 85 us per call, so
+  slower still, and greedy differed. Reverted.
+- **PYRE_QN_NATIVE=1** (the shared-memory IQ4_XS kernel) matches the Q8 greedy output and can now be graph-captured.
+  With graphs on, VRAM use is the same as Q8, because the cache takes what is free. With the cache cap at 4 GiB:
+  story 18.8-19.3 vs 19.3-19.4, code 18.2-18.5 vs 17.9-18.0. That is too small to change the default.
+- **Env snapshot:** decode-path `PYRE_*` reads come from a snapshot instead of `std::env::var` (the process
+  environment lock in every pool task). Steady 19.0-19.6 / 17.4-18.0, unchanged: not the pool overhead.
+- **Prefill on the int8 pool path** (`PYRE_QN_PF_POOL=1`, opt-in): 931-token copy prompt, **10.8 -> 15.3 tok/s**
+  (85.9 s -> 60.8 s), with the same 32 greedy tokens. It is opt-in only because the prompt's experts then use the
+  decode path's int8 rounding instead of f32. Profile per 256-token chunk (~16 s): hyper-connections 3.3-4.0 s and
+  DeltaNet 4.6 s still run on the CPU, routed experts 5.8 s (gate/up 4.0, down 1.25), attention 1.1 s. The next
+  prefill steps are hc and DeltaNet on the GPU for chunks, then GPU experts streamed per layer (Strata's approach).
