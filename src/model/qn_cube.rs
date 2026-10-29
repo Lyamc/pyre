@@ -772,6 +772,354 @@ fn k_xgu_b(x: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[
     }
 }
 
+/// k_xgu_b with four independent sub-block chains in flight per lane (the one-chain loop was latency-bound).
+#[cube(launch_unchecked)]
+fn k_xgu_b4(x: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], h: &mut [f32], rows: u32, cols: u32, rbg: u32, rbu: u32,
+    #[comptime] tg: u32, #[comptime] tu: u32) {
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let go = meta[(e * 4) as usize] + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let nsb = cols / 8;
+        let mut g0 = 0.0f32; let mut g1s = 0.0f32; let mut u0 = 0.0f32; let mut u1 = 0.0f32;
+        let mut sb = UNIT_POS_X;
+        while sb + 32 < nsb {
+            g0 += subdot8(ar, go, sb, x, 0u32, g2s, g2x, ks, g1, tg);
+            u0 += subdot8(ar, uo, sb, x, 0u32, g2s, g2x, ks, g1, tu);
+            g1s += subdot8(ar, go, sb + 32, x, 0u32, g2s, g2x, ks, g1, tg);
+            u1 += subdot8(ar, uo, sb + 32, x, 0u32, g2s, g2x, ks, g1, tu);
+            sb += 64u32;
+        }
+        if sb < nsb {
+            g0 += subdot8(ar, go, sb, x, 0u32, g2s, g2x, ks, g1, tg);
+            u0 += subdot8(ar, uo, sb, x, 0u32, g2s, g2x, ks, g1, tu);
+        }
+        let g = plane_sum(g0 + g1s);
+        let u = plane_sum(u0 + u1);
+        if UNIT_POS_X == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+/// k_xdown_b with the (expert, sub-block) loop flattened across the lanes: all experts' loads of a row are
+/// independent, instead of one expert after another.
+#[cube(launch_unchecked)]
+fn k_xdown_b4(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, #[comptime] td: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nsb = cols / 8;
+        let tot = ne * nsb;
+        let mut s0 = 0.0f32; let mut s1 = 0.0f32;
+        let mut j = UNIT_POS_X;
+        while j + 32 < tot {
+            let e0 = j / nsb; let e1 = (j + 32) / nsb;
+            s0 += f32::reinterpret(meta[(e0 * 4 + 3) as usize]) * subdot8(ar, meta[(e0 * 4 + 2) as usize] + row * rbd, j - e0 * nsb, h, e0 * cols, g2s, g2x, ks, g1, td);
+            s1 += f32::reinterpret(meta[(e1 * 4 + 3) as usize]) * subdot8(ar, meta[(e1 * 4 + 2) as usize] + row * rbd, j + 32 - e1 * nsb, h, e1 * cols, g2s, g2x, ks, g1, td);
+            j += 64u32;
+        }
+        if j < tot {
+            let e0 = j / nsb;
+            s0 += f32::reinterpret(meta[(e0 * 4 + 3) as usize]) * subdot8(ar, meta[(e0 * 4 + 2) as usize] + row * rbd, j - e0 * nsb, h, e0 * cols, g2s, g2x, ks, g1, td);
+        }
+        let t = plane_sum(s0 + s1);
+        if UNIT_POS_X == 0 {
+            y[row as usize] += t;
+        }
+    }
+}
+
+/// Q8 pack: per 32 values d = amax/127, q = round(v/d) as int8 (4 per word) - the same grid as
+/// k_q8copy / the CPU Q8 activations. One thread per 32-block.
+#[cube(launch_unchecked)]
+fn k_q8pack(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, nb: u32) {
+    let b = ABSOLUTE_POS_X;
+    if b < nb {
+        let base = soff + b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32u32 { amax = f32::max(amax, f32::abs(src[(base + i) as usize])); }
+        let d = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if d > 0.0f32 { id = 1.0f32 / d; }
+        sc[b as usize] = d;
+        for w in 0..8u32 {
+            let mut word = 0u32;
+            #[unroll]
+            for j in 0..4u32 {
+                let v = i32::cast_from(f32::round(src[(base + w * 4 + j) as usize] * id));
+                word |= (u32::cast_from(v) & 255u32) << (8 * j);
+            }
+            q[(b * 8 + w) as usize] = word;
+        }
+    }
+}
+
+/// Signed grid word: bytes of g negated where the mask byte is 0xFF (grid bytes are 1..127, no carries).
+#[cube]
+fn sgn(g: u32, m: u32) -> i32 {
+    i32::cast_from((g ^ m) + (m & 16843009u32))
+}
+
+/// IQ2_S (ty 0) / IQ2_XXS (ty 1) 8-group dot against int8 activations (xq words, xs per-32 scales).
+#[cube]
+fn gdot8(w: &[u32], rb: u32, q: u32, xq: &[u32], xs: &[f32], g2s: &[u32], g2x: &[u32], ks: &[u32], sm: &[u32], #[comptime] ty: u32) -> f32 {
+    let sb = q / 4;
+    let l = q % 4;
+    let x0 = i32::cast_from(xq[(q * 2) as usize]);
+    let x1 = i32::cast_from(xq[(q * 2 + 1) as usize]);
+    let mut r = 0.0f32;
+    if comptime!(ty == 0) {
+        let blk = rb + (sb / 8) * 21;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let sg = w[(blk + 9 + ib) as usize];
+        let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+        let s8 = (sg >> (8 * l)) & 255u32;
+        let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
+        if l >= 2 { scl = 0.5f32 + f32::cast_from(sc >> 4); }
+        let a = sgn(g2s[(idx * 2) as usize], sm[(s8 * 2) as usize]);
+        let b = sgn(g2s[(idx * 2 + 1) as usize], sm[(s8 * 2 + 1) as usize]);
+        let dot = dp4a(b, x1, dp4a(a, x0, 0i32));
+        r = f32::cast_from(dot) * d * scl * xs[sb as usize];
+    }
+    if comptime!(ty == 1) {
+        let blk = rb + (sb / 8) * 17;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qw = w[(blk + 1 + 2 * ib) as usize];
+        let a1 = w[(blk + 2 + 2 * ib) as usize];
+        let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
+        let idx = (qw >> (8 * l)) & 255u32;
+        let s8 = ks[((a1 >> (7 * l)) & 127u32) as usize] & 255u32;
+        let a = sgn(g2x[(idx * 2) as usize], sm[(s8 * 2) as usize]);
+        let b = sgn(g2x[(idx * 2 + 1) as usize], sm[(s8 * 2 + 1) as usize]);
+        let dot = dp4a(b, x1, dp4a(a, x0, 0i32));
+        r = f32::cast_from(dot) * db * xs[sb as usize];
+    }
+    r
+}
+
+/// Batched cached experts, gate/up with int8 activations and dp4a (IQ2_S / IQ2_XXS).
+#[cube(launch_unchecked)]
+fn k_xgu_q(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], sm: &[u32], h: &mut [f32], rows: u32, cols: u32, rbg: u32, rbu: u32,
+    #[comptime] tg: u32, #[comptime] tu: u32) {
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let go = meta[(e * 4) as usize] + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let nsb = cols / 8;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        let mut sb = UNIT_POS_X;
+        while sb < nsb {
+            gs += gdot8(ar, go, sb, xq, xs, g2s, g2x, ks, sm, tg);
+            us += gdot8(ar, uo, sb, xq, xs, g2s, g2x, ks, sm, tu);
+            sb += 32u32;
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if UNIT_POS_X == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+/// gdot8 with the activation words / scale already in registers.
+#[cube]
+fn gdot8x(w: &[u32], rb: u32, q: u32, x0: i32, x1: i32, xsc: f32, g2s: &[u32], g2x: &[u32], ks: &[u32], sm: &[u32], #[comptime] ty: u32) -> f32 {
+    let sb = q / 4;
+    let l = q % 4;
+    let mut r = 0.0f32;
+    if comptime!(ty == 0) {
+        let blk = rb + (sb / 8) * 21;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let sg = w[(blk + 9 + ib) as usize];
+        let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+        let s8 = (sg >> (8 * l)) & 255u32;
+        let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
+        if l >= 2 { scl = 0.5f32 + f32::cast_from(sc >> 4); }
+        let a = sgn(g2s[(idx * 2) as usize], sm[(s8 * 2) as usize]);
+        let b = sgn(g2s[(idx * 2 + 1) as usize], sm[(s8 * 2 + 1) as usize]);
+        r = f32::cast_from(dp4a(b, x1, dp4a(a, x0, 0i32))) * d * scl * xsc;
+    }
+    if comptime!(ty == 1) {
+        let blk = rb + (sb / 8) * 17;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qw = w[(blk + 1 + 2 * ib) as usize];
+        let a1 = w[(blk + 2 + 2 * ib) as usize];
+        let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
+        let idx = (qw >> (8 * l)) & 255u32;
+        let s8 = ks[((a1 >> (7 * l)) & 127u32) as usize] & 255u32;
+        let a = sgn(g2x[(idx * 2) as usize], sm[(s8 * 2) as usize]);
+        let b = sgn(g2x[(idx * 2 + 1) as usize], sm[(s8 * 2 + 1) as usize]);
+        r = f32::cast_from(dp4a(b, x1, dp4a(a, x0, 0i32))) * db * xsc;
+    }
+    r
+}
+
+/// k_xgu_q with `rw` rows per warp and the lane's activation groups held in registers (ng = cols / 256).
+#[cube(launch_unchecked)]
+fn k_xgu_q4(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], sm: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32,
+    #[comptime] ng: u32, #[comptime] rw: u32, #[comptime] tg: u32, #[comptime] tu: u32) {
+    let e = CUBE_POS_Y;
+    let lane = UNIT_POS_X;
+    let r0 = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) * rw;
+    let mut xa = Array::<i32>::new(comptime!((2 * ng) as usize));
+    let mut xsa = Array::<f32>::new(comptime!(ng as usize));
+    #[unroll]
+    for k in 0..ng {
+        let q = lane + 32 * k;
+        xa[(2 * k) as usize] = i32::cast_from(xq[(q * 2) as usize]);
+        xa[(2 * k + 1) as usize] = i32::cast_from(xq[(q * 2 + 1) as usize]);
+        xsa[k as usize] = xs[(q / 4) as usize];
+    }
+    let gb = meta[(e * 4) as usize];
+    let ub = meta[(e * 4 + 1) as usize];
+    #[unroll]
+    for r in 0..rw {
+        let row = r0 + r;
+        if row < rows {
+            let mut gs = 0.0f32;
+            let mut us = 0.0f32;
+            #[unroll]
+            for k in 0..ng {
+                let q = lane + 32 * k;
+                gs += gdot8x(ar, gb + row * rbg, q, xa[(2 * k) as usize], xa[(2 * k + 1) as usize], xsa[k as usize], g2s, g2x, ks, sm, tg);
+                us += gdot8x(ar, ub + row * rbu, q, xa[(2 * k) as usize], xa[(2 * k + 1) as usize], xsa[k as usize], g2s, g2x, ks, sm, tu);
+            }
+            let g = plane_sum(gs);
+            let u = plane_sum(us);
+            if lane == 0 {
+                h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+            }
+        }
+    }
+}
+
+/// Sign mask (0xFF bytes) for the low 4 bits of s, without a table.
+#[cube]
+fn smask4(s: u32) -> u32 {
+    (((s & 15u32) * 2113665u32) & 16843009u32) * 255u32
+}
+
+/// gdot8x with the grid in shared memory and the sign masks / IQ2_XXS sign parity computed.
+#[cube]
+fn gdot8s(w: &[u32], rb: u32, q: u32, x0: i32, x1: i32, xsc: f32, grid: &Shared<[u32]>, #[comptime] ty: u32) -> f32 {
+    let sb = q / 4;
+    let l = q % 4;
+    let mut r = 0.0f32;
+    if comptime!(ty == 0) {
+        let blk = rb + (sb / 8) * 21;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qs = w[(blk + 1 + ib) as usize];
+        let sg = w[(blk + 9 + ib) as usize];
+        let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+        let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+        let s8 = (sg >> (8 * l)) & 255u32;
+        let mut scl = 0.5f32 + f32::cast_from(sc & 15u32);
+        if l >= 2 { scl = 0.5f32 + f32::cast_from(sc >> 4); }
+        let m0 = smask4(s8); let m1 = smask4(s8 >> 4);
+        let a = i32::cast_from((grid[(idx * 2) as usize] ^ m0) + (m0 & 16843009u32));
+        let b = i32::cast_from((grid[(idx * 2 + 1) as usize] ^ m1) + (m1 & 16843009u32));
+        r = f32::cast_from(dp4a(b, x1, dp4a(a, x0, 0i32))) * d * scl * xsc;
+    }
+    if comptime!(ty == 1) {
+        let blk = rb + (sb / 8) * 17;
+        let ib = sb % 8;
+        let d = f32::reinterpret(w[blk as usize]);
+        let qw = w[(blk + 1 + 2 * ib) as usize];
+        let a1 = w[(blk + 2 + 2 * ib) as usize];
+        let db = d * (0.5f32 + f32::cast_from(a1 >> 28));
+        let idx = (qw >> (8 * l)) & 255u32;
+        let k7 = (a1 >> (7 * l)) & 127u32;
+        let s8 = k7 | ((u32::count_ones(k7) & 1u32) << 7);
+        let m0 = smask4(s8); let m1 = smask4(s8 >> 4);
+        let a = i32::cast_from((grid[(idx * 2) as usize] ^ m0) + (m0 & 16843009u32));
+        let b = i32::cast_from((grid[(idx * 2 + 1) as usize] ^ m1) + (m1 & 16843009u32));
+        r = f32::cast_from(dp4a(b, x1, dp4a(a, x0, 0i32))) * db * xsc;
+    }
+    r
+}
+
+/// Gate/up (both of type ty) with the grid table staged in shared memory; one row per warp.
+#[cube(launch_unchecked)]
+fn k_xgu_s(xq: &[u32], xs: &[f32], ar: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32,
+    #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let lane = UNIT_POS_X;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let go = meta[(e * 4) as usize] + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        #[unroll]
+        for k in 0..ng {
+            let q = lane + 32 * k;
+            let x0 = i32::cast_from(xq[(q * 2) as usize]);
+            let x1 = i32::cast_from(xq[(q * 2 + 1) as usize]);
+            let xsc = xs[(q / 4) as usize];
+            gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
+            us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if lane == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+/// Batched cached experts, Q2_0 down with int8 h and dp4a; (expert, group) flattened over the lanes.
+/// q2l[b] = the four 2-bit fields of byte b as bytes.
+#[cube(launch_unchecked)]
+fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nsb = cols / 8;
+        let tot = ne * nsb;
+        let mut s = 0.0f32;
+        let mut j = UNIT_POS_X;
+        while j < tot {
+            let e = j / nsb;
+            let q = j - e * nsb;
+            let sb = q / 4;
+            let l = q % 4;
+            let blk = meta[(e * 4 + 2) as usize] + row * rbd + (sb / 2) * 5;
+            let d = f32::reinterpret(ar[blk as usize]);
+            let qw = ar[(blk + 1 + 2 * (sb % 2) + l / 2) as usize];
+            let half = (qw >> (16 * (l % 2))) & 65535u32;
+            let xw = e * cols / 4 + q * 2;
+            let x0 = i32::cast_from(hq[xw as usize]);
+            let x1 = i32::cast_from(hq[(xw + 1) as usize]);
+            let v = dp4a(i32::cast_from(q2l[(half >> 8) as usize]), x1, dp4a(i32::cast_from(q2l[(half & 255u32) as usize]), x0, 0i32));
+            let ones = dp4a(16843009i32, x1, dp4a(16843009i32, x0, 0i32));
+            s += f32::reinterpret(meta[(e * 4 + 3) as usize]) * d * hs[((e * cols) / 32 + q / 4) as usize] * f32::cast_from(v - ones);
+            j += 32u32;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[row as usize] += t;
+        }
+    }
+}
+
 /// y[row] += sum_e wgt_e * (down_e row . h_e); down offset meta[4e+2], weight bits meta[4e+3].
 #[cube(launch_unchecked)]
 fn k_xdown_b(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, #[comptime] td: u32) {
@@ -893,7 +1241,20 @@ fn k_attn(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mut 
     }
 }
 /// Grid tables for the expert kernels.
-pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle }
+/// New expert kernels (PYRE_QN_XK=1 selects the old ones).
+fn xk4() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_XK").map(|v| v != "1").unwrap_or(true)) }
+
+/// dp4a expert kernels (PYRE_QN_XQ=0 turns them off).
+pub fn xkq() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_XQ").map(|v| v != "0").unwrap_or(true)) }
+
+/// rows per warp for the register-x gate/up kernel (PYRE_QN_XRW, 0 = old one-row kernel).
+pub fn xrw() -> u32 { std::env::var("PYRE_QN_XRW").ok().and_then(|v| v.parse().ok()).unwrap_or(1) }
+
+/// shared-memory grid gate/up kernel (PYRE_QN_XSH=0 off) and its warps per cube (PYRE_QN_XSHR).
+pub fn xsh() -> bool { std::env::var("PYRE_QN_XSH").map(|v| v != "0").unwrap_or(true) }
+pub fn xshr() -> u32 { std::env::var("PYRE_QN_XSHR").ok().and_then(|v| v.parse().ok()).unwrap_or(8) }
+
+pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle, sm: Handle, q2l: Handle }
 /// One cached expert: raw GGUF bytes of its gate, up and down rows.
 pub struct XEnt { pub off: [u32; 3], pub arena: usize, pub slot: usize, pub bytes: usize }
 /// Words of one repacked expert (gate, up, down).
@@ -1059,7 +1420,9 @@ impl Cube {
         let w64 = |t: &[u64]| -> Vec<u32> { t.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect() };
         let ks: Vec<u32> = KSIGNS_IQ2XS.iter().map(|&v| v as u32).collect();
         XTabs { g2s: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2XXS_GRID))),
-            ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))) }
+            ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))),
+            sm: self.client.create_from_slice(u32::as_bytes(&(0..256u32).flat_map(|b| [0u32, 4].map(|o| (0..4).map(|j| if (b >> (o + j)) & 1 == 1 { 0xFFu32 << (8 * j) } else { 0 }).sum::<u32>())).collect::<Vec<u32>>())),
+            q2l: self.client.create_from_slice(u32::as_bytes(&(0..256u32).map(|b| (0..4).map(|j| ((b >> (2 * j)) & 3) << (8 * j)).sum::<u32>()).collect::<Vec<u32>>())) }
     }
     pub fn xarena(&self, bytes: usize) -> Handle { self.client.empty(bytes) }
     /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
@@ -1083,6 +1446,44 @@ impl Cube {
         let mh = self.client.create_from_slice(u32::as_bytes(&meta));
         self.xrun_m(tb, ar, ar_bytes, &mh, ne, x, d, ff, tys, h, y, 0);
     }
+    /// The dp4a expert path (gate/up IQ2_S or IQ2_XXS, down Q2_0); false when the types don't fit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_q(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, mh: &Handle, ne: usize, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle) -> bool { self.xrun_qs(tb, ar, ar_bytes, mh, ne, x, d, ff, tys, h, y, 7) }
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_qs(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, mh: &Handle, ne: usize, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle, st: u32) -> bool {
+        if tys.0 > 1 || tys.1 > 1 || tys.2 != 3 || d % 32 != 0 || ff % 32 != 0 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let ml = ne * 4; let aw = ar_bytes / 4; let rpc = 8u32;
+        let (xq, xs) = (self.client.empty(d), self.client.empty(d / 8)); let (hq, hs) = (self.client.empty(ne * ff), self.client.empty(ne * ff / 8));
+        unsafe {
+            if st & 1 != 0 { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((d as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(x, d), a(&xq, d / 4), a(&xs, d / 32), 0, (d / 32) as u32);
+            if d % 256 == 0 && tys.0 == tys.1 && xsh() { let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+                k_xgu_s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
+                a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(gsrc, gn as usize), a(h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, gn, tys.0); }
+            else if d % 256 == 0 && xrw() > 0 { let rw = xrw(); let nw = (ff as u32).div_ceil(rw); k_xgu_q4::launch_unchecked(&self.client, CubeCount::Static(nw.div_ceil(4), ne as u32, 1), CubeDim::new_2d(32, 4),
+                a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.sm, 512), a(h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, (d / 256) as u32, rw, tys.0, tys.1); }
+            else { k_xgu_q::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
+                a(&xq, d / 4), a(&xs, d / 32), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.sm, 512), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); } }
+            if st & 4 != 0 { k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32); }
+            if st & 2 != 0 { k_xdown_q::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(mh, ml), a(&tb.q2l, 256), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32); }
+        }
+        true
+    }
+    /// gate-up + q8 + down with an explicit kernel choice (xbench).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn xrun_sel(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, mh: &Handle, ne: usize, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle, old: bool) {
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let ml = ne * 4; let aw = ar_bytes / 4; let rpc = 8u32;
+        let cc = CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1); let cd = CubeCount::Static((d as u32).div_ceil(rpc), 1, 1);
+        if old { k_xgu_b::launch_unchecked(&self.client, cc, CubeDim::new_2d(32, rpc), a(x, d), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); }
+        else { k_xgu_b4::launch_unchecked(&self.client, cc, CubeDim::new_2d(32, rpc), a(x, d), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); }
+        k_q8sim::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ne * ff), (ne * ff) as u32);
+        if old { k_xdown_b::launch_unchecked(&self.client, cd, CubeDim::new_2d(32, rpc), a(h, ne * ff), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2); }
+        else { k_xdown_b4::launch_unchecked(&self.client, cd, CubeDim::new_2d(32, rpc), a(h, ne * ff), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2); }
+    }
     /// xrun_b with the per-expert meta already on the GPU; skip bits 1/2/4 drop gate-up / q8 / down (benchmarks).
     #[allow(clippy::too_many_arguments)]
     pub fn xrun_m(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, mh: &Handle, ne: usize, x: &Handle, d: usize, ff: usize, tys: (u32, u32, u32), h: &Handle, y: &Handle, skip: u32) {
@@ -1092,10 +1493,15 @@ impl Cube {
         let aw = ar_bytes / 4;
         static RPC: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); let rpc = *RPC.get_or_init(|| std::env::var("PYRE_QN_XRPC").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
         unsafe {
-            if skip & 1 == 0 { k_xgu_b::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
+            if skip == 0 && xkq() && self.xrun_q(tb, ar, ar_bytes, mh, ne, x, d, ff, tys, h, y) { return; }
+            let v4 = xk4(); if skip & 1 == 0 && v4 { k_xgu_b4::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
+                a(x, d), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); }
+            if skip & 1 == 0 && !v4 { k_xgu_b::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rpc), ne as u32, 1), CubeDim::new_2d(32, rpc),
                 a(x, d), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(h, ne * ff), ff as u32, d as u32, rbs.0 as u32, rbs.1 as u32, tys.0, tys.1); }
             if skip & 2 == 0 { k_q8sim::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8), a(h, ne * ff), (ne * ff) as u32); }
-            if skip & 4 == 0 { k_xdown_b::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
+            if skip & 4 == 0 && v4 { k_xdown_b4::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
+                a(h, ne * ff), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2); }
+            if skip & 4 == 0 && !v4 { k_xdown_b::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), 1, 1), CubeDim::new_2d(32, rpc),
                 a(h, ne * ff), a(ar, aw), a(mh, ml), a(&tb.g2s, 2048), a(&tb.g2x, 512), a(&tb.ks, 128), a(&tb.g1, 4096), a(y, d), ne as u32, d as u32, ff as u32, rbs.2 as u32, tys.2); }
         }
     }    /// dst = Q8-grid copy of src[soff..soff+n]; z[..n] = 0.
@@ -1120,3 +1526,39 @@ pub struct CHc { pub norm: Handle, pub di: CMat, pub up: CMat }
 /// One layer's dense half (see `Model::layer_cube`). `fin` = router | shared gate | shared up | shared-gate row.
 pub struct GdnW { pub conv: Handle, pub a: Handle, pub dt: Handle, pub norm: Handle }
 pub struct CLayer { pub an: Option<(Handle, Handle)>, pub gdn: Option<GdnW>, pub hca: CHc, pub min: CMat, pub mout: CMat, pub hcf: CHc, pub fin: CMat, pub sdown: CMat }
+
+/// PYRE_QN_XBENCH: time the batched expert kernels on random IQ2_XXS/IQ2_XXS/Q2_0 experts (d 2560, ff 640),
+/// old vs new, and compare their outputs.
+pub fn xbench() -> anyhow::Result<()> {
+    let cb = Cube::new()?; let tb = cb.xtabs();
+    let (d, ff) = (2560usize, 640usize); for tys in [(1u32, 1u32, 3u32), (0u32, 0u32, 3u32)] {
+    let mut rng = 0x9e3779b97f4a7c15u64; let mut rb = |n: usize, blk: usize| -> Vec<u8> { (0..n).map(|i| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; if i % blk < 2 { if i % blk == 0 { 0x00 } else { 0x20 } } else { rng as u8 } }).collect() };
+    let nexp = 40usize; let g = |n: usize| n; let _ = g;
+    let (gbk, gw) = if tys.0 == 0 { (82usize, 21usize) } else { (66, 17) }; let gb = ff * d / 256 * gbk; let db = d * ff / 64 * 18;
+    let slot = ((2 * ff * d / 256 * gw + d * ff / 64 * 5) * 4).next_multiple_of(256);
+    let ar_bytes = slot * nexp; let ar = cb.xarena(ar_bytes);
+    let ents: Vec<XEnt> = (0..nexp).map(|i| cb.xupload(&ar, ar_bytes, i, slot, &rb(gb, gbk), &rb(gb, gbk), &rb(db, 18), tys)).collect();
+    let xs: Vec<f32> = (0..d).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect(); let x = cb.buf(&xs);
+    let bytes_per = (gb * 2 + db) as f64;
+    for ne in [4usize, 10, 20] {
+        let sel: Vec<(&XEnt, f32)> = (0..ne).map(|i| (&ents[(i * 7) % nexp], 0.1 + i as f32 * 0.01)).collect();
+        let mut outs = vec![];
+        for v in ["1", "q"] {
+            std::env::set_var("PYRE_QN_XK", v);
+            let meta: Vec<u32> = sel.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
+            let mh = cb.client.create_from_slice(u32::as_bytes(&meta));
+            let h = cb.empty(ne * ff); let y = cb.buf(&vec![0f32; d]);
+            // xk4 is cached per process: call the kernels through the explicit selector
+            let run = |old: bool| unsafe { if old { cb.xrun_sel(&tb, &ar, ar_bytes, &mh, ne, &x, d, ff, tys, &h, &y, true) } else { assert!(cb.xrun_q(&tb, &ar, ar_bytes, &mh, ne, &x, d, ff, tys, &h, &y)); } };
+            cb.client.write(&y, cubecl::bytes::Bytes::from_elems(vec![0f32; d])); run(v == "1"); let r = cb.read(&y); outs.push(r);
+            let t0 = std::time::Instant::now(); for _ in 0..200 { run(v == "1"); } cb.read(&y);
+            let us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+            eprintln!("xbench ne={ne} {}: {us:.1} us ({:.0} GB/s)", if v == "1" { "old" } else { "new" }, bytes_per * ne as f64 / us / 1e3);
+        }
+        { let meta: Vec<u32> = sel.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect(); let mh = cb.client.create_from_slice(u32::as_bytes(&meta)); let h = cb.empty(ne * ff); let y = cb.buf(&vec![0f32; d]);
+          for (st, nm) in [(1u32, "pack+gu"), (4, "pack h"), (2, "down"), (0, "none")] { cb.xrun_qs(&tb, &ar, ar_bytes, &mh, ne, &x, d, ff, tys, &h, &y, st); cb.read(&y); let t0 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_qs(&tb, &ar, ar_bytes, &mh, ne, &x, d, ff, tys, &h, &y, st); } cb.read(&y); eprintln!("xbench   stage {nm}: {:.1} us", t0.elapsed().as_secs_f64() * 1e6 / 200.0); } }
+        let md = outs[0].iter().zip(&outs[1]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max); let mx = outs[0].iter().fold(0f32, |a, b| a.max(b.abs()));
+        eprintln!("xbench tys={tys:?} ne={ne}: max |old-new| {md:.3e} (max |y| {mx:.3e})");
+    } }
+    Ok(())
+}
