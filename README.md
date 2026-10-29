@@ -649,3 +649,13 @@ enqueue 0.95 s (per-token kernel launches), dense wait 1.35 s, CPU experts 2.0 s
 Streaming a layer's experts to the GPU per piece is the next step, but at the current pageable ~4.5 GB/s plus
 1.1 ms host repack per expert (~770 MB per layer) it is slower than the CPU. It needs pinned, pre-repacked
 staging and pieces of several thousand tokens, as in Strata, to amortize.
+**Not made the default.** The gated check had PF_MULTI=4 on by default, with a quiet GPU and graphs on.
+- The 931-token prefill was again greedy-identical, at 17.8 tok/s.
+- But decode after a short prompt was slower and less stable than with `PF_MULTI=0` (same session):
+  story 18.2 / code 15.1 steady, against 19.2 / 16.8.
+- The cause: the expert cache was filled after the first 4-token piece, so it was ranked on 4 tokens.
+- Moving that fill to after the whole prompt gave 18.2 tok/s prefill, but greedy then differed on both the
+  931-token prompt and the code prompt (cache placement changes GPU vs CPU rounding), and decode was still lower
+  (18.1 / 15.6).
+- So PF_MULTI stays opt-in (default 0). Making it the default first needs the decode cache-fill and rounding
+  sensitivity sorted out.
