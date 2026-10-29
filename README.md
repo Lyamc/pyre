@@ -501,4 +501,12 @@ DeltaNet 2 ms), ~12 ms of small launch gaps, ~21 ms of large gaps where the GPU 
   and the hit rate stays ~59%.
 - Profile per token at ~19 tok/s: ~24 ms waiting on GPU readbacks (54 syncs, ~1,300 launches, while dense
   bytes would take only ~8-10 ms), ~16 ms CPU routed experts, ~5 ms enqueue. The next wins are fewer
-  launches and syncs (kernel fusion, GPU-side routing), not dense bandwidth.
+  launches and syncs (kernel fusion, GPU-side routing), not dense bandwidth.- The expert cache now fills completely right after prefill (it used to start from 64 experts and add 64 every
+  16 tokens). A 2.5 GiB fill takes ~2 s once; hit rate ~60% on a story prompt, ~38% on a code prompt
+  (~51% at 5 GiB), with little tok/s change.
+- Nsight Systems (CUDA trace only, 40 tokens, RTX 3060, Windows WDDM) per decode token: ~900 kernel launches
+  (~1,200 with `PYRE_QN_NATIVE=2`) at ~7.4 us of host time each (6.6-8.9 ms/token), ~185 host-to-device copies
+  at 17-25 us each (3-4.6 ms), ~100 event syncs; GPU kernel time ~23 ms (dense Q8 GEMV ~12 ms of it,
+  ~10 ms with the native IQ4 kernel). Host and GPU mostly take turns, so the next steps are fewer launches and
+  uploads (CUDA graph replay of the dense part, fused per-layer kernels, one upload per layer) rather than
+  faster kernels.
