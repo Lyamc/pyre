@@ -743,3 +743,4 @@ is opt-in: no measurable gain here.
 - The MTP draft head runs on the GPU over the draft vocabulary (~100 MB VRAM, 2.2 -> 0.75 ms per draft; same drafts).
   `PYRE_MTP_HEAD_GPU=0` turns it off.
 - The drafter's CPU matmuls run on their own 8-thread rayon pool (`PYRE_MTP_THREADS`, 0 = global pool): ~2-3 ms less per 3-draft round. GPU calls stay on the main thread (a CubeCL call from another thread opens a second stream and ~200 MB memory pool).
+- `PYRE_QN_HPIN=1` (opt-in): small host-to-device buffers go through CubeCL's page-locked staging pool; within noise here (~+0.3 tok/s).

@@ -1221,6 +1221,7 @@ fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
     acc
 }
 /// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
+pub fn hpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_HPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
     let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
@@ -1883,7 +1884,7 @@ impl Cube {
         for e in extra { for b in 0..nb { let x = &e[b * 32..(b + 1) * 32]; let amax = x.iter().fold(0f32, |a, v| a.max(v.abs())); let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 };
             sc.push(d); for c in x.chunks_exact(4) { let qb: Vec<u8> = c.iter().map(|v| ((v * id).round().clamp(-127.0, 127.0) as i8) as u8).collect(); words.push(u32::from_le_bytes([qb[0], qb[1], qb[2], qb[3]])); } } }
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); } for _ in extra { splits.push(splits.last().unwrap() + 1); }
-        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows, cols, splits, nat: vec![], qseg: vec![], kv: None })
+        Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows, cols, splits, nat: vec![], qseg: vec![], kv: None })
     }
     /// Like `upload`, but IQ4_XS matrices stay in their own format (half the bytes of Q8_0);
     /// the rest are packed as Q8_0 as before. Opt-in (PYRE_QN_NATIVE=1): on the RTX 3060 this kernel is
@@ -1893,7 +1894,7 @@ impl Cube {
         if !self.take(rows * cols + rows * cols / 8) { return None; }
         let mut words: Vec<u32> = Vec::with_capacity(rows * cols / 4); let mut sc: Vec<f32> = Vec::with_capacity(rows * cols / 32);
         for blk in q.chunks_exact(34) { sc.push(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32()); for c in blk[2..].chunks_exact(4) { words.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } }
-        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows, cols, splits: vec![0, rows], nat: vec![], qseg: vec![], kv: None })
+        Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows, cols, splits: vec![0, rows], nat: vec![], qseg: vec![], kv: None })
     }
     pub fn upload_mix(&self, ms: &[&QMat], extra: &[&[f32]]) -> Option<CMat> {
         use super::gguf_q::QType;
@@ -1917,18 +1918,24 @@ impl Cube {
                 let raw = m.raw_rows(0, m.rows); let mut v: Vec<u32> = Vec::with_capacity(raw.len() / 136 * 35);
                 for b in raw.chunks_exact(136) { v.push(half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32().to_bits()); v.push(u16::from_le_bytes([b[2], b[3]]) as u32); v.push(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
                     for c in b[8..].chunks_exact(4) { v.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } }
-                nat.push((r0, m.rows, self.client.create_from_slice(u32::as_bytes(&v))));
+                nat.push((r0, m.rows, self.hup(u32::as_bytes(&v))));
             } else { match qseg.last_mut() { Some((a, n, _)) if *a + *n == r0 => *n += m.rows, _ => qseg.push((r0, m.rows, qb)) } qb += m.rows; }
             r0 += m.rows;
         }
         for _ in extra { match qseg.last_mut() { Some((a, n, _)) if *a + *n == r0 => *n += 1, _ => qseg.push((r0, 1, qb)) } qb += 1; r0 += 1; }
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); } for _ in extra { splits.push(splits.last().unwrap() + 1); }
         let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect();
-        let kvh = if native_mode() >= 2 { let kb = |i: usize| (super::iq_tables::KVALUES_IQ4NL[i] as i32 as u32) & 255; let t2: Vec<u32> = (0..256).map(|b| kb(b & 15) | (kb(b >> 4) << 8)).collect(); self.client.create_from_slice(u32::as_bytes(&t2)) } else { self.client.create_from_slice(f32::as_bytes(&kv)) };
+        let kvh = if native_mode() >= 2 { let kb = |i: usize| (super::iq_tables::KVALUES_IQ4NL[i] as i32 as u32) & 255; let t2: Vec<u32> = (0..256).map(|b| kb(b & 15) | (kb(b >> 4) << 8)).collect(); self.hup(u32::as_bytes(&t2)) } else { self.hup(f32::as_bytes(&kv)) };
         NATIVE_STAT.fetch_add((nnat * cols) as u64, std::sync::atomic::Ordering::Relaxed); NATIVE_STAT.fetch_add(((nq8 * cols) as u64) << 40, std::sync::atomic::Ordering::Relaxed);
-        Some(CMat { w: self.client.create_from_slice(u32::as_bytes(&words)), s: self.client.create_from_slice(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
-    }    pub fn buf(&self, v: &[f32]) -> Handle { self.client.create_from_slice(f32::as_bytes(v)) }
+        Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
+    }    pub fn buf(&self, v: &[f32]) -> Handle { self.hup(f32::as_bytes(v)) }
     pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
+    /// Host-to-device for a small buffer (activations, expert tables): through CubeCL's page-locked staging pool when
+    /// PYRE_QN_HPIN=1, so the driver copies by DMA instead of staging a pageable buffer on this thread.
+    pub fn hup(&self, b: &[u8]) -> Handle {
+        if hpin() && b.len() <= (1 << 20) { let mut by = cubecl::bytes::Bytes::from_bytes_vec(b.to_vec()); self.client.staging(std::iter::once(&mut by), false); return self.client.create(by); }
+        self.client.create_from_slice(b)
+    }
     /// Start a readback now (its fence follows the work enqueued so far) and finish it later with `read_finish`,
     /// so work enqueued in between does not delay it (the verify wavefront).
     pub fn read_start(&self, h: &Handle) -> impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>> + Send + '_ { self.client.read_async(vec![h.clone()]) }
@@ -2062,10 +2069,10 @@ impl Cube {
         use super::iq_tables::*;
         let w64 = |t: &[u64]| -> Vec<u32> { t.iter().flat_map(|v| [*v as u32, (*v >> 32) as u32]).collect() };
         let ks: Vec<u32> = KSIGNS_IQ2XS.iter().map(|&v| v as u32).collect();
-        XTabs { g2s: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.client.create_from_slice(u32::as_bytes(&w64(&IQ2XXS_GRID))),
-            ks: self.client.create_from_slice(u32::as_bytes(&ks)), g1: self.client.create_from_slice(u32::as_bytes(&w64(&IQ1S_GRID))),
-            sm: self.client.create_from_slice(u32::as_bytes(&(0..256u32).flat_map(|b| [0u32, 4].map(|o| (0..4).map(|j| if (b >> (o + j)) & 1 == 1 { 0xFFu32 << (8 * j) } else { 0 }).sum::<u32>())).collect::<Vec<u32>>())),
-            q2l: self.client.create_from_slice(u32::as_bytes(&(0..256u32).map(|b| (0..4).map(|j| ((b >> (2 * j)) & 3) << (8 * j)).sum::<u32>()).collect::<Vec<u32>>())) }
+        XTabs { g2s: self.hup(u32::as_bytes(&w64(&IQ2S_GRID))), g2x: self.hup(u32::as_bytes(&w64(&IQ2XXS_GRID))),
+            ks: self.hup(u32::as_bytes(&ks)), g1: self.hup(u32::as_bytes(&w64(&IQ1S_GRID))),
+            sm: self.hup(u32::as_bytes(&(0..256u32).flat_map(|b| [0u32, 4].map(|o| (0..4).map(|j| if (b >> (o + j)) & 1 == 1 { 0xFFu32 << (8 * j) } else { 0 }).sum::<u32>())).collect::<Vec<u32>>())),
+            q2l: self.hup(u32::as_bytes(&(0..256u32).map(|b| (0..4).map(|j| ((b >> (2 * j)) & 3) << (8 * j)).sum::<u32>()).collect::<Vec<u32>>())) }
     }
     pub fn xarena(&self, bytes: usize) -> Handle { self.client.empty(bytes) }
     /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
@@ -2102,7 +2109,7 @@ impl Cube {
         let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff));
         let ne = ents.len();
         let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0], e.off[1], e.off[2], w.to_bits()]).collect();
-        let mh = self.client.create_from_slice(u32::as_bytes(&meta));
+        let mh = self.hup(u32::as_bytes(&meta));
         self.xrun_m(tb, ar, ar_bytes, &mh, ne, x, d, ff, tys, h, y, 0);
     }
     /// The dp4a expert path (gate/up IQ2_S or IQ2_XXS, down Q2_0); false when the types don't fit.
@@ -2149,7 +2156,7 @@ impl Cube {
         if ars.is_empty() || ars.len() > 2 { return false; }
         let fl = |e: &XEnt| if ars.len() == 2 && e.arena == 1 { 1u32 << 31 } else { 0 };
         let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0] | fl(e), e.off[1], e.off[2] | fl(e), w.to_bits()]).collect();
-        let mh = self.client.create_from_slice(u32::as_bytes(&meta)); let ml = ne * 4;
+        let mh = self.hup(u32::as_bytes(&meta)); let ml = ne * 4;
         let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
         let (ar, ar1) = (&ars[0], ars.last().unwrap());
         unsafe {
