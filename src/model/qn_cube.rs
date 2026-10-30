@@ -23,6 +23,8 @@ fn nats_on() -> bool { match NATS_OV.load(std::sync::atomic::Ordering::Relaxed) 
 pub fn natr_min() -> usize { static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
 /// PYRE_QN_READNB=1: read_start queues the readback without waiting for the device thread to drain
 pub fn readnb() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_READNB").map(|v| v == "1").unwrap_or(false)) }
+/// PYRE_QN_NATR_Y: warps per cube for k_gemv_iq4d_r (default 4; b307 sweep -> 4 best)
+pub fn natr_y() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_Y").ok().and_then(|v| v.parse().ok()).unwrap_or(4)) }
 pub fn natr() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR").map(|v| v != "0").unwrap_or(true)) }
 pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
@@ -2800,7 +2802,7 @@ impl Cube {
             if nats_on() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
-            for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { unsafe { k_gemv_iq4d_r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE * 4), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { unsafe { k_gemv_iq4d_r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } continue; }
                 unsafe { k_gemv_iq4d_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
