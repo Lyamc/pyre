@@ -1343,7 +1343,8 @@ impl Model {
         let c = &self.cfg; let t = std::time::Instant::now();
         let geo = super::mtp::Geo { d: c.d, hc: c.hc, nh: c.n_head, nkv: c.n_kv, hd: c.hd, n_rot: c.n_rot, eps: c.eps, top_k: c.top_k, rope_base: c.rope_base };
         let ids = super::mtp::draft_vocab(self.out.rows); let out = &self.out;
-        let ids = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { vec![] } else { ids };
+        // the draft-vocabulary subset head stays even with the main head on the GPU (A 33.2 vs 30.0 steady; PYRE_MTP_HEAD_FULL=1 drafts with the full GPU head)
+        let ids = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_FULL").map(|v| v == "1").unwrap_or(false) { vec![] } else { ids };
         let m = super::mtp::Mtp::load(&p, &geo, ids, |r, y| out.row(r, y))?;
         if env_var("PYRE_MTP_LAZY").is_err() { m.warm(); }
         crate::limits::vlog("mtp loaded"); eprintln!("mtp: drafter {} loaded in {:.1} s", p.display(), t.elapsed().as_secs_f64());
