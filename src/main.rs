@@ -229,7 +229,7 @@ fn load_qn(dir: &std::path::Path, id: &str, backend_name: &str, n_predict: usize
     let t = std::time::Instant::now();
     let mut m = model::qwen4exp_gguf::Model::load(&f)?;
     let label = qn_attach_gpu(&mut m, backend_name)?;
-    m.load_mtp()?;
+    m.load_mtp()?; m.prewarm_verify();
     let tp = std::time::Instant::now(); let gb = m.prefault_experts(); if gb > 0.0 { tracing::info!("qwen4exp: {gb:.1} GiB of routed experts made resident in {:.1}s", tp.elapsed().as_secs_f64()); }
     tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
         f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());

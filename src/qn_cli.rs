@@ -127,7 +127,7 @@ fn run_gguf(a: QnArgs) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut m = crate::model::qwen4exp_gguf::Model::load(&f)?;
     crate::qn_attach_gpu(&mut m, &a.backend)?;
-    if a.spec != Some(0) { m.load_mtp()?; }
+    if a.spec != Some(0) { m.load_mtp()?; } m.prewarm_verify();
     let spec_k = a.spec.unwrap_or_else(|| m.spec_default());
     if a.spec.is_none() { eprintln!("spec: default draft length {spec_k}{}", if spec_k == 0 { " (no MTP drafter or multi-verify unavailable: plain decode)" } else { " (MTP)" }); }
     let tp = std::time::Instant::now(); let gb = m.prefault_experts(); eprintln!("experts resident: {gb:.1} GiB in {:.1}s", tp.elapsed().as_secs_f64());

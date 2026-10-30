@@ -1376,6 +1376,18 @@ impl Model {
     // ---- speculative decoding: multi-token verify on the decode (CubeCL) path, with rollback ----
 
     /// True when `forward_multi` can run: every layer on the CubeCL decode path with DeltaNet on the GPU.
+    /// Compile the decode and verify-window kernels now (opt-in PYRE_QN_PREWARM=1; b326: same output, no clear gain: NATIVE2 A tps 30.3 vs 33.1 off): a throwaway state runs a
+    /// one-token step and one verify window of every size up to the spec maximum; the expert cache's routing
+    /// counts and stats are reset afterwards so the cache fills exactly as without it.
+    pub fn prewarm_verify(&self) {
+        if env_var("PYRE_QN_PREWARM").map(|v| v != "1").unwrap_or(true) || !self.multi_ok() { return; }
+        let t0 = std::time::Instant::now(); let mut st = self.new_state();
+        let _ = self.forward_inner(&[1, 2], &mut st);
+        let mw = self.spec_max_window().min(if super::qn_cube::native_mode() == 2 { 7 } else { 3 }); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
+        for t in 1..=mw { let ids: Vec<u32> = (0..t as u32).map(|i| 3 + i).collect(); let _ = if t == 1 { self.forward_inner(&ids, &mut st) } else { self.forward_multi(&ids, &mut st).pop().unwrap_or_default() }; }
+        if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); if !g.map.is_empty() { eprintln!("prewarm: warning, expert cache already filled ({})", g.map.len()); } for c in g.cnt.iter_mut() { for v in c.iter_mut() { *v = 0; } } g.calls = 0; g.hits = 0; g.total = 0; }
+        eprintln!("prewarm: decode/verify kernels (T<={mw}) in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
     pub fn multi_ok(&self) -> bool {
         self.cube.is_some() && env_var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })))
