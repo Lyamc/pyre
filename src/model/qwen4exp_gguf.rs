@@ -106,6 +106,8 @@ fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
 pub struct VGraph { xn: H, da: H, mixed: H, proj: H, core: H, co: H, o: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 static VGRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static VG_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[allow(clippy::type_complexity)]
+static VG_STATE: std::sync::Mutex<(Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>, Vec<Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
 fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
@@ -509,6 +511,7 @@ impl Model {
     fn gdn_bufs(&self, st: &State) -> Vec<(H, H)> {
         let cb = self.cube.as_ref().unwrap();
         let mk = |_: ()| st.conv.iter().zip(&st.ssm).map(|(a, b)| (cb.buf(a), cb.buf(b))).collect::<Vec<_>>();
+        if vgraph_on() { /* PYRE_QN_VGRAPH: one set of GPU state buffers reused by every State (refilled from its CPU state), so verify graphs captured in prewarm keep their key for the real request */ let mut g = VG_STATE.lock().unwrap(); if g.0.len() == st.conv.len() { for ((h1, h2), (a, b)) in g.0.iter().zip(st.conv.iter().zip(&st.ssm)) { cb.client.write(h1, burn_cubecl::cubecl::bytes::Bytes::from_elems(a.clone())); cb.client.write(h2, burn_cubecl::cubecl::bytes::Bytes::from_elems(b.clone())); } return g.0.clone(); } let v = cb.client.memory_persistent_allocation((), mk); g.0 = v.clone(); g.1.clear(); return v; }
         if graph_on() { cb.client.memory_persistent_allocation((), mk) } else { mk(()) }
     }
     /// DeltaNet layer dense part (hc mix, in-proj, conv, delta, out-proj, hc combine, ffn hc mix, router/shared
@@ -1419,7 +1422,7 @@ impl Model {
         if !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
         let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv; let (cn, sn) = ((c.conv_k - 1) * ch, c.lin_nv * c.lin_dk * c.lin_dv);
-        while !st.pf && st.ck.len() < t - 1 { st.ck.push((0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect()); }
+        while !st.pf && st.ck.len() < t - 1 { let i = st.ck.len(); let v: Vec<(H, H)> = if vgraph_on() { let mut g = VG_STATE.lock().unwrap(); if g.1.len() <= i { let nv = cb.client.memory_persistent_allocation((), |_| (0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect()); g.1.push(nv); } g.1[i].clone() } else { (0..st.gdn.len()).map(|_| (cb.empty(cn), cb.empty(sn))).collect() }; st.ck.push(v); }
         let mut xh: Vec<Vec<f32>> = vec![vec![0f32; hc * d]; t];
         let mut e = vec![0f32; d];
         for (ti, &id) in ids.iter().enumerate() { self.embd.row(id as usize, &mut e); for s in 0..hc { xh[ti][s * d..(s + 1) * d].copy_from_slice(&e); } }
