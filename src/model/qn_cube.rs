@@ -2786,6 +2786,60 @@ fn k_xgu_ex8(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: 
 }
 /// PYRE_QN_XGU_ROWS (8 or 16, default 8; 16 was slower in nsys e9): rows per cube of k_xgu_ex8
 fn xgu_rows() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU_ROWS").ok().and_then(|v| v.parse().ok()).filter(|&v: &u32| v == 8 || v == 16).unwrap_or(8)) }
+/// PYRE_QN_XEXACT gate/up, two rows per warp (16 lanes each: 8 integer lanes x gate/up), no shared integer stage:
+/// each lane does its own blocks in order and accumulates at once, the same per-lane fma order and hsum as k_xgu_ex8.
+#[cube(launch_unchecked)]
+fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let row = (CUBE_POS_X * CUBE_DIM_Y + wy) * 2u32 + half;
+    let act = e < oc[3] && row < rows;
+    if act {
+        let mut ti = 0u32;
+        if e >= oc[0] { ti += 1u32; }
+        if e >= oc[1] { ti += 1u32; }
+        if e >= oc[2] { ti += 1u32; }
+        let xo = ti * nsb * 64;
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let mut base = (m0 & 2147483647u32) + row * rbg;
+        if r >= 8u32 { base = meta[(e * 4 + 1) as usize] + row * rbu; }
+        let lane = r % 8u32;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut iv = 0i32;
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { iv = iq2_lane_int(ar, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar[(base + s * bw) as usize]); }
+            else { iv = iq2_lane_int(ar1, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(iv), d, acc);
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        h[(e * rows + row) as usize] = sl * u;
+    }
+}
+/// PYRE_QN_XGU2: 1 (default) k_xgu_ex16, 0 k_xgu_ex8, 2 alternate per call (both in one trace)
+fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
+static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cube(launch_unchecked)]
 fn k_xdown_ex8(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
     let mut pi = Shared::<[i32]>::new_slice(4096usize);
@@ -3630,6 +3684,9 @@ impl Cube {
             _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
         unsafe {
             k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
+            let g2 = match xgu2() { 0 => false, 2 => XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0, _ => true };
+            if xex8() && g2 { k_xgu_ex16::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
             if xex8() { let ry = xgu_rows(); k_xgu_ex8::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(ry), ne as u32, 1), CubeDim::new_2d(32, ry),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else {
             k_xgu_ex::launch_unchecked(&self.client, CubeCount::Static(ff as u32, ne as u32, 1), CubeDim::new_1d(32),
