@@ -89,14 +89,14 @@ impl Pool {
 }
 
 const PB: usize = 256;
-fn pedq() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PEDQ").map(|v| v != "0").unwrap_or(true)) }
+fn pedq() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PEDQ").map(|v| v == "1").unwrap_or(false)) }
 fn tfa() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_TFA").map(|v| v != "0").unwrap_or(true)) }
 fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
     // PYRE_QN_TFA (default on): claim tasks with one fetch_add instead of a CAS retry loop (24 workers on one line).
     // A worker that raced into a newer generation g2 still owns ticket i of g2: it runs that task with g2's job
     // (job/n are published before the ticket and stay valid until all g2 tasks, including this one, are done).
     // ticket layout under TFA: gen(20) | n(20) | index(24), so a claim carries its own generation and task count
-    // PYRE_QN_PEDQ (default on): double-ended claims. Tasks are ordered big first (tiered blocks), so fast (P-core)
+    // PYRE_QN_PEDQ=1 (opt-in; b409 slower: pool ms A 28.6->33.3 B 35.9->50.4 C 39.4->53.8, E-cores on the small tail tiers delay per-expert GUQ/chain completion): double-ended claims. Tasks are ordered big first (tiered blocks), so fast (P-core)
     // workers take indices from the front and slow (E-core) workers from the back (the small tiers): the middle
     // field holds back+PB (bias PB > threads so failed back claims never borrow into gen). Which worker runs a task
     // does not change what it computes -> bit-identical.
