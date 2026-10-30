@@ -3006,6 +3006,87 @@ fn k_xdown_q(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l:
 /// k_xgu_s over the entries of up to 4 window tokens in one launch: entry e belongs to token
 /// (e >= o1) + (e >= o2) + (e >= o3), whose packed activation starts at ti * d/4 words (scales ti * d/32).
 /// Per entry and row the same arithmetic as k_xgu_s (PYRE_QN_XBATCH, default on).
+/// k_xgu_st / k_xdown_qt for up to 8 window tokens: entry offsets eo[0..=t] from a buffer; per entry/row arithmetic unchanged.
+#[cube(launch_unchecked)]
+fn k_xgu_st8(xq: &[u32], xs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, eo: &[u32], nt: u32, dq: u32,
+    #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let lane = UNIT_POS_X;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let mut ti = 0u32;
+    for k in 1..nt { if e >= eo[k as usize] { ti += 1u32; } }
+    let xo = ti * dq;
+    let so = ti * (dq / 8);
+    if row < rows {
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let go = (m0 & 2147483647u32) + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        #[unroll]
+        for k in 0..ng {
+            let q = lane + 32 * k;
+            let x0 = i32::cast_from(xq[(xo + q * 2) as usize]);
+            let x1 = i32::cast_from(xq[(xo + q * 2 + 1) as usize]);
+            let xsc = xs[(so + q / 4) as usize];
+            if sel == 0u32 {
+                gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+            } else {
+                gs += gdot8s(ar1, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar1, uo, q, x0, x1, xsc, &grid, ty);
+            }
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if lane == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+#[cube(launch_unchecked)]
+fn k_xdown_qt8(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], rows: u32, cols: u32, rbd: u32, eo: &[u32]) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let ti = CUBE_POS_Y;
+    let e0 = eo[ti as usize];
+    let e1 = eo[(ti + 1) as usize];
+    if row < rows {
+        let nsb = cols / 8;
+        let tot = (e1 - e0) * nsb;
+        let mut s = 0.0f32;
+        let mut j = UNIT_POS_X;
+        while j < tot {
+            let el = j / nsb;
+            let q = j - el * nsb;
+            let e = e0 + el;
+            let sb = q / 4;
+            let l = q % 4;
+            let m2 = meta[(e * 4 + 2) as usize];
+            let blk = (m2 & 2147483647u32) + row * rbd + (sb / 2) * 5;
+            let wi = blk + 1 + 2 * (sb % 2) + l / 2;
+            let mut d = 0.0f32;
+            let mut qw = 0u32;
+            if (m2 >> 31) == 0u32 { d = f32::reinterpret(ar[blk as usize]); qw = ar[wi as usize]; } else { d = f32::reinterpret(ar1[blk as usize]); qw = ar1[wi as usize]; }
+            let half = (qw >> (16 * (l % 2))) & 65535u32;
+            let xw = e * cols / 4 + q * 2;
+            let x0 = i32::cast_from(hq[xw as usize]);
+            let x1 = i32::cast_from(hq[(xw + 1) as usize]);
+            let v = dp4a(i32::cast_from(q2l[(half >> 8) as usize]), x1, dp4a(i32::cast_from(q2l[(half & 255u32) as usize]), x0, 0i32));
+            let ones = dp4a(16843009i32, x1, dp4a(16843009i32, x0, 0i32));
+            s += f32::reinterpret(meta[(e * 4 + 3) as usize]) * d * hs[((e * cols) / 32 + q / 4) as usize] * f32::cast_from(v - ones);
+            j += 32u32;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[(ti * rows + row) as usize] = t;
+        }
+    }
+}
 #[cube(launch_unchecked)]
 fn k_xgu_st(xq: &[u32], xs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, o1: u32, o2: u32, o3: u32, dq: u32,
     #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
@@ -3741,6 +3822,7 @@ impl Cube {
     /// y = t * d outputs (token ti at ti * d; a token without entries gets zeros, which callers ignore).
     #[allow(clippy::too_many_arguments)]
     pub fn xrun_fast_multi(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, cnt: &[usize], mh: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+        if cnt.len() > 4 && cnt.len() <= 8 && t8() && x8() { return self.xrun_fast_multi8(tb, ars, ar_bytes, cnt, mh, src, sn, d, ff, tys, y); }
         if cnt.len() > 4 && cnt.len() <= 8 && t8() { let t = cnt.len(); let rs = sn / t; let mut e0 = 0usize; let mut ok = true;
             for c0 in (0..t).step_by(4) { let c1 = (c0 + 4).min(t); let ne: usize = cnt[c0..c1].iter().sum();
                 if ne > 0 { ok &= self.xrun_fast_multi(tb, ars, ar_bytes, &cnt[c0..c1], &mh.clone().offset_start((e0 * 4 * 4) as u64), &src.clone().offset_start((c0 * rs * 4) as u64), (c1 - c0) * rs, d, ff, tys, &y.clone().offset_start((c0 * d * 4) as u64)); }
@@ -3763,6 +3845,29 @@ impl Cube {
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
             k_xdown_qt::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
                 a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, o[1], o[2], o[3], o[4]);
+        }
+        true
+    }
+    /// xrun_fast_multi for 5-8 tokens in one set of launches (PYRE_QN_X8, default on under T8)
+    pub fn xrun_fast_multi8(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, cnt: &[usize], mh: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+        let t = cnt.len(); let ne: usize = cnt.iter().sum();
+        if t == 0 || t > 8 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 || ars.is_empty() || ars.len() > 2 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32; let ml = ne * 4;
+        let mut o = [0u32; 9]; for i in 0..8 { o[i + 1] = o[i] + cnt.get(i).copied().unwrap_or(0) as u32; }
+        let eo = self.hup(u32::as_bytes(&o));
+        let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+        let (ar, ar1) = (&ars[0], ars.last().unwrap());
+        let (xq, xs) = (self.empty(t * d / 4), self.empty(t * d / 32)); let h = self.empty(ne * ff); let (hq, hs) = (self.empty(ne * ff / 4), self.empty(ne * ff / 32));
+        let nb = (d / 32) as u32;
+        unsafe {
+            k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static(nb.div_ceil(64), t as u32, 1), CubeDim::new_1d(64), a(src, sn), a(&xq, t * d / 4), a(&xs, t * d / 32), 0, sn as u32 / t as u32, nb);
+            k_xgu_st8::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
+                a(&xq, t * d / 4), a(&xs, t * d / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, a(&eo, 9), t as u32, (d / 4) as u32, (d / 256) as u32, gn, tys.0);
+            k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
+            k_xdown_qt8::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, a(&eo, 9));
         }
         true
     }
@@ -3933,4 +4038,6 @@ pub fn t8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock:
 /// PYRE_QN_GATE8 (default on under T8): 5-8 token gate as one k_gate_m launch (t is comptime there; per-token arithmetic unchanged)
 /// PYRE_QN_W8 (default on; only under T8): single-launch 8-buffer rms / comb / comb3 / delta for 5-8 tokens
 fn w8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_W8").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_X8 (default on; only under T8): single-set xrun_fast_multi for 5-8 tokens
+fn x8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_X8").map(|v| v != "0").unwrap_or(true)) }
 fn gate8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GATE8").map(|v| v != "0").unwrap_or(true)) }
