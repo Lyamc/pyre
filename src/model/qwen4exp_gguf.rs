@@ -1354,7 +1354,18 @@ impl Model {
         let m = super::mtp::Mtp::load(&p, &geo, ids, |r, y| out.row(r, y))?;
         if env_var("PYRE_MTP_LAZY").is_err() { m.warm(); }
         crate::limits::vlog("mtp loaded"); eprintln!("mtp: drafter {} loaded in {:.1} s", p.display(), t.elapsed().as_secs_f64());
-        self.mtp = Some(m); Ok(())
+        self.mtp = Some(m);
+        // upload the drafter's GPU copies now instead of in the first draft round (PYRE_MTP_EAGER=0: lazy)
+        if env_var("PYRE_MTP_EAGER").map(|v| v != "0").unwrap_or(true) { self.mtp_gpu_init(); }
+        Ok(())
+    }
+    fn mtp_gpu_on(&self) -> bool { env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) }
+    fn mtp_gpu_init(&self) {
+        let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
+        if self.mtp_gpu_on() { self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
+            for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
+            eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp }); }
+        if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }); }
     }
 
     // ---- speculative decoding: multi-token verify on the decode (CubeCL) path, with rollback ----
