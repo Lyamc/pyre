@@ -52,7 +52,7 @@ fn mtp_cpu<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     match P.get_or_init(|| { let n = env_usize("PYRE_MTP_THREADS").unwrap_or(8); if n == 0 { None } else { rayon::ThreadPoolBuilder::new().num_threads(n).build().ok() } }) { Some(p) => p.install(f), None => f() }
 }
 /// PYRE_QN_XARENA_PERSIST=1: the expert arenas in CubeCL's persistent pool, so the dynamic pool's page size is not grown to the arena size (else every later new page is ~2.7 GB)
-fn xarena_persist() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PERSIST").map(|v| v == "1").unwrap_or(false)) }
+fn xarena_persist() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PERSIST").map(|v| v != "0").unwrap_or(true)) }
 fn xmeta1() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XMETA1").map(|v| v != "0").unwrap_or(true)) }
 fn xcopys() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCOPYS").map(|v| v == "1").unwrap_or(false)) }
 fn xarena_pin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PIN").map(|v| v == "1").unwrap_or(false)) }
@@ -125,7 +125,7 @@ fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: 
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
 fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
-fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v == "1").unwrap_or(false)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
+fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v != "0").unwrap_or(true)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1414,7 +1414,7 @@ impl Model {
     /// one-token step and one verify window of every size up to the spec maximum; the expert cache's routing
     /// counts and stats are reset afterwards so the cache fills exactly as without it.
     pub fn prewarm_verify(&self) {
-        if env_var("PYRE_QN_PREWARM").map(|v| v != "1").unwrap_or(true) || !self.multi_ok() { return; }
+        if env_var("PYRE_QN_PREWARM").map(|v| v == "0").unwrap_or(false) || !self.multi_ok() { return; }
         let t0 = std::time::Instant::now(); let mut st = self.new_state();
         let _ = self.forward_inner(&[1, 2], &mut st);
         let mw = self.spec_max_window().min(if super::qn_cube::native_mode() == 2 { 7 } else { 3 }); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
