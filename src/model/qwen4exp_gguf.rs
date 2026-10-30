@@ -117,13 +117,15 @@ fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: 
     let mut m = VG2.lock().unwrap(); let e = m.entry(slot).or_insert((None, String::new()));
     if e.0.is_some() && e.1 == key { unsafe { e.0.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
     if !e.1.is_empty() && env_var("PYRE_QN_XDEBUG").is_ok() { static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("vgraph2 recapture {slot:?}: {} -> {}", e.1, key); } }
-    if gate_open() { f(); return; }
+    if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("vg eager behind gate: slot {:?} had {}", slot, if e.0.is_some() { "other key" } else { "none" }); } f(); return; }
     e.0 = None; if VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) || cb.client.graph_prepare().is_err() { f(); return; }
     cb.client.memory_persistent_allocation((), |_| f());
     match cb.client.start_capture() { Ok(()) => { cb.client.memory_persistent_allocation((), |_| f()); match cb.client.stop_capture() { Ok(gr) => { e.0 = Some(gr); e.1 = key.to_string(); VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } Err(er) => { eprintln!("vgraph2: capture failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
         Err(er) => { eprintln!("vgraph2: start failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
 }
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// PIPE: verify-graph segments run eagerly because a host gate was open and no matching graph existed
+pub static VG_EAGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
 fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
 fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v != "0").unwrap_or(true)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
@@ -1658,7 +1660,7 @@ impl Model {
             cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t);
         };
         if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        else if gate_open() { seg(b); }
+        else if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("lg eager behind gate: il {il} t {t} had {}", if b.g.is_some() { "other key" } else { "none" }); } seg(b); }
         else {
             b.g = None; b.keep.clear();
             let vf = |s: &str| if env_var("PYRE_QN_VGDBG").is_ok() { let _ = cb.client.flush(); std::thread::sleep(std::time::Duration::from_millis(30)); if let Some(v) = crate::limits::vram() { eprintln!("vgdbg il {il} t {t} {s}: free {} MiB", v.free >> 20); } };
