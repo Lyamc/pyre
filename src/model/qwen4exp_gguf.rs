@@ -126,6 +126,9 @@ fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: 
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// PIPE: verify-graph segments run eagerly because a host gate was open and no matching graph existed
 pub static VG_EAGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// PIPE: (layer, T) whose DeltaNet verify graph was missing behind a gate; the continuation skips that layer until a
+/// normal (ungated) pass has captured it, so it replays behind later gates instead of always running eagerly
+static VG_SKIP: std::sync::Mutex<std::collections::BTreeSet<(usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
 // no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
 fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
 fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v != "0").unwrap_or(true)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
@@ -1605,7 +1608,7 @@ impl Model {
         // PIPE: the next layer's dense half is enqueued behind this layer's host gate (not across a PLE layer, which needs the residual on the host)
         let (an, ln) = (*ai, *li); let mut nx: Option<(H, H, H)> = None;
         let nl = il + 1;
-        if pipe_on() && env_var("PYRE_QN_PIPE_NEXT").map(|v| v != "0").unwrap_or(true) && nl < self.layers.len() && self.layers[nl].ple.is_none() {
+        if pipe_on() && env_var("PYRE_QN_PIPE_NEXT").map(|v| v != "0").unwrap_or(true) && nl < self.layers.len() && !VG_SKIP.lock().unwrap().contains(&(nl, xs.len())) && self.layers[nl].ple.is_none() {
             let mut f = |s: &mut State| { let (ly, cn) = (&self.layers[nl], self.cl[nl].as_ref().unwrap()); nx = Some(match if vgraph_on() { self.lcm_dense_g(nl, ly, cn, xs, s, ln) } else { None } { Some(x) => x, None => self.lcm_dense(nl, ly, cn, xs, s, an, ln, start, 0, xs.len()) }); };
             self.lcm_moe_p(il, l, cl, xs, st, dd, rall, 0, Some(&mut f));
         } else { self.lcm_moe(il, l, cl, xs, st, dd, rall, 0); }
@@ -1660,14 +1663,14 @@ impl Model {
             cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t);
         };
         if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        else if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("lg eager behind gate: il {il} t {t} had {}", if b.g.is_some() { "other key" } else { "none" }); } seg(b); }
+        else if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); VG_SKIP.lock().unwrap().insert((il, t)); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("lg eager behind gate: il {il} t {t} had {}", if b.g.is_some() { "other key" } else { "none" }); } seg(b); }
         else {
             b.g = None; b.keep.clear();
             let vf = |s: &str| if env_var("PYRE_QN_VGDBG").is_ok() { let _ = cb.client.flush(); std::thread::sleep(std::time::Duration::from_millis(30)); if let Some(v) = crate::limits::vram() { eprintln!("vgdbg il {il} t {t} {s}: free {} MiB", v.free >> 20); } };
             vf("pre");
             if cb.client.graph_prepare().is_ok() { vf("prepared"); cb.client.memory_persistent_allocation((), |_| seg(b)); vf("eager");
                 match cb.client.start_capture() {
-                    Ok(()) => { cb.client.memory_persistent_allocation((), |_| seg(b)); let r = cb.client.stop_capture(); vf("captured"); match r { Ok(g) => { b.g = Some(g); b.key = key; if env_var("PYRE_QN_XDEBUG").is_ok() { let n = VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed); if n < 4 || n % 12 == 0 { let r = cb.client.memory_report(burn_cubecl::cubecl::MemoryScope::CurrentStream); let s = format!("{r:?}"); crate::limits::vlog(&format!("vgraph capture {n}")); eprintln!("vgraph: captured layer {il} T={t} usage {:?} | {}", r.usage(), &s[..s.len().min(1500)]); } } let mut k = vec![cs.clone(), ss.clone()]; k.extend(xs.iter().cloned()); for (a, bb) in &cka { k.push(a.clone()); k.push(bb.clone()); } b.keep = k; VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    Ok(()) => { cb.client.memory_persistent_allocation((), |_| seg(b)); let r = cb.client.stop_capture(); vf("captured"); match r { Ok(g) => { b.g = Some(g); b.key = key; VG_SKIP.lock().unwrap().remove(&(il, t)); if env_var("PYRE_QN_XDEBUG").is_ok() { let n = VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed); if n < 4 || n % 12 == 0 { let r = cb.client.memory_report(burn_cubecl::cubecl::MemoryScope::CurrentStream); let s = format!("{r:?}"); crate::limits::vlog(&format!("vgraph capture {n}")); eprintln!("vgraph: captured layer {il} T={t} usage {:?} | {}", r.usage(), &s[..s.len().min(1500)]); } } let mut k = vec![cs.clone(), ss.clone()]; k.extend(xs.iter().cloned()); for (a, bb) in &cka { k.push(a.clone()); k.push(bb.clone()); } b.keep = k; VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                         Err(e) => { eprintln!("vgraph: layer {il} T={t} capture failed, verify graphs off: {e:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
                     Err(e) => { eprintln!("vgraph: layer {il} start failed, verify graphs off: {e:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
             } else { seg(b); }
