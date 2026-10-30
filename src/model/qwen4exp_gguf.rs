@@ -392,8 +392,7 @@ impl Model {
             let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let pos = start; let sp = &cl.min.splits;
             self.kv_push(cb, *ai, st, pos + 1);
             let g = st.kvg[*ai].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
-            let cs: Vec<f32> = (0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos()).chain((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())).collect();
-            let csb = cb.buf(&cs); let att = cb.empty(nh * hd);
+            let csb = self.rope_h(cb, pos, half); let att = cb.empty(nh * hd);
             cb.attn(&proj, cl.min.rows, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &att, nh, nkv, hd, half, pos, c.eps);
             if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; cb.copy(&proj, cl.min.rows, sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
             g.len = pos + 1; *ai += 1;
@@ -569,6 +568,16 @@ impl Model {
     }
     /// Fill the host expert arena at load, hottest first by the routing profile, skipping the `skip` hottest
     /// (those live in the GPU cache), in parallel; stops at PYRE_QN_XARENA_GB or the RAM reserve.
+    /// The rope cos/sin row of `pos` on the device, uploaded once and shared by every attention layer (each small
+    /// write costs tens of microseconds on the stream); PYRE_QN_ROPEC=0 uploads it per layer as before.
+    fn rope_h(&self, cb: &super::qn_cube::Cube, pos: usize, half: usize) -> H {
+        let mk = || { let cs: Vec<f32> = (0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos()).chain((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())).collect(); cb.buf(&cs) };
+        if env_var("PYRE_QN_ROPEC").map(|v| v == "0").unwrap_or(false) { return mk(); }
+        static C: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), H>>> = std::sync::Mutex::new(None);
+        let mut g = C.lock().unwrap(); let m = g.get_or_insert_with(Default::default);
+        if m.len() > 8192 { m.clear(); }
+        m.entry((pos, half)).or_insert_with(mk).clone()
+    }
     fn xpk_prefill(&self, skip: usize, cbp: Option<&super::qn_cube::Cube>) {
         if env_var("PYRE_QN_XARENA_GB").map(|v| v.parse::<f64>().unwrap_or(0.0) <= 0.0).unwrap_or(true) { return; }
         use rayon::prelude::*;
@@ -1582,8 +1591,7 @@ impl Model {
                 let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
                 self.kv_push(cb, ai0, st, pos + 1);
                 let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
-                let cs: Vec<f32> = (0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos()).chain((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())).collect();
-                let csb = cb.buf(&cs);
+                let csb = self.rope_h(cb, pos, half);
                 cb.attn(&pj, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &at(&core, ti * core_n), nh, nkv, hd, half, pos, c.eps);
                 if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; cb.copy(&proj, t * pr, ti * pr + sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
                 g.len = pos + 1;
