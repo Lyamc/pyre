@@ -1406,7 +1406,7 @@ impl Model {
         if env_var("PYRE_QN_PREWARM").map(|v| v == "0").unwrap_or(false) || !self.multi_ok() { return; }
         let t0 = std::time::Instant::now(); let mut st = self.new_state();
         let _ = self.forward_inner(&[1, 2], &mut st);
-        let mw = self.spec_max_window().min(if super::qn_cube::native_mode() == 2 { 7 } else { 3 }); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
+        let mw = self.spec_max_window().min(env_usize("PYRE_QN_PREWARM_MAX").unwrap_or(if super::qn_cube::native_mode() == 2 { 7 } else { 3 })); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
         for t in 1..=mw { let ids: Vec<u32> = (0..t as u32).map(|i| 3 + i).collect(); let _ = if t == 1 { self.forward_inner(&ids, &mut st) } else { self.forward_multi(&ids, &mut st).pop().unwrap_or_default() }; }
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); if !g.map.is_empty() { eprintln!("prewarm: warning, expert cache already filled ({})", g.map.len()); } for c in g.cnt.iter_mut() { for v in c.iter_mut() { *v = 0; } } g.calls = 0; g.hits = 0; g.total = 0; }
         eprintln!("prewarm: decode/verify kernels (T<={mw}) in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
