@@ -1304,6 +1304,83 @@ fn k_gate_m(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u3
     }
 }
 
+/// k_gate_m with every weight word / scale of all hc rows loaded up front (hc * ceil(words/32) independent
+/// loads in flight per lane instead of 2-3 per dependent row pass). Per (row, token) each lane accumulates the
+/// same words in the same ascending order, then plane_sum and the row sum in st order: bit-identical to k_gate_m.
+#[cube(launch_unchecked)]
+fn k_gate_m2(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, xs: u32, ds: u32, os: u32, #[comptime] lr: usize, #[comptime] hc: u32, #[comptime] t: u32) {
+    let mut lo = Shared::<[f32]>::new_slice(comptime!(lr * t as usize));
+    let hcf = f32::cast_from(hc);
+    let tid = UNIT_POS_Y * 32 + UNIT_POS_X;
+    let i = CUBE_POS_X * 8 + UNIT_POS_Y;
+    let words = comptime!(lr as u32 / 4);
+    let nb = comptime!(lr as u32 / 32);
+    let ni = comptime!((lr as u32 / 4).div_ceil(32));
+    // weights first (they do not depend on lo), so their latency overlaps the silu prologue
+    let mut wv = Array::<u32>::new(comptime!((hc * ni) as usize));
+    let mut sv = Array::<f32>::new(comptime!((hc * ni) as usize));
+    let mut ic = i; if ic >= d { ic = d - 1; }
+    #[unroll]
+    for st in 0..hc {
+        let row = st * d + ic;
+        #[unroll]
+        for it in 0..ni {
+            let wi = UNIT_POS_X + it * 32;
+            let mut wc = wi; if wc >= words { wc = words - 1; }
+            wv[(st * ni + it) as usize] = w[(row * words + wc) as usize];
+            sv[(st * ni + it) as usize] = s[(row * nb + wc / 8) as usize];
+        }
+    }
+    #[unroll]
+    for tk in 0..t {
+        let mut j = tid;
+        while (j as usize) < lr {
+            let v = dn[(tk * ds + j) as usize] / hcf;
+            lo[(tk * comptime!(lr as u32) + j) as usize] = v / (1.0f32 + f32::exp(-v));
+            j += 256u32;
+        }
+    }
+    sync_cube();
+    if i < d {
+        let mut acc = Array::<f32>::new(comptime!(t as usize));
+        #[unroll]
+        for tk in 0..t { acc[tk as usize] = 0.0f32; }
+        #[unroll]
+        for st in 0..hc {
+            let row = st * d + i;
+            let mut g = Array::<f32>::new(comptime!(t as usize));
+            #[unroll]
+            for tk in 0..t { g[tk as usize] = 0.0f32; }
+            #[unroll]
+            for it in 0..ni {
+                let wi = UNIT_POS_X + it * 32;
+                if wi < words {
+                    let word = wv[(st * ni + it) as usize];
+                    let sc = sv[(st * ni + it) as usize];
+                    #[unroll]
+                    for tk in 0..t {
+                        let mut part = 0.0f32;
+                        #[unroll]
+                        for jj in 0..4u32 {
+                            let v = dec(word, jj);
+                            part += v * lo[(tk * comptime!(lr as u32) + wi * 4 + jj) as usize];
+                        }
+                        g[tk as usize] += part * sc;
+                    }
+                }
+            }
+            #[unroll]
+            for tk in 0..t {
+                let gt = plane_sum(g[tk as usize]);
+                acc[tk as usize] += xn[(tk * xs + row) as usize] / (1.0f32 + f32::exp(-gt));
+            }
+        }
+        if UNIT_POS_X == 0 {
+            #[unroll]
+            for tk in 0..t { out[(tk * os + ooff + i) as usize] = acc[tk as usize] / hcf; }
+        }
+    }
+}
 /// mixed[i] = mean_s xn[s,i] * sigmoid(up[s*d+i] . silu(dn[0..lr]/hc)); one plane per output i.
 #[cube(launch_unchecked)]
 fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, #[comptime] lr: usize, #[comptime] hc: u32) {
@@ -2086,6 +2163,66 @@ fn k_xdown_b4(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks:
 
 /// Q8 pack: per 32 values d = amax/127, q = round(v/d) as int8 (4 per word) - the same grid as
 /// k_q8copy / the CPU Q8 activations. One thread per 32-block.
+/// Lossy draft-head GEMV (only the MTP drafter uses it): Q8_0 weights x int8-quantised activations (k_q8pack),
+/// one lane per 32-wide block, 8 dp4a per block. Not bit-identical to k_gemv; drafts only (verify decides output).
+#[cube(launch_unchecked)]
+fn k_gemv_q8d(xq: &[u32], xs: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nb = cols / 32;
+        let wb = row * (cols / 4);
+        let sb = row * nb;
+        let mut acc = 0.0f32;
+        let mut b = UNIT_POS_X;
+        while b < nb {
+            let mut p = 0i32;
+            #[unroll]
+            for j in 0..8u32 { p = dp4a(i32::cast_from(w[(wb + b * 8 + j) as usize]), i32::cast_from(xq[(b * 8 + j) as usize]), p); }
+            acc += f32::cast_from(p) * s[(sb + b) as usize] * xs[b as usize];
+            b += 32u32;
+        }
+        let t = plane_sum(acc);
+        if UNIT_POS_X == 0 { out[row as usize] = t; }
+    }
+}
+/// Draft-head argmax + top probability (mtp::best on the GPU, one 1024-thread cube): out[0] = index (as f32, exact
+/// below 2^24; ties keep the lowest index like best()), out[1] = 1 / sum exp(v - max).
+#[cube(launch_unchecked)]
+fn k_best(lg: &[f32], out: &mut [f32], n: u32) {
+    let mut sv = Shared::<[f32]>::new_slice(1024usize);
+    let mut si = Shared::<[u32]>::new_slice(1024usize);
+    let tid = UNIT_POS_X;
+    let mut bv = f32::new(-3.0e38);
+    let mut bi = 0u32;
+    let mut i = tid;
+    while i < n { let v = lg[i as usize]; if v > bv { bv = v; bi = i; } i += 1024u32; }
+    sv[tid as usize] = bv; si[tid as usize] = bi;
+    sync_cube();
+    let mut h = 512u32;
+    while h > 0u32 {
+        if tid < h {
+            let (a, b) = (sv[tid as usize], sv[(tid + h) as usize]);
+            if b > a || (b == a && si[(tid + h) as usize] < si[tid as usize]) { sv[tid as usize] = b; si[tid as usize] = si[(tid + h) as usize]; }
+        }
+        sync_cube();
+        h = h / 2u32;
+    }
+    let mx = sv[0];
+    let bix = si[0];
+    sync_cube();
+    let mut z = 0.0f32;
+    let mut j = tid;
+    while j < n { z += f32::exp(lg[j as usize] - mx); j += 1024u32; }
+    sv[tid as usize] = z;
+    sync_cube();
+    let mut h2 = 512u32;
+    while h2 > 0u32 {
+        if tid < h2 { sv[tid as usize] = sv[tid as usize] + sv[(tid + h2) as usize]; }
+        sync_cube();
+        h2 = h2 / 2u32;
+    }
+    if tid == 0u32 { out[0] = f32::cast_from(bix); out[1] = 1.0f32 / sv[0]; }
+}
 #[cube(launch_unchecked)]
 fn k_q8pack(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, nb: u32) {
     let b = ABSOLUTE_POS_X;
@@ -2760,7 +2897,23 @@ impl Cube {
         super::qn_gpu::GPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); super::qn_gpu::GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     }
-    /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
+    /// lossy draft-head GEMV (k_gemv_q8d): plain Q8 CMat only (no native/qseg segments); false = not eligible
+    pub fn gemv_q8d(&self, m: &CMat, x: &Handle, out: &Handle) -> bool {
+        if !m.nat.is_empty() || !m.qseg.is_empty() || m.cols % 32 != 0 { return false; }
+        let nb = m.cols / 32; let xq = self.empty(m.cols / 4); let xs = self.empty(nb);
+        unsafe { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), m.cols), BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), 0u32, nb as u32) }
+        unsafe { k_gemv_q8d::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            BufferArg::from_raw_parts(xq, m.cols / 4), BufferArg::from_raw_parts(xs, nb), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+            BufferArg::from_raw_parts(out.clone(), m.rows), m.rows as u32, m.cols as u32) }
+        true
+    }    /// k_best into o[0..2] (no readback; PYRE_MTP_GX chained drafts)
+    pub fn best_into(&self, lg: &Handle, n: usize, o: &Handle) { unsafe { k_best::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), BufferArg::from_raw_parts(lg.clone(), n), BufferArg::from_raw_parts(o.clone(), 2), n as u32) } }
+    /// mtp::best on the GPU: (argmax, 1/sum exp(v-max)) of lg[0..n] with an 8-byte readback
+    pub fn best(&self, lg: &Handle, n: usize) -> (usize, f32) {
+        let o = self.empty(2);
+        unsafe { k_best::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), BufferArg::from_raw_parts(lg.clone(), n), BufferArg::from_raw_parts(o.clone(), 2), n as u32) }
+        let r = self.read(&o); (r[0] as usize, r[1])
+    }    /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
     pub fn gemv(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, out: &Handle, on: usize, ooff: usize) {
         if !m.nat.is_empty() && native_mode() == 3 {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4x::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
@@ -2886,6 +3039,10 @@ impl Cube {
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
         if !(2..=4).contains(&t) { return false; }
         let lr = up.cols;
+        // PYRE_QN_GATEM2 (default on for T=2; =0 reverts): loads hoisted, bit-identical; T=2 30.8->28.8 us, T=3 47.3->54.8 us (register pressure) so T>=3 keeps k_gate_m
+        if t == 2 && std::env::var("PYRE_QN_GATEM2").map(|v| v != "0").unwrap_or(true) { unsafe { k_gate_m2::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+            BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
+            BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) } return true; }
         unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) }

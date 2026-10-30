@@ -1,7 +1,7 @@
 Third-party notices
 
 == Strata (https://github.com/Niko1221/Strata), MIT ==
-Used in pyre: data/draft_vocab_en.bin and data/draft_vocab_cjk.bin (copied unchanged from Strata's data/draft_vocab_en.bin and data/draft_vocab.bin), and the pinned revision / SHA256 list read by scripts/mtp_fetch.py from Strata's tools/mtp_fetch.py. Several pyre files follow Strata's designs (each says so in its header); no Strata C++/CUDA is linked or vendored.
+Used in pyre: data/draft_vocab_en.bin and data/draft_vocab_cjk.bin (copied unchanged from Strata's data/draft_vocab_en.bin and data/draft_vocab.bin), and the pinned revision / SHA256 list read by scripts/mtp_fetch.py from Strata's tools/mtp_fetch.py. Several pyre files follow Strata's designs (each says so in its header); no Strata C++/CUDA is linked or vendored. The opt-in PYRE_QN_PIPE verify pipeline (src/model/qwen4exp_gguf.rs, and the pyre_host_gate/pyre_host_pinned additions in the local CubeCL fork) reimplements the design of Strata's mapped-memory verify pipeline (src/core/verify.cpp: per-layer host flags, CPU rows through pinned host memory).
 
 MIT License
 
