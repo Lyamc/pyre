@@ -276,7 +276,7 @@ impl Model {
                       for (nm, m) in [("min", &c0.min), ("hca.di", &c0.hca.di), ("hca.up", &c0.hca.up), ("mout", &c0.mout), ("fin", &c0.fin), ("sdown", &c0.sdown)] {
                         let gb = (m.rows * m.cols) as f64 * 9.0 / 8.0 / 1e9;
                         cb.gemv_m(m, &x3, 3 * hc * d, 0, m.cols, &o3, 3 * 20000, 0, m.rows.min(20000), 3); cb.read(&o3); let t1 = std::time::Instant::now(); for _ in 0..50 { cb.gemv_m(m, &x3, 3 * hc * d, 0, m.cols, &o3, 3 * 20000, 0, m.rows.min(20000), 3); } cb.read(&o3); let us = t1.elapsed().as_secs_f64() * 1e6 / 50.0;
-                        eprintln!("cubebench gemv_m T=3 {nm} {}x{}: {us:.1} us ({:.0} GB/s)", m.rows, m.cols, gb / (us * 1e-6)); } }
+                        eprintln!("cubebench gemv_m T=3 {nm} {}x{}: {us:.1} us ({:.0} GB/s)", m.rows, m.cols, gb / (us * 1e-6)); } if super::qn_cube::native_mode() == 2 { for (nm, m) in [("min", &c0.min), ("mout", &c0.mout), ("fin", &c0.fin)] { cb.natcheck(nm, m); } } }
                     bench("gate", &|| cb.gate(&x, &dn, &c0.hca.up, &o, 20000, 0, hc, d));
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }

@@ -16,6 +16,9 @@ fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sy
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
 /// PYRE_QN_NATS=0: the per-8-values k_gemv_iq4d_m instead of the sub-block k_gemv_iq4s_m
 pub fn nats() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATS").map(|v| v == "1").unwrap_or(false)) }
+/// Test override for nats(): 0 = env, 1 = iq4d_m, 2 = iq4s_m.
+pub static NATS_OV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn nats_on() -> bool { match NATS_OV.load(std::sync::atomic::Ordering::Relaxed) { 1 => false, 2 => true, _ => nats() } }
 pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
 pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -897,8 +900,11 @@ fn k_gemv_iq4d_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32],
 #[cube]
 fn prmt(a: u32, b: u32, sel: u32) -> u32 {
     let s7 = sel & 0x7777u32;
+    // copies: a bare parameter reached the asm as the address of its slot (LLVM backend)
+    let a1 = a | 0u32;
+    let b1 = b | 0u32;
     let d: u32;
-    gpu_asm!("prmt.b32 {d}, {a}, {b}, {s};", a = in(_) a, b = in(_) b, s = in(_) s7, d = out(_) d, options(pure, nomem));
+    gpu_asm!("prmt.b32 {d}, {a}, {b}, {s};", a = in(_) a1, b = in(_) b1, s = in(_) s7, d = out(_) d, options(pure, nomem));
     d
 }
 
@@ -2442,6 +2448,33 @@ impl Cube {
         Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
     }    pub fn buf(&self, v: &[f32]) -> Handle { self.hup(f32::as_bytes(v)) }
     pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
+    /// CPU reference for the first native segment of m (first 64 rows, 3 columns, f64 from the packed IQ4_XS words),
+    /// against gemv_m with iq4d_m and with iq4s_m. The GPU side quantizes x to Q8, so expect ~1e-2 relative error.
+    pub fn natcheck(&self, nm: &str, m: &CMat) {
+        let Some((r0, n, wh)) = m.nat.first() else { eprintln!("natcheck {nm}: not native"); return };
+        let (cols, rows) = (m.cols, m.rows);
+        let wb = self.client.read_one(wh.clone()).expect("gpu readback");
+        let w: Vec<u32> = wb.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let x: Vec<f32> = (0..3 * cols).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        let xh = self.buf(&x);
+        const LV: [f64; 16] = [-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0];
+        let nb = cols / 256; let nr = (*n).min(64);
+        let mut rf = vec![0f64; 3 * nr];
+        for r in 0..nr { for b in 0..nb { let b0 = r * nb * 35 + b * 35; let d = f32::from_bits(w[b0]) as f64; let (sh, sl) = (w[b0 + 1], w[b0 + 2]);
+            for ib in 0..8 { let ls = ((((sl >> (4 * ib)) & 15) | (((sh >> (2 * ib)) & 3) << 4)) as i32 - 32) as f64;
+                for k in 0..4 { let q = w[b0 + 3 + ib * 4 + k];
+                    for by in 0..4 { let v = (q >> (8 * by)) & 255; let (lo, hi) = (LV[(v & 15) as usize], LV[(v >> 4) as usize]);
+                        let cl = b * 256 + ib * 32 + 4 * k + by;
+                        for t in 0..3 { rf[t * nr + r] += d * ls * (lo * x[t * cols + cl] as f64 + hi * x[t * cols + cl + 16] as f64); } } } } } }
+        for ov in [1u32, 2] {
+            NATS_OV.store(ov, std::sync::atomic::Ordering::Relaxed);
+            let o = self.empty(3 * rows); self.gemv_m(m, &xh, 3 * cols, 0, cols, &o, 3 * rows, 0, rows, 3); let g = self.read(&o);
+            let (mut me, mut mx) = (0f64, 0f64);
+            for t in 0..3 { for r in 0..nr { let a = g[t * rows + r0 + r] as f64; me = me.max((a - rf[t * nr + r]).abs()); mx = mx.max(rf[t * nr + r].abs()); } }
+            eprintln!("natcheck {nm} {}: maxerr {me:.4e} maxref {mx:.4e}", if ov == 1 { "iq4d_m" } else { "iq4s_m" });
+        }
+        NATS_OV.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Host-to-device for a small buffer (activations, expert tables): through CubeCL's page-locked staging pool when
     /// PYRE_QN_HPIN=1, so the driver copies by DMA instead of staging a pageable buffer on this thread.
     pub fn hup(&self, b: &[u8]) -> Handle {
@@ -2519,7 +2552,7 @@ impl Cube {
         if !m.nat.is_empty() && native_mode() == 2 && (2..=4).contains(&nt) && natm() {
             let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
             unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) }
-            if nats() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            if nats_on() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4d_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
