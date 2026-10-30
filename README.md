@@ -881,3 +881,7 @@ Steady tok/s, n=96, one run each (Q8 default / PYRE_QN_NATIVE=2): A 31.8 / 35.0,
 - PYRE_QN_PREWARM=1 (opt-in): decode/verify kernels compiled at load; no clear gain.
 - Q8 with 3-token drafts needs a smaller expert cache to stay inside the VRAM reserve (2.0 GiB fits) and is then slower than the default.
 - Remaining lever (not started): Strata's verify pipeline waits on host-mapped flags on the GPU (no per-layer host readback) and streams ~55% of expert misses over PCIe with a copy kernel; see C:\Temp\qnx\overnight.md for the design notes.
+
+### Verify MoE glue as a graph (opt-in, PYRE_QN_MOEGRAPH=1, parked)
+
+With VGRAPH on, the GPU side of each verify layer's MoE glue becomes one captured graph per (layer, window size). That covers the window q8pack, the cached experts' gate/up and down, and the shared expert's silu_mul and down GEMV. The routing goes in as a fixed, padded table (t * top_k entries) plus per-token counts in a 4-word device buffer, written before each replay. The kernels k_xgu_stg and k_xdown_qtg skip the padding entries. The idea comes from Strata (MIT, github.com/Niko1221/Strata); none of its code is used. Greedy output is identical on Q8 A/B/C (n=96). Launches per run drop about 40% (CUBECL_LAUNCH_LOG: ~25k to ~15k), but tok/s does not change (A 31.9/32.8 off vs 31.6/32.7 on). Launches are not the bottleneck, so the flag stays opt-in. comb3_m is not in the graph yet.
