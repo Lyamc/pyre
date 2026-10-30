@@ -51,6 +51,7 @@ fn mtp_cpu<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     static P: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     match P.get_or_init(|| { let n = env_usize("PYRE_MTP_THREADS").unwrap_or(8); if n == 0 { None } else { rayon::ThreadPoolBuilder::new().num_threads(n).build().ok() } }) { Some(p) => p.install(f), None => f() }
 }
+fn xarena_pin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PIN").map(|v| v == "1").unwrap_or(false)) }
 fn xshare() -> f32 { static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)) }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, stream: Vec<usize>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
@@ -434,7 +435,11 @@ impl Model {
             let nst = if xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 { let sh = xshare(); xcg.stream.len().min(if sh > 0.0 { (off.len() as f32 * sh).round() as usize } else { off.len() }) } else { 0 };
             // with PYRE_QN_XSHARE the last (lowest-weight) misses go to the GPU, as Strata's dispatch takes the tail
             let s0 = if xshare() > 0.0 { off.len() - nst } else { 0 };
-            let strm: Vec<(usize, f32)> = off.drain(s0..s0 + nst).collect();
+            let strm: Vec<(usize, f32)> = if xarena_pin() {
+                // pinned arena: the last nst misses already packed there (the rest stay CPU misses, as in Strata)
+                let pk = self.xpk.lock().unwrap(); let mut pick: Vec<usize> = (0..off.len()).rev().filter(|&i| pk.map.contains_key(&(il, off[i].0))).take(nst).collect(); drop(pk);
+                pick.sort_unstable(); let v: Vec<(usize, f32)> = pick.iter().map(|&i| off[i]).collect(); for &i in pick.iter().rev() { off.remove(i); } v
+            } else { off.drain(s0..s0 + nst).collect() };
             xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
             // CPU workers start on the missed experts while this thread enqueues the GPU side
             let mut gpu = || {
@@ -544,7 +549,12 @@ impl Model {
         let mut v = super::qn_cube::repack(tys.0, l.gate_e.raw_rows(e * ff, ff)); let uo = v.len(); v.extend(super::qn_cube::repack(tys.1, l.up_e.raw_rows(e * ff, ff))); let dof = v.len(); v.extend(super::qn_cube::repack(tys.2, l.down_e.raw_rows(e * d, d)));
         super::qn_cube::XUP_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // shared (refcounted) bytes: an upload hands CubeCL a cheap clone instead of copying the expert again
-        let a = std::sync::Arc::new((burn_cubecl::cubecl::bytes::Bytes::from_elems(v).shared(), uo, dof));
+        // PYRE_QN_XARENA_PIN=1: the packed expert lives in CubeCL's page-locked pool, so a PCIe-share upload of it is a
+        // zero-copy async DMA (CubeCL never restages pinned bytes), as Strata streams from its pinned host blobs
+        let mut by = burn_cubecl::cubecl::bytes::Bytes::from_elems(v);
+        let cap0 = (env_var("PYRE_QN_XARENA_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) * (1u64 << 30) as f64) as usize;
+        if xarena_pin() && { let pk = self.xpk.lock().unwrap(); !pk.full && pk.bytes + by.len() <= cap0 } { if let Some(cb) = self.cube.as_ref() { cb.client.staging(std::iter::once(&mut by), false); } }
+        let a = std::sync::Arc::new((by.shared(), uo, dof));
         let cap = (env_var("PYRE_QN_XARENA_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) * (1u64 << 30) as f64) as usize;
         let mut pk = self.xpk.lock().unwrap();
         let len = a.0.len();
@@ -1405,6 +1415,7 @@ impl Model {
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
+            eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }
@@ -1624,14 +1635,17 @@ impl Model {
             let tyw = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
             if xshare() > 0.0 && !xcg.stream.is_empty() && xfast() && tyw.0 == tyw.1 && tyw.0 <= 1 && tyw.2 == 3 && xcg.arena.len() <= 2 {
                 let mut cm: std::collections::HashMap<usize, usize> = Default::default();
-                for o in &offs { for &(e, _) in o { *cm.entry(e).or_default() += 1; } }
+                // with the pinned arena only experts already packed there fly (as Strata streams only pinned blobs): any other would
+                // be repacked and staged on this thread, which costs more than the CPU pool needs for it
+                let ina = |e: usize| !xarena_pin() || self.xpk.lock().unwrap().map.contains_key(&(il, e));
+                for o in &offs { for &(e, _) in o { if ina(e) { *cm.entry(e).or_default() += 1; } } }
                 let k = ((cm.len() as f32 * xshare()).round() as usize).min(xcg.stream.len());
                 if k > 0 {
                     let mut v: Vec<(usize, usize)> = cm.into_iter().collect(); v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                    for (j, &(e, _)) in v[..k].iter().enumerate() { let sl = xcg.stream[j]; let pk = self.xpacked(il, e, tyw);
+                    let qu = std::time::Instant::now(); for (j, &(e, _)) in v[..k].iter().enumerate() { let sl = xcg.stream[j]; let pk = self.xpacked(il, e, tyw);
                         let mut ent = cb.xupload_pk(&xcg.arena[sl / xcg.per], xcg.ar_bytes, sl % xcg.per, xcg.slot, &pk.0, pk.1, pk.2); ent.arena = sl / xcg.per; ent.slot = sl;
                         xcg.map.insert((il, e), ent); sins.push((il, e)); }
-                    let set: std::collections::HashSet<usize> = v[..k].iter().map(|x| x.0).collect();
+                    SD[1].fetch_add(qu.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); let set: std::collections::HashSet<usize> = v[..k].iter().map(|x| x.0).collect();
                     for ti in 0..t { let (mv, keep): (Vec<(usize, f32)>, Vec<(usize, f32)>) = offs[ti].drain(..).partition(|(e, _)| set.contains(e)); offs[ti] = keep; ons[ti].extend(mv); }
                 }
             }
@@ -1644,7 +1658,7 @@ impl Model {
                         let y0 = cb.empty(d);
                         let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect();
                         let mut first = true; let mut ok = true;
-                        if xcr.arena.len() <= 2 { ok = cb.xrun_fast_to(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &ents, rd, rn, d, c.ff_exp, tyf, &xcr.scr, false, &y0); } else {
+                        if xcr.arena.len() <= 2 { let q = std::time::Instant::now(); ok = cb.xrun_fast_to(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &ents, rd, rn, d, c.ff_exp, tyf, &xcr.scr, false, &y0); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } else {
                         for ar in 0..xcr.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ar).cloned().collect(); if grp.is_empty() { continue; }
                             ok &= cb.xrun_fast_to(&xcr.tabs, std::slice::from_ref(&xcr.arena[ar]), xcr.ar_bytes, &grp, rd, rn, d, c.ff_exp, tyf, &xcr.scr, !first, &y0); first = false; } }
                         if ok { ygs[ti] = Some(y0); } ok };
@@ -1661,7 +1675,7 @@ impl Model {
                 }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                 for ti in 0..t { shs.push(at(&sh_all, ti * d)); }
-                if kick() { let _ = cb.client.flush(); }
+                let qf = std::time::Instant::now(); if kick() { let _ = cb.client.flush(); } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             };
             // union of the missed experts; each token keeps its own order for the accumulation
             let mut lists: Vec<(usize, Vec<(usize, f32)>)> = vec![]; let mut pos_of: std::collections::HashMap<usize, usize> = Default::default();
@@ -1717,6 +1731,7 @@ static BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 static BUSYN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static SIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SD: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static MISS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WV: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
