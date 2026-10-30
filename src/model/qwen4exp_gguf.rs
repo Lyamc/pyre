@@ -1147,6 +1147,8 @@ impl Model {
         let usek = qdot::supports_k(l.gate_e.ty) && qdot::supports_k(l.up_e.ty) && env_var("PYRE_QN_Q8K").map(|v| v != "0").unwrap_or(true);
         let actk: Vec<qdot::Q8K> = if usek { (0..t).map(|ti| { let mut a = qdot::Q8K::default(); qdot::quantize_k_into(&x[ti * d..(ti + 1) * d], &mut a); a }).collect() } else { vec![] };
         let blk = env_usize("PYRE_QN_SBLK").unwrap_or(32); let nb = ff.div_ceil(blk);
+        { let np: usize = work.iter().map(|w| w.1.len()).sum(); XW2[1].fetch_add(np as u64, std::sync::atomic::Ordering::Relaxed); XW2[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if fused() { self.routed_fused(l, work, t, y, side, ord, &acts, &actk, usek, blk, nb); XW2[0].fetch_add(z0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); return; }
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
         let mut hid = vec![0f32; hoff[work.len()]]; let hp = SyncPtr(hid.as_mut_ptr());
         thread_local! { static SC: std::cell::RefCell<(super::qdot::Scratch, super::qdot::Scratch)> = std::cell::RefCell::new(Default::default()); }
@@ -1200,7 +1202,51 @@ impl Model {
                             for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } continue; }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         });
-        use std::sync::atomic::Ordering::Relaxed; HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
+        use std::sync::atomic::Ordering::Relaxed; XW2[0].fetch_add(z0.elapsed().as_nanos() as u64, Relaxed); HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    /// PYRE_QN_FUSE=1: one pool wake per layer. Task wi = expert wi: its gate/up rows (the same per-row code as
+    /// routed_pool_ord), its own hidden quantize (same function/input), then its down rows into per-(expert,token)
+    /// partials w*dot (same expressions); afterwards every token adds its partials in its own expert order
+    /// (ord, or work order when None) exactly as the ordered/unordered paths do: bit-identical.
+    /// PYRE_QN_FUSE_SERIAL=N: run the tasks on the calling thread when the layer has <= N expert x token pairs.
+    #[allow(clippy::too_many_arguments)]
+    fn routed_fused(&self, l: &Layer, work: &[(usize, &Vec<(usize, f32)>)], t: usize, y: &mut [f32], side: &mut dyn FnMut(), ord: Option<&[Vec<(usize, usize)>]>, acts: &[super::qdot::Q8Act], actk: &[super::qdot::Q8K], usek: bool, blk: usize, nb: usize) {
+        use super::qdot; use super::spin_pool::SyncPtr;
+        let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
+        let mut slot0 = vec![0usize; work.len()]; let mut slot_n = 0usize; for (wi, (_, toks)) in work.iter().enumerate() { slot0[wi] = slot_n; slot_n += toks.len(); }
+        let mut part = vec![0f32; slot_n * d]; let pp = SyncPtr(part.as_mut_ptr());
+        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
+        let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
+        let task = |wi: usize| { let (e, toks) = work[wi]; let nt = toks.len(); let mut hid = vec![0f32; nt * ff]; let mut sc = qdot::Scratch::default();
+            for b in 0..nb { let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
+                let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
+                let multi = usek && nt >= 2 && nt <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
+                if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = ([0f32; 16], [0f32; 16]);
+                    for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                        if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
+                        qdot::row_dot_k_multi(gm.ty, gr, &al, &mut gv); qdot::row_dot_k_multi(um.ty, ur, &al, &mut uv);
+                        for j in 0..nt { hid[j * ff + r0 + r] = silu(gv[j]) * uv[j]; } }
+                    continue; }
+                for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
+                    if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
+                    for (j, &(ti, _)) in toks.iter().enumerate() {
+                        let v = if usek { let pr = if pair_on() && gm.ty == um.ty { qdot::row_dot_k_pair(gm.ty, gr, ur, &actk[ti]) } else { None }; if let Some((g, u)) = pr { silu(g) * u } else { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], &mut sc)) * qdot::row_dot(um.ty, ur, &acts[ti], &mut sc) };
+                        hid[j * ff + r0 + r] = v; } } }
+            let hq: Vec<qdot::Q8Act> = if used { vec![] } else { (0..nt).map(|j| qdot::quantize(&hid[j * ff..(j + 1) * ff])).collect() };
+            let hdq: Vec<qdot::Q8D> = if !used { vec![] } else { (0..nt).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[j * ff..(j + 1) * ff], &mut a); a }).collect() };
+            let dm = l.down_e.slice_rows(e * d, d); let al: Vec<&qdot::Q8D> = hdq.iter().collect();
+            for r in 0..d { let dr = dm.row_raw(r); if r + 4 < d { prefetch(dm.row_raw(r + 4)); }
+                if used && nt >= 2 && nt <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
+                    for (j, &(_, w)) in toks.iter().enumerate() { unsafe { pp.slice((slot0[wi] + j) * d + r, 1)[0] = w * ov[j]; } } continue; }
+                for (j, &(_, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[j]) } else { qdot::row_dot(dm.ty, dr, &hq[j], &mut sc) }; unsafe { pp.slice((slot0[wi] + j) * d + r, 1)[0] = v; } } } };
+        let ser = env_usize("PYRE_QN_FUSE_SERIAL").unwrap_or(0);
+        if slot_n <= ser { side(); for wi in 0..work.len() { task(wi); } } else {
+            let pool = qn_pool(); pool.run_side(work.len(), &|wi| task(wi), &mut || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }); }
+        // ordered sums: per token, its partials in its expert order (ord) or work order
+        match ord { Some(ord) => for (ti, lst) in ord.iter().enumerate() { let yt = &mut y[ti * d..(ti + 1) * d]; for &(wi, j) in lst { let p = &part[(slot0[wi] + j) * d..(slot0[wi] + j + 1) * d]; for r in 0..d { yt[r] += p[r]; } } },
+            None => for (wi, (_, toks)) in work.iter().enumerate() { for (j, &(ti, _)) in toks.iter().enumerate() { let p = &part[(slot0[wi] + j) * d..(slot0[wi] + j + 1) * d]; let yt = &mut y[ti * d..(ti + 1) * d]; for r in 0..d { yt[r] += p[r]; } } } }
+        let _ = t;
     }
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
@@ -1513,10 +1559,12 @@ impl Model {
         for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); if headb { hb.extend_from_slice(&hh); nb += 1; } else { lg.push(self.head_logits(&hh)); } }
         // one head GEMV for all verify tokens: the weights are read once; each column uses the same per-row arithmetic
         if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(if self.headc.is_some() { 4 } else { 8 }); let y = if let Some(hm) = &self.headc { /* GPU Q8 head (PYRE_QN_GPUHEAD=1): up to 4 columns per gemv_m, weights read once */ let xb = cb.buf(&hb[done * d..(done + c) * d]); let o = cb.empty(c * hm.rows); if c == 1 { cb.gemv(hm, &xb, d, 0, &o, hm.rows, 0); } else { cb.gemv_m(hm, &xb, c * d, 0, d, &o, c * hm.rows, 0, hm.rows, c); } cb.read(&o) } else { self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap() }; let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
+        if env_var("PYRE_QN_XWIN2").is_ok() { use std::sync::atomic::Ordering::Relaxed; eprintln!("xwin2 T={t} pool_ms {:.2} pairs {} calls {}", XW2[0].swap(0, Relaxed) as f64 / 1e6, XW2[1].swap(0, Relaxed), XW2[2].swap(0, Relaxed)); }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} (dense {:.1} flush {:.1}) | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6, WV[3].swap(0, Relaxed) as f64 / 1e6, WV[4].swap(0, Relaxed) as f64 / 1e6);
             eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("route-to-meta {:.1} route {:.1} | ", RTN.swap(0, Relaxed) as f64 / 1e6, RTN2.swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
+            if false {}
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }
@@ -1867,6 +1915,9 @@ fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
     let cut = ws[r - 1]; // keep experts strictly above the rank-(r-1) weight or equal to it
     off.retain(|x| x.1 >= cut);
 }
+/// PYRE_QN_XWIN2: per-window routed_pool_ord wall ns / pairs / calls
+static XW2: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+fn fused() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_FUSE").map(|v| v == "1").unwrap_or(false)) }
 static BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BUSYN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
