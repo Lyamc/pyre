@@ -672,7 +672,7 @@ pub fn sc16_tab() -> bool { static P: std::sync::OnceLock<bool> = std::sync::Onc
 
 /// IQ2_S: qh byte -> its four 2-bit groups one per byte (bits 8-9 of index k in byte k), see kk::g2i (Strata hi_spread.iq2s, MIT)
 pub static HI2S: [u64; 256] = { let mut t = [0u64; 256]; let mut h = 0; while h < 256 { let mut k = 0; while k < 4 { t[h] |= (((h >> (2 * k)) & 3) as u64) << (8 * k); k += 1; } h += 1; } t };
-/// PYRE_QN_GIDX: IQ2_S grid indices via HI2S + punpcklbw on the non-gather path (bit-identical)
-pub fn gidx() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GIDX").map(|v| v != "0").unwrap_or(false)) }
-/// PYRE_QN_PFB: IQ2 super-block prefetch distance in bytes (0 = off)
-pub fn pfb() -> usize { static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PFB").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+/// PYRE_QN_GIDX: IQ2_S grid indices via HI2S + punpcklbw on the non-gather path (bit-identical), default on; PYRE_QN_GIDX=0 disables
+pub fn gidx() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GIDX").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_PFB: IQ2 super-block prefetch distance in bytes, default 2048 like Strata (0 = off)
+pub fn pfb() -> usize { static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PFB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)) }
