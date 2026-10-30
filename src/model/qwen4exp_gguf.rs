@@ -1740,8 +1740,9 @@ impl Model {
                             let hx = cb.empty(c.ff_exp * grp.len()); cb.xrun_b(&xcr.tabs, &xcr.arena[ar], xcr.ar_bytes, &grp, &xb, d, c.ff_exp, tys, &hx, &y0); }
                         ygs[ti] = Some(y0);
                     }
-                    cb.silu_mul(rd, rn, d + ne, d + ne + sf, &at(&hb_all, ti * sf), sf);
+                    if !combm() { cb.silu_mul(rd, rn, d + ne, d + ne + sf, &at(&hb_all, ti * sf), sf); }
                 }
+                if combm() { cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t); }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                 for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
                 let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);

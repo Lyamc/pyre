@@ -1401,6 +1401,16 @@ fn k_copy(src: &[f32], dst: &mut [f32], so: u32, dof: u32, n: u32) {
     }
 }
 
+/// k_silu_mul for t rows in one launch (row ti = CUBE_POS_Y: f at ti * fs, h at ti * n)
+#[cube(launch_unchecked)]
+fn k_silu_mul_m(f: &[f32], h: &mut [f32], og: u32, ou: u32, n: u32, fs: u32) {
+    let j = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if j < n {
+        let g = f[(ti * fs + og + j) as usize];
+        h[(ti * n + j) as usize] = g / (1.0f32 + f32::exp(-g)) * f[(ti * fs + ou + j) as usize];
+    }
+}
 #[cube(launch_unchecked)]
 fn k_silu_mul(f: &[f32], h: &mut [f32], og: u32, ou: u32, n: u32) {
     let j = ABSOLUTE_POS as u32;
@@ -3135,6 +3145,10 @@ impl Cube {
     pub fn copy(&self, src: &Handle, srcn: usize, so: usize, dst: &Handle, dstn: usize, dof: usize, n: usize) {
         unsafe { k_copy::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(src.clone(), srcn), BufferArg::from_raw_parts(dst.clone(), dstn), so as u32, dof as u32, n as u32) }
+    }
+    pub fn silu_mul_m(&self, f: &Handle, fnn: usize, fs: usize, og: usize, ou: usize, h: &Handle, n: usize, t: usize) {
+        unsafe { k_silu_mul_m::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(f.clone(), fnn), BufferArg::from_raw_parts(h.clone(), t * n), og as u32, ou as u32, n as u32, fs as u32) }
     }
     pub fn silu_mul(&self, f: &Handle, fnn: usize, og: usize, ou: usize, h: &Handle, n: usize) {
         unsafe { k_silu_mul::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
