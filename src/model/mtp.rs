@@ -110,7 +110,7 @@ impl Mtp {
             qn: st.norm("self_attn.q_norm.weight")?, kn: st.norm("self_attn.k_norm.weight")?,
             rsu: st.q8s(&["mlp.gate.weight", "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight"])?, ne, sd: st.q8("mlp.shared_expert.down_proj.weight")?,
             sgate: st.vec("mlp.shared_expert_gate.weight")?, ex: (0..ne).map(|_| OnceLock::new()).collect(), st, head, ids,
-            window: std::env::var("PYRE_MTP_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(256) })
+            window: std::env::var("PYRE_MTP_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(128) /* 128: C tps 30.6->33.8 (less prompt catch-up), acceptance same; 64 loses acceptance */ })
     }
     pub fn row(&self) -> usize { self.nkv * self.hd }
     pub fn rdim(&self) -> usize { self.hc * self.d }
