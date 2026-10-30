@@ -1473,7 +1473,9 @@ impl Model {
         let (cs, ss) = st.gdn[li0].clone(); let cn = (c.conv_k - 1) * (2 * nk * dk + nv * c.lin_dv);
         let cka: Vec<(H, H)> = (0..t - 1).map(|ti| st.ck[ti][li0].clone()).collect();
         let q0 = std::time::Instant::now();
-        let key = format!("{:?}{:?}{:?}{:?}", cs, ss, cka, xs);
+        // key on stable ids + offsets: a handle's Debug includes its slice location, which moves when a page is split
+        let hk = |h: &H| format!("{:?}/{:?}/{:?};", h.memory.descriptor().id, h.offset_start, h.offset_end);
+        let mut key = String::new(); for h in [&cs, &ss].into_iter().chain(cka.iter().flat_map(|(a, b)| [a, b])).chain(xs.iter()) { key.push_str(&hk(h)); }
         let mut gm = self.vg.lock().unwrap();
         // the window's scratch is shared by every layer's graph of this window size (they run one after another on one
         // stream): per-layer buffers pinned ~50 MiB of pool pages per captured graph
