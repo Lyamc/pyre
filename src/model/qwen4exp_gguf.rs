@@ -1150,10 +1150,13 @@ impl Model {
         let mut hoff = vec![0usize; work.len() + 1]; for (i, (_, toks)) in work.iter().enumerate() { hoff[i + 1] = hoff[i] + toks.len() * ff; }
         let mut hid = vec![0f32; hoff[work.len()]]; let hp = SyncPtr(hid.as_mut_ptr());
         thread_local! { static SC: std::cell::RefCell<(super::qdot::Scratch, super::qdot::Scratch)> = std::cell::RefCell::new(Default::default()); }
+        // PYRE_QN_LFIRST=1: gate/up tasks of the experts with the most window tokens first (task order only; every
+        // hidden row is computed by the same code, so results are unchanged)
+        let lfo: Vec<usize> = if env_var("PYRE_QN_LFIRST").map(|v| v == "1").unwrap_or(false) && work.len() > 1 { let mut o: Vec<usize> = (0..work.len()).collect(); o.sort_by_key(|&i| std::cmp::Reverse(work[i].1.len())); o } else { vec![] };
         let (t_first, t_last) = (std::sync::atomic::AtomicU64::new(u64::MAX), std::sync::atomic::AtomicU64::new(0)); let zp = std::time::Instant::now();
         pool.run_side(work.len() * nb, &|k| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
-            let (wi, b) = (k / nb, k % nb); let (e, toks) = work[wi];
+            let (wi, b) = (k / nb, k % nb); let wi = if lfo.is_empty() { wi } else { lfo[wi] }; let (e, toks) = work[wi];
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();

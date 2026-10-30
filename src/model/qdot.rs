@@ -540,7 +540,16 @@ pub fn q2_0_dot_d(row: &[u8], a: &Q8D) -> f32 {
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q2_0_d_avx2(row: &[u8], a: &Q8D) -> f32 {
+unsafe fn q2_0_d_avx2(row: &[u8], a: &Q8D) -> f32 { if dvnni() { q2_0_d_v(row, a) } else { q2_0_d_b::<false>(row, a) } }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q2_0_d_v(row: &[u8], a: &Q8D) -> f32 { q2_0_d_b::<true>(row, a) }
+/// PYRE_QN_DVNNI: Q2_0 down dots with AVX-VNNI vpdpbusd (u2 weights x s8 activations, 4 products per i32 lane);
+/// the same exact i32 sums as maddubs+madd(1) (no saturation: 2*3*127 < 32767), so bit-identical.
+pub fn dvnni() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| vnni() && std::env::var("PYRE_QN_DVNNI").map(|v| v != "0").unwrap_or(false)) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q2_0_d_b<const V: bool>(row: &[u8], a: &Q8D) -> f32 {
     use std::arch::x86_64::*;
     let m3 = _mm256_set1_epi8(3); let one = _mm256_set1_epi16(1);
     let mut acc = _mm256_setzero_ps(); let mut corr = 0f32; let rp = row.as_ptr(); let xq = a.q.as_ptr();
@@ -550,7 +559,7 @@ unsafe fn q2_0_d_avx2(row: &[u8], a: &Q8D) -> f32 {
         let lo = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 2), qv), m3);
         let hi = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 6), _mm_srli_epi16(qv, 4)), m3);
         let x0 = _mm256_loadu_si256(xq.add(i * 64) as *const __m256i); let x1 = _mm256_loadu_si256(xq.add(i * 64 + 32) as *const __m256i);
-        let p = _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one));
+        let p = if V { _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), lo, x0), hi, x1) } else { _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one)) };
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc);
         corr -= dd * *a.s.get_unchecked(i) as f32; }
     corr + k::hsum(acc)
@@ -566,6 +575,13 @@ pub fn kbench() {
         for r in 0..ne * rows * d / 256 { v[r * 82] = 0x00; v[r * 82 + 1] = 0x1c; } v };
     let pool = super::spin_pool::Pool::new(8, std::time::Duration::from_micros(2000));
     { let w = mk(8); let mut hsh = 0u64; for r in 0..8 * rows { hsh = hsh.rotate_left(5) ^ row_dot_k(QType::IQ2S, &w[r * rb..(r + 1) * rb], &a).to_bits() as u64; } eprintln!("kbench checksum {hsh:016x}"); }
+    { let (ff, dr) = (512usize, 2560usize); let rbq = ff / 64 * 18; let mut hx = vec![0f32; ff]; for i in 0..ff { hx[i] = ((i * 7919 % 1000) as f32 - 500.0) / 300.0; }
+      let mut ad = Q8D::default(); quantize_d_into(&hx, &mut ad); let ne = 300; let mut w = vec![0u8; ne * dr * rbq]; let mut sd = 0x9e3779b97f4a7c15u64;
+      for b in w.iter_mut() { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; *b = sd as u8; } for r in 0..ne * dr * ff / 64 { w[r * 18] = 0x00; w[r * 18 + 1] = 0x1c; }
+      let nrow = ne * dr; let mut hsh = 0u64; let mut hb = 0u64;
+      for r in 0..nrow { let v = unsafe { q2_0_d_b::<false>(&w[r * rbq..(r + 1) * rbq], &ad) }; hb = hb.rotate_left(5) ^ v.to_bits() as u64; hsh = hsh.rotate_left(5) ^ q2_0_dot_d(&w[r * rbq..(r + 1) * rbq], &ad).to_bits() as u64; }
+      let t0 = std::time::Instant::now(); let mut sk = 0f32; for _ in 0..3 { for r in 0..nrow { sk += q2_0_dot_d(&w[r * rbq..(r + 1) * rbq], &ad); } }
+      eprintln!("kbench Q2_0 down checksum {hsh:016x} base {hb:016x} identical={} dvnni={} {:.2} ns/row (sink {})", hsh == hb, dvnni(), t0.elapsed().as_secs_f64() * 1e9 / (3 * nrow) as f64, sk.to_bits() & 1); }
     for &(ne, label) in &[(1usize, "hot 1 expert"), (300, "stream 300 experts")] {
         let w = mk(ne); let nrow = ne * rows; let reps = if ne == 1 { 200 } else { 2 };
         for &th in &[1usize, 8] {
@@ -648,7 +664,13 @@ pub fn q2_0_dot_d_multi(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
+unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) { if dvnni() { q2_0_d_multi_v(row, acts, out) } else { q2_0_d_multi_b::<false>(row, acts, out) } }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q2_0_d_multi_v(row: &[u8], acts: &[&Q8D], out: &mut [f32]) { q2_0_d_multi_b::<true>(row, acts, out) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q2_0_d_multi_b<const V: bool>(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m3 = _mm256_set1_epi8(3); let one = _mm256_set1_epi16(1); let n = acts.len();
     let mut acc = [_mm256_setzero_ps(); 8]; let mut corr = [0f32; 8]; let rp = row.as_ptr();
@@ -660,7 +682,7 @@ unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
         for j in 0..n { let a = acts.get_unchecked(j); let xq = a.q.as_ptr();
             let dd = h * *a.d.get_unchecked(i);
             let x0 = _mm256_loadu_si256(xq.add(i * 64) as *const __m256i); let x1 = _mm256_loadu_si256(xq.add(i * 64 + 32) as *const __m256i);
-            let p = _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one));
+            let p = if V { _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), lo, x0), hi, x1) } else { _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one)) };
             acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc[j]);
             corr[j] -= dd * *a.s.get_unchecked(i) as f32; } }
     for j in 0..n { out[j] = corr[j] + k::hsum(acc[j]); }
