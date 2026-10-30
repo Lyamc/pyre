@@ -2473,6 +2473,101 @@ fn k_xdown_qt(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l
         }
     }
 }
+/// PYRE_QN_MOEGRAPH: k_xgu_st / k_xdown_qt with the cumulative entry counts o1..o4 read from `oc` (device) instead of
+/// launch scalars and a grid sized for the window's maximum entries; entries e >= o4 are padding and skipped, so one
+/// captured launch serves every routing. Same per-entry/per-row arithmetic as the originals.
+#[cube(launch_unchecked)]
+fn k_xgu_stg(xq: &[u32], xs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, oc: &[u32], dq: u32,
+    #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let lane = UNIT_POS_X;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let o1 = oc[0];
+    let o2 = oc[1];
+    let o3 = oc[2];
+    let o4 = oc[3];
+    let mut ti = 0u32;
+    if e >= o1 { ti += 1u32; }
+    if e >= o2 { ti += 1u32; }
+    if e >= o3 { ti += 1u32; }
+    let xo = ti * dq;
+    let so = ti * (dq / 8);
+    if row < rows && e < o4 {
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let go = (m0 & 2147483647u32) + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        #[unroll]
+        for k in 0..ng {
+            let q = lane + 32 * k;
+            let x0 = i32::cast_from(xq[(xo + q * 2) as usize]);
+            let x1 = i32::cast_from(xq[(xo + q * 2 + 1) as usize]);
+            let xsc = xs[(so + q / 4) as usize];
+            if sel == 0u32 {
+                gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+            } else {
+                gs += gdot8s(ar1, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar1, uo, q, x0, x1, xsc, &grid, ty);
+            }
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if lane == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn k_xdown_qtg(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], rows: u32, cols: u32, rbd: u32, oc: &[u32]) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let ti = CUBE_POS_Y;
+    let o1 = oc[0];
+    let o2 = oc[1];
+    let o3 = oc[2];
+    let o4 = oc[3];
+    let mut e0 = 0u32;
+    let mut e1 = o1;
+    if ti == 1u32 { e0 = o1; e1 = o2; } else if ti == 2u32 { e0 = o2; e1 = o3; } else if ti == 3u32 { e0 = o3; e1 = o4; }
+    if row < rows {
+        let nsb = cols / 8;
+        let tot = (e1 - e0) * nsb;
+        let mut s = 0.0f32;
+        let mut j = UNIT_POS_X;
+        while j < tot {
+            let el = j / nsb;
+            let q = j - el * nsb;
+            let e = e0 + el;
+            let sb = q / 4;
+            let l = q % 4;
+            let m2 = meta[(e * 4 + 2) as usize];
+            let blk = (m2 & 2147483647u32) + row * rbd + (sb / 2) * 5;
+            let wi = blk + 1 + 2 * (sb % 2) + l / 2;
+            let mut d = 0.0f32;
+            let mut qw = 0u32;
+            if (m2 >> 31) == 0u32 { d = f32::reinterpret(ar[blk as usize]); qw = ar[wi as usize]; } else { d = f32::reinterpret(ar1[blk as usize]); qw = ar1[wi as usize]; }
+            let half = (qw >> (16 * (l % 2))) & 65535u32;
+            let xw = e * cols / 4 + q * 2;
+            let x0 = i32::cast_from(hq[xw as usize]);
+            let x1 = i32::cast_from(hq[(xw + 1) as usize]);
+            let v = dp4a(i32::cast_from(q2l[(half >> 8) as usize]), x1, dp4a(i32::cast_from(q2l[(half & 255u32) as usize]), x0, 0i32));
+            let ones = dp4a(16843009i32, x1, dp4a(16843009i32, x0, 0i32));
+            s += f32::reinterpret(meta[(e * 4 + 3) as usize]) * d * hs[((e * cols) / 32 + q / 4) as usize] * f32::cast_from(v - ones);
+            j += 32u32;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[(ti * rows + row) as usize] = t;
+        }
+    }
+}
 /// y[row] += sum_e wgt_e * (down_e row . h_e); down offset meta[4e+2], weight bits meta[4e+3].
 #[cube(launch_unchecked)]
 fn k_xdown_b(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, #[comptime] td: u32) {
@@ -3095,6 +3190,30 @@ impl Cube {
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
             k_xdown_qt::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
                 a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, o[1], o[2], o[3], o[4]);
+        }
+        true
+    }
+    /// xrun_fast_multi with a fixed shape (PYRE_QN_MOEGRAPH): `mh` holds max_ne entries (padding allowed past the
+    /// real ones), `oc` the 4 cumulative per-token entry counts, both written by the host before the launch, so the
+    /// launches (grid max_ne, buffer sizes) do not depend on the routing and can be captured once and replayed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_graph_multi(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, max_ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+        let ne = max_ne;
+        if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 || ars.is_empty() || ars.len() > 2 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32; let ml = ne * 4;
+        let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+        let (ar, ar1) = (&ars[0], ars.last().unwrap());
+        let (xq, xs) = (self.empty(t * d / 4), self.empty(t * d / 32)); let h = self.empty(ne * ff); let (hq, hs) = (self.empty(ne * ff / 4), self.empty(ne * ff / 32));
+        let nb = (d / 32) as u32;
+        unsafe {
+            k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static(nb.div_ceil(64), t as u32, 1), CubeDim::new_1d(64), a(src, sn), a(&xq, t * d / 4), a(&xs, t * d / 32), 0, sn as u32 / t as u32, nb);
+            k_xgu_stg::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
+                a(&xq, t * d / 4), a(&xs, t * d / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, a(oc, 4), (d / 4) as u32, (d / 256) as u32, gn, tys.0);
+            k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
+            k_xdown_qtg::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, a(oc, 4));
         }
         true
     }

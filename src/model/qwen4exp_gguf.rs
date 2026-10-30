@@ -168,6 +168,21 @@ fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_CONVM").map(|v| v != "0").unwrap_or(true)) }
 // PYRE_QN_COMBM=0: per-token k_comb after the verify mixer instead of one k_comb_m
 fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_COMBM").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_MOEGRAPH=1 (opt-in, needs PYRE_QN_VGRAPH=1): a verify window's GPU MoE glue (window q8pack, cached-expert
+/// gate/up + down for all tokens, shared-expert silu_mul + down) as one captured graph per (layer, T). The routing
+/// goes in as a fixed-size device table (t * top_k entries, padded; cumulative per-token counts in a 4-word buffer)
+/// written before the replay, so the launch sequence no longer depends on which experts were picked. Idea after
+/// Strata (MIT, github.com/Niko1221/Strata: fixed verify graphs fed by device-side expert plans); reimplemented here.
+fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
+pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// PYRE_QN_MOEGRAPH fixed buffers per window size: routing table, counts, routed-hit y, shared h and y, a copy of rd
+struct MgB { meta: H, oc: H, y: H, hb: H, sh: H, rd: H }
+#[allow(clippy::type_complexity)]
+static MGB: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MgB>>>> = std::sync::LazyLock::new(Default::default);
+fn mg_bufs(cb: &super::qn_cube::Cube, t: usize, max_ne: usize, d: usize, sf: usize, rn: usize) -> std::sync::Arc<MgB> {
+    let mut m = MGB.lock().unwrap();
+    m.entry(t).or_insert_with(|| std::sync::Arc::new(cb.client.memory_persistent_allocation((), |_| MgB { meta: cb.empty(max_ne * 4), oc: cb.empty(4), y: cb.empty(t * d), hb: cb.empty(t * sf), sh: cb.empty(t * d), rd: cb.empty(t * rn) }))).clone()
+}
 // PYRE_QN_XBATCH=0: the window's GPU expert hits token by token
 fn xbatch() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XBATCH").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
@@ -1720,7 +1735,7 @@ impl Model {
         let mut yr = vec![0f32; t * d];
         let mut ygs: Vec<Option<burn_cubecl::cubecl::server::Handle>> = vec![None; t];
         let mut shs: Vec<burn_cubecl::cubecl::server::Handle> = Vec::with_capacity(t);
-        let (hb_all, sh_all) = (cb.empty(t * sf), cb.empty(t * d)); let mut sh_b = false;
+        let (hb_all, sh_all) = (cb.empty(t * sf), cb.empty(t * d)); let mut sh_b = false; let mut sh_g: Option<H> = None;
         let xin: Vec<f32> = rvs.iter().flat_map(|r| r[..d].iter().copied()).collect();
         if let Some(xm) = &self.xc {
             let mut xcg = xm.lock().unwrap();
@@ -1762,7 +1777,30 @@ impl Model {
                 }
             }
             let xcr = &*xcg;
+            let tyg = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
+            let mg_ok = moegraph() && vgraph_on() && xbatch() && combm() && xfast() && xmeta1() && !st.pf && (2..=4).contains(&t) && xcr.arena.len() <= 2 && !xcr.arena.is_empty()
+                && tyg.0 == tyg.1 && tyg.0 <= 1 && tyg.2 == 3 && d % 256 == 0 && c.ff_exp % 32 == 0;
             let mut gpu = || {
+                if mg_ok {
+                    let maxne = t * c.top_k; let mut all: Vec<u32> = Vec::with_capacity(maxne * 4); let mut oc = [0u32; 4]; let mut acc = 0u32;
+                    for (ti, o) in oc.iter_mut().enumerate() { if ti < t { let ents: Vec<(&super::qn_cube::XEnt, f32)> = ons[ti].iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); all.extend(super::qn_cube::Cube::xmeta(&xcr.arena, &ents)); acc += ents.len() as u32; } *o = acc; }
+                    if all.len() <= maxne * 4 {
+                        all.resize(maxne * 4, 0);
+                        let mg = mg_bufs(cb, t, maxne, d, sf, rn);
+                        cb.client.write(&mg.meta, burn_cubecl::cubecl::bytes::Bytes::from_elems(all)); cb.client.write(&mg.oc, burn_cubecl::cubecl::bytes::Bytes::from_elems(oc.to_vec()));
+                        cb.copy(&rd, t * rn, 0, &mg.rd, t * rn, 0, t * rn);
+                        let key: String = xcr.arena.iter().map(|h| format!("{:?};", h.memory.descriptor().id)).collect();
+                        let q = std::time::Instant::now();
+                        let f = || { cb.xrun_graph_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, maxne, &mg.meta, &mg.oc, &mg.rd, t * rn, d, c.ff_exp, tyg, &mg.y);
+                            cb.silu_mul_m(&mg.rd, t * rn, rn, d + ne, d + ne + sf, &mg.hb, sf, t);
+                            cb.gemv_m(&cl.sdown, &mg.hb, t * sf, 0, sf, &mg.sh, t * d, 0, d, t); };
+                        vg_run(cb, (3, il, t), &key, &f); MG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        for ti in 0..t { ygs[ti] = Some(at(&mg.y, ti * d)); shs.push(at(&mg.sh, ti * d)); } sh_b = true; sh_g = Some(mg.sh.clone());
+                        let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
                 // PYRE_QN_XMETA1=0 reverts: the window's expert tables in one upload (one small write per layer, not per token)
                 let mut moff = vec![usize::MAX; t]; let mut mall: Option<H> = None;
                 if xmeta1() && xfast() && xcr.arena.len() <= 2 {
@@ -1831,6 +1869,7 @@ impl Model {
         }
         let q6 = std::time::Instant::now();
         let yball = cb.buf(&yr);
+        let sh_all = sh_g.unwrap_or(sh_all);
         if sh_b && combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
         for ti in 0..t {
             let yb = at(&yball, ti * d);
