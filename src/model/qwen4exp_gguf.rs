@@ -693,6 +693,11 @@ impl Model {
             let mh = cb.client.create_from_slice(&[ent.off[0], ent.off[1], ent.off[2], 0.1f32.to_bits()].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()); if let Some(Some(c0)) = self.cl.iter().find(|x| x.is_some()) { let xx = cb.buf(&vec![0.01f32; 4 * d]); let oo = cb.empty(20000); cb.gemv(&c0.fin, &xx, 4 * d, 0, &oo, 20000, 0); cb.read(&oo); let t1 = std::time::Instant::now(); for _ in 0..200 { cb.gemv(&c0.fin, &xx, 4 * d, 0, &oo, 20000, 0); } cb.read(&oo); eprintln!("cubebench (late) gemv fin: {:.1} us", t1.elapsed().as_secs_f64() * 1e6 / 200.0); }
             for sk in [0u32, 6, 5, 3] { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); cb.read(&y0); let t1 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_m(&xc.tabs, &xc.arena[ent.arena], xc.ar_bytes, &mh, 1, &xb, d, ff, tys, &hx, &y0, sk); } cb.read(&y0); eprintln!("cubebench expert skip {sk}: {:.1} us", t1.elapsed().as_secs_f64() * 1e6 / 200.0); }
             eprintln!("cubebench expert {:?}/{:?}/{:?} ({:.2} MB)", l.gate_e.ty, l.up_e.ty, l.down_e.ty, ent.bytes as f64 / 1e6);
+            { let il0 = *il; let es: Vec<&super::qn_cube::XEnt> = xc.map.iter().filter(|((li, _), en)| *li == il0 && en.arena < 2).map(|(_, en)| en).take(8).collect();
+              for ne in [1usize, 2, 4, 8] { if es.len() < ne { break; } let ents: Vec<(&super::qn_cube::XEnt, f32)> = es[..ne].iter().map(|e| (*e, 0.1f32)).collect();
+                if !cb.xrun_fast_to(&xc.tabs, &xc.arena, xc.ar_bytes, &ents, &xb, d, d, ff, tys, &xc.scr, false, &y0) { eprintln!("cubebench xfast ne {ne}: not eligible"); break; } cb.read(&y0);
+                let t1 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_fast_to(&xc.tabs, &xc.arena, xc.ar_bytes, &ents, &xb, d, d, ff, tys, &xc.scr, false, &y0); } cb.read(&y0);
+                let us = t1.elapsed().as_secs_f64() * 1e6 / 200.0; eprintln!("cubebench xfast ne {ne}: {us:.1} us ({:.0} GB/s)", ne as f64 * ent.bytes as f64 / (us * 1e-6) / 1e9); } }
         } }
         if n > 0 && env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }
@@ -1430,7 +1435,10 @@ impl Model {
         }
         let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
-        for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); lg.push(self.head_logits(&hh)); }
+        let headb = self.headc.is_none() && env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
+        for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); if headb { hb.extend_from_slice(&hh); nb += 1; } else { lg.push(self.head_logits(&hh)); } }
+        // one head GEMV for all verify tokens: the weights are read once; each column uses the same per-row arithmetic
+        if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(8); let y = self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap(); let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
