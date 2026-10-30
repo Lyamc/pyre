@@ -500,10 +500,14 @@ impl Model {
             } else { off.drain(s0..s0 + nst).collect() };
             xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
             // PYRE_QN_XEXACT single token: hits with the CPU arithmetic, CPU rows unsummed, one in-order sum (as the verify path)
-            if xexact() && strm.is_empty() && xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 && !xcg.arena.is_empty() && d % 256 == 0 && c.ff_exp % 64 == 0 {
+            if xexact() && xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 && !xcg.arena.is_empty() && d % 256 == 0 && c.ff_exp % 64 == 0 {
                 let xcr = &*xcg; let mut ex_y: Option<H> = None;
                 let mut gpu = || {
-                    if !on.is_empty() { let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); let n = ents.len() as u32;
+                    // streamed misses (XSTREAM/XSHARE) join the hits: same exact kernels, so placement cannot change output
+                    let sents: Vec<(super::qn_cube::XEnt, f32)> = strm.iter().enumerate().map(|(j, &(e, w))| { let sl = xcr.stream[j];
+                        let pk = self.xpacked(il, e, tys0); let mut ent = cb.xupload_pk(&xcr.arena[sl / xcr.per], xcr.ar_bytes, sl % xcr.per, xcr.slot, &pk.0, pk.1, pk.2);
+                        ent.arena = sl / xcr.per; ent.slot = sl; (ent, w) }).collect();
+                    if !(on.is_empty() && sents.is_empty()) { let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).chain(sents.iter().map(|(e, w)| (e, *w))).collect(); let n = ents.len() as u32;
                         let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&super::qn_cube::Cube::xmeta(&xcr.arena, &ents))); let och = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&[n, n, n, n]));
                         let yent = cb.empty(ents.len() * d); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, 1, ents.len(), &mh, &och, &rd, rn, d, c.ff_exp, tys0, &yent); ex_y = Some(yent); }
                     cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
@@ -520,7 +524,7 @@ impl Model {
                     { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
                 } else { gpu(); }
                 let kk = c.top_k; let mut tab = vec![0u32; kk + 1]; let mut n = 0usize;
-                for &e in &seln { let cd = if let Some(p2) = on.iter().position(|x| x.0 == e) { Some(p2 as u32) } else { off.iter().position(|x| x.0 == e).map(|i| (1u32 << 31) | i as u32) };
+                for &e in &seln { let cd = if let Some(p2) = on.iter().position(|x| x.0 == e) { Some(p2 as u32) } else if let Some(p3) = strm.iter().position(|x| x.0 == e) { Some((on.len() + p3) as u32) } else { off.iter().position(|x| x.0 == e).map(|i| (1u32 << 31) | i as u32) };
                     if let Some(cd) = cd { if n < kk { tab[1 + n] = cd; n += 1; } } }
                 tab[0] = n as u32;
                 drop(xcg);
