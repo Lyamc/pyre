@@ -934,6 +934,66 @@ fn k_rms(x: &[f32], norm: &[f32], xn: &mut [f32], d: u32, eps: f32) {
     }
 }
 
+/// k_gate for t tokens of a verify window (comptime t <= 4): each weight word is loaded once and used for
+/// every token; each token's arithmetic is the same, in the same order, as k_gate (identical results).
+/// Token j reads xn[j*xs..], dn[j*ds..] and writes out[j*os + ooff + i].
+#[cube(launch_unchecked)]
+fn k_gate_m(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, xs: u32, ds: u32, os: u32, #[comptime] lr: usize, #[comptime] hc: u32, #[comptime] t: u32) {
+    let mut lo = Shared::<[f32]>::new_slice(comptime!(lr * t as usize));
+    let hcf = f32::cast_from(hc);
+    let tid = UNIT_POS_Y * 32 + UNIT_POS_X;
+    #[unroll]
+    for tk in 0..t {
+        let mut j = tid;
+        while (j as usize) < lr {
+            let v = dn[(tk * ds + j) as usize] / hcf;
+            lo[(tk * comptime!(lr as u32) + j) as usize] = v / (1.0f32 + f32::exp(-v));
+            j += 256u32;
+        }
+    }
+    sync_cube();
+    let i = CUBE_POS_X * 8 + UNIT_POS_Y;
+    if i < d {
+        let words = comptime!(lr as u32 / 4);
+        let nb = comptime!(lr as u32 / 32);
+        let mut acc = Array::<f32>::new(comptime!(t as usize));
+        #[unroll]
+        for tk in 0..t { acc[tk as usize] = 0.0f32; }
+        #[unroll]
+        for st in 0..hc {
+            let row = st * d + i;
+            let mut g = Array::<f32>::new(comptime!(t as usize));
+            #[unroll]
+            for tk in 0..t { g[tk as usize] = 0.0f32; }
+            let mut wi = UNIT_POS_X;
+            while wi < words {
+                let word = w[(row * words + wi) as usize];
+                let sc = s[(row * nb + wi / 8) as usize];
+                #[unroll]
+                for tk in 0..t {
+                    let mut part = 0.0f32;
+                    #[unroll]
+                    for jj in 0..4u32 {
+                        let v = dec(word, jj);
+                        part += v * lo[(tk * comptime!(lr as u32) + wi * 4 + jj) as usize];
+                    }
+                    g[tk as usize] += part * sc;
+                }
+                wi += 32u32;
+            }
+            #[unroll]
+            for tk in 0..t {
+                let gt = plane_sum(g[tk as usize]);
+                acc[tk as usize] += xn[(tk * xs + row) as usize] / (1.0f32 + f32::exp(-gt));
+            }
+        }
+        if UNIT_POS_X == 0 {
+            #[unroll]
+            for tk in 0..t { out[(tk * os + ooff + i) as usize] = acc[tk as usize] / hcf; }
+        }
+    }
+}
+
 /// mixed[i] = mean_s xn[s,i] * sigmoid(up[s*d+i] . silu(dn[0..lr]/hc)); one plane per output i.
 #[cube(launch_unchecked)]
 fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, #[comptime] lr: usize, #[comptime] hc: u32) {
@@ -2278,6 +2338,15 @@ impl Cube {
     pub fn rms(&self, x: &Handle, norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
         unsafe { k_rms::launch_unchecked(&self.client, CubeCount::Static(hc as u32, 1, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(norm.clone(), hc * d), BufferArg::from_raw_parts(xn.clone(), hc * d), d as u32, eps) }
+    }
+    /// k_gate over t tokens at strides xs / ds / os (elements); false when t is not 2..=4 (caller loops k_gate)
+    pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
+        if !(2..=4).contains(&t) { return false; }
+        let lr = up.cols;
+        unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+            BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
+            BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) }
+        true
     }
     pub fn gate(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize) {
         let lr = up.cols;

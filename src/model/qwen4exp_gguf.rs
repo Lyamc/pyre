@@ -1400,7 +1400,7 @@ impl Model {
         let xn = cb.empty(t * w); let da = cb.empty(t * dar); let mixed = cb.empty(t * d); let proj = cb.empty(t * pr);
         for ti in 0..t { cb.rms(&xs[ti], &cl.hca.norm, &at(&xn, ti * w), hc, d, c.eps); }
         cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
-        for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); }
+        if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
         cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
         // the mixer, token by token (recurrent / causal state)
         let core_n = match l.mix { Mixer::Attn { .. } => c.n_head * c.hd, Mixer::Lin { .. } => c.lin_nv * c.lin_dk };
@@ -1451,7 +1451,7 @@ impl Model {
         let df = cb.empty(t * dfr); let rd = cb.empty(t * rn);
         for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); cb.rms(&xs[ti], &cl.hcf.norm, &at(&xn, ti * w), hc, d, c.eps); }
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
-        for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); }
+        if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);
         HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         (rd, df, da)
@@ -1612,6 +1612,8 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
 /// PYRE_QN_PREWAKE (default on; =0 off): wake the expert pool just before each layer's router readback.
 /// PYRE_QN_PAIR=1 (opt-in): gate and up rows of a CPU expert in one interleaved IQ2 kernel (same results)
 fn pair_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PAIR").map(|v| v == "1").unwrap_or(false)) }
+/// PYRE_QN_GATEM=0 turns off the multi-token hyper-connection gate kernel in verify windows
+fn gatem() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_GATEM").map(|v| v != "0").unwrap_or(true)) }
 fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(true)) }
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
