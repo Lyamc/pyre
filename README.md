@@ -798,3 +798,12 @@ Before each cache refill every expert's routing count loses 1/2^k, so recently r
 - PYRE_QN_PAIR=1 runs a CPU expert's gate and up rows through one interleaved IQ2 kernel. Results are bit-identical to two row_dot_k calls (checked in PYRE_QN_KBENCH). KBENCH gate+up time per expert: 1 thread 198 -> 195 us; 8 threads streamed 33.2 -> 29.5 us. In the model (4 alternating pairs, steady tok/s) it averaged 24.54 vs 24.50 on plain A and 24.05 vs 23.95 on spec2 B, which is noise, so it stays opt-in.
 - Merging the down step into the gate/up tasks was not built. Down needs an expert's whole hidden vector (quantised per 64 values) before any output row, so a merged task would cover a whole expert. With ~5 misses per layer that is too coarse for 16 threads.
 - Draft length (adaptive length on, as before): --spec 3 gave 22.1 (A, 70.7% accepted) / 22.6 (B, 70.6%); --spec 4 gave 23.4 (A, 65.2%) / 19.7 (B, 60.0%). The spec2 default is ~24-24.5, so it stays.
+### Verify cost and draft length 1 default
+
+PYRE_SPEC_TIME=1 prints wall time per phase (draft, verify by window size, keep, plain steps). Measured on prompt A with PYRE_QN_PROFILE, one plain token against one 3-token verify:
+- Plain token: ~43 ms. GPU wait 20 ms, CPU misses ~11 ms (~170 expert misses).
+- 3-token verify: ~78 ms (1.8x). GPU wait 36-39 ms (1.8x), CPU routed 25-28 ms for 450-610 distinct experts (630-700 expert-token entries; the window shares only ~15%), enqueue 3 ms.
+- Drafter (CPU): ~4.5 ms for one draft, ~7.7 ms for two (plus head ~0.8 and catch-up ~1.0 ms).
+- The tokens of a window route to mostly different experts, so CPU work grows almost linearly with the window. A 2-token verify costs less per accepted token than a 3-token one.
+
+Default draft length is now 1 (3 alternating pairs, steady tok/s, all greedy-identical): A 26.24/26.15/26.03 vs 25.41/25.39/25.53 with k=2; B 23.70/22.68/24.08 vs 22.79/23.02/23.92. Acceptance is 87.5% / 86.4% at k=1. --spec 2 still works.

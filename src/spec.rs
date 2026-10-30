@@ -119,6 +119,8 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
     let adapt = std::env::var("PYRE_SPEC_ADAPT").map(|v| v != "0").unwrap_or(true);
     let mut ts = 0f64; let mut tv = [0f64; 10]; let mut p_acc = 0.7f64; let mut skipped = 0usize;
     let mut pending = sampler.sample(&mut logits, history);
+    // PYRE_SPEC_TIME: per-phase wall time (draft, verify by window, keep, plain steps), printed at the end
+    let (mut tm_d, mut tm_k, mut tm_s, mut ns_) = (0f64, 0f64, 0f64, 0usize); let mut tm_v = [(0f64, 0usize); 10];
     loop {
         history.push(pending); produced += 1;
         if !emit(pending) || produced >= max_new { break; }
@@ -126,7 +128,9 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         let kk = k.min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
         let mut drafts: Vec<(u32, Option<Vec<(u32, f32)>>)> = vec![];
         if kk > 0 && target.can_verify() {
+            let td = std::time::Instant::now();
             if mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; } }
+            tm_d += td.elapsed().as_secs_f64();
             if drafts.is_empty() && ng { drafts = ngram_draft(history, kk, ng_min, ng_max).into_iter().map(|t| (t, None)).collect(); }
         }
         if adapt && !drafts.is_empty() && ts > 0.0 {
@@ -139,14 +143,14 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         if drafts.is_empty() {
             let t0 = std::time::Instant::now();
             logits = target.step(pending);
-            let dt = t0.elapsed().as_secs_f64(); ts = if ts == 0.0 { dt } else { 0.8 * ts + 0.2 * dt };
+            let dt = t0.elapsed().as_secs_f64(); tm_s += dt; ns_ += 1; ts = if ts == 0.0 { dt } else { 0.8 * ts + 0.2 * dt };
             pending = sampler.sample(&mut logits, history);
             continue;
         }
         let t0 = std::time::Instant::now();
         let mut toks = vec![pending]; toks.extend(drafts.iter().map(|d| d.0));
         let ls = target.verify(&toks);
-        { let dt = t0.elapsed().as_secs_f64(); let t = toks.len(); tv[t] = if tv[t] == 0.0 { dt } else { 0.7 * tv[t] + 0.3 * dt }; }
+        { let dt = t0.elapsed().as_secs_f64(); let t = toks.len(); tm_v[t].0 += dt; tm_v[t].1 += 1; tv[t] = if tv[t] == 0.0 { dt } else { 0.7 * tv[t] + 0.3 * dt }; }
         // accept the longest prefix
         let mut acc = 0usize; let mut next = None;
         let mut hist = history.clone();
@@ -168,7 +172,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
             next = Some(sampler.pick(&res)); break;
         }
         let nx = match next { Some(t) => t, None => { let mut lg = ls[drafts.len()].clone(); sampler.sample(&mut lg, &hist) } };
-        target.keep(toks.len(), acc + 1);
+        let tk = std::time::Instant::now(); target.keep(toks.len(), acc + 1); tm_k += tk.elapsed().as_secs_f64();
         p_acc = 0.7 * p_acc + 0.3 * (acc as f64 / drafts.len() as f64);
         out.rounds += 1; out.drafted += drafts.len(); out.accepted += acc;
         ROUNDS.fetch_add(1, Relaxed); DRAFTED.fetch_add(drafts.len() as u64, Relaxed); ACCEPTED.fetch_add(acc as u64, Relaxed);
@@ -178,6 +182,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         if stop { break; }
         pending = nx;
     }
+    if std::env::var("PYRE_SPEC_TIME").is_ok() { eprint!("spectime: draft {:.1} ms keep {:.1} ms plain {} x {:.2} ms |", tm_d * 1e3, tm_k * 1e3, ns_, if ns_ > 0 { tm_s * 1e3 / ns_ as f64 } else { 0.0 }); for (t, &(s, n)) in tm_v.iter().enumerate() { if n > 0 { eprint!(" verify{t} {n} x {:.2} ms", s * 1e3 / n as f64); } } eprintln!(" | rounds {} draft/round {:.2} ms", out.rounds, if out.rounds > 0 { tm_d * 1e3 / out.rounds as f64 } else { 0.0 }); }
     LAST_DRAFT.store(k, Relaxed);
     LAST_ACC.store((if out.drafted > 0 { out.accepted as f32 / out.drafted as f32 } else { 0.0 }).to_bits(), Relaxed);
     out
