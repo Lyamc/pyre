@@ -1856,7 +1856,8 @@ impl Model {
                     if let Some(nx) = next.as_mut() { nx(&mut *stp); }
                     cb.client.flush_queue();
                 }
-                let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                // no blocking flush (drop-queue event wait) behind an open host gate: it would stall until the gate timed out
+                let qf = std::time::Instant::now(); if kick() && pslot.is_none() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             };
             // union of the missed experts; each token keeps its own order for the accumulation
             let mut lists: Vec<(usize, Vec<(usize, f32)>)> = vec![]; let mut pos_of: std::collections::HashMap<usize, usize> = Default::default();
