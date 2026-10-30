@@ -71,7 +71,7 @@ impl Pool {
         sh.done.store(0, Relaxed);
         sh.n.store(n, Relaxed);
         sh.job.store(&job as *const Job as *mut Job<'static>, Relaxed);
-        if tfa() && sh.etail == 0 { assert!(n < 1 << 20); sh.ticket.store(((g & 0xfffff) << 44) | ((n as u64) << 24), Release); } else { sh.ticket.store(g << 32, Relaxed); }
+        if tfa() && sh.etail == 0 { assert!(n + PB < 1 << 20); sh.ticket.store(((g & 0xfffff) << 44) | (((n + if pedq() { PB } else { 0 }) as u64) << 24), Release); } else { sh.ticket.store(g << 32, Relaxed); }
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
         let tj = Instant::now();
@@ -88,12 +88,28 @@ impl Pool {
     }
 }
 
+const PB: usize = 256;
+fn pedq() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PEDQ").map(|v| v != "0").unwrap_or(true)) }
 fn tfa() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_TFA").map(|v| v != "0").unwrap_or(true)) }
 fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
     // PYRE_QN_TFA (default on): claim tasks with one fetch_add instead of a CAS retry loop (24 workers on one line).
     // A worker that raced into a newer generation g2 still owns ticket i of g2: it runs that task with g2's job
     // (job/n are published before the ticket and stay valid until all g2 tasks, including this one, are done).
     // ticket layout under TFA: gen(20) | n(20) | index(24), so a claim carries its own generation and task count
+    // PYRE_QN_PEDQ (default on): double-ended claims. Tasks are ordered big first (tiered blocks), so fast (P-core)
+    // workers take indices from the front and slow (E-core) workers from the back (the small tiers): the middle
+    // field holds back+PB (bias PB > threads so failed back claims never borrow into gen). Which worker runs a task
+    // does not change what it computes -> bit-identical.
+    if tfa() && sh.etail == 0 && pedq() { let gm = g & 0xfffff;
+        loop {
+            let t0 = sh.ticket.load(Acquire); if t0 >> 44 != gm || (t0 & 0xff_ffff) as usize + PB >= ((t0 >> 24) & 0xfffff) as usize { return; }
+            let (t, i) = if slow { let t = sh.ticket.fetch_sub(1 << 24, AcqRel); (t, (((t >> 24) & 0xfffff) as usize).wrapping_sub(PB + 1)) } else { let t = sh.ticket.fetch_add(1, AcqRel); (t, (t & 0xff_ffff) as usize) };
+            let (tg, f, b) = (t >> 44, (t & 0xff_ffff) as usize, ((t >> 24) & 0xfffff) as usize);
+            if f + PB >= b { return; }
+            if tg == gm { call(job.f, i); } else { let j = sh.job.load(Acquire); unsafe { call((*j).f, i); } }
+            sh.done.fetch_add(1, Release);
+            if tg != gm { return; }
+        } }
     if tfa() && sh.etail == 0 { let _ = slow; let gm = g & 0xfffff;
         loop {
             let t0 = sh.ticket.load(Acquire); if t0 >> 44 != gm || (t0 & 0xff_ffff) >= ((t0 >> 24) & 0xfffff) { return; }
