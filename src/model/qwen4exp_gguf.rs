@@ -111,6 +111,8 @@ static VG_STATE: std::sync::Mutex<(Vec<(burn_cubecl::cubecl::server::Handle, bur
 /// PYRE_QN_VGRAPH attention layers: captured graphs of the pre-mixer and post-mixer halves, per (part, layer, T)
 #[allow(clippy::type_complexity)]
 static VG2: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Option<burn_cubecl::cubecl::client::Graph>, String)>>> = std::sync::LazyLock::new(Default::default);
+/// PYRE_MTP_GPUSTEP (default on with PYRE_MTP_GPU, =0 off): the drafter's per-token step on the GPU
+fn mtp_gpustep() -> bool { env_var("PYRE_MTP_GPUSTEP").map(|v| v != "0").unwrap_or(true) }
 fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: &(dyn Fn() + Sync)) {
     // one graph per distinct input set too: prewarm T=5..7 windows run as 4+rest groups on slices of other buffers
     let lt = (slot.1, slot.2);
@@ -1357,7 +1359,7 @@ impl Model {
         if n == 0 || k == 0 { return None; }
         let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
         // PYRE_MTP_GPU=1 (default with PYRE_QN_NATIVE=2, whose dense weights leave the VRAM for it; =0 off): the drafter's dense matrices (~95 MB Q8) run as GPU GEMVs on this thread; experts stay on the CPU
-        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false))) { (Some(cb), true) => {
+        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v != "0").unwrap_or(true)) { (Some(cb), true) => {
             let map = self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
                 for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
                 eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp });
@@ -1373,15 +1375,16 @@ impl Model {
         if lo < n - 1 {
             let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
             for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
-            let gsc = env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) && env_var("PYRE_MTP_GPUCATCH").map(|v| v != "0").unwrap_or(true);
+            let gsc = mtp_gpustep() && env_var("PYRE_MTP_GPUCATCH").map(|v| v == "1").unwrap_or(false);
             let mut gdone_c = false;
             if ok && gsc { if let (Some(cb), Some(map), Some(Some(_))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
-                // PYRE_MTP_GPUCATCH (default on with GPUSTEP): catch-up cells on the GPU, written straight into the resident K/V ring
+                // PYRE_MTP_GPUCATCH=1 (opt-in): catch-up cells on the GPU, written straight into the resident K/V ring; inputs in one upload, K/V copies in one readback
                 let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
                 if kv.end() != lo || kv.n == 0 { m.kv_reset(&mut kv, lo); }
                 let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap);
-                let mut okc = true;
-                for j in 0..n - 1 - lo { match m.kv_cell_gpu(cb, &g, &kc, &vc, cap, &rs[j * w..(j + 1) * w], &es[j * d..(j + 1) * d], lo + j) { Some((k, v)) => m.kv_push(&mut kv, &k, &v), None => { okc = false; break; } } }
+                let mut okc = true; let nc = n - 1 - lo; let rsb = cb.buf(&rs); let esb = cb.buf(&es); let pkn = 2 * nc * row; let pka = cb.empty(pkn);
+                for j in 0..nc { if m.kv_cell_gpu(cb, &g, &kc, &vc, cap, &rsb.clone().offset_start((j * w * 4) as u64), &esb.clone().offset_start((j * d * 4) as u64), lo + j, &pka, pkn, j).is_none() { okc = false; break; } }
+                if okc { let hv = cb.read(&pka); for j in 0..nc { m.kv_push(&mut kv, &hv[2 * j * row..(2 * j + 1) * row], &hv[(2 * j + 1) * row..(2 * j + 2) * row]); } }
                 if okc { gr.end = kv.end(); gr.gid = kv.gid; gdone_c = true; } else { kv = Default::default(); gr.end = 0; gdone_c = true; }
             } }
             if gdone_c {} else if ok { if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } else { mtp_cpu(|| m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } } else { kv = Default::default(); }
@@ -1393,11 +1396,22 @@ impl Model {
         let mut e = vec![0f32; d];
         // PYRE_MTP_GPUSTEP=1 (needs PYRE_MTP_GPU=1): each draft step on the GPU (draft-only numerics), routed experts on the CPU, head + k_best on the GPU
         let mut gdone = false;
-        if env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) && kv.end() == n - 1 && kv.n > 0 {
+        if mtp_gpustep() && kv.end() == n - 1 && kv.n > 0 {
             if let (Some(cb), Some(map), Some(Some(hm))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
                 let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
                 let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap); let kc0 = kv.c0; let mut rh = cb.buf(&r);
-                for j in 0..k {
+                // PYRE_MTP_GRAPH (default on, =0 off): the step as two captured CUDA graphs (head included); pp24 A 33.5 vs 29.8* steady, B 27.2 vs 26.8, C 29.1 vs 29.2, greedy == refs
+                let gmode = env_var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true); let rid = gr.id;
+                for j in 0..(if gmode { k } else { 0 }) {
+                    self.embd.row(tok as usize, &mut e);
+                    let Some((lg, rr2, krow, vrow)) = m.step_gpu_g(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j, rid) else { break };
+                    if j == 0 { m.kv_push(&mut kv, &krow, &vrow); }
+                    let th = std::time::Instant::now(); let (i, p) = cb.best(&lg, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
+                    HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if j > 0 && p < min_p { break; }
+                    out.push((id, None)); rh = rr2; tok = id;
+                }
+                for j in 0..(if gmode { 0 } else { k }) {
                     self.embd.row(tok as usize, &mut e);
                     let Some(gs) = m.step_gpu(cb, &g, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j) else { break };
                     if j == 0 { m.kv_push(&mut kv, &gs.krow, &gs.vrow); }
@@ -1422,7 +1436,7 @@ impl Model {
             out.push((id, None)); r = r2; tok = id;
         }
         kv.truncate(n, row); st.mtp_kv = kv;
-        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: head {:.1} ms catch-up {:.1} ms, {} drafts {:.1} ms | {:?}", HEAD_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, (t1 - t0).as_secs_f64() * 1e3, out.len(), t1.elapsed().as_secs_f64() * 1e3, super::mtp::TM.iter().map(|a| (a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e5).round() / 10.0).collect::<Vec<_>>()); }
+        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: graph replays {} captures {} | head {:.1} ms catch-up {:.1} ms, {} drafts {:.1} ms | {:?}", super::mtp::GG_REPLAYS.load(std::sync::atomic::Ordering::Relaxed), super::mtp::GG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed), HEAD_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, (t1 - t0).as_secs_f64() * 1e3, out.len(), t1.elapsed().as_secs_f64() * 1e3, super::mtp::TM.iter().map(|a| (a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e5).round() / 10.0).collect::<Vec<_>>()); }
         Some(out)
     }
     fn mtp_keep_r(&self, st: &mut State, pos: usize, x: &[f32]) {
@@ -1453,7 +1467,7 @@ impl Model {
         if env_var("PYRE_MTP_EAGER").map(|v| v != "0").unwrap_or(true) { self.mtp_gpu_init(); }
         Ok(())
     }
-    fn mtp_gpu_on(&self) -> bool { env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) }
+    fn mtp_gpu_on(&self) -> bool { env_var("PYRE_MTP_GPU").map(|v| v != "0").unwrap_or(true) }
     fn mtp_gpu_init(&self) {
         let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
         if self.mtp_gpu_on() { self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
@@ -1475,7 +1489,7 @@ impl Model {
     /// counts and stats are reset afterwards so the cache fills exactly as without it.
     /// PYRE_MTP_GPUSTEP: compile the GPU draft step's kernels (one throwaway step), so the first draft does not pay ~300 ms of JIT
     fn mtp_step_warm(&self) {
-        if !env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) { return; }
+        if !mtp_gpustep() || !self.mtp_gpu_on() { return; }
         let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
         let hm = self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } cb.upload_q8(h.rows, h.cols, h.blocks()) });
         match (self.mtp_dense.get(), hm) { (Some(map), Some(hm)) => { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }

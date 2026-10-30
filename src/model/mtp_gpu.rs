@@ -66,6 +66,32 @@ fn k_attn1(qn: &[f32], qf: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], c0: 
         out[(h * hd + i2) as usize] = o / red[0] * sg(qf[(h * 2 * hd + hd + i2) as usize]); i2 += 256u32; }
 }
 
+// PYRE_MTP_GRAPH: variants reading the per-call scalars from pb = [pos, kv slot offset, c0, n] (f32) so a captured graph stays valid
+#[cube(launch_unchecked)]
+fn k_rope_p(v: &mut [f32], inv: &[f32], pb: &[f32], stride: u32, half: u32) {
+    let pos = pb[0]; let base = CUBE_POS_X * stride; let i = UNIT_POS_X;
+    if i < half { let a = pos * inv[i as usize]; let s = f32::sin(a); let c = f32::cos(a); let x0 = v[(base + i) as usize]; let x1 = v[(base + i + half) as usize];
+        v[(base + i) as usize] = x0 * c - x1 * s; v[(base + i + half) as usize] = x1 * c + x0 * s; }
+}
+#[cube(launch_unchecked)]
+fn k_cp_p(src: &[f32], dst: &mut [f32], pb: &[f32], n: u32) { let i = ABSOLUTE_POS_X; if i < n { let o = u32::cast_from(pb[1]); dst[(o + i) as usize] = src[i as usize]; } }
+#[cube(launch_unchecked)]
+fn k_attn1p(qn: &[f32], qf: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], pb: &[f32], row: u32, hd: u32, grp: u32, scale: f32, cap: u32) {
+    let mut sc = Shared::<[f32]>::new_slice(512usize);
+    let mut red = Shared::<[f32]>::new_slice(2usize);
+    let c0 = u32::cast_from(pb[2]); let n = u32::cast_from(pb[3]);
+    let h = CUBE_POS_X; let kvh = h / grp; let tid = UNIT_POS_X;
+    let mut p = tid;
+    while p < n { let mut a = 0.0f32; let kb = ((c0 + p) % cap) * row + kvh * hd; let mut i = 0u32; while i < hd { a += qn[(h * 2 * hd + i) as usize] * kc[(kb + i) as usize]; i += 1u32; } sc[p as usize] = a * scale; p += 256u32; }
+    sync_cube();
+    if tid == 0u32 { let mut mx = f32::new(-3.0e38); let mut q = 0u32; while q < n { mx = f32::max(mx, sc[q as usize]); q += 1u32; }
+        let mut s = 0.0f32; let mut q2 = 0u32; while q2 < n { let e = f32::exp(sc[q2 as usize] - mx); sc[q2 as usize] = e; s += e; q2 += 1u32; } red[0] = s; }
+    sync_cube();
+    let mut i2 = tid;
+    while i2 < hd { let mut o = 0.0f32; let mut q3 = 0u32; while q3 < n { o += sc[q3 as usize] * vc[(((c0 + q3) % cap) * row + kvh * hd + i2) as usize]; q3 += 1u32; }
+        out[(h * hd + i2) as usize] = o / red[0] * sg(qf[(h * 2 * hd + hd + i2) as usize]); i2 += 256u32; }
+}
+
 fn g1(n: usize) -> CubeCount { CubeCount::Static((n as u32).div_ceil(256).max(1), 1, 1) }
 macro_rules! ba { ($h:expr, $n:expr) => { BufferArg::from_raw_parts(($h).clone(), $n) } }
 pub fn rms_seg(cb: &Cube, x: &H, xn: usize, w: &H, wn: usize, y: &H, l: usize, stride: usize, nseg: usize, wsegs: usize, eps: f32) {
@@ -82,4 +108,11 @@ pub fn cp(cb: &Cube, src: &H, sn: usize, dst: &H, dn: usize, so: usize, dof: usi
 pub fn silu2(cb: &Cube, r: &H, rn: usize, g: &H, off: usize, sf: usize) { unsafe { k_silu2::launch_unchecked(&cb.client, g1(sf), CubeDim::new_1d(256), ba!(r, rn), ba!(g, sf), off as u32, sf as u32) } }
 pub fn attn1(cb: &Cube, qn: &H, qf: &H, qlen: usize, kc: &H, vc: &H, kvn: usize, out: &H, nh: usize, c0: usize, n: usize, row: usize, hd: usize, grp: usize, scale: f32, cap: usize) {
     unsafe { k_attn1::launch_unchecked(&cb.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256), ba!(qn, qlen), ba!(qf, qlen), ba!(kc, kvn), ba!(vc, kvn), ba!(out, nh * hd), c0 as u32, n as u32, row as u32, hd as u32, grp as u32, scale, cap as u32) }
+}
+pub fn rope_p(cb: &Cube, v: &H, vn: usize, inv: &H, half: usize, stride: usize, nseg: usize, pb: &H) {
+    unsafe { k_rope_p::launch_unchecked(&cb.client, CubeCount::Static(nseg as u32, 1, 1), CubeDim::new_1d(half.next_power_of_two().max(32) as u32), ba!(v, vn), ba!(inv, half), ba!(pb, 4), stride as u32, half as u32) }
+}
+pub fn cp_p(cb: &Cube, src: &H, sn: usize, dst: &H, dn: usize, pb: &H, n: usize) { let _ = sn; unsafe { k_cp_p::launch_unchecked(&cb.client, g1(n), CubeDim::new_1d(256), ba!(src, sn), ba!(dst, dn), ba!(pb, 4), n as u32) } }
+pub fn attn1p(cb: &Cube, qn: &H, qf: &H, qlen: usize, kc: &H, vc: &H, kvn: usize, out: &H, nh: usize, pb: &H, row: usize, hd: usize, grp: usize, scale: f32, cap: usize) {
+    unsafe { k_attn1p::launch_unchecked(&cb.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256), ba!(qn, qlen), ba!(qf, qlen), ba!(kc, kvn), ba!(vc, kvn), ba!(out, nh * hd), ba!(pb, 4), row as u32, hd as u32, grp as u32, scale, cap as u32) }
 }

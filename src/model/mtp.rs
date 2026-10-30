@@ -231,7 +231,13 @@ impl Mtp {
 }
 
 /// PYRE_MTP_GPUSTEP: one draft step's GPU outputs (s = final mixer output for the head, rr = drafter residual, the new K/V cell)
-pub struct GRing { pub k: H, pub v: H, pub cap: usize, pub end: usize, pub gid: u64 }
+pub struct GRing { pub k: H, pub v: H, pub cap: usize, pub end: usize, pub gid: u64, pub id: u64 }
+/// PYRE_MTP_GRAPH: the persistent buffers and the two captured graphs of the GPU draft step (before / after the CPU routed experts)
+pub struct GG { fx: Vec<H>, b1: Vec<H>, b2: Vec<H>, g1: Option<burn_cubecl::cubecl::client::Graph>, g2: Option<burn_cubecl::cubecl::client::Graph>, o1: Option<(H, H, H)>, key: (u64, usize, usize) }
+pub static GG_S: std::sync::Mutex<Option<GG>> = std::sync::Mutex::new(None);
+pub static GG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GG_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GG_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub struct GStep { pub s: H, pub rr: H, pub krow: Vec<f32>, pub vrow: Vec<f32> }
 type H = burn_cubecl::cubecl::server::Handle;
 type Cb = super::qn_cube::Cube;
@@ -243,7 +249,7 @@ impl Mtp {
     pub fn kv_sync(&self, cb: &Cb, ring: &mut Option<GRing>, kv: &mut Kv) {
         static GID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); if kv.gid == 0 { kv.gid = GID.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let row = self.row(); let cap = self.window + 32;
-        if ring.as_ref().map(|g| g.cap != cap).unwrap_or(true) { *ring = Some(GRing { k: cb.empty(cap * row), v: cb.empty(cap * row), cap, end: 0, gid: 0 }); }
+        if ring.as_ref().map(|g| g.cap != cap).unwrap_or(true) { static RID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); *ring = Some(GRing { k: cb.empty(cap * row), v: cb.empty(cap * row), cap, end: 0, gid: 0, id: RID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }); }
         let g = ring.as_mut().unwrap(); let from = if g.gid == kv.gid && g.end >= kv.c0 && g.end <= kv.end() { g.end } else { kv.c0 };
         for c in from..kv.end() { let i = c - kv.c0; let o = ((c % cap) * row * 4) as u64;
             cb.client.write(&g.k.clone().offset_start(o), burn_cubecl::cubecl::bytes::Bytes::from_elems(kv.k[i * row..(i + 1) * row].to_vec()));
@@ -251,35 +257,37 @@ impl Mtp {
         g.end = kv.end(); g.gid = kv.gid;
     }
     /// compile the GPU step kernels now (one throwaway step on a 1-cell K/V)
-    pub fn warm_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
-        let r = cb.buf(&vec![0.01f32; self.rdim()]); if self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1).is_none() { eprintln!("mtp: warm step returned None"); } if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); } }
+    pub fn warm_gpu<'a>(&self, cb: &Cb, g: &(dyn Fn(&Q8Mat) -> Option<&'a CM> + Sync), head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
+        let r = cb.buf(&vec![0.01f32; self.rdim()]); if self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1).is_none() { eprintln!("mtp: warm step returned None"); } if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); }
+        if std::env::var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true) { if let Some((lg, ..)) = self.step_gpu_g(cb, g, head, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1, g0.id) { let _ = cb.best(&lg, head.rows); } } }
     pub fn kv_reset(&self, kv: &mut Kv, c0: usize) { *kv = Kv { c0, ..Default::default() }; }
     /// one catch-up cell on the GPU: K/V of cell `pos` written to the ring and returned (k, v) for the CPU copy
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_cell_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, cap: usize, r: &[f32], emb: &[f32], pos: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    /// `rb`/`eb` = this cell's residual / embedding (offset handles into one upload); its K/V also go to `pk` at cell slot `j` (2*row each), read once by the caller
+    pub fn kv_cell_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, cap: usize, rb: &H, eb: &H, pos: usize, pk: &H, pkn: usize, j: usize) -> Option<()> {
         use super::mtp_gpu as mg; let (d, hc, hd, eps) = (self.d, self.hc, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
-        let eb = cb.buf(emb); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
+        let eb = eb.clone(); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
         let e2 = cb.empty(d); cb.gemv(g(&self.fc_e)?, &en, d, 0, &e2, d, 0);
-        let rb = cb.buf(r); let hn = cb.empty(w); mg::rms_seg(cb, &rb, w, &gw[1], w, &hn, w, w, 1, 1, eps);
+        let hn = cb.empty(w); mg::rms_seg(cb, rb, w, &gw[1], w, &hn, w, w, 1, 1, eps);
         let h2 = cb.empty(w); let fh = g(&self.fc_h)?; for s in 0..hc { cb.gemv(fh, &hn, w, s * d, &h2, w, s * d); }
         let rr = cb.empty(w); mg::add_b(cb, &h2, &e2, &rr, d, w);
         let (m, _) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?;
         let kf = cb.empty(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = cb.empty(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
         let kn = cb.empty(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_seg(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pos);
         mg::cp(cb, &kn, row, kc, cap * row, 0, (pos % cap) * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, (pos % cap) * row, row);
-        let pk = cb.empty(2 * row); mg::cp(cb, &kn, row, &pk, 2 * row, 0, 0, row); mg::cp(cb, &vf, row, &pk, 2 * row, 0, row, row);
-        let hv = cb.read(&pk); Some((hv[..row].to_vec(), hv[row..].to_vec()))
+        mg::cp(cb, &kn, row, pk, pkn, 0, 2 * j * row, row); mg::cp(cb, &vf, row, pk, pkn, 0, (2 * j + 1) * row, row); Some(())
     }
     pub fn kv_upload(&self, cb: &Cb, kv: &Kv, extra: usize) -> (H, H, usize) { let row = self.row(); let mut k = kv.k.clone(); k.resize((kv.n + extra) * row, 0.0); let mut v = kv.v.clone(); v.resize((kv.n + extra) * row, 0.0); (cb.buf(&k), cb.buf(&v), kv.n) }
     pub fn kv_push(&self, kv: &mut Kv, k: &[f32], v: &[f32]) { let row = self.row(); kv.k.extend_from_slice(k); kv.v.extend_from_slice(v); kv.n += 1;
         if kv.n > self.window { let drop = kv.n - self.window; kv.k.drain(..drop * row); kv.v.drain(..drop * row); kv.c0 += drop; kv.n -= drop; } }
-    fn hc_mix_g<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, h: &Hc, ni: usize, x: &H) -> Option<(H, H)> {
+    fn hc_mix_g<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, h: &Hc, ni: usize, x: &H) -> Option<(H, H)> { self.hc_mix_a(cb, g, h, ni, x, &mut |n| cb.empty(n)) }
+    fn hc_mix_a<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, h: &Hc, ni: usize, x: &H, al: &mut dyn FnMut(usize) -> H) -> Option<(H, H)> {
         use super::mtp_gpu as mg; let (d, hc) = (self.d, self.hc); let w = hc * d; let gw = self.gw(cb);
-        let xn = cb.empty(w); mg::rms_seg(cb, x, w, &gw[ni], w, &xn, d, d, hc, hc, self.eps);
-        let nr = h.down.rows; let o = cb.empty(nr); cb.gemv(g(&h.down)?, &xn, w, 0, &o, nr, 0);
-        let lo = cb.empty(h.lr); let inj = cb.empty(hc); mg::hc_pre(cb, &o, nr, &lo, &inj, h.lr, hc, nr > h.lr);
-        let gate = cb.empty(w); cb.gemv(g(&h.up)?, &lo, h.lr, 0, &gate, w, 0);
-        let mixed = cb.empty(d); mg::hc_mixed(cb, &xn, &gate, &mixed, d, hc); Some((mixed, inj))
+        let xn = al(w); mg::rms_seg(cb, x, w, &gw[ni], w, &xn, d, d, hc, hc, self.eps);
+        let nr = h.down.rows; let o = al(nr); cb.gemv(g(&h.down)?, &xn, w, 0, &o, nr, 0);
+        let lo = al(h.lr); let inj = al(hc); mg::hc_pre(cb, &o, nr, &lo, &inj, h.lr, hc, nr > h.lr);
+        let gate = al(w); cb.gemv(g(&h.up)?, &lo, h.lr, 0, &gate, w, 0);
+        let mixed = al(d); mg::hc_mixed(cb, &xn, &gate, &mixed, d, hc); Some((mixed, inj))
     }
     /// routed experts of one token on the CPU (as `step`), given the MLP mix output and the router logits
     fn routed(&self, m2: &[f32], lg: &[f32]) -> Vec<f32> {
@@ -326,6 +334,87 @@ impl Mtp {
         let yb = cb.buf(&y); mg::hc_comb(cb, &rr, &yb, &inj2, d, hc);
         let (s, _) = self.hc_mix_g(cb, g, &self.mix, 4, &rr)?; tick(7, &mut tt);
         Some(GStep { s, rr, krow: hv[ne + 2 * d..ne + 2 * d + row].to_vec(), vrow: hv[ne + 2 * d + row..].to_vec() })
+    }
+}
+impl Mtp {
+    /// PYRE_MTP_GRAPH (default on, =0 off): `step_gpu` with persistent buffers and the per-call scalars in a device buffer, captured as two
+    /// CUDA graphs (before / after the CPU routed experts; the second includes the draft head GEMV). First call per key runs
+    /// eagerly (allocates, compiles), the second runs eagerly then captures, later calls replay. `rid` = GPU K/V ring id.
+    /// Returns (head logits handle, drafter residual handle, K row, V row).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn step_gpu_g<'a>(&self, cb: &Cb, g: &(dyn Fn(&Q8Mat) -> Option<&'a CM> + Sync), head: &CM, kc: &H, vc: &H, cap: usize, kc0: usize, r: &H, emb: &[f32], pos: usize, rid: u64) -> Option<(H, H, Vec<f32>, Vec<f32>)> {
+        use super::mtp_gpu as mg; let (d, w, row, ne) = (self.d, self.hc * self.d, self.row(), self.ne); let mut tt = std::time::Instant::now();
+        let mut gl = GG_S.lock().unwrap(); let key = (rid, cap, head.rows);
+        if gl.as_ref().map(|x| x.key != key).unwrap_or(true) { *gl = Some(GG { fx: vec![cb.empty(4 + d), cb.empty(w), cb.empty(d), cb.empty(head.rows)], b1: vec![], b2: vec![], g1: None, g2: None, o1: None, key }); }
+        let gg = gl.as_mut().unwrap(); let fx = gg.fx.clone();
+        let n = pos + 1; let c0 = n.saturating_sub(self.window).max(kc0);
+        let mut hv = vec![pos as f32, ((pos % cap) * row) as f32, c0 as f32, (n - c0) as f32]; hv.extend_from_slice(emb);
+        let up = cb.buf(&hv); mg::cp(cb, &up, 4 + d, &fx[0], 4 + d, 0, 0, 4 + d); mg::cp(cb, r, w, &fx[1], w, 0, 0, w);
+        let off = GG_OFF.load(std::sync::atomic::Ordering::Relaxed);
+        // part 1
+        let o1 = if let (Some(gr), Some(o)) = (gg.g1.as_ref(), gg.o1.clone()) { unsafe { gr.replay() }.expect("mtp graph replay"); GG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); o } else {
+            let fresh = gg.b1.is_empty(); let o = self.g_run(cb, &mut gg.b1, &|al| self.gp1(cb, g, &fx, kc, vc, cap, al))?;
+            if !fresh && !off { gg.g1 = self.g_capture(cb, &mut gg.b1, &|al| self.gp1(cb, g, &fx, kc, vc, cap, al)); }
+            gg.o1 = Some(o.clone()); o };
+        let (rr, inj2, pk) = o1; let pn = ne + 2 * d + 2 * row;
+        let hv = cb.read(&pk); tick(2, &mut tt); let _ = pn;
+        let (lg, m2c, yshc) = (&hv[..ne], &hv[ne..ne + d], &hv[ne + d..ne + 2 * d]);
+        let mut y = self.routed(m2c, lg); let sgv = sigm(self.sgate.iter().zip(m2c).map(|(a, b)| a * b).sum::<f32>()); for i in 0..d { y[i] += yshc[i] * sgv; } tick(6, &mut tt);
+        let yb = cb.buf(&y); mg::cp(cb, &yb, d, &fx[2], d, 0, 0, d);
+        // part 2 (+ head)
+        if let Some(gr) = gg.g2.as_ref() { unsafe { gr.replay() }.expect("mtp graph replay"); GG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } else {
+            let fresh = gg.b2.is_empty(); self.g_run(cb, &mut gg.b2, &|al| self.gp2(cb, g, head, &fx, &rr, &inj2, al))?;
+            if !fresh && !off { gg.g2 = self.g_capture(cb, &mut gg.b2, &|al| self.gp2(cb, g, head, &fx, &rr, &inj2, al)); } }
+        tick(7, &mut tt);
+        Some((fx[3].clone(), rr, hv[ne + 2 * d..ne + 2 * d + row].to_vec(), hv[ne + 2 * d + row..].to_vec()))
+    }
+    /// run `f` eagerly with buffers from `bs` (allocated and recorded on the first run)
+    fn g_run<T>(&self, cb: &Cb, bs: &mut Vec<H>, f: &(dyn Fn(&mut dyn FnMut(usize) -> H) -> Option<T> + Sync)) -> Option<T> {
+        let mut i = 0usize; let mut al = |n: usize| { let h = if i < bs.len() { bs[i].clone() } else { let h = cb.empty(n); bs.push(h.clone()); h }; i += 1; h }; f(&mut al)
+    }
+    /// capture `f` (not executed) as a CUDA graph over the recorded buffers; None (and graphs off) on failure
+    fn g_capture<T: Send>(&self, cb: &Cb, bs: &mut Vec<H>, f: &(dyn Fn(&mut dyn FnMut(usize) -> H) -> Option<T> + Sync)) -> Option<burn_cubecl::cubecl::client::Graph> {
+        if cb.client.graph_prepare().is_err() { GG_OFF.store(true, std::sync::atomic::Ordering::Relaxed); return None; }
+        let nb = bs.len();
+        match cb.client.start_capture() { Ok(()) => { let ok = cb.client.memory_persistent_allocation((), |_| self.g_run(cb, bs, f).is_some());
+                match cb.client.stop_capture() { Ok(gr) if ok && bs.len() == nb => { GG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); Some(gr) }
+                    Ok(_) => { eprintln!("mtp graph: capture allocated or failed, off"); GG_OFF.store(true, std::sync::atomic::Ordering::Relaxed); None }
+                    Err(e) => { eprintln!("mtp graph: capture failed, off: {e:?}"); GG_OFF.store(true, std::sync::atomic::Ordering::Relaxed); None } } }
+            Err(e) => { eprintln!("mtp graph: start failed, off: {e:?}"); GG_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); None } }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gp1<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, fx: &[H], kc: &H, vc: &H, cap: usize, al: &mut dyn FnMut(usize) -> H) -> Option<(H, H, H)> {
+        use super::mtp_gpu as mg; let (d, hc, nh, hd, eps) = (self.d, self.hc, self.nh, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
+        let pb = &fx[0]; let eb = fx[0].clone().offset_start(16); let r = &fx[1];
+        let en = al(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
+        let e2 = al(d); cb.gemv(g(&self.fc_e)?, &en, d, 0, &e2, d, 0);
+        let hn = al(w); mg::rms_seg(cb, r, w, &gw[1], w, &hn, w, w, 1, 1, eps);
+        let h2 = al(w); let fh = g(&self.fc_h)?; for s in 0..hc { cb.gemv(fh, &hn, w, s * d, &h2, w, s * d); }
+        let rr = al(w); mg::add_b(cb, &h2, &e2, &rr, d, w);
+        let (m, inj) = self.hc_mix_a(cb, g, &self.hca, 2, &rr, al)?;
+        let kf = al(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = al(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
+        let kn = al(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_p(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pb);
+        mg::cp_p(cb, &kn, row, kc, cap * row, pb, row); mg::cp_p(cb, &vf, row, vc, cap * row, pb, row);
+        let qr = self.q.rows; let qf = al(qr); cb.gemv(g(&self.q)?, &m, d, 0, &qf, qr, 0);
+        let qn = al(qr); mg::rms_seg(cb, &qf, qr, &gw[5], hd, &qn, hd, 2 * hd, nh, 1, eps); mg::rope_p(cb, &qn, qr, &gw[7], self.n_rot / 2, 2 * hd, nh, pb);
+        let att = al(nh * hd); mg::attn1p(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, pb, row, hd, nh / self.nkv, (hd as f32).sqrt().recip(), cap);
+        let bo = al(d); cb.gemv(g(&self.o)?, &att, nh * hd, 0, &bo, d, 0);
+        mg::hc_comb(cb, &rr, &bo, &inj, d, hc);
+        let (m2, inj2) = self.hc_mix_a(cb, g, &self.hcf, 3, &rr, al)?;
+        let rn = self.rsu.rows; let rsu = al(rn); cb.gemv(g(&self.rsu)?, &m2, d, 0, &rsu, rn, 0);
+        let sf = (rn - self.ne) / 2; let gsb = al(sf); mg::silu2(cb, &rsu, rn, &gsb, self.ne, sf);
+        let ysh = al(d); cb.gemv(g(&self.sd)?, &gsb, sf, 0, &ysh, d, 0);
+        let ne = self.ne; let pn = ne + 2 * d + 2 * row; let pk = al(pn);
+        mg::cp(cb, &rsu, rn, &pk, pn, 0, 0, ne); mg::cp(cb, &m2, d, &pk, pn, 0, ne, d); mg::cp(cb, &ysh, d, &pk, pn, 0, ne + d, d);
+        mg::cp(cb, &kn, row, &pk, pn, 0, ne + 2 * d, row); mg::cp(cb, &vf, row, &pk, pn, 0, ne + 2 * d + row, row);
+        Some((rr, inj2, pk))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gp2<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM, fx: &[H], rr: &H, inj2: &H, al: &mut dyn FnMut(usize) -> H) -> Option<()> {
+        use super::mtp_gpu as mg; let (d, hc) = (self.d, self.hc);
+        mg::hc_comb(cb, rr, &fx[2], inj2, d, hc);
+        let (s, _) = self.hc_mix_a(cb, g, &self.mix, 4, rr, al)?;
+        cb.gemv(head, &s, d, 0, &fx[3], head.rows, 0); Some(())
     }
 }
 /// argmax and its softmax probability
