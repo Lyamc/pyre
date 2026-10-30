@@ -849,3 +849,8 @@ PYRE_QN_FAST=1 (opt-in) sets both; explicit PYRE_ROUTE_PRIOR / PYRE_QN_TAIL_SKIP
 PYRE_SPEC_HI=acc (opt-in): while recent acceptance is at least acc, drafts may run to PYRE_SPEC_HI_K (4) with the later-draft gate at PYRE_SPEC_HI_P (0.6). With 0.95 / 0.9: A 26.3-27.9, B 23.0-24.2, C 25.8-26.5, against default A 28.7-28.8, B 22.7-23.4, C 26.3-27.2. Longer windows cost more than their extra accepted tokens, so it stays off.
 
 Drafter time per round (PYRE_MTP_DEBUG): ~9.5 ms (head 1.3, catch-up 1.0, 1.5-1.9 steps; experts ~2.1, attention ~1.5, input ~1.3, rest ~3.3) of a ~89 ms round on A, about 11%. A full GPU drafter would save perhaps 6-7 ms (<10%), so it was not built.
+### Opt-in: Strata's adaptive VRAM tier (PYRE_QN_ADAPT=1)
+
+Ported from Strata (MIT), src/program/generate.cpp `adapt`: every PYRE_QN_ADAPT_EVERY tokens (default 12), per layer the most-routed missing experts (decayed count >= 2) replace the least-routed resident ones when they beat them by more than PYRE_QN_ADAPT_GAIN (1.5); at most PYRE_QN_ADAPT_SWAPS (96) a round; counts then decay by PYRE_QN_ADAPT_DECAY (0.7). Quick runs (RTX 3060, busy desktop): A 26.1 vs 27.0, B 22.3 vs 21.6, C 25.0 vs 24.6 steady tok/s; B and C greedy-identical, A diverges (cache contents change GPU/CPU expert placement), so it stays opt-in.
+
+PYRE_VRAMLOG=1 prints NVML VRAM at each load stage and during decode. Finding: with PYRE_QN_GRAPH=1, VRAM grows ~2.7 GiB during decode (37 recaptures; old graphs' persistent buffers are kept), which is what left only ~1.2 GiB free; without graphs pyre peaks at ~8.2 GiB with the 2.5 GiB cache. PYRE_QN_GPUHEAD=1 no longer also uploads the burn LM head copy and no longer panics on the empty drafter subset head.

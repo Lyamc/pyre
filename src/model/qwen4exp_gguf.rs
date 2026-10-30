@@ -71,6 +71,15 @@ fn xprofile() -> &'static Option<Vec<Vec<f64>>> {
         Some((0..nl).map(|l| (0..ne).map(|e| u(2 + l * ne + e) as f64 * k).collect()).collect())
     })
 }
+/// Strata's adaptive tier (PYRE_QN_ADAPT=1, opt-in): see `Model::xadapt`.
+fn adapt_on() -> bool { static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *A.get_or_init(|| env_var("PYRE_QN_ADAPT").map(|v| v == "1").unwrap_or(false)) }
+/// tokens between adaptive rounds (PYRE_QN_ADAPT_EVERY, default 12: Strata's 4 verify rounds at ~3 tokens a round)
+fn adapt_every() -> usize { env_usize("PYRE_QN_ADAPT_EVERY").unwrap_or(12).max(1) }
+const XSCALE: u32 = 16;
+/// one routing's count step: x16 with the adaptive tier (its 0.7 decay needs fractions), else 1
+fn xinc() -> u32 { if adapt_on() { XSCALE } else { 1 } }
+fn env_f32(k: &str) -> Option<f32> { env_var(k).ok().and_then(|v| v.parse().ok()) }
+pub static ADAPT_SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Cache rank of an expert: routing count in this conversation plus the profile prior (x1000, integer
 /// so ties break the same way every run).
 fn xscore(xc: &XCache, il: usize, e: usize) -> u64 {
@@ -219,7 +228,7 @@ impl Model {
             let (Some(di), Some(up)) = (g.upload(&a)?, g.upload(&[&h.up])?) else { return Ok(None) };
             Ok(Some(GHc { norm: g.up3(&h.norm, [1, hc, d]), di, up, inj: h.inject.is_some() }))
         };
-        let (mut on, mut off) = (0, 0); let b0 = g.budget_left();
+        crate::limits::vlog("burn gpu up"); let (mut on, mut off) = (0, 0); let b0 = g.budget_left();
         let mut gl = vec![];
         if env_var("PYRE_QN_CUBE").map(|v| v != "0").unwrap_or(true) {
             if let Ok(cb) = super::qn_cube::Cube::new() {
@@ -238,7 +247,7 @@ impl Model {
                     if c.is_some() { on += 1 } else { off += 1 }
                     cl.push(c); gl.push(None);
                 }
-                let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
+                crate::limits::vlog("cube dense layers"); let used = cb0 - cb.budget.load(std::sync::atomic::Ordering::Relaxed);
                 g.budget.fetch_sub(used, std::sync::atomic::Ordering::Relaxed);
                 if env_var("PYRE_QN_TYPES").is_ok() { for (i, l) in self.layers.iter().enumerate().take(4) {
                     let mut v: Vec<(&str, &QMat)> = vec![("hca.down", &l.hc_a.down), ("hca.up", &l.hc_a.up), ("router", &l.router), ("sh_gate", &l.sh_gate), ("sh_up", &l.sh_up), ("sh_down", &l.sh_down)];
@@ -272,7 +281,7 @@ impl Model {
                 // PYRE_QN_XSTREAM=K: K cache slots kept free for streaming missed experts to the GPU per layer
                 if let Some(xm) = &self.xc { let mut x = xm.lock().unwrap(); let k = xstream().min(x.free.len()); for _ in 0..k { let sl = x.free.remove(0); x.stream.push(sl); } x.budget = x.budget.saturating_sub(k * x.slot); }
                 { let ns = super::qn_cube::NATIVE_STAT.load(std::sync::atomic::Ordering::Relaxed); if ns > 0 { eprintln!("gpu: dense native IQ4_XS {:.0} M weights, Q8_0 {:.0} M (mixed mats)", (ns & ((1u64 << 40) - 1)) as f64 / 1e6, (ns >> 40) as f64 / 1e6); } }
-                self.cube = Some(cb);
+                crate::limits::vlog("expert cache"); self.cube = Some(cb);
             }
         }
         if self.cube.is_none() { for l in &self.layers {
@@ -293,9 +302,9 @@ impl Model {
         let mut m = std::collections::HashMap::new();
         let mut extra: Vec<Vec<&QMat>> = vec![];
         for l in &self.layers { if let Some(p) = &l.ple { extra.push(vec![&p.key, &p.value]); } }
-        extra.push(vec![&self.head.down]); extra.push(vec![&self.head.up]); extra.push(vec![&self.out]);
+        extra.push(vec![&self.head.down]); extra.push(vec![&self.head.up]); if self.headc.is_none() { extra.push(vec![&self.out]); } // the cube head (PYRE_QN_GPUHEAD=1) makes the burn copy dead weight
         for grp in extra { if let Some(gm) = g.upload(&grp)? { m.insert(grp[0].key(), gm); } }
-        let gb = (b0 - g.budget_left()) as f64 / (1u64 << 30) as f64;
+        crate::limits::vlog("burn extras (ple, head hc, lm head)"); let gb = (b0 - g.budget_left()) as f64 / (1u64 << 30) as f64;
         if env_var("PYRE_QN_GPUBENCH").is_ok() { if let Some(Some(l0)) = gl.iter().find(|x| x.is_some()) {
             let x1 = vec![0.01f32; d]; let xh = vec![0.01f32; hc * d];
             let b = |name: &str, f: &dyn Fn() -> usize| { for _ in 0..3 { f(); } let t0 = std::time::Instant::now(); let mut n = 0; for _ in 0..20 { n = f(); } eprintln!("gpubench {name}: {:.3} ms ({n} out)", t0.elapsed().as_secs_f64() * 50.0); };
@@ -402,7 +411,7 @@ impl Model {
             // route on the host, run the cached experts on the GPU while the CPU pool runs the rest
             let mut xcg = xm.lock().unwrap();
             let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg));
-            for &(e, _) in &sel { xcg.cnt[il][e] += 1; }
+            for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); }
             xcg.total += sel.len() as u64;
             let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             tail_skip(&mut off, &on);
@@ -557,8 +566,43 @@ impl Model {
         eprintln!("host expert arena: {} experts, {:.2} GiB pre-packed in {:.1}s, {:.1} GiB RAM free", pk.map.len(), pk.bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64(), avail_ram() as f64 / (1u64 << 30) as f64);
         super::qn_cube::XUP_NS[0].store(0, std::sync::atomic::Ordering::Relaxed);
     }
+    /// PYRE_QN_ADAPT=1 (opt-in): Strata's adaptive VRAM tier (Strata, MIT, src/program/generate.cpp `adapt`):
+    /// per layer, the most-routed missing experts (decayed count >= 2) replace the least-routed resident ones
+    /// when they beat them by more than 1.5 (`--adapt-min-gain`); at most 96 swaps a round, biggest gains first;
+    /// then every count is multiplied by 0.7 (`--adapt-decay`). Counts are kept x16 (xinc) so the decay works on integers.
+    fn xadapt(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
+        let s = XSCALE; let floor = 2 * s; let gain = (env_f32("PYRE_QN_ADAPT_GAIN").unwrap_or(1.5) * s as f32) as u32;
+        let maxs = env_usize("PYRE_QN_ADAPT_SWAPS").unwrap_or(96);
+        let mut swaps: Vec<(u32, usize, usize, usize)> = vec![]; // gain, layer, in, out
+        for (il, l) in self.layers.iter().enumerate() {
+            if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
+            let u = &xc.cnt[il];
+            let mut cand: Vec<(u32, usize)> = vec![]; let mut vict: Vec<(u32, usize)> = vec![];
+            for e in 0..self.cfg.n_exp { if xc.map.contains_key(&(il, e)) { vict.push((u[e], e)); } else if u[e] >= floor { cand.push((u[e], e)); } }
+            if cand.is_empty() || vict.is_empty() { continue; }
+            cand.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1))); vict.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            for i in 0..cand.len().min(vict.len()) { if cand[i].0 < vict[i].0 + gain { break; } swaps.push((cand[i].0 - vict[i].0, il, cand[i].1, vict[i].1)); }
+        }
+        swaps.sort_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2)))); swaps.truncate(maxs);
+        let mut jobs: Vec<(usize, usize, usize, (u32, u32, u32))> = vec![];
+        for &(_, il, ein, eout) in &swaps {
+            let Some(v) = xc.map.remove(&(il, eout)) else { continue };
+            let l = &self.layers[il];
+            let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+            jobs.push((il, ein, v.slot, tys));
+        }
+        { use rayon::prelude::*;
+            let pks: Vec<_> = jobs.par_iter().map(|&(il, e, _, tys)| self.xpacked(il, e, tys)).collect();
+            for (&(il, e, sl, _), pk) in jobs.iter().zip(pks.iter()) {
+                let mut ent = cb.xupload_pk(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, &pk.0, pk.1, pk.2);
+                ent.arena = sl / xc.per; ent.slot = sl; xc.map.insert((il, e), ent); } }
+        ADAPT_SWAPS.fetch_add(jobs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let dec = env_f32("PYRE_QN_ADAPT_DECAY").unwrap_or(0.7);
+        for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c = (*c as f32 * dec) as u32; } }
+    }
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
-        xc.calls += 1;
+        xc.calls += 1; if xc.calls <= 3 || xc.calls % 32 == 0 { crate::limits::vlog(&format!("refill call {} (cache {} experts)", xc.calls, xc.map.len())); }
+        if adapt_on() && xc.calls != 1 && !xc.map.is_empty() { if xc.calls % adapt_every() == 0 { self.xadapt(cb, xc); } return; }
         let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
         // an empty cache fills right away (the call before prefill has no routing counts yet, so the first
         // real fill used to wait until call `every` and then add only XSWAP experts)
@@ -944,7 +988,7 @@ impl Model {
             let top = &idx[..c.top_k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
             let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
             for (&e, w) in top.iter().zip(ws) { by_exp[e].push((ti, w / sum)); }
-            if let Some(xm) = &self.xc { if let Some(il) = self.layers.iter().position(|x| std::ptr::eq(x, l)) { let mut g = xm.lock().unwrap(); for &e in top { g.cnt[il][e] += 1; } } }
+            if let Some(xm) = &self.xc { if let Some(il) = self.layers.iter().position(|x| std::ptr::eq(x, l)) { let mut g = xm.lock().unwrap(); for &e in top { g.cnt[il][e] += xinc(); } } }
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
         // PYRE_QN_PF_POOL=1: prompt chunks also take the int8 pool path below (decode numerics, opt-in: it
@@ -1217,7 +1261,7 @@ impl Model {
             let (s, r2) = if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.step(&mut kv, &r, &e, n - 1 + j)) } else { mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)) }; let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
             // the draft-vocabulary head on the GPU (PYRE_MTP_HEAD_GPU=0: off): ~100 MB of VRAM, a fraction of the full head's time
-            let hg = if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.cube.as_ref().and_then(|cb| self.mtp_headc.get_or_init(|| { let h = m.head_q8(); let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }).as_ref().map(|hm| (cb, hm))) } else { None };
+            let hg = if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.cube.as_ref().and_then(|cb| self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }).as_ref().map(|hm| (cb, hm))) } else { None };
             let (id, p) = if let Some((cb, hm)) = hg { let xb = cb.buf(&s); let o = cb.empty(hm.rows); cb.gemv(hm, &xb, s.len(), 0, &o, hm.rows, 0); let (i, p) = super::mtp::best(&cb.read(&o)); (m.head_ids()[i], p) }
                 else if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
             HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1249,7 +1293,7 @@ impl Model {
         let ids = if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { vec![] } else { ids };
         let m = super::mtp::Mtp::load(&p, &geo, ids, |r, y| out.row(r, y))?;
         if env_var("PYRE_MTP_LAZY").is_err() { m.warm(); }
-        eprintln!("mtp: drafter {} loaded in {:.1} s", p.display(), t.elapsed().as_secs_f64());
+        crate::limits::vlog("mtp loaded"); eprintln!("mtp: drafter {} loaded in {:.1} s", p.display(), t.elapsed().as_secs_f64());
         self.mtp = Some(m); Ok(())
     }
 
@@ -1367,7 +1411,7 @@ impl Model {
         let keep = keep.max(1); let c = &self.cfg;
         // rejected drafts must not shift the expert-cache schedule or usage counts (greedy identity)
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); g.calls = g.calls.saturating_sub(t - keep);
-            for ti in keep..t { if let Some(v) = st.spec_sel.get(ti) { for &(il, e) in v { g.cnt[il][e] = g.cnt[il][e].saturating_sub(1); } } } }
+            for ti in keep..t { if let Some(v) = st.spec_sel.get(ti) { for &(il, e) in v { g.cnt[il][e] = g.cnt[il][e].saturating_sub(xinc()); } } } }
         let n = st.tokens.len() - t + keep;
         st.tokens.truncate(n);
         if let Some(cb) = &self.cube { if st.gdn_gpu {
@@ -1490,7 +1534,7 @@ impl Model {
             let (mut ons, mut offs) = (Vec::with_capacity(t), Vec::with_capacity(t));
             for (ti, rv) in rvs.iter().enumerate() {
                 let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg));
-                for &(e, _) in &sel { xcg.cnt[il][e] += 1; if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
+                for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
                 xcg.total += sel.len() as u64;
                 let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| xcg.map.contains_key(&(il, *e)));
             tail_skip(&mut off, &on);

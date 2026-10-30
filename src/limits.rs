@@ -122,3 +122,6 @@ mod tests {
         assert_eq!(super::parse_size("1.5g"), Some(3 << 29));
     }
 }
+
+/// PYRE_VRAMLOG=1: print NVML used VRAM at a load/run stage (for the VRAM audit).
+pub fn vlog(tag: &str) { if std::env::var("PYRE_VRAMLOG").is_ok() { if let Some(v) = vram() { eprintln!("vram {tag}: used {} MiB, free {} MiB", v.used >> 20, v.free >> 20); } } }
