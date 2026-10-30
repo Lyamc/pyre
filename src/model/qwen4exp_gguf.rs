@@ -1380,7 +1380,25 @@ impl Model {
         // a later draft is kept only when the drafter is this sure of it (Strata gates draft length on the MTP probability too; PYRE_MTP_MIN_P=0 drafts the full length)
         let min_p: f32 = crate::spec::draft_min_p().unwrap_or_else(|| env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9));
         let mut e = vec![0f32; d];
-        for j in 0..k {
+        // PYRE_MTP_GPUSTEP=1 (needs PYRE_MTP_GPU=1): each draft step on the GPU (draft-only numerics), routed experts on the CPU, head + k_best on the GPU
+        let mut gdone = false;
+        if env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) && kv.end() == n - 1 && kv.n > 0 {
+            if let (Some(cb), Some(map), Some(Some(hm))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
+                let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
+                let (kc, vc, mut nc) = m.kv_upload(cb, &kv, k); let cap = nc + k; let mut rh = cb.buf(&r);
+                for j in 0..k {
+                    self.embd.row(tok as usize, &mut e);
+                    let Some(gs) = m.step_gpu(cb, &g, &kc, &vc, nc, cap, &rh, &e, n - 1 + j) else { break };
+                    if j == 0 { m.kv_push(&mut kv, &gs.krow, &gs.vrow); } nc += 1;
+                    let th = std::time::Instant::now(); let o = cb.empty(hm.rows); cb.gemv(hm, &gs.s, d, 0, &o, hm.rows, 0); let (i, p) = cb.best(&o, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
+                    HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if j > 0 && p < min_p { break; }
+                    out.push((id, None)); rh = gs.rr; tok = id;
+                }
+                gdone = true;
+            }
+        }
+        for j in 0..(if gdone { 0 } else { k }) {
             self.embd.row(tok as usize, &mut e);
             let (s, r2) = if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.step(&mut kv, &r, &e, n - 1 + j)) } else { mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)) }; let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset

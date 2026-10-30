@@ -89,6 +89,7 @@ pub struct Mtp {
     rsu: Q8Mat, sd: Q8Mat, sgate: Vec<f32>, ne: usize,
     st: St, ex: Vec<OnceLock<(Q8Mat, Q8Mat)>>,
     head: Q8Mat, ids: Vec<u32>, pub window: usize,
+    gw: OnceLock<Vec<burn_cubecl::cubecl::server::Handle>>,
 }
 
 pub struct Geo { pub d: usize, pub hc: usize, pub nh: usize, pub nkv: usize, pub hd: usize, pub n_rot: usize, pub eps: f32, pub top_k: usize, pub rope_base: f32 }
@@ -109,7 +110,7 @@ impl Mtp {
             q: st.q8("self_attn.q_proj.weight")?, k: st.q8("self_attn.k_proj.weight")?, v: st.q8("self_attn.v_proj.weight")?, o: st.q8("self_attn.o_proj.weight")?,
             qn: st.norm("self_attn.q_norm.weight")?, kn: st.norm("self_attn.k_norm.weight")?,
             rsu: st.q8s(&["mlp.gate.weight", "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight"])?, ne, sd: st.q8("mlp.shared_expert.down_proj.weight")?,
-            sgate: st.vec("mlp.shared_expert_gate.weight")?, ex: (0..ne).map(|_| OnceLock::new()).collect(), st, head, ids,
+            sgate: st.vec("mlp.shared_expert_gate.weight")?, ex: (0..ne).map(|_| OnceLock::new()).collect(), st, head, ids, gw: OnceLock::new(),
             window: std::env::var("PYRE_MTP_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(128) /* 128: C tps 30.6->33.8 (less prompt catch-up), acceptance same; 64 loses acceptance */ })
     }
     pub fn row(&self) -> usize { self.nkv * self.hd }
@@ -229,6 +230,71 @@ impl Mtp {
     }
 }
 
+/// PYRE_MTP_GPUSTEP: one draft step's GPU outputs (s = final mixer output for the head, rr = drafter residual, the new K/V cell)
+pub struct GStep { pub s: H, pub rr: H, pub krow: Vec<f32>, pub vrow: Vec<f32> }
+type H = burn_cubecl::cubecl::server::Handle;
+type Cb = super::qn_cube::Cube;
+type CM = super::qn_cube::CMat;
+impl Mtp {
+    fn gw(&self, cb: &Cb) -> &Vec<H> { self.gw.get_or_init(|| vec![cb.buf(&self.pre_e), cb.buf(&self.pre_h), cb.buf(&self.hca.norm), cb.buf(&self.hcf.norm), cb.buf(&self.mix.norm), cb.buf(&self.qn), cb.buf(&self.kn), cb.buf(&self.rope_inv)]) }
+    /// the K/V cells on the GPU, with room for `extra` more; returns (k, v, cells)
+    pub fn kv_upload(&self, cb: &Cb, kv: &Kv, extra: usize) -> (H, H, usize) { let row = self.row(); let mut k = kv.k.clone(); k.resize((kv.n + extra) * row, 0.0); let mut v = kv.v.clone(); v.resize((kv.n + extra) * row, 0.0); (cb.buf(&k), cb.buf(&v), kv.n) }
+    pub fn kv_push(&self, kv: &mut Kv, k: &[f32], v: &[f32]) { let row = self.row(); kv.k.extend_from_slice(k); kv.v.extend_from_slice(v); kv.n += 1;
+        if kv.n > self.window { let drop = kv.n - self.window; kv.k.drain(..drop * row); kv.v.drain(..drop * row); kv.c0 += drop; kv.n -= drop; } }
+    fn hc_mix_g<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, h: &Hc, ni: usize, x: &H) -> Option<(H, H)> {
+        use super::mtp_gpu as mg; let (d, hc) = (self.d, self.hc); let w = hc * d; let gw = self.gw(cb);
+        let xn = cb.empty(w); mg::rms_seg(cb, x, w, &gw[ni], w, &xn, d, d, hc, hc, self.eps);
+        let nr = h.down.rows; let o = cb.empty(nr); cb.gemv(g(&h.down)?, &xn, w, 0, &o, nr, 0);
+        let lo = cb.empty(h.lr); let inj = cb.empty(hc); mg::hc_pre(cb, &o, nr, &lo, &inj, h.lr, hc, nr > h.lr);
+        let gate = cb.empty(w); cb.gemv(g(&h.up)?, &lo, h.lr, 0, &gate, w, 0);
+        let mixed = cb.empty(d); mg::hc_mixed(cb, &xn, &gate, &mixed, d, hc); Some((mixed, inj))
+    }
+    /// routed experts of one token on the CPU (as `step`), given the MLP mix output and the router logits
+    fn routed(&self, m2: &[f32], lg: &[f32]) -> Vec<f32> {
+        let mut idx: Vec<usize> = (0..lg.len()).collect();
+        idx.select_nth_unstable_by(self.top_k, |a, b| lg[*b].partial_cmp(&lg[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        let top = &idx[..self.top_k]; let mx = top.iter().map(|&e| lg[e]).fold(f32::NEG_INFINITY, f32::max);
+        let ws: Vec<f32> = top.iter().map(|&e| (lg[e] - mx).exp()).collect(); let wsum: f32 = ws.iter().sum(); let (d, ff) = (self.d, self.ff);
+        let parts: Vec<Vec<f32>> = top.par_iter().zip(ws.par_iter()).map(|(&e, &w)| { let (gu, dn) = self.expert(e); let h = mm(gu, m2, 1);
+            let a: Vec<f32> = (0..ff).map(|i| silu(h[i]) * h[ff + i]).collect(); let mut o = mm(dn, &a, 1); let w = w / wsum; for v in o.iter_mut() { *v *= w; } o }).collect();
+        let mut y = vec![0f32; d]; for p in parts { for i in 0..d { y[i] += p[i]; } } y
+    }
+    /// `step` on the GPU (draft-only numerics): K/V cell `ncell` of the GPU cache (capacity `cap` cells) is written,
+    /// attention runs over the last `window` cells, routed experts run on the CPU after one packed readback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, ncell: usize, cap: usize, r: &H, emb: &[f32], pos: usize) -> Option<GStep> {
+        use super::mtp_gpu as mg; let (d, hc, nh, hd, eps) = (self.d, self.hc, self.nh, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
+        let mut tt = std::time::Instant::now();
+        let eb = cb.buf(emb); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
+        let e2 = cb.empty(d); cb.gemv(g(&self.fc_e)?, &en, d, 0, &e2, d, 0);
+        let hn = cb.empty(w); mg::rms_seg(cb, r, w, &gw[1], w, &hn, w, w, 1, 1, eps);
+        let h2 = cb.empty(w); let fh = g(&self.fc_h)?; for s in 0..hc { cb.gemv(fh, &hn, w, s * d, &h2, w, s * d); }
+        let rr = cb.empty(w); mg::add_b(cb, &h2, &e2, &rr, d, w);
+        let (m, inj) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?;
+        let kf = cb.empty(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = cb.empty(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
+        let kn = cb.empty(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_seg(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pos);
+        mg::cp(cb, &kn, row, kc, cap * row, 0, ncell * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, ncell * row, row);
+        let n = ncell + 1; let c0 = n.saturating_sub(self.window);
+        let qr = self.q.rows; let qf = cb.empty(qr); cb.gemv(g(&self.q)?, &m, d, 0, &qf, qr, 0);
+        let qn = cb.empty(qr); mg::rms_seg(cb, &qf, qr, &gw[5], hd, &qn, hd, 2 * hd, nh, 1, eps); mg::rope_seg(cb, &qn, qr, &gw[7], self.n_rot / 2, 2 * hd, nh, pos);
+        let att = cb.empty(nh * hd); mg::attn1(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, c0, n - c0, row, hd, nh / self.nkv, (hd as f32).sqrt().recip());
+        let bo = cb.empty(d); cb.gemv(g(&self.o)?, &att, nh * hd, 0, &bo, d, 0);
+        mg::hc_comb(cb, &rr, &bo, &inj, d, hc);
+        let (m2, inj2) = self.hc_mix_g(cb, g, &self.hcf, 3, &rr)?;
+        let rn = self.rsu.rows; let rsu = cb.empty(rn); cb.gemv(g(&self.rsu)?, &m2, d, 0, &rsu, rn, 0);
+        let sf = (rn - self.ne) / 2; let gsb = cb.empty(sf); mg::silu2(cb, &rsu, rn, &gsb, self.ne, sf);
+        let ysh = cb.empty(d); cb.gemv(g(&self.sd)?, &gsb, sf, 0, &ysh, d, 0);
+        let ne = self.ne; let pn = ne + 2 * d + 2 * row; let pk = cb.empty(pn);
+        mg::cp(cb, &rsu, rn, &pk, pn, 0, 0, ne); mg::cp(cb, &m2, d, &pk, pn, 0, ne, d); mg::cp(cb, &ysh, d, &pk, pn, 0, ne + d, d);
+        mg::cp(cb, &kn, row, &pk, pn, 0, ne + 2 * d, row); mg::cp(cb, &vf, row, &pk, pn, 0, ne + 2 * d + row, row);
+        let hv = cb.read(&pk); tick(2, &mut tt);
+        let (lg, m2c, yshc) = (&hv[..ne], &hv[ne..ne + d], &hv[ne + d..ne + 2 * d]);
+        let mut y = self.routed(m2c, lg); let sgv = sigm(self.sgate.iter().zip(m2c).map(|(a, b)| a * b).sum::<f32>()); for i in 0..d { y[i] += yshc[i] * sgv; } tick(6, &mut tt);
+        let yb = cb.buf(&y); mg::hc_comb(cb, &rr, &yb, &inj2, d, hc);
+        let (s, _) = self.hc_mix_g(cb, g, &self.mix, 4, &rr)?; tick(7, &mut tt);
+        Some(GStep { s, rr, krow: hv[ne + 2 * d..ne + 2 * d + row].to_vec(), vrow: hv[ne + 2 * d + row..].to_vec() })
+    }
+}
 /// argmax and its softmax probability
 pub fn best(lg: &[f32]) -> (usize, f32) {
     let (bi, bv) = lg.iter().enumerate().fold((0, f32::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a });
