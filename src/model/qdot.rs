@@ -341,7 +341,7 @@ unsafe fn iq2_sb<const V: bool>(t: QType, rp: *const u8, i: usize, a: &Q8K, acc:
             let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
-            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc16(sbv)); }
         _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc)
     } else {
         let s8 = sign8();
@@ -406,6 +406,9 @@ mod kk {
         let hi = _mm_and_si128(_mm_sllv_epi32(_mm_set1_epi32(h as i32), _mm_setr_epi32(8, 6, 4, 2)), _mm_set1_epi32(0x300));
         _mm256_i32gather_epi64::<8>(super::IQ2S_GRID.as_ptr() as *const i64, _mm_or_si128(q, hi))
     }
+    /// IQ2_S scale byte -> the sc2 vector (lanes 0-7 = 2*(b&15)+1, 8-15 = 2*(b>>4)+1) by one load from a const table
+    /// (Strata, MIT: scale_vecs.s16, src/kernels/cpu/iq_avx2.cpp); the same lanes as sc2, so bit-identical.
+    #[inline(always)] pub unsafe fn sc16(b: u8) -> __m256i { if super::sc16_tab() { _mm256_loadu_si256(super::SC16.as_ptr().add(b as usize) as *const __m256i) } else { sc2(2 * (b & 0xF) as i32 + 1, 2 * (b >> 4) as i32 + 1) } }
     #[inline(always)] pub unsafe fn sc2(lo: i32, hi: i32) -> __m256i { _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)) }
     /// 32 sign bytes (+1/-1) from 32 bits
     #[inline(always)] pub unsafe fn signs(bits: u32) -> __m256i {
@@ -436,7 +439,7 @@ unsafe fn iq2s_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
             let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
-            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc16(sbv)); }
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc); }
     k::hsum(acc)
 }
@@ -603,7 +606,7 @@ unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out:
                     let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
                     g[ib] = _mm256_set_epi64x(q(3), q(2), q(1), q(0)); }
                     sg[ib] = kk::signs((sgp.add(4 * ib) as *const u32).read_unaligned());
-                    let sbv = *sb.add(ib); sc[ib] = kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1); }
+                    let sbv = *sb.add(ib); sc[ib] = kk::sc16(sbv); }
                 f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() }
             _ => { let b = rp.add(i * 66); let qs = b.add(2);
                 for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
@@ -649,3 +652,7 @@ unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
             corr[j] -= dd * *a.s.get_unchecked(i) as f32; } }
     for j in 0..n { out[j] = corr[j] + k::hsum(acc[j]); }
 }
+/// (2s+1) scale vectors of an IQ2_S scale byte, see kk::sc16
+pub static SC16: [[i16; 16]; 256] = { let mut t = [[0i16; 16]; 256]; let mut b = 0; while b < 256 { let mut l = 0; while l < 8 { t[b][l] = 2 * (b & 15) as i16 + 1; t[b][l + 8] = 2 * (b >> 4) as i16 + 1; l += 1; } b += 1; } t };
+/// PYRE_QN_SC16 (default on): IQ2_S scale vectors from SC16
+pub fn sc16_tab() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_SC16").map(|v| v != "0").unwrap_or(true)) }
