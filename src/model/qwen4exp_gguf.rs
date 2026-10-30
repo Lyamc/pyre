@@ -1794,7 +1794,7 @@ impl Model {
                         let f = || { cb.xrun_graph_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, maxne, &mg.meta, &mg.oc, &mg.rd, t * rn, d, c.ff_exp, tyg, &mg.y);
                             cb.silu_mul_m(&mg.rd, t * rn, rn, d + ne, d + ne + sf, &mg.hb, sf, t);
                             cb.gemv_m(&cl.sdown, &mg.hb, t * sf, 0, sf, &mg.sh, t * d, 0, d, t); };
-                        vg_run(cb, (3, il, t), &key, &f); MG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        vg_run(cb, (3, il, t), &key, &f); { let n = MG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if n == 0 || n == 5000 { eprintln!("moegraph: run {n} (layer {il} t {t} maxne {maxne}), vgraph captures so far {}", VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)); } }
                         SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         for ti in 0..t { ygs[ti] = Some(at(&mg.y, ti * d)); shs.push(at(&mg.sh, ti * d)); } sh_b = true; sh_g = Some(mg.sh.clone());
                         let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
