@@ -253,6 +253,23 @@ impl Mtp {
     /// compile the GPU step kernels now (one throwaway step on a 1-cell K/V)
     pub fn warm_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
         let r = cb.buf(&vec![0.01f32; self.rdim()]); if self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1).is_none() { eprintln!("mtp: warm step returned None"); } if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); } }
+    pub fn kv_reset(&self, kv: &mut Kv, c0: usize) { *kv = Kv { c0, ..Default::default() }; }
+    /// one catch-up cell on the GPU: K/V of cell `pos` written to the ring and returned (k, v) for the CPU copy
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cell_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, cap: usize, r: &[f32], emb: &[f32], pos: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        use super::mtp_gpu as mg; let (d, hc, hd, eps) = (self.d, self.hc, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
+        let eb = cb.buf(emb); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
+        let e2 = cb.empty(d); cb.gemv(g(&self.fc_e)?, &en, d, 0, &e2, d, 0);
+        let rb = cb.buf(r); let hn = cb.empty(w); mg::rms_seg(cb, &rb, w, &gw[1], w, &hn, w, w, 1, 1, eps);
+        let h2 = cb.empty(w); let fh = g(&self.fc_h)?; for s in 0..hc { cb.gemv(fh, &hn, w, s * d, &h2, w, s * d); }
+        let rr = cb.empty(w); mg::add_b(cb, &h2, &e2, &rr, d, w);
+        let (m, _) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?;
+        let kf = cb.empty(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = cb.empty(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
+        let kn = cb.empty(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_seg(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pos);
+        mg::cp(cb, &kn, row, kc, cap * row, 0, (pos % cap) * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, (pos % cap) * row, row);
+        let pk = cb.empty(2 * row); mg::cp(cb, &kn, row, &pk, 2 * row, 0, 0, row); mg::cp(cb, &vf, row, &pk, 2 * row, 0, row, row);
+        let hv = cb.read(&pk); Some((hv[..row].to_vec(), hv[row..].to_vec()))
+    }
     pub fn kv_upload(&self, cb: &Cb, kv: &Kv, extra: usize) -> (H, H, usize) { let row = self.row(); let mut k = kv.k.clone(); k.resize((kv.n + extra) * row, 0.0); let mut v = kv.v.clone(); v.resize((kv.n + extra) * row, 0.0); (cb.buf(&k), cb.buf(&v), kv.n) }
     pub fn kv_push(&self, kv: &mut Kv, k: &[f32], v: &[f32]) { let row = self.row(); kv.k.extend_from_slice(k); kv.v.extend_from_slice(v); kv.n += 1;
         if kv.n > self.window { let drop = kv.n - self.window; kv.k.drain(..drop * row); kv.v.drain(..drop * row); kv.c0 += drop; kv.n -= drop; } }

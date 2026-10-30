@@ -1373,7 +1373,18 @@ impl Model {
         if lo < n - 1 {
             let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
             for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
-            if ok { if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } else { mtp_cpu(|| m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } } else { kv = Default::default(); }
+            let gsc = env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) && env_var("PYRE_MTP_GPUCATCH").map(|v| v != "0").unwrap_or(true);
+            let mut gdone_c = false;
+            if ok && gsc { if let (Some(cb), Some(map), Some(Some(_))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
+                // PYRE_MTP_GPUCATCH (default on with GPUSTEP): catch-up cells on the GPU, written straight into the resident K/V ring
+                let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
+                if kv.end() != lo || kv.n == 0 { m.kv_reset(&mut kv, lo); }
+                let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap);
+                let mut okc = true;
+                for j in 0..n - 1 - lo { match m.kv_cell_gpu(cb, &g, &kc, &vc, cap, &rs[j * w..(j + 1) * w], &es[j * d..(j + 1) * d], lo + j) { Some((k, v)) => m.kv_push(&mut kv, &k, &v), None => { okc = false; break; } } }
+                if okc { gr.end = kv.end(); gr.gid = kv.gid; gdone_c = true; } else { kv = Default::default(); gr.end = 0; gdone_c = true; }
+            } }
+            if gdone_c {} else if ok { if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } else { mtp_cpu(|| m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } } else { kv = Default::default(); }
         }
         let t1 = std::time::Instant::now();
         let mut r = self.mtp_r_get(st, n - 1)?.to_vec(); let mut tok = pending; let mut out = vec![];
