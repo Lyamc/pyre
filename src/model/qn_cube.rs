@@ -1459,6 +1459,7 @@ fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
 pub fn hpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_HPIN").map(|v| v == "1").unwrap_or(false)) }
 /// A repacked expert in host memory: (gate|up|down words as shared bytes, up offset, down offset) in u32 words.
 pub type Pk = std::sync::Arc<(cubecl::bytes::Bytes, usize, usize)>;
+pub fn gemv1r() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_GEMV1R").map(|v| v == "1").unwrap_or(false)) }
 pub fn xs2() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XS2").map(|v| v == "1").unwrap_or(false)) }
 pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
@@ -2223,6 +2224,13 @@ impl Cube {
             for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, (ooff + r0) as u32) } }
+            return;
+        }
+        // PYRE_QN_GEMV1R=1: one-column k_gemv4r (4 rows per warp share each activation load; same per-row order)
+        if gemv1r() {
+            unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE * 4), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+                BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, xoff as u32, 0u32, ooff as u32, 0u32, 1u32, false, false, false) }
             return;
         }
         unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
