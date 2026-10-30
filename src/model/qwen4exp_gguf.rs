@@ -105,6 +105,8 @@ pub struct VGraph { xn: H, da: H, mixed: H, proj: H, core: H, co: H, o: H, df: H
 static VGRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static VG_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
+fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
 fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v == "1").unwrap_or(false)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
@@ -1413,9 +1415,10 @@ impl Model {
                 let q4 = std::time::Instant::now();
                 let fut = cb.read_start(&dd.0);
                 if let Some(&(nl, ng)) = stages.get(i + 1) { if !(ng == 0 && self.layers[nl].ple.is_some()) {
-                    let (n0, n1) = grp[ng];
+                    let (n0, n1) = grp[ng]; let q4d = std::time::Instant::now();
                     dq[ng] = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xs.as_ref().unwrap()[n0..n1], st, ctr[nl].0, ctr[nl].1, start + n0, n0, t));
-                    let _ = cb.client.flush();
+                    let q4f = std::time::Instant::now(); WV[3].fetch_add((q4f - q4d).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if wflush() { let _ = cb.client.flush(); } WV[4].fetch_add(q4f.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 } }
                 let q4b = std::time::Instant::now();
                 if prewake() { qn_pool().prewake(); }
@@ -1445,7 +1448,7 @@ impl Model {
         if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(8); let y = self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap(); let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
-            eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
+            eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} (dense {:.1} flush {:.1}) | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6, WV[3].swap(0, Relaxed) as f64 / 1e6, WV[4].swap(0, Relaxed) as f64 / 1e6);
             eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("route-to-meta {:.1} route {:.1} | ", RTN.swap(0, Relaxed) as f64 / 1e6, RTN2.swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
@@ -1776,7 +1779,7 @@ static SIDE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static SD: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 static MISS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HEAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static WV: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static WV: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 static HY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 static PH: [std::sync::atomic::AtomicU64; 1] = [std::sync::atomic::AtomicU64::new(0)];
 static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
