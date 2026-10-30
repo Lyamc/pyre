@@ -179,6 +179,8 @@ pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 struct MgB { meta: H, oc: H, y: H, hb: H, sh: H, rd: H }
 #[allow(clippy::type_complexity)]
 static MGB: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MgB>>>> = std::sync::LazyLock::new(Default::default);
+#[allow(clippy::type_complexity)]
+static MG_RD: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), String>>> = std::sync::LazyLock::new(Default::default);
 fn mg_bufs(cb: &super::qn_cube::Cube, t: usize, max_ne: usize, d: usize, sf: usize, rn: usize) -> std::sync::Arc<MgB> {
     let mut m = MGB.lock().unwrap();
     m.entry(t).or_insert_with(|| std::sync::Arc::new(cb.client.memory_persistent_allocation((), |_| MgB { meta: cb.empty(max_ne * 4), oc: cb.empty(4), y: cb.empty(t * d), hb: cb.empty(t * sf), sh: cb.empty(t * d), rd: cb.empty(t * rn) }))).clone()
@@ -1788,11 +1790,15 @@ impl Model {
                         all.resize(maxne * 4, 0);
                         let mg = mg_bufs(cb, t, maxne, d, sf, rn);
                         cb.client.write(&mg.meta, burn_cubecl::cubecl::bytes::Bytes::from_elems(all)); cb.client.write(&mg.oc, burn_cubecl::cubecl::bytes::Bytes::from_elems(oc.to_vec()));
-                        cb.copy(&rd, t * rn, 0, &mg.rd, t * rn, 0, t * rn);
-                        let key: String = xcr.arena.iter().map(|h| format!("{:?};", h.memory.descriptor().id)).collect();
+                        // rd straight from the dense half when its buffer was the same last time for this (layer, T) (the VGRAPH
+                        // DeltaNet graphs own a fixed rd); otherwise copied into the fixed buffer so the graph is not recaptured
+                        let rid = format!("{:?}/{:?}", rd.memory.descriptor().id, rd.offset_start);
+                        let stable = { let mut m = MG_RD.lock().unwrap(); let e = m.entry((il, t)).or_default(); let same = *e == rid; *e = rid.clone(); same };
+                        let src = if stable { rd.clone() } else { cb.copy(&rd, t * rn, 0, &mg.rd, t * rn, 0, t * rn); mg.rd.clone() };
+                        let key: String = xcr.arena.iter().map(|h| format!("{:?};", h.memory.descriptor().id)).collect::<String>() + &format!("{:?}/{:?}", src.memory.descriptor().id, src.offset_start);
                         let q = std::time::Instant::now();
-                        let f = || { cb.xrun_graph_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, maxne, &mg.meta, &mg.oc, &mg.rd, t * rn, d, c.ff_exp, tyg, &mg.y);
-                            cb.silu_mul_m(&mg.rd, t * rn, rn, d + ne, d + ne + sf, &mg.hb, sf, t);
+                        let f = || { cb.xrun_graph_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, maxne, &mg.meta, &mg.oc, &src, t * rn, d, c.ff_exp, tyg, &mg.y);
+                            cb.silu_mul_m(&src, t * rn, rn, d + ne, d + ne + sf, &mg.hb, sf, t);
                             cb.gemv_m(&cl.sdown, &mg.hb, t * sf, 0, sf, &mg.sh, t * d, 0, d, t); };
                         vg_run(cb, (3, il, t), &key, &f); { let n = MG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if n == 0 || n == 5000 { eprintln!("moegraph: run {n} (layer {il} t {t} maxne {maxne}), vgraph captures so far {}", VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)); } }
                         SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
