@@ -190,6 +190,8 @@ fn xallcpu() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock
 fn xexact_types(l: &Layer) -> bool { let t = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9)); t.0 == t.1 && t.0 <= 1 && t.2 == 3 }
 /// PYRE_QN_XSCR_EX=0: the exact decode kernels allocate their temporaries per call instead of using the persistent XScr
 fn xscr_ex() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSCR_EX").map(|v| v != "0").unwrap_or(true)) }
+/// XEXACT default expert cache (GiB): native IQ4_XS dense + native LM head leave room for more experts
+fn xexact_cache_gb() -> f64 { 5.4 } // e20/e21: ~3480 slots, min free ~1.5 GB
 fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
 pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -349,11 +351,11 @@ impl Model {
                 self.cl = cl;
                 // LM head on the GPU (opt-in PYRE_QN_GPUHEAD=1: only ~+0.3 tok/s, and as Q8 it costs VRAM
                 // default on with PYRE_QN_NATIVE=2 (same output on A/B/C; the verify head then runs as one batched GPU GEMV); PYRE_QN_GPUHEAD=0 off
-                if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
+                if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(super::qn_cube::native2()) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
-                let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(if xexact() { 3usize << 30 } else { 5usize << 29 }); // XEXACT: 3 GiB (e5: +hits, C +1.6 tok/s, ~3.3 GB VRAM still free); default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
-                let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
+                let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(if xexact() { (xexact_cache_gb() * (1u64 << 30) as f64) as usize } else { 5usize << 29 }); // XEXACT: 3 GiB (e5: +hits, C +1.6 tok/s, ~3.3 GB VRAM still free); default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
+                let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(if xexact() { 512 } else { 2048 }) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
@@ -1460,7 +1462,7 @@ impl Model {
         if n == 0 || k == 0 { return None; }
         let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
         // PYRE_MTP_GPU=1 (default with PYRE_QN_NATIVE=2, whose dense weights leave the VRAM for it; =0 off): the drafter's dense matrices (~95 MB Q8) run as GPU GEMVs on this thread; experts stay on the CPU
-        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false))) { (Some(cb), true) => {
+        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(super::qn_cube::native2())) { (Some(cb), true) => {
             let map = self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
                 for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
                 eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp });
@@ -1527,7 +1529,7 @@ impl Model {
         if env_var("PYRE_MTP_EAGER").map(|v| v != "0").unwrap_or(true) { self.mtp_gpu_init(); }
         Ok(())
     }
-    fn mtp_gpu_on(&self) -> bool { env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) }
+    fn mtp_gpu_on(&self) -> bool { env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(super::qn_cube::native2()) }
     fn mtp_gpu_init(&self) {
         let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
         if self.mtp_gpu_on() { self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
