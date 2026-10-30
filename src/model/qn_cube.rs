@@ -2629,6 +2629,7 @@ pub struct CMat { w: Handle, s: Handle, pub rows: usize, pub cols: usize, pub sp
 
 impl Cube {
     pub fn new() -> anyhow::Result<Self> {
+        crate::limits::vram_watch();
         let client = cubecl::Device::cuda(0).map_err(|e| anyhow::anyhow!("cuda: {e:?}"))?.client();
         let v = crate::limits::vram().ok_or_else(|| anyhow::anyhow!("no NVML VRAM reading"))?;
         let budget = v.free as i64 - crate::limits::reserve() as i64 - (1536i64 << 20);
@@ -2702,7 +2703,7 @@ impl Cube {
         NATIVE_STAT.fetch_add((nnat * cols) as u64, std::sync::atomic::Ordering::Relaxed); NATIVE_STAT.fetch_add(((nq8 * cols) as u64) << 40, std::sync::atomic::Ordering::Relaxed);
         Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
     }    pub fn buf(&self, v: &[f32]) -> Handle { self.hup(f32::as_bytes(v)) }
-    pub fn empty(&self, n: usize) -> Handle { self.client.empty(n * 4) }
+    pub fn empty(&self, n: usize) -> Handle { crate::limits::vram_check((n * 4) as u64); self.client.empty(n * 4) }
     /// CPU reference for the first native segment of m (first 64 rows, 3 columns, f64 from the packed IQ4_XS words),
     /// against gemv_m with iq4d_m and with iq4s_m. The GPU side quantizes x to Q8, so expect ~1e-2 relative error.
     pub fn natcheck(&self, nm: &str, m: &CMat) {
@@ -2734,6 +2735,7 @@ impl Cube {
     /// Host-to-device for a small buffer (activations, expert tables): through CubeCL's page-locked staging pool when
     /// PYRE_QN_HPIN=1, so the driver copies by DMA instead of staging a pageable buffer on this thread.
     pub fn hup(&self, b: &[u8]) -> Handle {
+        crate::limits::vram_check(b.len() as u64);
         if hpin() && b.len() <= (1 << 20) { let mut by = cubecl::bytes::Bytes::from_bytes_vec(b.to_vec()); self.client.staging(std::iter::once(&mut by), false); return self.client.create(by); }
         self.client.create_from_slice(b)
     }
@@ -2977,7 +2979,7 @@ impl Cube {
             sm: self.hup(u32::as_bytes(&(0..256u32).flat_map(|b| [0u32, 4].map(|o| (0..4).map(|j| if (b >> (o + j)) & 1 == 1 { 0xFFu32 << (8 * j) } else { 0 }).sum::<u32>())).collect::<Vec<u32>>())),
             q2l: self.hup(u32::as_bytes(&(0..256u32).map(|b| (0..4).map(|j| ((b >> (2 * j)) & 3) << (8 * j)).sum::<u32>()).collect::<Vec<u32>>())) }
     }
-    pub fn xarena(&self, bytes: usize) -> Handle { self.client.empty(bytes) }
+    pub fn xarena(&self, bytes: usize) -> Handle { crate::limits::vram_check(bytes as u64); self.client.empty(bytes) }
     /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
     #[allow(clippy::too_many_arguments)]
     pub fn xupload(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
