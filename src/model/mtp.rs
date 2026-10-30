@@ -252,7 +252,7 @@ impl Mtp {
     }
     /// compile the GPU step kernels now (one throwaway step on a 1-cell K/V)
     pub fn warm_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
-        let r = cb.buf(&vec![0.01f32; self.rdim()]); if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); } }
+        let r = cb.buf(&vec![0.01f32; self.rdim()]); if self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1).is_none() { eprintln!("mtp: warm step returned None"); } if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); } }
     pub fn kv_upload(&self, cb: &Cb, kv: &Kv, extra: usize) -> (H, H, usize) { let row = self.row(); let mut k = kv.k.clone(); k.resize((kv.n + extra) * row, 0.0); let mut v = kv.v.clone(); v.resize((kv.n + extra) * row, 0.0); (cb.buf(&k), cb.buf(&v), kv.n) }
     pub fn kv_push(&self, kv: &mut Kv, k: &[f32], v: &[f32]) { let row = self.row(); kv.k.extend_from_slice(k); kv.v.extend_from_slice(v); kv.n += 1;
         if kv.n > self.window { let drop = kv.n - self.window; kv.k.drain(..drop * row); kv.v.drain(..drop * row); kv.c0 += drop; kv.n -= drop; } }
@@ -279,26 +279,27 @@ impl Mtp {
     #[allow(clippy::too_many_arguments)]
     pub fn step_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, cap: usize, kc0: usize, r: &H, emb: &[f32], pos: usize) -> Option<GStep> {
         use super::mtp_gpu as mg; let (d, hc, nh, hd, eps) = (self.d, self.hc, self.nh, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
-        let mut tt = std::time::Instant::now();
+        let mut tt = std::time::Instant::now(); let dbg = std::env::var("PYRE_MTP_TSTEP").is_ok(); let mut tq = std::time::Instant::now();
+        let mut sy = |tag: &str, h: &H| { if dbg { let _ = cb.read(&h.clone()); eprintln!("tstep {tag} {:.2} ms", tq.elapsed().as_secs_f64() * 1e3); tq = std::time::Instant::now(); } };
         let eb = cb.buf(emb); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
         let e2 = cb.empty(d); cb.gemv(g(&self.fc_e)?, &en, d, 0, &e2, d, 0);
         let hn = cb.empty(w); mg::rms_seg(cb, r, w, &gw[1], w, &hn, w, w, 1, 1, eps);
         let h2 = cb.empty(w); let fh = g(&self.fc_h)?; for s in 0..hc { cb.gemv(fh, &hn, w, s * d, &h2, w, s * d); }
-        let rr = cb.empty(w); mg::add_b(cb, &h2, &e2, &rr, d, w);
-        let (m, inj) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?;
+        let rr = cb.empty(w); mg::add_b(cb, &h2, &e2, &rr, d, w); sy("input", &rr);
+        let (m, inj) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?; sy("hca", &m);
         let kf = cb.empty(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = cb.empty(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
         let kn = cb.empty(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_seg(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pos);
-        mg::cp(cb, &kn, row, kc, cap * row, 0, (pos % cap) * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, (pos % cap) * row, row);
+        mg::cp(cb, &kn, row, kc, cap * row, 0, (pos % cap) * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, (pos % cap) * row, row); sy("kv", &kn);
         let n = pos + 1; let c0 = n.saturating_sub(self.window).max(kc0);
         let qr = self.q.rows; let qf = cb.empty(qr); cb.gemv(g(&self.q)?, &m, d, 0, &qf, qr, 0);
-        let qn = cb.empty(qr); mg::rms_seg(cb, &qf, qr, &gw[5], hd, &qn, hd, 2 * hd, nh, 1, eps); mg::rope_seg(cb, &qn, qr, &gw[7], self.n_rot / 2, 2 * hd, nh, pos);
-        let att = cb.empty(nh * hd); mg::attn1(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, c0, n - c0, row, hd, nh / self.nkv, (hd as f32).sqrt().recip(), cap);
+        let qn = cb.empty(qr); mg::rms_seg(cb, &qf, qr, &gw[5], hd, &qn, hd, 2 * hd, nh, 1, eps); mg::rope_seg(cb, &qn, qr, &gw[7], self.n_rot / 2, 2 * hd, nh, pos); sy("q", &qn);
+        let att = cb.empty(nh * hd); mg::attn1(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, c0, n - c0, row, hd, nh / self.nkv, (hd as f32).sqrt().recip(), cap); sy("attn", &att);
         let bo = cb.empty(d); cb.gemv(g(&self.o)?, &att, nh * hd, 0, &bo, d, 0);
-        mg::hc_comb(cb, &rr, &bo, &inj, d, hc);
-        let (m2, inj2) = self.hc_mix_g(cb, g, &self.hcf, 3, &rr)?;
+        mg::hc_comb(cb, &rr, &bo, &inj, d, hc); sy("o", &rr);
+        let (m2, inj2) = self.hc_mix_g(cb, g, &self.hcf, 3, &rr)?; sy("hcf", &m2);
         let rn = self.rsu.rows; let rsu = cb.empty(rn); cb.gemv(g(&self.rsu)?, &m2, d, 0, &rsu, rn, 0);
         let sf = (rn - self.ne) / 2; let gsb = cb.empty(sf); mg::silu2(cb, &rsu, rn, &gsb, self.ne, sf);
-        let ysh = cb.empty(d); cb.gemv(g(&self.sd)?, &gsb, sf, 0, &ysh, d, 0);
+        let ysh = cb.empty(d); cb.gemv(g(&self.sd)?, &gsb, sf, 0, &ysh, d, 0); sy("shared", &ysh);
         let ne = self.ne; let pn = ne + 2 * d + 2 * row; let pk = cb.empty(pn);
         mg::cp(cb, &rsu, rn, &pk, pn, 0, 0, ne); mg::cp(cb, &m2, d, &pk, pn, 0, ne, d); mg::cp(cb, &ysh, d, &pk, pn, 0, ne + d, d);
         mg::cp(cb, &kn, row, &pk, pn, 0, ne + 2 * d, row); mg::cp(cb, &vf, row, &pk, pn, 0, ne + 2 * d + row, row);

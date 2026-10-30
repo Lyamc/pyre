@@ -1453,7 +1453,7 @@ impl Model {
             if t == 1 { cb.gemv(g, &xb, q.cols, 0, &o, q.rows, 0); } else { cb.gemv_m(g, &xb, t * q.cols, 0, q.cols, &o, t * q.rows, 0, q.rows, t); } let _ = cb.read(&o); } } }
             eprintln!("mtp: drafter kernels warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }
         if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }); }
-        if env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) { if let (Some(map), Some(Some(hm))) = (self.mtp_dense.get(), self.mtp_headc.get()) { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); } }
+        self.mtp_step_warm();
     }
 
     // ---- speculative decoding: multi-token verify on the decode (CubeCL) path, with rollback ----
@@ -1462,8 +1462,17 @@ impl Model {
     /// Compile the decode and verify-window kernels now (opt-in PYRE_QN_PREWARM=1; b326: same output, no clear gain: NATIVE2 A tps 30.3 vs 33.1 off): a throwaway state runs a
     /// one-token step and one verify window of every size up to the spec maximum; the expert cache's routing
     /// counts and stats are reset afterwards so the cache fills exactly as without it.
+    /// PYRE_MTP_GPUSTEP: compile the GPU draft step's kernels (one throwaway step), so the first draft does not pay ~300 ms of JIT
+    fn mtp_step_warm(&self) {
+        if !env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) { return; }
+        let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
+        let hm = self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } cb.upload_q8(h.rows, h.cols, h.blocks()) });
+        match (self.mtp_dense.get(), hm) { (Some(map), Some(hm)) => { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }
+            (a, b) => eprintln!("mtp: gpu step NOT warmed (dense {} head {})", a.is_some(), b.is_some()) }
+    }
     pub fn prewarm_verify(&self) {
         if env_var("PYRE_QN_PREWARM").map(|v| v == "0").unwrap_or(false) || !self.multi_ok() { return; }
+        self.mtp_step_warm();
         let t0 = std::time::Instant::now(); let mut st = self.new_state();
         let _ = self.forward_inner(&[1, 2], &mut st);
         let mw = self.spec_max_window().min(if super::qn_cube::native_mode() == 2 { 7 } else { 3 }); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
