@@ -438,3 +438,97 @@ pub fn find() -> Option<std::path::PathBuf> {
     let snap = std::path::Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots");
     std::fs::read_dir(snap).ok()?.filter_map(|e| e.ok()).map(|e| e.path().join("mtp.safetensors")).find(|p| p.exists())
 }
+/// PYRE_MTP_GX (=1 on): routed experts on the GPU from a resident LRU pool of Q8 expert slots (PYRE_MTP_GX_MB, default 400)
+/// and k draft steps chained on the GPU (argmax -> Q8 draft-vocab embedding -> next step) with one readback per draft run.
+/// Experts not resident are skipped for that draft (weights renormalised over the resident picks); misses are uploaded
+/// after the run (up to PYRE_MTP_GX_UP per run, default 16). Draft-only numerics: verify decides every token.
+pub fn gx_on() -> bool { static M: OnceLock<bool> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GX").map(|v| v != "0").unwrap_or(false)) }
+pub static GX_ST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+const GXK: usize = 16;
+pub struct GXP { n: usize, wsl: usize, ssl: usize, wsd: usize, ssd: usize, wgu: H, sgu: H, wdn: H, sdn: H, smap: H, sgw: H, ew: H, es: H, ewn: usize, esn: usize,
+    slot_of: Vec<i32>, exp_of: Vec<i32>, last: Vec<u64>, clock: u64 }
+pub struct GG3 { fx: Vec<H>, b: Vec<H>, g: Option<burn_cubecl::cubecl::client::Graph>, o: Option<(H, H, H)>, key: (u64, usize, usize), ob: H }
+pub static GX_S: std::sync::Mutex<Option<(Option<GXP>, Option<GG3>)>> = std::sync::Mutex::new(None);
+fn q8ws(q: &Q8Mat) -> (Vec<f32>, Vec<f32>) {
+    let mut w = vec![0f32; q.rows * q.cols / 4]; let mut s = vec![0f32; q.rows * q.cols / 32];
+    w.par_chunks_mut(8 * 256).zip(s.par_chunks_mut(256)).zip(q.blocks().par_chunks(34 * 256)).for_each(|((w, s), bl)| {
+        for (b, blk) in bl.chunks_exact(34).enumerate() { s[b] = half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32(); for (i, c) in blk[2..].chunks_exact(4).enumerate() { w[b * 8 + i] = f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])); } } });
+    (w, s)
+}
+impl Mtp {
+    fn gx_new(&self, cb: &Cb, emb: &(dyn Fn(u32, &mut [f32]) + Sync)) -> Option<GXP> {
+        let (d, ff, ne) = (self.d, self.ff, self.ne); if ne > 1024 || self.top_k > 64 || d % 32 != 0 || ff % 32 != 0 { eprintln!("mtp gx: unsupported shape, off"); return None; }
+        let mb: usize = std::env::var("PYRE_MTP_GX_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let per = 3 * d * ff * 9 / 8; let n = (mb << 20) / per; if n < self.top_k { eprintln!("mtp gx: budget too small"); return None; } let n = n.min(ne);
+        let nh = self.head.rows; let eb = nh * d * 9 / 8;
+        if !cb.take(n * per + eb) { eprintln!("mtp gx: no vram budget, off"); return None; }
+        let t0 = std::time::Instant::now();
+        let (mut ew, mut es) = (vec![0f32; nh * d / 4], vec![0f32; nh * d / 32]);
+        ew.par_chunks_mut(d / 4).zip(es.par_chunks_mut(d / 32)).zip(self.ids.par_iter()).for_each(|((ew, es), &id)| { let mut row = vec![0f32; d]; emb(id, &mut row);
+            for (bi, b) in row.chunks_exact(32).enumerate() { let am = b.iter().fold(0f32, |a, v| a.max(v.abs())); let sc = am / 127.0; let iv = if sc > 0.0 { 1.0 / sc } else { 0.0 }; es[bi] = sc;
+                for (ci, c) in b.chunks_exact(4).enumerate() { let q: Vec<u8> = c.iter().map(|v| ((v * iv).round().clamp(-127.0, 127.0) as i8) as u8).collect(); ew[bi * 8 + ci] = f32::from_bits(u32::from_le_bytes([q[0], q[1], q[2], q[3]])); } } });
+        let (wsl, ssl, wsd, ssd) = (2 * ff * d / 4, 2 * ff * d / 32, d * ff / 4, d * ff / 32);
+        let p = GXP { n, wsl, ssl, wsd, ssd, wgu: cb.empty(n * wsl), sgu: cb.empty(n * ssl), wdn: cb.empty(n * wsd), sdn: cb.empty(n * ssd), smap: cb.buf(&vec![-1f32; ne]), sgw: cb.buf(&self.sgate),
+            ewn: ew.len(), esn: es.len(), ew: cb.buf(&ew), es: cb.buf(&es), slot_of: vec![-1; ne], exp_of: vec![-1; n], last: vec![0; n], clock: 0 };
+        eprintln!("mtp gx: {n} expert slots ({:.0} MB) + draft-vocab embedding ({:.0} MB) on gpu, {:.0} ms", (n * per) as f64 / 1e6, eb as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
+        Some(p)
+    }
+    fn gx_upload(&self, cb: &Cb, p: &mut GXP, ids: &[usize]) {
+        use super::mtp_gpu as mg; let up: usize = std::env::var("PYRE_MTP_GX_UP").ok().and_then(|v| v.parse().ok()).unwrap_or(2); let mut nup = 0; let mut ch = false; let tu = std::time::Instant::now();
+        for &e in ids { if e >= self.ne { continue; } p.clock += 1; let s = p.slot_of[e];
+            if s >= 0 { p.last[s as usize] = p.clock; GX_ST[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); continue; }
+            GX_ST[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); if nup >= up { continue; }
+            let sl = (0..p.n).min_by_key(|&i| p.last[i]).unwrap(); if p.exp_of[sl] >= 0 { p.slot_of[p.exp_of[sl] as usize] = -1; }
+            let (gu, dn) = self.expert(e); let (w1, s1) = q8ws(gu); let (w2, s2) = q8ws(dn);
+            for (src, dst, tot, off) in [(&w1, &p.wgu, p.n * p.wsl, sl * p.wsl), (&s1, &p.sgu, p.n * p.ssl, sl * p.ssl), (&w2, &p.wdn, p.n * p.wsd, sl * p.wsd), (&s2, &p.sdn, p.n * p.ssd, sl * p.ssd)] {
+                let t = cb.buf(src); mg::cpw(cb, &t, dst, tot, off, src.len()); }
+            p.exp_of[sl] = e as i32; p.slot_of[e] = sl as i32; p.last[sl] = p.clock; nup += 1; ch = true; GX_ST[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if ch { let v: Vec<f32> = p.slot_of.iter().map(|&s| s as f32).collect(); let t = cb.buf(&v); mg::cpw(cb, &t, &p.smap, self.ne, 0, self.ne); } GX_ST[3].fetch_add(tu.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gpx<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM, fx: &[H], kc: &H, vc: &H, cap: usize, p: &GXP, al: &mut dyn FnMut(usize) -> H) -> Option<(H, H, H)> {
+        use super::mtp_gpu as mg; let (d, ff, ne, kk, row) = (self.d, self.ff, self.ne, self.top_k, self.row()); let w = self.hc * d; let pn = ne + 2 * d + 2 * row;
+        let (rr, inj2, pk) = self.gp1(cb, g, fx, kc, vc, cap, al)?;
+        let sel = al(3 * kk); mg::xsel(cb, &pk, pn, &p.smap, &sel, ne, kk);
+        let m2 = pk.clone().offset_start((ne * 4) as u64);
+        let h = al(kk * 2 * ff); mg::xgv(cb, &m2, d, &p.wgu, p.n * p.wsl, &p.sgu, p.n * p.ssl, &sel, kk, &h, 2 * ff, d, 0, p.wsl, p.ssl);
+        let a = al(kk * ff); mg::xact(cb, &h, &a, ff, kk);
+        let o = al(kk * d); mg::xgv(cb, &a, kk * ff, &p.wdn, p.n * p.wsd, &p.sdn, p.n * p.ssd, &sel, kk, &o, d, ff, ff, p.wsd, p.ssd);
+        mg::xsum(cb, &o, &sel, &pk, pn, &p.sgw, &fx[2], d, kk, ne);
+        self.gp2(cb, g, head, fx, &rr, &inj2, al)?;
+        let bo = al(2); cb.best_into(&fx[3], head.rows, &bo);
+        mg::next(cb, &fx[0], &bo, &p.ew, p.ewn, &p.es, p.esn, d, cap, row, self.window);
+        mg::cp(cb, &rr, w, &fx[1], w, 0, 0, w);
+        Some((pk, sel, bo))
+    }
+    /// k chained GPU draft steps from position `pos` (see gx_on); returns per step (draft-head index, p) and step 0's K/V row
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn draft_gx<'a>(&self, cb: &Cb, g: &(dyn Fn(&Q8Mat) -> Option<&'a CM> + Sync), head: &CM, kc: &H, vc: &H, cap: usize, kc0: usize, r: &H, emb: &[f32], pos: usize, rid: u64, k: usize, embf: &(dyn Fn(u32, &mut [f32]) + Sync)) -> Option<(Vec<(usize, f32)>, Vec<f32>, Vec<f32>)> {
+        use super::mtp_gpu as mg; let (d, w, row, kk) = (self.d, self.hc * self.d, self.row(), self.top_k); let k = k.min(GXK); let pn = self.ne + 2 * d + 2 * row; let _ = pn;
+        let mut gl = GX_S.lock().unwrap(); if gl.is_none() { *gl = Some((self.gx_new(cb, embf), None)); }
+        let (po, go) = gl.as_mut().unwrap(); let p = po.as_mut()?; let key = (rid, cap, head.rows);
+        if go.as_ref().map(|x| x.key != key).unwrap_or(true) { *go = Some(GG3 { fx: vec![cb.empty(4 + d), cb.empty(w), cb.empty(d), cb.empty(head.rows)], b: vec![], g: None, o: None, key, ob: cb.empty(2 * GXK + GXK * kk + 2 * row) }); }
+        let gg = go.as_mut().unwrap(); let fx = gg.fx.clone(); let obn = 2 * GXK + GXK * kk + 2 * row;
+        let n = pos + 1; let c0 = n.saturating_sub(self.window).max(kc0);
+        let mut hv = vec![pos as f32, ((pos % cap) * row) as f32, c0 as f32, (n - c0) as f32]; hv.extend_from_slice(emb);
+        let up = cb.buf(&hv); mg::cp(cb, &up, 4 + d, &fx[0], 4 + d, 0, 0, 4 + d); mg::cp(cb, r, w, &fx[1], w, 0, 0, w);
+        let off = GG_OFF.load(std::sync::atomic::Ordering::Relaxed);
+        let pr: &GXP = p;
+        for j in 0..k {
+            let (pk, sel, bo) = if let (Some(gr), Some(o)) = (gg.g.as_ref(), gg.o.clone()) { unsafe { gr.replay() }.expect("mtp gx graph replay"); GG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); o } else {
+                let fresh = gg.b.is_empty(); let o = self.g_run(cb, &mut gg.b, &|al| self.gpx(cb, g, head, &fx, kc, vc, cap, pr, al))?;
+                if !fresh && !off { gg.g = self.g_capture(cb, &mut gg.b, &|al| self.gpx(cb, g, head, &fx, kc, vc, cap, pr, al)); }
+                gg.o = Some(o.clone()); o };
+            mg::cp(cb, &bo, 2, &gg.ob, obn, 0, 2 * j, 2); mg::cp(cb, &sel, 3 * kk, &gg.ob, obn, 2 * kk, 2 * GXK + j * kk, kk);
+            if j == 0 { mg::cp(cb, &pk, pn, &gg.ob, obn, self.ne + 2 * d, 2 * GXK + GXK * kk, 2 * row); }
+        }
+        let hv = cb.read(&gg.ob);
+        let bs: Vec<(usize, f32)> = (0..k).map(|j| (hv[2 * j] as usize, hv[2 * j + 1])).collect();
+        let ids: Vec<usize> = (0..k * kk).map(|i| hv[2 * GXK + i] as usize).collect();
+        let kvo = 2 * GXK + GXK * kk; let (kr, vr) = (hv[kvo..kvo + row].to_vec(), hv[kvo + row..kvo + 2 * row].to_vec());
+        self.gx_upload(cb, p, &ids);
+        if std::env::var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp gx: hits {} misses {} uploads {} ({:.1} ms)", GX_ST[0].load(std::sync::atomic::Ordering::Relaxed), GX_ST[1].load(std::sync::atomic::Ordering::Relaxed), GX_ST[2].load(std::sync::atomic::Ordering::Relaxed), GX_ST[3].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6); }
+        Some((bs, kr, vr))
+    }
+}

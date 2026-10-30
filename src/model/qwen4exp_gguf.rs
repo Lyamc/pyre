@@ -1375,10 +1375,10 @@ impl Model {
         if lo < n - 1 {
             let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
             for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
-            let gsc = mtp_gpustep() && env_var("PYRE_MTP_GPUCATCH").map(|v| v == "1").unwrap_or(false);
+            let gsc = mtp_gpustep() && env_var("PYRE_MTP_GPUCATCH").map(|v| v != "0").unwrap_or(true);
             let mut gdone_c = false;
             if ok && gsc { if let (Some(cb), Some(map), Some(Some(_))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
-                // PYRE_MTP_GPUCATCH=1 (opt-in): catch-up cells on the GPU, written straight into the resident K/V ring; inputs in one upload, K/V copies in one readback
+                // PYRE_MTP_GPUCATCH (default on, =0 off; pp26 B 27.7 vs 26.6, C/A same, greedy == refs): catch-up cells on the GPU, written straight into the resident K/V ring; inputs in one upload, K/V copies in one readback
                 let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
                 if kv.end() != lo || kv.n == 0 { m.kv_reset(&mut kv, lo); }
                 let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap);
@@ -1402,7 +1402,16 @@ impl Model {
                 let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap); let kc0 = kv.c0; let mut rh = cb.buf(&r);
                 // PYRE_MTP_GRAPH (default on, =0 off): the step as two captured CUDA graphs (head included); pp24 A 33.5 vs 29.8* steady, B 27.2 vs 26.8, C 29.1 vs 29.2, greedy == refs
                 let gmode = env_var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true); let rid = gr.id;
-                for j in 0..(if gmode { k } else { 0 }) {
+                // PYRE_MTP_GX=1: routed experts on the GPU (resident LRU pool) + the k draft steps chained on the GPU, one readback per run
+                let gxm = gmode && super::mtp::gx_on();
+                if gxm { self.embd.row(tok as usize, &mut e); let th = std::time::Instant::now();
+                    if let Some((bs, krow, vrow)) = m.draft_gx(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1, rid, k, &|t, o| self.embd.row(t as usize, o)) {
+                        m.kv_push(&mut kv, &krow, &vrow);
+                        for (j, &(i, p)) in bs.iter().enumerate() { if j > 0 && p < min_p { break; } out.push((m.head_ids()[i.min(hm.rows - 1)], None)); }
+                    }
+                    HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                for j in 0..(if gmode && !gxm { k } else { 0 }) {
                     self.embd.row(tok as usize, &mut e);
                     let Some((lg, rr2, krow, vrow)) = m.step_gpu_g(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j, rid) else { break };
                     if j == 0 { m.kv_push(&mut kv, &krow, &vrow); }

@@ -2906,7 +2906,9 @@ impl Cube {
             BufferArg::from_raw_parts(xq, m.cols / 4), BufferArg::from_raw_parts(xs, nb), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
             BufferArg::from_raw_parts(out.clone(), m.rows), m.rows as u32, m.cols as u32) }
         true
-    }    /// mtp::best on the GPU: (argmax, 1/sum exp(v-max)) of lg[0..n] with an 8-byte readback
+    }    /// k_best into o[0..2] (no readback; PYRE_MTP_GX chained drafts)
+    pub fn best_into(&self, lg: &Handle, n: usize, o: &Handle) { unsafe { k_best::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), BufferArg::from_raw_parts(lg.clone(), n), BufferArg::from_raw_parts(o.clone(), 2), n as u32) } }
+    /// mtp::best on the GPU: (argmax, 1/sum exp(v-max)) of lg[0..n] with an 8-byte readback
     pub fn best(&self, lg: &Handle, n: usize) -> (usize, f32) {
         let o = self.empty(2);
         unsafe { k_best::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), BufferArg::from_raw_parts(lg.clone(), n), BufferArg::from_raw_parts(o.clone(), 2), n as u32) }
