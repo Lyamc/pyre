@@ -715,7 +715,11 @@ impl Model {
         }
         cand.sort_by(|a, b| b.0.cmp(&a.0));
         let mut want = std::collections::HashSet::new(); let mut tot = 0usize;
-        for &(_, il, e) in &cand { let s = size(&self.layers[il]); if tot + s > xc.budget { break; } tot += s; want.insert((il, e)); }
+        // PYRE_QN_XPERLAYER=1 (opt-in): every layer gets an equal share of the slots (Strata's per-layer slot ranges,
+        // expert_cache.cpp layer_slot_range), ranked within the layer; a layer short of candidates leaves its share to the rest
+        let pl_cap = if env_var("PYRE_QN_XPERLAYER").map(|v| v == "1").unwrap_or(false) { let nl = self.layers.len().max(1); let ns = xc.budget / slot.max(1); Some(ns.div_ceil(nl)) } else { None };
+        let mut per: Vec<usize> = vec![0; self.layers.len()];
+        for &(_, il, e) in &cand { if let Some(cap) = pl_cap { if per[il] >= cap { continue; } } let s = size(&self.layers[il]); if tot + s > xc.budget { if pl_cap.is_some() { continue; } break; } tot += s; per[il] += 1; want.insert((il, e)); }
         // eviction order: resident experts that fell out of the wanted set, least used first
         let mut evict: Vec<(u64, usize, usize)> = xc.map.keys().filter(|k| !want.contains(k)).map(|&(il, e)| (xscore(xc, il, e), il, e)).collect();
         // full tie-break: HashMap key order is random per process, and the slot an expert lands in decides the GPU summation order (run-to-run identical output)
