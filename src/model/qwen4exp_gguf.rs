@@ -1321,7 +1321,7 @@ impl Model {
         // PYRE_QN_GUQ (default on): the task finishing an expert's last gate/up block quantizes that expert's hidden
         // rows for down (same function, same input -> identical), instead of a serial pass between the two rounds
         let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
-        let guq = used && !exq && env_var("PYRE_QN_GUQ").map(|v| v != "0").unwrap_or(true);
+        let guq = used && env_var("PYRE_QN_GUQ").map(|v| v != "0").unwrap_or(true);
         let mut hdq: Vec<Vec<qdot::Q8D>> = if guq { work.iter().map(|(_, toks)| (0..toks.len()).map(|_| qdot::Q8D::default()).collect()).collect() } else { vec![] };
         struct QP(*mut Vec<qdot::Q8D>); unsafe impl Sync for QP {} unsafe impl Send for QP {}
         let qp = QP(hdq.as_mut_ptr()); let qp = &qp;
@@ -1339,11 +1339,11 @@ impl Model {
             struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
             let (wi, r0, r1) = if !gtask.is_empty() { gtask[k] } else { let (wi, b) = (k / nb, k % nb); (if lfo.is_empty() { wi } else { lfo[wi] }, b * blk, ((b + 1) * blk).min(ff)) }; let (e, toks) = work[wi];
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
-            struct Q<'a>(bool, &'a [std::sync::atomic::AtomicUsize], usize, &'a QP, usize, usize, &'a SyncPtr, &'a [usize]);
+            struct Q<'a>(bool, &'a [std::sync::atomic::AtomicUsize], usize, &'a QP, usize, usize, &'a SyncPtr, &'a [usize], bool);
             impl Drop for Q<'_> { fn drop(&mut self) { if !self.0 { return; } if self.1[self.2].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
                 let v = unsafe { &mut *self.3 .0.add(self.2) }; let (ff, wi) = (self.5, self.2);
-                for j in 0..self.4 { super::qdot::quantize_d_into(unsafe { self.6.slice(self.7[wi] + j * ff, ff) }, &mut v[j]); } } } }
-            let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff);
+                for j in 0..self.4 { let hx = unsafe { self.6.slice(self.7[wi] + j * ff, ff) }; if self.8 { super::qdot::quantize_d_into_x(hx, &mut v[j]); } else { super::qdot::quantize_d_into(hx, &mut v[j]); } } } } }
+            let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff, exq);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
                 let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
                 let multi = usek && toks.len() >= 2 && toks.len() <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
