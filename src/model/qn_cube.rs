@@ -1351,6 +1351,26 @@ fn k_comb_m(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], a: &
         if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else { x3[k as usize] += v; }
     }
 }
+/// The post-MoE k_comb3 (gate on, b on, c per token where cm bit ti) for up to 4 tokens in one launch; token ti =
+/// CUBE_POS_Y; a, b, gb, dn are contiguous per token (strides d, d, gs, ds); per element k_comb's arithmetic.
+#[cube(launch_unchecked)]
+fn k_comb3_m(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], c0: &[f32], c1: &[f32], c2: &[f32], c3: &[f32], a: &[f32], b: &[f32], gb: &[f32], dn: &[f32], d: u32, gs: u32, goff: u32, ds: u32, lr: u32, cm: u32, #[comptime] hc: u32) {
+    let k = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if k < d * hc {
+        let st = k / d;
+        let i = k % d;
+        let mut o = a[(ti * d + i) as usize];
+        o = o / (1.0f32 + f32::exp(-gb[(ti * gs + goff) as usize]));
+        o += b[(ti * d + i) as usize];
+        if ((cm >> ti) & 1u32) == 1u32 {
+            if ti == 0u32 { o += c0[i as usize]; } else if ti == 1u32 { o += c1[i as usize]; } else if ti == 2u32 { o += c2[i as usize]; } else { o += c3[i as usize]; }
+        }
+        let inj = dn[(ti * ds + lr + st) as usize] / f32::cast_from(hc);
+        let v = o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+        if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else { x3[k as usize] += v; }
+    }
+}
 /// x[s,i] += (a[i] * (gate? sigmoid(gb[goff]) : 1) + (b? b[i] : 0)) * 2 sigmoid(dn[lr+s]/hc)
 #[cube(launch_unchecked)]
 fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], c: &[f32], gb: &[f32], dn: &[f32], d: u32, goff: u32, lr: u32, #[comptime] hc: u32, #[comptime] gate: bool, #[comptime] addb: bool, #[comptime] addc: bool) {
@@ -2768,6 +2788,18 @@ impl Cube {
         unsafe { k_comb_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
             BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(dn.clone(), t * ds), d as u32, ds as u32, lr as u32, hc as u32) }
+    }
+    /// k_comb3 (gate, b, optional per-token c) for xs.len() <= 4 tokens in one launch
+    #[allow(clippy::too_many_arguments)]
+    pub fn comb3_m(&self, xs: &[Handle], cs: &[Option<Handle>], a: &Handle, b: &Handle, gb: &Handle, gn: usize, gs: usize, goff: usize, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone(); let mut cm = 0u32;
+        for i in 0..t { if cs[i].is_some() { cm |= 1 << i; } }
+        let c = |i: usize| -> Handle { match cs.get(i) { Some(Some(h)) => h.clone(), _ => a.clone() } };
+        unsafe { k_comb3_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
+            BufferArg::from_raw_parts(c(0), d), BufferArg::from_raw_parts(c(1), d), BufferArg::from_raw_parts(c(2), d), BufferArg::from_raw_parts(c(3), d),
+            BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(b.clone(), t * d), BufferArg::from_raw_parts(gb.clone(), gn), BufferArg::from_raw_parts(dn.clone(), t * ds),
+            d as u32, gs as u32, goff as u32, ds as u32, lr as u32, cm, hc as u32) }
     }
     pub fn comb(&self, x: &Handle, a: &Handle, b: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) { self.comb3(x, a, b, None, g, dn, lr, hc, d) }
     #[allow(clippy::too_many_arguments)]

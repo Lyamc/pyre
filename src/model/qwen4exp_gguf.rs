@@ -1660,7 +1660,7 @@ impl Model {
         let mut yr = vec![0f32; t * d];
         let mut ygs: Vec<Option<burn_cubecl::cubecl::server::Handle>> = vec![None; t];
         let mut shs: Vec<burn_cubecl::cubecl::server::Handle> = Vec::with_capacity(t);
-        let (hb_all, sh_all) = (cb.empty(t * sf), cb.empty(t * d));
+        let (hb_all, sh_all) = (cb.empty(t * sf), cb.empty(t * d)); let mut sh_b = false;
         let xin: Vec<f32> = rvs.iter().flat_map(|r| r[..d].iter().copied()).collect();
         if let Some(xm) = &self.xc {
             let mut xcg = xm.lock().unwrap();
@@ -1734,7 +1734,7 @@ impl Model {
                     cb.silu_mul(rd, rn, d + ne, d + ne + sf, &at(&hb_all, ti * sf), sf);
                 }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
-                for ti in 0..t { shs.push(at(&sh_all, ti * d)); }
+                for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
                 let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             };
             // union of the missed experts; each token keeps its own order for the accumulation
@@ -1763,9 +1763,11 @@ impl Model {
         }
         let q6 = std::time::Instant::now();
         let yball = cb.buf(&yr);
+        if sh_b && combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
         for ti in 0..t {
             let yb = at(&yball, ti * d);
             cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d);
+        }
         }
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
         HY[0].fetch_add(ns(q6, std::time::Instant::now()), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
