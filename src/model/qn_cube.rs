@@ -1270,6 +1270,66 @@ fn k_gemv_iq4s_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32],
 }
 
 /// IQ4_XS GEMV with int8 activations (x packed by k_q8pack) and dp4a. t2[b] = IQ4_NL level of the low
+/// k_gemv_iq4s_m in ggml/Strata native_iq4_xs_mmvq order for any row length (PYRE_QN_NATX): lane l keeps one partial per
+/// virtual warp v (blocks 4v + l/8 + 16k), summed ((p0 + p1) + p2) + p3 then xor butterfly - the 4-warp kernel's bits on
+/// one warp (Strata, MIT, native_mmvq.cu note at the ROWS kernels).
+#[cube(launch_unchecked)]
+fn k_gemv_iq4s_mx(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32, #[comptime] fm: bool) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nb = cols / 256;
+        let rw = nb * 35;
+        let ib = UNIT_POS_X % 8;
+        let cq = cols / 4;
+        let cs = cols / 32;
+        let mut a0 = 0.0f32; let mut a0b = 0.0f32; let mut a0c = 0.0f32; let mut a0d = 0.0f32;
+        let mut a1 = 0.0f32; let mut a1b = 0.0f32; let mut a1c = 0.0f32; let mut a1d = 0.0f32;
+        let mut a2 = 0.0f32; let mut a2b = 0.0f32; let mut a2c = 0.0f32; let mut a2d = 0.0f32;
+        let mut a3 = 0.0f32; let mut a3b = 0.0f32; let mut a3c = 0.0f32; let mut a3d = 0.0f32;
+        let mut blk = UNIT_POS_X / 8; let mut m = 0u32;
+        while blk < nb {
+            let b0 = row * rw + blk * 35;
+            let d = f32::reinterpret(w[b0 as usize]);
+            let sh = w[(b0 + 1) as usize];
+            let sl = w[(b0 + 2) as usize];
+            let ls = i32::cast_from(((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4)) - 32i32;
+            let xw = blk * 64 + ib * 8;
+            let mut s0 = 0i32;
+            let mut s1 = 0i32;
+            let mut s2 = 0i32;
+            let mut s3 = 0i32;
+            #[unroll]
+            for j in 0..4u32 {
+                let q = w[(b0 + 3 + ib * 4 + j) as usize];
+                let (lu, hu) = iq4_lookup(q);
+                let lo = i32::cast_from(lu);
+                let hi = i32::cast_from(hu);
+                s0 = dp4a(hi, i32::cast_from(xq[(xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(xw + j) as usize]), s0));
+                if nt > 1u32 { s1 = dp4a(hi, i32::cast_from(xq[(cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(cq + xw + j) as usize]), s1)); }
+                if nt > 2u32 { s2 = dp4a(hi, i32::cast_from(xq[(2 * cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(2 * cq + xw + j) as usize]), s2)); }
+                if nt > 3u32 { s3 = dp4a(hi, i32::cast_from(xq[(3 * cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(3 * cq + xw + j) as usize]), s3)); }
+            }
+            let xi = blk * 8 + ib;
+            let vd = d * hround(xs[xi as usize]); let vs = f32::cast_from(s0 * ls); let vv = vd * vs; let vw = m % 4u32; if vw == 0u32 { if fm { a0 = fma(vd, vs, a0); } else { a0 += vv; } } else if vw == 1u32 { if fm { a0b = fma(vd, vs, a0b); } else { a0b += vv; } } else if vw == 2u32 { if fm { a0c = fma(vd, vs, a0c); } else { a0c += vv; } } else { if fm { a0d = fma(vd, vs, a0d); } else { a0d += vv; } }
+            if nt > 1u32 { let vd = d * hround(xs[(cs + xi) as usize]); let vs = f32::cast_from(s1 * ls); let vv = vd * vs; let vw = m % 4u32; if vw == 0u32 { if fm { a1 = fma(vd, vs, a1); } else { a1 += vv; } } else if vw == 1u32 { if fm { a1b = fma(vd, vs, a1b); } else { a1b += vv; } } else if vw == 2u32 { if fm { a1c = fma(vd, vs, a1c); } else { a1c += vv; } } else { if fm { a1d = fma(vd, vs, a1d); } else { a1d += vv; } } }
+            if nt > 2u32 { let vd = d * hround(xs[(2 * cs + xi) as usize]); let vs = f32::cast_from(s2 * ls); let vv = vd * vs; let vw = m % 4u32; if vw == 0u32 { if fm { a2 = fma(vd, vs, a2); } else { a2 += vv; } } else if vw == 1u32 { if fm { a2b = fma(vd, vs, a2b); } else { a2b += vv; } } else if vw == 2u32 { if fm { a2c = fma(vd, vs, a2c); } else { a2c += vv; } } else { if fm { a2d = fma(vd, vs, a2d); } else { a2d += vv; } } }
+            if nt > 3u32 { let vd = d * hround(xs[(3 * cs + xi) as usize]); let vs = f32::cast_from(s3 * ls); let vv = vd * vs; let vw = m % 4u32; if vw == 0u32 { if fm { a3 = fma(vd, vs, a3); } else { a3 += vv; } } else if vw == 1u32 { if fm { a3b = fma(vd, vs, a3b); } else { a3b += vv; } } else if vw == 2u32 { if fm { a3c = fma(vd, vs, a3c); } else { a3c += vv; } } else { if fm { a3d = fma(vd, vs, a3d); } else { a3d += vv; } } }
+            blk += 4u32; m += 1u32;
+        }
+        let t0 = wsum(((a0 + a0b) + a0c) + a0d);
+        let t1 = wsum(((a1 + a1b) + a1c) + a1d);
+        let t2s = wsum(((a2 + a2b) + a2c) + a2d);
+        let t3 = wsum(((a3 + a3b) + a3c) + a3d);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t0;
+            if nt > 1u32 { out[(ooff + ost + row) as usize] = t1; }
+            if nt > 2u32 { out[(ooff + 2 * ost + row) as usize] = t2s; }
+            if nt > 3u32 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
+/// IQ4_XS GEMV with int8 activations (x packed by k_q8pack) and dp4a. t2[b] = IQ4_NL level of the low
 /// nibble of byte b in bits 0..8 and of the high nibble in bits 8..16, so one lookup per weight byte.
 #[cube(launch_unchecked)]
 fn k_gemv_iq4d(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32) {
@@ -3011,7 +3071,9 @@ impl Cube {
         if !m.nat.is_empty() && native_mode() == 2 && ((2..=4).contains(&nt) && natm() || natx() && (1..=4).contains(&nt)) {
             let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
             if natx() { unsafe { k_q8pack_mx::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) } } else { unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) } }
-            if nats_on() || natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            if natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_mx::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32, natx_fma()) } } } else if nats_on() || natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
             for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { unsafe { k_gemv_iq4d_r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
@@ -3459,3 +3521,6 @@ fn natchk(cb: &Cube, m: &CMat, x: &Handle, xoff: usize, xst: usize, xq: &Handle,
             let g = ov[ooff + c * ost + r0 + r]; tot += 1; if g.to_bits() != v[0].to_bits() { bad += 1; maxu = maxu.max((g.to_bits() as i64 - v[0].to_bits() as i64).unsigned_abs() as u32); } } } }
     eprintln!("natchk call {call}: {}x{} nt={nt} nat rows {rows_nat} q8 rows {} | q8_1 codes bad {qbad} scales bad {sbad} | out {bad}/{tot} differ (max {maxu} ulp)", m.rows, cols, m.rows - rows_nat);
 }
+
+/// PYRE_QN_NATX_FMA=1: NATX in-lane accumulation as fma(d, sumi, acc) (nvcc contracts ggml's tmp += d*sumi)
+fn natx_fma() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_NATX_FMA").map(|v| v == "1").unwrap_or(false)) }
