@@ -144,6 +144,8 @@ fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v
 /// Submit queued GPU work before the CPU expert pass (WDDM otherwise holds it until the next read). PYRE_QN_KICK=1 on (no measurable effect on HYTE, so off).
 /// One-arena low-overhead expert path (PYRE_QN_XFAST=0 off).
 fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XFAST").map(|v| v != "0").unwrap_or(true)) }
+// PYRE_QN_KICKQ=1: the kick hands the queue to the device thread without waiting for it to drain
+fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICKQ").map(|v| v == "1").unwrap_or(false)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -287,7 +289,8 @@ impl Model {
                 } }
                 self.cl = cl;
                 // LM head on the GPU (opt-in PYRE_QN_GPUHEAD=1: only ~+0.3 tok/s, and as Q8 it costs VRAM
-                if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(false) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
+                // default on with PYRE_QN_NATIVE=2 (same output on A/B/C; the verify head then runs as one batched GPU GEMV); PYRE_QN_GPUHEAD=0 off
+                if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
                 let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
@@ -471,7 +474,7 @@ impl Model {
                 }
                 cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
                 cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
-                if kick() { let _ = cb.client.flush(); }
+                if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } }
             };
             MISS[3].fetch_add(off.len() as u64, std::sync::atomic::Ordering::Relaxed); MISS[4].fetch_add(on.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if !off.is_empty() {
@@ -485,7 +488,7 @@ impl Model {
         } else {
             cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
             cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
-            if kick() { let _ = cb.client.flush(); }
+            if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } }
             self.routed(l, &rv[..d], &rv[d..d + ne], 1, &mut yr, false);
         }
         let q6 = std::time::Instant::now();
@@ -1418,7 +1421,7 @@ impl Model {
                     let (n0, n1) = grp[ng]; let q4d = std::time::Instant::now();
                     dq[ng] = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xs.as_ref().unwrap()[n0..n1], st, ctr[nl].0, ctr[nl].1, start + n0, n0, t));
                     let q4f = std::time::Instant::now(); WV[3].fetch_add((q4f - q4d).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if wflush() { let _ = cb.client.flush(); } WV[4].fetch_add(q4f.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if wflush() { let _ = cb.client.flush(); } else if kickq() { cb.client.flush_queue(); } WV[4].fetch_add(q4f.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 } }
                 let q4b = std::time::Instant::now();
                 if prewake() { qn_pool().prewake(); }
@@ -1442,10 +1445,10 @@ impl Model {
         }
         let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
-        let headb = self.headc.is_none() && env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
+        let headb = env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
         for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); if headb { hb.extend_from_slice(&hh); nb += 1; } else { lg.push(self.head_logits(&hh)); } }
         // one head GEMV for all verify tokens: the weights are read once; each column uses the same per-row arithmetic
-        if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(8); let y = self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap(); let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
+        if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(if self.headc.is_some() { 4 } else { 8 }); let y = if let Some(hm) = &self.headc { /* GPU Q8 head (PYRE_QN_GPUHEAD=1): up to 4 columns per gemv_m, weights read once */ let xb = cb.buf(&hb[done * d..(done + c) * d]); let o = cb.empty(c * hm.rows); if c == 1 { cb.gemv(hm, &xb, d, 0, &o, hm.rows, 0); } else { cb.gemv_m(hm, &xb, c * d, 0, d, &o, c * hm.rows, 0, hm.rows, c); } cb.read(&o) } else { self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap() }; let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} (dense {:.1} flush {:.1}) | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6, WV[3].swap(0, Relaxed) as f64 / 1e6, WV[4].swap(0, Relaxed) as f64 / 1e6);
@@ -1720,7 +1723,7 @@ impl Model {
                 }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                 for ti in 0..t { shs.push(at(&sh_all, ti * d)); }
-                let qf = std::time::Instant::now(); if kick() { let _ = cb.client.flush(); } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             };
             // union of the missed experts; each token keeps its own order for the accumulation
             let mut lists: Vec<(usize, Vec<(usize, f32)>)> = vec![]; let mut pos_of: std::collections::HashMap<usize, usize> = Default::default();
