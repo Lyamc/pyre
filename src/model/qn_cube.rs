@@ -2474,6 +2474,24 @@ fn k_xdown_qt(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l
         }
     }
 }
+/// PYRE_QN_XEXACT: qdot::xround / qdot::xexp, op for op
+#[cube]
+fn xround_g(x: f32) -> f32 {
+    let v = f32::floor(f32::abs(x) + 0.5f32);
+    let mut r = v;
+    if x < 0.0f32 { r = -v; }
+    r
+}
+#[cube]
+fn xexp_g(x0: f32) -> f32 {
+    let x = f32::min(f32::max(x0, -87.0f32), 88.0f32);
+    let n = f32::floor(fma(x, f32::reinterpret(1069066811u32), 0.5f32));
+    let r1 = fma(-n, f32::reinterpret(1060205056u32), x);
+    let r = fma(-n, f32::reinterpret(901758606u32), r1);
+    let mut p = f32::reinterpret(961547521u32);
+    p = fma(p, r, f32::reinterpret(985008993u32)); p = fma(p, r, f32::reinterpret(1007192201u32)); p = fma(p, r, f32::reinterpret(1026206379u32)); p = fma(p, r, f32::reinterpret(1042983595u32)); p = fma(p, r, 0.5f32); p = fma(p, r, 1.0f32); p = fma(p, r, 1.0f32);
+    p * f32::reinterpret(u32::cast_from(i32::cast_from(n) + 127i32) << 23u32)
+}
 /// PYRE_QN_XEXACT: Q8K activation quantization exactly as qdot::quantize_k_into (one scale per 256, sequential amax,
 /// d = amax/127, id = 1/d, q = round(x * id)); CUBE_POS_Y = token (row stride sst), one thread per 256-block.
 #[cube(launch_unchecked)]
@@ -2492,7 +2510,7 @@ fn k_q8k_m(src: &[f32], q: &mut [u32], sc: &mut [f32], sst: u32, nb: u32) {
             let mut word = 0u32;
             #[unroll]
             for j in 0..4u32 {
-                let v = i32::cast_from(f32::round(src[(base + w * 4 + j) as usize] * id));
+                let v = i32::cast_from(xround_g(src[(base + w * 4 + j) as usize] * id));
                 word |= (u32::cast_from(v) & 255u32) << (8 * j);
             }
             q[(c * nb * 64 + b * 64 + w) as usize] = word;
@@ -2517,7 +2535,7 @@ fn k_q8d(src: &[f32], q: &mut [u32], sc: &mut [f32], ss: &mut [u32], nb: u32) {
             let mut word = 0u32;
             #[unroll]
             for j in 0..4u32 {
-                let v = i32::cast_from(f32::round(src[(base + w * 4 + j) as usize] * id));
+                let v = i32::cast_from(xround_g(src[(base + w * 4 + j) as usize] * id));
                 sm += v;
                 word |= (u32::cast_from(v) & 255u32) << (8 * j);
             }
@@ -2632,7 +2650,7 @@ fn k_xgu_ex(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &
     if act && UNIT_POS == 0 {
         let g = ((fa[0] + fa[4]) + (fa[2] + fa[6])) + ((fa[1] + fa[5]) + (fa[3] + fa[7]));
         let u = ((fa[8] + fa[12]) + (fa[10] + fa[14])) + ((fa[9] + fa[13]) + (fa[11] + fa[15]));
-        let ex = f32::cast_from(f64::exp(f64::cast_from(-g)));
+        let ex = xexp_g(-g);
         let sg = 1.0f32 / (1.0f32 + ex);
         let sl = g * sg;
         h[(e * rows + row) as usize] = sl * u;
@@ -2762,7 +2780,7 @@ fn k_xgu_ex8(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: 
         let f = wy * 16;
         let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
         let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
-        let ex = f32::cast_from(f64::exp(f64::cast_from(-g)));
+        let ex = xexp_g(-g);
         let sg = 1.0f32 / (1.0f32 + ex);
         let sl = g * sg;
         h[(e * rows + row) as usize] = sl * u;

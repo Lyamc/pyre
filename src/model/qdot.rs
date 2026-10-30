@@ -293,6 +293,41 @@ unsafe fn dot_q8_avx2(row: &[u8], sc: &[f32], a: &Q8Act) -> f32 {
 // float multiply-add per 256 values remains. pyre's own implementation.
 pub struct Q8K { pub q: Vec<i8>, pub d: Vec<f32>, pub s8: Vec<i32> }
 impl Default for Q8K { fn default() -> Self { Q8K { q: vec![], d: vec![], s8: vec![] } } }
+/// PYRE_QN_XEXACT helpers, mirrored op for op by the GPU kernels (qn_cube xround_g / xexp_g), so CPU and GPU
+/// experts agree bit for bit without depending on libm: round half away from zero as floor(|x| + 0.5) with the sign,
+/// and exp from a fixed reduction (fma steps) + degree-7 Horner polynomial (fma) + an exact power-of-two scale.
+#[inline] pub fn xround(x: f32) -> f32 { let v = (x.abs() + 0.5).floor(); if x < 0.0 { -v } else { v } }
+#[inline] pub fn xexp(x: f32) -> f32 {
+    let x = x.max(-87.0).min(88.0);
+    let n = x.mul_add(f32::from_bits(0x3fb8aa3b), 0.5).floor();
+    let r = (-n).mul_add(f32::from_bits(0x3f317200), x); let r = (-n).mul_add(f32::from_bits(0x35bfbe8e), r);
+    let mut p = f32::from_bits(0x39500d01); p = p.mul_add(r, f32::from_bits(0x3ab60b61)); p = p.mul_add(r, f32::from_bits(0x3c088889)); p = p.mul_add(r, f32::from_bits(0x3d2aaaab)); p = p.mul_add(r, f32::from_bits(0x3e2aaaab)); p = p.mul_add(r, 0.5); p = p.mul_add(r, 1.0); p = p.mul_add(r, 1.0);
+    p * f32::from_bits(((n as i32 + 127) as u32) << 23)
+}
+#[inline] pub fn xsilu(x: f32) -> f32 { x * (1.0 / (1.0 + xexp(-x))) }
+/// quantize_k_into with xround (PYRE_QN_XEXACT)
+pub fn quantize_k_into_x(x: &[f32], a: &mut Q8K) {
+    let n = x.len(); a.q.resize(n, 0); a.d.resize(n / 256, 0.0); a.s8.resize(n / 8, 0);
+    for b in 0..n / 256 {
+        let xb = &x[b * 256..(b + 1) * 256];
+        let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 }; a.d[b] = d;
+        for j in 0..256 { a.q[b * 256 + j] = xround(xb[j] * id) as i8; }
+    }
+    for k in 0..n / 8 { a.s8[k] = a.q[8 * k..8 * k + 8].iter().map(|&v| v as i32).sum(); }
+}
+/// quantize_d_into with xround (PYRE_QN_XEXACT)
+pub fn quantize_d_into_x(x: &[f32], a: &mut Q8D) {
+    let n = x.len(); a.q.resize(n, 0); a.d.resize(n / 64, 0.0); a.s.resize(n / 64, 0);
+    for b in 0..n / 64 {
+        let xb = &x[b * 64..(b + 1) * 64];
+        let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0; let id = if d > 0.0 { 1.0 / d } else { 0.0 }; a.d[b] = d;
+        let mut s = 0i32;
+        for j in 0..16 { for k in 0..4 { let v = xround(xb[4 * j + k] * id) as i8; a.q[b * 64 + 16 * k + j] = v; s += v as i32; } }
+        a.s[b] = s;
+    }
+}
 pub fn quantize_k_into(x: &[f32], a: &mut Q8K) {
     let n = x.len(); a.q.resize(n, 0); a.d.resize(n / 256, 0.0); a.s8.resize(n / 8, 0);
     for b in 0..n / 256 {
