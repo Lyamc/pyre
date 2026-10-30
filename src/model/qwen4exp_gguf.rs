@@ -1305,6 +1305,7 @@ impl Model {
         // catch-up: cells i < n-1 whose residual is known (token i+1 is committed)
         let first = st.mtp_r.front().map(|r| r.0).unwrap_or(n);
         let lo = if kv.n > 0 && kv.end() >= first { kv.end() } else { first.max((n - 1).saturating_sub(m.window)) };
+        if env_var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp: catch n {n} lo {lo} kv {}..{} first {first}", kv.c0, kv.end()); }
         if lo < n - 1 {
             let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
             for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
@@ -1365,6 +1366,10 @@ impl Model {
         if self.mtp_gpu_on() { self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
             for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
             eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp }); }
+        // compile the drafter's GEMV kernels now (1, 2-4 and >4 columns): a first catch-up of 5+ cells mid-decode otherwise pays ~150 ms of JIT
+        if let Some(map) = self.mtp_dense.get() { let t0 = std::time::Instant::now(); for q in m.dense_mats() { if let Some(g) = map.get(&(q as *const _ as usize)) { for t in [1usize, 2, 3, 4, 5, 8, 64] { let xb = cb.buf(&vec![0f32; t * q.cols]); let o = cb.empty(t * q.rows);
+            if t == 1 { cb.gemv(g, &xb, q.cols, 0, &o, q.rows, 0); } else { cb.gemv_m(g, &xb, t * q.cols, 0, q.cols, &o, t * q.rows, 0, q.rows, t); } let _ = cb.read(&o); } } }
+            eprintln!("mtp: drafter kernels warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }
         if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }); }
     }
 
