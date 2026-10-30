@@ -179,7 +179,20 @@ pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str
 }
 
 /// rayon pool for the CPU GGUF path (PYRE_QN_THREADS, default 16 of the 13900K's 32 threads).
+/// Opt this process out of Windows power throttling (EcoQoS) unless PYRE_ECOQOS=1. When the user is at the
+/// desktop, Windows may treat a background console job as low priority and run it at reduced clocks or on
+/// E-cores; decode then slows ~30%. This is a per-process request, not a system setting.
+pub fn no_power_throttle() {
+    #[cfg(windows)] {
+        if std::env::var("PYRE_ECOQOS").map(|v| v == "1").unwrap_or(false) { return; }
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling, PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION};
+        let st = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, StateMask: 0 };
+        let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st as *const _ as *const core::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
+        if ok == 0 { eprintln!("power throttling opt-out failed"); }
+    }
+}
 pub fn qn_threads() {
+    no_power_throttle();
     let n = std::env::var("PYRE_QN_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
 }

@@ -767,3 +767,10 @@ output is identical. `--spec 0` (or PYRE_SPEC=0 / config `spec: 0`) disables; `-
   lane mapping and summation order as k_gemv4r). Same output; no clear speedup in a noisy session.
 - Measured and not kept: 32 pool workers incl. P-core hyper-threads (-5%), longer pool spin (3 ms) and
   4/16/24 MTP drafter threads (8 stays best).
+
+
+### Windows power throttling opt-out (default on)
+With the user at the desktop, Windows' EcoQoS throttled pyre (a non-foreground console job) to ~15 tok/s.
+`qwen-next`/`serve` now ask Windows not to throttle this process (SetProcessInformation
+ProcessPowerThrottling, per-process; no system setting changes). Measured on HYTE with the desktop in use:
+plain pA 15.0 -> 22.2 tok/s, spec2 pA 16.3 -> 23.6. PYRE_ECOQOS=1 restores the old behaviour.
