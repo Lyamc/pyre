@@ -39,7 +39,7 @@ pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl:
 /// experts kept in the device layout in RAM so a PCIe upload is a plain copy). Filled on first use up to
 /// PYRE_QN_XARENA_GB, and never while less than PYRE_QN_RAM_RESERVE_GB (default 16) of RAM would stay free.
 #[derive(Default)]
-pub struct XPk { map: std::collections::HashMap<(usize, usize), std::sync::Arc<(Vec<u32>, usize, usize)>>, bytes: usize, full: bool, next_check: usize }
+pub struct XPk { map: std::collections::HashMap<(usize, usize), super::qn_cube::Pk>, bytes: usize, full: bool, next_check: usize }
 #[cfg(windows)]
 fn avail_ram() -> usize { use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX}; let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() }; m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32; if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { return 0; } m.ullAvailPhys as usize }
 #[cfg(not(windows))]
@@ -515,16 +515,17 @@ impl Model {
 
     /// Keep the most-routed experts (by count so far) resident on the GPU, within the cache budget.
     /// Expert (il, e) repacked for the GPU arena, from the host arena when it is there.
-    fn xpacked(&self, il: usize, e: usize, tys: (u32, u32, u32)) -> std::sync::Arc<(Vec<u32>, usize, usize)> {
+    fn xpacked(&self, il: usize, e: usize, tys: (u32, u32, u32)) -> super::qn_cube::Pk {
         if let Some(v) = self.xpk.lock().unwrap().map.get(&(il, e)) { return v.clone(); }
         let (l, ff, d) = (&self.layers[il], self.cfg.ff_exp, self.cfg.d);
         let t0 = std::time::Instant::now();
         let mut v = super::qn_cube::repack(tys.0, l.gate_e.raw_rows(e * ff, ff)); let uo = v.len(); v.extend(super::qn_cube::repack(tys.1, l.up_e.raw_rows(e * ff, ff))); let dof = v.len(); v.extend(super::qn_cube::repack(tys.2, l.down_e.raw_rows(e * d, d)));
         super::qn_cube::XUP_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let a = std::sync::Arc::new((v, uo, dof));
+        // shared (refcounted) bytes: an upload hands CubeCL a cheap clone instead of copying the expert again
+        let a = std::sync::Arc::new((burn_cubecl::cubecl::bytes::Bytes::from_elems(v).shared(), uo, dof));
         let cap = (env_var("PYRE_QN_XARENA_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) * (1u64 << 30) as f64) as usize;
         let mut pk = self.xpk.lock().unwrap();
-        let len = a.0.len() * 4;
+        let len = a.0.len();
         if cap > 0 && !pk.full && pk.bytes + len <= cap {
             if pk.bytes >= pk.next_check { let rsv = env_usize("PYRE_QN_RAM_RESERVE_GB").unwrap_or(16) << 30;
                 if avail_ram() < rsv + (1 << 30) { pk.full = true; eprintln!("host expert arena: stop at {:.2} GiB (RAM reserve)", pk.bytes as f64 / (1u64 << 30) as f64); } else { pk.next_check = pk.bytes + (1 << 30); } }

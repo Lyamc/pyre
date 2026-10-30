@@ -1457,6 +1457,8 @@ fn subdot8(w: &[u32], rb: u32, q: u32, x: &[f32], xo: u32, g2s: &[u32], g2x: &[u
 }
 /// Repack GGUF blocks into word-aligned blocks with an f32 scale first (layouts in `subdot`).
 pub fn hpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_HPIN").map(|v| v == "1").unwrap_or(false)) }
+/// A repacked expert in host memory: (gate|up|down words as shared bytes, up offset, down offset) in u32 words.
+pub type Pk = std::sync::Arc<(cubecl::bytes::Bytes, usize, usize)>;
 pub fn xs2() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XS2").map(|v| v == "1").unwrap_or(false)) }
 pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
@@ -2338,7 +2340,7 @@ impl Cube {
         let t0 = std::time::Instant::now();
         let mut v = repack(tys.0, g); let uo = v.len(); v.extend(repack(tys.1, u)); let dof = v.len(); v.extend(repack(tys.2, d));
         let t1 = std::time::Instant::now();
-        let base = slot * slot_bytes; let len = v.len() * 4; assert!(len <= slot_bytes && base + len <= ar_bytes);
+        let base = slot * slot_bytes; let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         self.client.write(&hd, cubecl::bytes::Bytes::from_elems(v));
         XUP_NS[0].fetch_add((t1 - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XUP_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2347,12 +2349,12 @@ impl Cube {
     }
     /// Upload one pre-packed expert (`xpacked`: gate words, then up at `uo`, down at `dof`) into slot `slot`.
     #[allow(clippy::too_many_arguments)]
-    pub fn xupload_pk(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, v: &[u32], uo: usize, dof: usize) -> XEnt {
+    pub fn xupload_pk(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, v: &cubecl::bytes::Bytes, uo: usize, dof: usize) -> XEnt {
         let t0 = std::time::Instant::now();
-        let base = slot * slot_bytes; let len = v.len() * 4; assert!(len <= slot_bytes && base + len <= ar_bytes);
+        let base = slot * slot_bytes; let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         // pinned staging (CubeCL's page-locked pool) so the copy is a real async DMA, like Strata's staging memcpyAsync
-        let mut by = cubecl::bytes::Bytes::from_elems(v.to_vec()); if xpin() { self.client.staging(std::iter::once(&mut by), false); }
+        let mut by = v.clone(); if xpin() { self.client.staging(std::iter::once(&mut by), false); }
         if xs2() {
             // PYRE_QN_XS2=1: issue the copy from a dedicated thread, which CubeCL gives its own CUDA stream, so the
             // transfer overlaps the compute stream (Strata copies on a separate stream); CubeCL orders the later
