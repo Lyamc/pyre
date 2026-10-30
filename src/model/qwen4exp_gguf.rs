@@ -1163,12 +1163,19 @@ impl Model {
         let mut hdq: Vec<Vec<qdot::Q8D>> = if guq { work.iter().map(|(_, toks)| (0..toks.len()).map(|_| qdot::Q8D::default()).collect()).collect() } else { vec![] };
         struct QP(*mut Vec<qdot::Q8D>); unsafe impl Sync for QP {} unsafe impl Send for QP {}
         let qp = QP(hdq.as_mut_ptr()); let qp = &qp;
-        let left: Vec<std::sync::atomic::AtomicUsize> = if guq { (0..work.len()).map(|_| std::sync::atomic::AtomicUsize::new(nb)).collect() } else { vec![] };
+        // PYRE_QN_GGUIDE (default on): gate/up row blocks in 3 tiers (64-row blocks for ~50% of ff, 32 for ~30%, 16 for the
+        // rest), claimed tier-major (all experts' big blocks first), so the job tail is a 16-row block; every hidden row is
+        // still computed by one task with the same per-row code -> identical results. PYRE_QN_GGUIDE=0: uniform SBLK blocks.
+        let gtask: Vec<(usize, usize, usize)> = if env_var("PYRE_QN_GGUIDE").map(|v| v != "0").unwrap_or(true) && env_var("PYRE_QN_SBLK").is_err() {
+            let mut bs: Vec<Vec<(usize, usize)>> = vec![vec![]; 3]; let mut r = 0usize;
+            for (ti, &(f, sz)) in [(0.5f64, 64usize), (0.3, 32), (0.2, 16)].iter().enumerate() { let end = if ti == 2 { ff } else { (r + ((f * ff as f64) / sz as f64).round() as usize * sz).min(ff) }; while r < end { let e2 = (r + sz).min(end); bs[ti].push((r, e2)); r = e2; } }
+            let mut v = vec![]; for tier in &bs { for wi in 0..work.len() { let w2 = if lfo.is_empty() { wi } else { lfo[wi] }; for &(a, b) in tier { v.push((w2, a, b)); } } } v } else { vec![] };
+        let gnb = if gtask.is_empty() { nb } else { gtask.len() / work.len().max(1) }; let gtn = if gtask.is_empty() { work.len() * nb } else { gtask.len() }; let gtask = &gtask;
+        let left: Vec<std::sync::atomic::AtomicUsize> = if guq { (0..work.len()).map(|_| std::sync::atomic::AtomicUsize::new(gnb)).collect() } else { vec![] };
         let (t_first, t_last) = (std::sync::atomic::AtomicU64::new(u64::MAX), std::sync::atomic::AtomicU64::new(0)); let zp = std::time::Instant::now();
         let gu = |k: usize| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
-            let (wi, b) = (k / nb, k % nb); let wi = if lfo.is_empty() { wi } else { lfo[wi] }; let (e, toks) = work[wi];
-            let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
+            let (wi, r0, r1) = if !gtask.is_empty() { gtask[k] } else { let (wi, b) = (k / nb, k % nb); (if lfo.is_empty() { wi } else { lfo[wi] }, b * blk, ((b + 1) * blk).min(ff)) }; let (e, toks) = work[wi];
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
             struct Q<'a>(bool, &'a [std::sync::atomic::AtomicUsize], usize, &'a QP, usize, usize, &'a SyncPtr, &'a [usize]);
             impl Drop for Q<'_> { fn drop(&mut self) { if !self.0 { return; } if self.1[self.2].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
@@ -1225,13 +1232,13 @@ impl Model {
         // in side() (GPU enqueue); same per-task code and per-row order -> identical results
         let chain = guq && env_var("PYRE_QN_CHAIN").map(|v| v != "0").unwrap_or(true);
         let (z1, z2);
-        if chain { let ngu = work.len() * nb; let gd = std::sync::atomic::AtomicUsize::new(0); let hqe: Vec<Vec<qdot::Q8Act>> = vec![];
+        if chain { let ngu = gtn; let gd = std::sync::atomic::AtomicUsize::new(0); let hqe: Vec<Vec<qdot::Q8Act>> = vec![];
             pool.run_side(ngu + nd, &|k| { if k < ngu { gu(k); gd.fetch_add(1, std::sync::atomic::Ordering::Release); } else {
                 while gd.load(std::sync::atomic::Ordering::Acquire) < ngu { std::hint::spin_loop(); }
                 let hd: &[Vec<qdot::Q8D>] = unsafe { std::slice::from_raw_parts(qp.0 as *const Vec<qdot::Q8D>, work.len()) }; down(k - ngu, hd, &hqe); } }, &mut sidef);
             z1 = std::time::Instant::now(); z2 = z1; TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         } else {
-        pool.run_side(work.len() * nb, &gu, &mut sidef);
+        pool.run_side(gtn, &gu, &mut sidef);
         z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
         let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else if guq { hdq } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
@@ -2060,4 +2067,29 @@ pub fn pool_bench() {
             std::hint::black_box((&acts, &actk, &hd)); v.push((z1.as_secs_f64() * 1e6, z.elapsed().as_secs_f64() * 1e6)); }
         let mut a: Vec<f64> = v.iter().map(|p| p.0).collect(); let mut b: Vec<f64> = v.iter().map(|p| p.1).collect();
         eprintln!("pbench quant t={t} pairs={pairs}: in-acts {:.1} us, total serial {:.1} us (median)", med(&mut a).0, med(&mut b).0); }
+    // PYRE_QN_PBENCH expert: one expert's gate/up (ff x d) + down (d x ff, Q2_0) at T=1..3 tokens, synthetic weights;
+    // hot = the same expert repeatedly (cache-resident), cold = 64 distinct experts (~100 MB, DRAM-streamed);
+    // par = 24-way pool over distinct experts (aggregate). Reports us per expert and the implied weight GB/s.
+    use super::gguf_q::QType;
+    for gty in [QType::IQ2XXS, QType::IQ2S] {
+        let (gb, db) = (gty.row_bytes(d), QType::Q2_0.row_bytes(ff)); let ne = 64usize; let eb = 2 * ff * gb + d * db;
+        let mut w = vec![0u8; ne * eb]; let mut st = 0x9E3779B97F4A7C15u64; for c in w.chunks_mut(8) { st ^= st << 13; st ^= st >> 7; st ^= st << 17; let bb = st.to_le_bytes(); let n = c.len(); c.copy_from_slice(&bb[..n]); }
+        // keep f16 scales finite/small (clear high bits of every odd byte; timing only)
+        for i in (1..w.len()).step_by(2) { w[i] &= 0x3B; }
+        let actk: Vec<qdot::Q8K> = (0..3).map(|ti| { let mut a = qdot::Q8K::default(); qdot::quantize_k_into(&x[ti * d..(ti + 1) * d], &mut a); a }).collect();
+        let hd: Vec<qdot::Q8D> = (0..3).map(|p| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&x[p * ff..(p + 1) * ff], &mut a); a }).collect();
+        let one = |e: usize, t: usize| -> f32 { let base = &w[e * eb..(e + 1) * eb]; let (gw, rest) = base.split_at(ff * gb); let (uw, dw) = rest.split_at(ff * gb);
+            let al: Vec<&qdot::Q8K> = actk[..t].iter().collect(); let dl: Vec<&qdot::Q8D> = hd[..t].iter().collect(); let (mut gv, mut uv, mut ov) = ([0f32; 16], [0f32; 16], [0f32; 8]); let mut acc = 0f32;
+            for r in 0..ff { let (gr, ur) = (&gw[r * gb..(r + 1) * gb], &uw[r * gb..(r + 1) * gb]);
+                if t == 1 { gv[0] = qdot::row_dot_k(gty, gr, &actk[0]); uv[0] = qdot::row_dot_k(gty, ur, &actk[0]); } else { qdot::row_dot_k_multi(gty, gr, &al, &mut gv); qdot::row_dot_k_multi(gty, ur, &al, &mut uv); }
+                acc += gv[0] * uv[0]; }
+            for r in 0..d { let dr = &dw[r * db..(r + 1) * db]; if t == 1 { ov[0] = qdot::q2_0_dot_d(dr, &hd[0]); } else { qdot::q2_0_dot_d_multi(dr, &dl, &mut ov); } acc += ov[0]; }
+            acc };
+        for t in 1..=3usize {
+            let mut vh = vec![]; for _ in 0..200 { let z = std::time::Instant::now(); std::hint::black_box(one(0, t)); vh.push(z.elapsed().as_secs_f64() * 1e6); }
+            let mut vc = vec![]; for i in 0..400 { let z = std::time::Instant::now(); std::hint::black_box(one(1 + (i * 37) % (ne - 1), t)); vc.push(z.elapsed().as_secs_f64() * 1e6); }
+            let mut vp = vec![]; for _ in 0..50 { let z = std::time::Instant::now(); pool.run(ne, &|e| { std::hint::black_box(one(e, t)); }); vp.push(z.elapsed().as_secs_f64() * 1e6 / ne as f64); }
+            let (h, c, pp) = (med(&mut vh).0, med(&mut vc).0, med(&mut vp).0); let mb = eb as f64 / 1e6;
+            eprintln!("pbench expert {gty:?}+Q2_0 {mb:.2} MB t={t}: 1-thread hot {h:.0} us ({:.1} GB/s), cold {c:.0} us ({:.1} GB/s); pool {n}x distinct {pp:.1} us/expert ({:.1} GB/s aggregate)", mb / h * 1e3, mb / c * 1e3, mb / pp * 1e3);
+        } }
 }
