@@ -2698,6 +2698,24 @@ fn k_xdown_ex(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta:
         y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
     }
 }
+/// PYRE_QN_XEXACT: per token, its routed experts' weighted rows summed in routing order from 0 (as the CPU's
+/// per-token accumulation), each row from the GPU entry rows (gy) or the CPU rows (cy, code bit 31).
+#[cube(launch_unchecked)]
+fn k_rsum_ex(gy: &[f32], cy: &[f32], tab: &[u32], y: &mut [f32], d: u32, kk: u32) {
+    let r = ABSOLUTE_POS_X;
+    let ti = CUBE_POS_Y;
+    if r < d {
+        let b = ti * (kk + 1);
+        let n = tab[b as usize];
+        let mut acc = 0.0f32;
+        for k in 0..n {
+            let cd = tab[(b + 1 + k) as usize];
+            let ix = cd & 2147483647u32;
+            if (cd >> 31) == 1u32 { acc = acc + cy[(ix * d + r) as usize]; } else { acc = acc + gy[(ix * d + r) as usize]; }
+        }
+        y[(ti * d + r) as usize] = acc;
+    }
+}
 /// PYRE_QN_MOEGRAPH: k_xgu_st / k_xdown_qt with the cumulative entry counts o1..o4 read from `oc` (device) instead of
 /// launch scalars and a grid sized for the window's maximum entries; entries e >= o4 are padding and skipped, so one
 /// captured launch serves every routing. Same per-entry/per-row arithmetic as the originals.
@@ -3446,6 +3464,10 @@ impl Cube {
     /// `y` gets one row per entry (entry e at e * d, weighted, not summed). `mh` holds ne entries, `oc` the cumulative
     /// per-token counts. Only IQ2_S/IQ2_XXS gate+up with Q2_0 down.
     #[allow(clippy::too_many_arguments)]
+    pub fn rsum_ex(&self, gy: &Handle, cy: &Handle, tab: &Handle, y: &Handle, d: usize, kk: usize, t: usize) {
+        let a = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };
+        unsafe { k_rsum_ex::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), a(gy), a(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(y.clone(), t * d), d as u32, kk as u32) }
+    }
     pub fn xrun_exact(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
         if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 64 != 0 || d / 256 > 16 || ff / 64 > 64 || ars.is_empty() || ars.len() > 2 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
