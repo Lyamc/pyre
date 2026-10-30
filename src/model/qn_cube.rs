@@ -3392,8 +3392,8 @@ impl Cube {
     }
     /// k_gate over t tokens at strides xs / ds / os (elements); false when t is not 2..=4 (caller loops k_gate)
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
-        if t > 4 && t <= 8 && t8() { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); if n == 1 { self.gate(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d); } else { self.gate_m(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d, n, xs, ds, os); } } return true; }
-        if !(2..=4).contains(&t) { return false; }
+        if t > 4 && t <= 8 && t8() && !gate8() { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); if n == 1 { self.gate(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d); } else { self.gate_m(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d, n, xs, ds, os); } } return true; }
+        if !((2..=4).contains(&t) || t <= 8 && t8() && gate8()) { return false; }
         let lr = up.cols;
         unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
@@ -3780,3 +3780,6 @@ fn gemv8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::
 
 /// PYRE_QN_T8 (or PYRE_QN_GEMV8=1): verify windows of 5-8 tokens keep the multi-token kernels (split 4 + rest launches)
 pub fn t8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_T8").map(|v| v == "1").unwrap_or(false) || gemv8()) }
+
+/// PYRE_QN_GATE8 (default on under T8): 5-8 token gate as one k_gate_m launch (t is comptime there; per-token arithmetic unchanged)
+fn gate8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GATE8").map(|v| v != "0").unwrap_or(true)) }

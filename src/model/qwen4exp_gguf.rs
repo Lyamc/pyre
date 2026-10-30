@@ -1454,7 +1454,9 @@ impl Model {
         // same two phases across its batch groups)
         // windows of 5..8 tokens run as two groups (4 + rest) the same way, so every group stays on the 2..4-token
         // kernels (one-token kernels per token were ~2x the cost of a 3-token window); PYRE_QN_WAVE8=0 reverts
-        let wave8 = t > 4 && t <= 8 && env_var("PYRE_QN_WAVE8").map(|v| v != "0").unwrap_or(true);
+        // PYRE_QN_T8_SINGLE=n (hybrid, with T8): windows of 5..=n tokens run as one group, larger ones as WAVE8 groups
+        let t8s = if super::qn_cube::t8() { env_usize("PYRE_QN_T8_SINGLE").unwrap_or(8) } else { 4 };
+        let wave8 = t > 4 && t <= 8 && t > t8s && env_var("PYRE_QN_WAVE8").map(|v| v != "0").unwrap_or(true);
         if (t >= 2 && env_var("PYRE_QN_WAVE").map(|v| v != "0").unwrap_or(false)) || wave8 {
             let ta = if wave8 { 4 } else { t.div_ceil(2) }; let grp = [(0usize, ta), (ta, t)];
             let mut ctr = vec![]; { let (mut a, mut b) = (0, 0); for l in &self.layers { ctr.push((a, b)); match l.mix { Mixer::Attn { .. } => a += 1, Mixer::Lin { .. } => b += 1 } } }
