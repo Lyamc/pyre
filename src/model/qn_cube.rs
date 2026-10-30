@@ -897,7 +897,7 @@ fn k_gemv_iq4d_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32],
 #[cube]
 fn prmt(a: u32, b: u32, sel: u32) -> u32 {
     let s7 = sel & 0x7777u32;
-    let mut d: u32;
+    let d: u32;
     gpu_asm!("prmt.b32 {d}, {a}, {b}, {s};", a = in(_) a, b = in(_) b, s = in(_) s7, d = out(_) d, options(pure, nomem));
     d
 }
