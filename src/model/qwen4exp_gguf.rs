@@ -1829,7 +1829,8 @@ impl Model {
                 }
             }
             let xcr = &*xcg;
-            let pslot = if pipe_on() && offs.iter().any(|o| !o.is_empty()) { pipe_slot(cb, t * d * 4) } else { None };
+            // PYRE_QN_PIPE_MINROWS: gate only layers with at least this many CPU (token, expert) rows; below it the gate/spin overhead outweighs the overlap
+            let pslot = if pipe_on() && offs.iter().map(|o| o.len()).sum::<usize>() >= env_usize("PYRE_QN_PIPE_MINROWS").unwrap_or(1).max(1) { pipe_slot(cb, t * d * 4) } else { None };
             piped = pslot.is_some();
             let pgate = std::sync::Arc::new(PGate { m: std::sync::Mutex::new(false), cv: std::sync::Condvar::new(), tgt: std::sync::Mutex::new(None) });
             let pg_open = PGateOpen(pgate.clone());
@@ -1984,7 +1985,7 @@ fn qn_pool() -> &'static super::spin_pool::Pool {
         let mut pin: Vec<usize> = match env_var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
         // PYRE_QN_LSIB=1: the calling (launcher) thread moves to the SMT sibling of the first fast core and an extra
         // pinned worker takes that core, so GPU launches in run_side's side closure (PIPE) no longer cost a P-core of expert work
-        let lsib = env_var("PYRE_QN_LSIB").map(|v| v == "1").unwrap_or(false) && pin.len() >= 2 && pin[1] != pin[0] + 1;
+        let lsib = env_var("PYRE_QN_LSIB").map(|v| v == "1").unwrap_or(env_usize("PYRE_QN_PIPE").unwrap_or(0) >= 1) && pin.len() >= 2 && pin[1] != pin[0] + 1;
         let auto_pin = pin == auto;
         if lsib { let p0 = pin[0]; super::spin_pool::pin_to(p0 + 1); pin.insert(0, p0 + 1); eprintln!("expert pool: launcher pinned to sibling cpu {}", p0 + 1); }
         let n = env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(if pin.len() >= 4 { pin.len() } else { rayon::current_num_threads() });
