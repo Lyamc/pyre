@@ -1676,6 +1676,135 @@ fn k_gemv_iq4(x: &[f32], w: &[u32], kv: &[f32], out: &mut [f32], rows: u32, cols
 /// One cube (256 units) per stream: xn = x * rsqrt(mean(x^2) + eps) * norm.
 /// k_rms for up to 4 tokens in one launch (cube (stream, token)); each cube does exactly k_rms's operations in its
 /// order, so the bits are k_rms's (Strata's split norm, src/kernels/cuda/fused_gr.cu: one block per token AND stream).
+/// 8-buffer copies of k_rms4 / k_comb_m / k_comb3_m / k_delta_m (PYRE_QN_W8 under T8): token ti's arithmetic is unchanged.
+#[cube(launch_unchecked)]
+fn k_rms8(x0: &[f32], x1: &[f32], x2: &[f32], x3: &[f32], x4: &[f32], x5: &[f32], x6: &[f32], x7: &[f32], norm: &[f32], xn: &mut [f32], d: u32, w: u32, eps: f32) {
+    let base = CUBE_POS_X * d; let tk = CUBE_POS_Y; let ob = tk * w;
+    let mut acc = 0.0f32;
+    let mut i = UNIT_POS_X;
+    while i < d {
+        let j = (base + i) as usize;
+        let mut v = x0[j]; if tk == 1u32 { v = x1[j]; } if tk == 2u32 { v = x2[j]; } if tk == 3u32 { v = x3[j]; } if tk == 4u32 { v = x4[j]; } if tk == 5u32 { v = x5[j]; } if tk == 6u32 { v = x6[j]; } if tk == 7u32 { v = x7[j]; }
+        acc += v * v;
+        i += CUBE_DIM_X;
+    }
+    let p = plane_sum(acc);
+    let mut sh = Shared::<[f32]>::new_slice(8usize);
+    if UNIT_POS_X % 32 == 0 {
+        sh[(UNIT_POS_X / 32) as usize] = p;
+    }
+    sync_cube();
+    let mut tot = 0.0f32;
+    for j in 0..8u32 {
+        tot += sh[j as usize];
+    }
+    let r = 1.0f32 / f32::sqrt(tot / f32::cast_from(d) + eps);
+    let mut i2 = UNIT_POS_X;
+    while i2 < d {
+        let k = (base + i2) as usize;
+        let mut v = x0[k]; if tk == 1u32 { v = x1[k]; } if tk == 2u32 { v = x2[k]; } if tk == 3u32 { v = x3[k]; } if tk == 4u32 { v = x4[k]; } if tk == 5u32 { v = x5[k]; } if tk == 6u32 { v = x6[k]; } if tk == 7u32 { v = x7[k]; }
+        xn[(ob + base + i2) as usize] = v * r * norm[k];
+        i2 += CUBE_DIM_X;
+    }
+}
+#[cube(launch_unchecked)]
+fn k_comb_m8(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], x4: &mut [f32], x5: &mut [f32], x6: &mut [f32], x7: &mut [f32], a: &[f32], dn: &[f32], d: u32, ds: u32, lr: u32, #[comptime] hc: u32) {
+    let k = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if k < d * hc {
+        let st = k / d;
+        let i = k % d;
+        let o = a[(ti * d + i) as usize];
+        let inj = dn[(ti * ds + lr + st) as usize] / f32::cast_from(hc);
+        let v = o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+        if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else if ti == 3u32 { x3[k as usize] += v; } else if ti == 4u32 { x4[k as usize] += v; } else if ti == 5u32 { x5[k as usize] += v; } else if ti == 6u32 { x6[k as usize] += v; } else { x7[k as usize] += v; }
+    }
+}
+#[cube(launch_unchecked)]
+fn k_comb3_m8(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], x4: &mut [f32], x5: &mut [f32], x6: &mut [f32], x7: &mut [f32], c0: &[f32], c1: &[f32], c2: &[f32], c3: &[f32], c4: &[f32], c5: &[f32], c6: &[f32], c7: &[f32], a: &[f32], b: &[f32], gb: &[f32], dn: &[f32], d: u32, gs: u32, goff: u32, ds: u32, lr: u32, cm: u32, #[comptime] hc: u32) {
+    let k = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if k < d * hc {
+        let st = k / d;
+        let i = k % d;
+        let mut o = a[(ti * d + i) as usize];
+        o = o / (1.0f32 + f32::exp(-gb[(ti * gs + goff) as usize]));
+        o += b[(ti * d + i) as usize];
+        if ((cm >> ti) & 1u32) == 1u32 {
+            if ti == 0u32 { o += c0[i as usize]; } else if ti == 1u32 { o += c1[i as usize]; } else if ti == 2u32 { o += c2[i as usize]; } else if ti == 3u32 { o += c3[i as usize]; } else if ti == 4u32 { o += c4[i as usize]; } else if ti == 5u32 { o += c5[i as usize]; } else if ti == 6u32 { o += c6[i as usize]; } else { o += c7[i as usize]; }
+        }
+        let inj = dn[(ti * ds + lr + st) as usize] / f32::cast_from(hc);
+        let v = o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+        if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else if ti == 3u32 { x3[k as usize] += v; } else if ti == 4u32 { x4[k as usize] += v; } else if ti == 5u32 { x5[k as usize] += v; } else if ti == 6u32 { x6[k as usize] += v; } else { x7[k as usize] += v; }
+    }
+}
+#[cube(launch_unchecked)]
+fn k_delta_m8(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32], c0: &mut [f32], c1: &mut [f32], c2: &mut [f32], c3: &mut [f32], c4: &mut [f32], c5: &mut [f32], c6: &mut [f32], c7: &mut [f32],
+    nk: u32, ch: u32, pn: u32, ostr: u32, ckm: u32, zoff: u32, boff: u32, aoff: u32, eps: f32, #[comptime] dk: u32, #[comptime] nt: u32) {
+    let h = CUBE_POS_X;
+    let j = UNIT_POS_X;
+    let kh = h % nk;
+    let mut qs = Shared::<[f32]>::new_slice(dk as usize);
+    let mut ks = Shared::<[f32]>::new_slice(dk as usize);
+    let mut red = Shared::<[f32]>::new_slice(comptime!((dk / 32) as usize));
+    let base = h * dk * dk;
+    let mut st = Array::<f32>::new(comptime!(dk as usize));
+    #[unroll]
+    for i in 0..dk {
+        st[i as usize] = s[(base + i * dk + j) as usize];
+    }
+    #[unroll]
+    for t in 0..nt {
+        let cbs = t * ch;
+        let pb = t * pn;
+        let qj = co[(cbs + kh * dk + j) as usize];
+        let kj = co[(cbs + nk * dk + kh * dk + j) as usize];
+        let sq = cube_sum(qj * qj, &mut red, comptime!(dk / 32));
+        let sk = cube_sum(kj * kj, &mut red, comptime!(dk / 32));
+        qs[j as usize] = qj / f32::sqrt(sq + 1e-6f32) / f32::sqrt(f32::cast_from(dk));
+        ks[j as usize] = kj / f32::sqrt(sk + 1e-6f32);
+        sync_cube();
+        let vj = co[(cbs + 2 * nk * dk + h * dk + j) as usize];
+        let x = proj[(pb + aoff + h) as usize] + dt[h as usize];
+        let mut sp = x;
+        if x <= 20.0f32 {
+            sp = f32::ln(1.0f32 + f32::exp(x));
+        }
+        let g = f32::exp(sp * a[h as usize]);
+        let b = 1.0f32 / (1.0f32 + f32::exp(-proj[(pb + boff + h) as usize]));
+        let mut mem = 0.0f32;
+        #[unroll]
+        for i in 0..dk {
+            mem += st[i as usize] * ks[i as usize];
+        }
+        mem *= g;
+        let delta = (vj - mem) * b;
+        let mut o = 0.0f32;
+        #[unroll]
+        for i in 0..dk {
+            let v = st[i as usize] * g + ks[i as usize] * delta;
+            st[i as usize] = v;
+            o += v * qs[i as usize];
+        }
+        if ((ckm >> t) & 1u32) == 1u32 {
+            #[unroll]
+            for i in 0..dk {
+                let idx = (base + i * dk + j) as usize;
+                if t == 0u32 { c0[idx] = st[i as usize]; } else if t == 1u32 { c1[idx] = st[i as usize]; } else if t == 2u32 { c2[idx] = st[i as usize]; } else if t == 3u32 { c3[idx] = st[i as usize]; } else if t == 4u32 { c4[idx] = st[i as usize]; } else if t == 5u32 { c5[idx] = st[i as usize]; } else if t == 6u32 { c6[idx] = st[i as usize]; } else { c7[idx] = st[i as usize]; }
+            }
+        }
+        let so = cube_sum(o * o, &mut red, comptime!(dk / 32));
+        let r = 1.0f32 / f32::sqrt(so / f32::cast_from(dk) + eps);
+        let z = proj[(pb + zoff + h * dk + j) as usize];
+        out[(t * ostr + h * dk + j) as usize] = o * r * norm[j as usize] / (1.0f32 + f32::exp(-z));
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..dk {
+        s[(base + i * dk + j) as usize] = st[i as usize];
+    }
+}
+
 #[cube(launch_unchecked)]
 fn k_rms4(x0: &[f32], x1: &[f32], x2: &[f32], x3: &[f32], norm: &[f32], xn: &mut [f32], d: u32, w: u32, eps: f32) {
     let base = CUBE_POS_X * d; let tk = CUBE_POS_Y; let ob = tk * w;
@@ -3375,6 +3504,9 @@ impl Cube {
     }
     /// rms of t tokens (separate x buffers) into xn at token stride hc*d; one launch for up to 4 (PYRE_QN_RMS4=0: per token)
     pub fn rms_t(&self, xs: &[Handle], norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
+        if xs.len() > 4 && t8() && w8() { let t = xs.len(); let w = hc * d; let g = |i: usize| unsafe { BufferArg::from_raw_parts(xs[i.min(t - 1)].clone(), w) };
+            unsafe { k_rms8::launch_unchecked(&self.client, CubeCount::Static(hc as u32, t as u32, 1), CubeDim::new_1d(256), g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7),
+                BufferArg::from_raw_parts(norm.clone(), w), BufferArg::from_raw_parts(xn.clone(), t * w), d as u32, w as u32, eps) } return; }
         if xs.len() > 4 && t8() { let w = hc * d; for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.rms_t(&xs[c0..c1], norm, &xn.clone().offset_start((c0 * w * 4) as u64), hc, d, eps); } return; }
         let t = xs.len(); let w = hc * d;
         if t >= 2 && t <= 4 && std::env::var("PYRE_QN_RMS4").map(|v| v != "0").unwrap_or(true) {
@@ -3409,6 +3541,9 @@ impl Cube {
     #[allow(clippy::too_many_arguments)]
     /// k_comb for xs.len() <= 4 tokens in one launch: a = t*d contiguous, dn = t*ds contiguous
     pub fn comb_m(&self, xs: &[Handle], a: &Handle, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        if xs.len() > 4 && t8() && w8() { let t = xs.len(); let x = |i: usize| unsafe { BufferArg::from_raw_parts(xs[i.min(t - 1)].clone(), hc * d) };
+            unsafe { k_comb_m8::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), x(0), x(1), x(2), x(3), x(4), x(5), x(6), x(7),
+                BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(dn.clone(), t * ds), d as u32, ds as u32, lr as u32, hc as u32) } return; }
         if xs.len() > 4 { for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.comb_m(&xs[c0..c1], &a.clone().offset_start((c0 * d * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), ds, lr, hc, d); } return; }
         let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone();
         unsafe { k_comb_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
@@ -3418,6 +3553,13 @@ impl Cube {
     /// k_comb3 (gate, b, optional per-token c) for xs.len() <= 4 tokens in one launch
     #[allow(clippy::too_many_arguments)]
     pub fn comb3_m(&self, xs: &[Handle], cs: &[Option<Handle>], a: &Handle, b: &Handle, gb: &Handle, gn: usize, gs: usize, goff: usize, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        if xs.len() > 4 && t8() && w8() { let t = xs.len(); let x = |i: usize| unsafe { BufferArg::from_raw_parts(xs[i.min(t - 1)].clone(), hc * d) }; let mut cm = 0u32;
+            for i in 0..t { if cs[i].is_some() { cm |= 1 << i; } }
+            let c = |i: usize| unsafe { BufferArg::from_raw_parts(match cs.get(i) { Some(Some(h)) => h.clone(), _ => a.clone() }, d) };
+            unsafe { k_comb3_m8::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), x(0), x(1), x(2), x(3), x(4), x(5), x(6), x(7),
+                c(0), c(1), c(2), c(3), c(4), c(5), c(6), c(7),
+                BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(b.clone(), t * d), BufferArg::from_raw_parts(gb.clone(), gn), BufferArg::from_raw_parts(dn.clone(), t * ds),
+                d as u32, gs as u32, goff as u32, ds as u32, lr as u32, cm, hc as u32) } return; }
         if xs.len() > 4 { for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); let o = |h: &Handle, n: usize| h.clone().offset_start((c0 * n * 4) as u64);
             self.comb3_m(&xs[c0..c1], &cs[c0..c1], &o(a, d), &o(b, d), &o(gb, gs), gn - c0 * gs, gs, goff, &o(dn, ds), ds, lr, hc, d); } return; }
         let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone(); let mut cm = 0u32;
@@ -3464,6 +3606,13 @@ impl Cube {
     /// `delta` for nt (1..=4) tokens: co/proj/out at strides ch/pn/ostr; checkpoint t (< 3) written to cks[t] when bit t of ckm is set.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_m(&self, co: &Handle, ch: usize, proj: &Handle, pn: usize, w: &GdnW, s: &Handle, out: &Handle, ostr: usize, cks: &[Option<Handle>], ckm: u32, nk: usize, nv: usize, dk: usize, zoff: usize, boff: usize, aoff: usize, eps: f32, nt: usize) {
+        if nt > 4 && nt <= 8 && t8() && w8() { let sn = nv * dk * dk; let dummy = self.empty(1);
+            let ck = |i: usize| unsafe { match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => BufferArg::from_raw_parts(h.clone(), sn), _ => BufferArg::from_raw_parts(dummy.clone(), 1) } };
+            unsafe { k_delta_m8::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
+                BufferArg::from_raw_parts(co.clone(), nt * ch), BufferArg::from_raw_parts(proj.clone(), nt * pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
+                BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), sn), BufferArg::from_raw_parts(out.clone(), nt * ostr),
+                ck(0), ck(1), ck(2), ck(3), ck(4), ck(5), ck(6), ck(7),
+                nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) } return; }
         if nt > 4 { for c0 in (0..nt).step_by(4) { let n = (nt - c0).min(4); self.delta_m(&co.clone().offset_start((c0 * ch * 4) as u64), ch, &proj.clone().offset_start((c0 * pn * 4) as u64), pn, w, s, &out.clone().offset_start((c0 * ostr * 4) as u64), ostr, &cks[c0.min(cks.len())..(c0 + n).min(cks.len())], (ckm >> c0) & 15, nk, nv, dk, zoff, boff, aoff, eps, n); } return; }
         let sn = nv * dk * dk; let dummy = self.empty(1);
         let ck = |i: usize| match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => (h.clone(), sn), _ => (dummy.clone(), 1) };
@@ -3782,4 +3931,6 @@ fn gemv8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::
 pub fn t8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_T8").map(|v| v == "1").unwrap_or(false) || gemv8()) }
 
 /// PYRE_QN_GATE8 (default on under T8): 5-8 token gate as one k_gate_m launch (t is comptime there; per-token arithmetic unchanged)
+/// PYRE_QN_W8 (default on; only under T8): single-launch 8-buffer rms / comb / comb3 / delta for 5-8 tokens
+fn w8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_W8").map(|v| v != "0").unwrap_or(true)) }
 fn gate8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GATE8").map(|v| v != "0").unwrap_or(true)) }
