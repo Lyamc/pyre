@@ -1553,7 +1553,7 @@ impl Model {
         let (ai0, li0) = (*ai, *li);
         let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) };
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
-        let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0);
+        let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.xwarm_read(il, l, &dd.0);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
     }
@@ -1817,7 +1817,7 @@ impl Model {
                 ord[ti].push((wi, lists[wi].1.len())); lists[wi].1.push((ti, wt)); } }
             if !lists.is_empty() {
                 let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
-                MISS[0].fetch_add(lists.len() as u64, std::sync::atomic::Ordering::Relaxed); MISS[1].fetch_add(lists.iter().map(|x| x.1.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
+                if xwarm() > 0 { if let Some(v) = XW.lock().unwrap().get_mut(il) { *v = lists.iter().map(|x| x.0).collect(); } } MISS[0].fetch_add(lists.len() as u64, std::sync::atomic::Ordering::Relaxed); MISS[1].fetch_add(lists.iter().map(|x| x.1.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
                 MISS[2].fetch_add(ons.iter().map(|o| o.len() as u64).sum(), std::sync::atomic::Ordering::Relaxed);
                 let tr = std::time::Instant::now();
                 self.routed_pool_ord(l, &xin, &work, t, &mut yr, &mut gpu, Some(&ord));
@@ -1891,6 +1891,27 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
 fn pair_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PAIR").map(|v| v == "1").unwrap_or(false)) }
 /// PYRE_QN_GATEM=0 turns off the multi-token hyper-connection gate kernel in verify windows
 fn gatem() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_GATEM").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_XWARM=1 (opt-in): while the caller waits for a verify layer's routing readback, the pool workers prefetch
+/// (into L2/L3) the weight bytes of the experts this layer ran on the CPU in the previous window, so the CPU misses
+/// that repeat start from cache. Prefetch only: no arithmetic changes (bit-identical). =2: gate/up only.
+fn xwarm() -> u8 { static P: std::sync::OnceLock<u8> = std::sync::OnceLock::new(); *P.get_or_init(|| env_usize("PYRE_QN_XWARM").unwrap_or(0) as u8) }
+static XW: std::sync::Mutex<Vec<Vec<usize>>> = std::sync::Mutex::new(Vec::new());
+impl Model {
+    fn xwarm_read(&self, il: usize, l: &Layer, h: &burn_cubecl::cubecl::server::Handle) -> Vec<f32> {
+        let cb = self.cube.as_ref().unwrap();
+        let es: Vec<usize> = if xwarm() > 0 { let mut g = XW.lock().unwrap(); if g.len() < self.layers.len() { g.resize(self.layers.len(), vec![]); } g[il].clone() } else { vec![] };
+        if es.is_empty() { return cb.read(h); }
+        let (ff, d) = (self.cfg.ff_exp, self.cfg.d);
+        let span = |m: &super::gguf_q::QMat, r0: usize, n: usize| -> (usize, usize) { let a = m.row_raw(r0).as_ptr() as usize; (a, m.row_raw(r0 + n - 1).as_ptr_range().end as usize - a) };
+        let mut rg: Vec<(usize, usize)> = vec![];
+        for &e in &es { rg.push(span(&l.gate_e, e * ff, ff)); rg.push(span(&l.up_e, e * ff, ff)); if xwarm() == 1 { rg.push(span(&l.down_e, e * d, d)); } }
+        const CH: usize = 32768; let mut ch: Vec<(usize, usize)> = vec![];
+        for (a, n) in rg { let mut o = 0; while o < n { ch.push((a + o, (n - o).min(CH))); o += CH; } }
+        let mut out = vec![];
+        qn_pool().run_side(ch.len(), &|k| { let (a, n) = ch[k]; #[cfg(target_arch = "x86_64")] unsafe { use std::arch::x86_64::*; let mut o = 0; while o < n { _mm_prefetch::<_MM_HINT_T1>((a + o) as *const i8); o += 64; } } }, &mut || { out = cb.read(h); });
+        out
+    }
+}
 fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(true)) }
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();

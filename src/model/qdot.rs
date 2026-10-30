@@ -345,7 +345,7 @@ unsafe fn iq2_sb<const V: bool>(t: QType, rp: *const u8, i: usize, a: &Q8K, acc:
         _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc)
     } else {
         let s8 = sign8();
-        let b = rp.add(i * 66); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
+        let b = rp.add(i * 66); kk::pf(b); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
         let mut ia = _mm256_setzero_si256();
         for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
             let gq = |l: usize| *IQ2XXS_GRID.get_unchecked(*qs.add(8 * ib + l) as usize) as i64;
@@ -467,7 +467,7 @@ unsafe fn iq2xxs_k_v(row: &[u8], a: &Q8K) -> f32 { iq2xxs_k_b::<true>(row, a) }
 unsafe fn iq2xxs_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
     use std::arch::x86_64::*;
     let s8 = sign8(); let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
-    for i in 0..n / 256 { let b = rp.add(i * 66); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
+    for i in 0..n / 256 { let b = rp.add(i * 66); kk::pf(b); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
         let mut ia = _mm256_setzero_si256();
         for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
             let gq = |l: usize| *IQ2XXS_GRID.get_unchecked(*qs.add(8 * ib + l) as usize) as i64;
@@ -621,7 +621,7 @@ unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out:
                     sg[ib] = kk::signs((sgp.add(4 * ib) as *const u32).read_unaligned());
                     let sbv = *sb.add(ib); sc[ib] = kk::sc16(sbv); }
                 f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() }
-            _ => { let b = rp.add(i * 66); let qs = b.add(2);
+            _ => { let b = rp.add(i * 66); kk::pf(b); let qs = b.add(2);
                 for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
                     let gq = |l: usize| *IQ2XXS_GRID.get_unchecked(*qs.add(8 * ib + l) as usize) as i64;
                     g[ib] = _mm256_set_epi64x(gq(3), gq(2), gq(1), gq(0));
