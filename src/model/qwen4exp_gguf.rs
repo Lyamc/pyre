@@ -179,9 +179,18 @@ thread_local! { static GATE_OPEN: std::cell::Cell<bool> = const { std::cell::Cel
 fn gate_open() -> bool { GATE_OPEN.with(|g| g.get()) }
 static PIPE_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Host-side latch the stream-ordered gate waits on (bounded: PYRE_QN_PIPE_TMO_MS, default 2000).
-struct PGate { m: std::sync::Mutex<bool>, cv: std::sync::Condvar }
+struct PGate { m: std::sync::Mutex<bool>, cv: std::sync::Condvar, tgt: std::sync::Mutex<Option<(usize, u32)>> }
+/// PYRE_QN_PIPE=2: the gate is a bounded device wait (pyre_wait_flag kernel, __nanosleep backoff, %globaltimer
+/// timeout PYRE_QN_PIPE_SPIN_US default 100000 us, capped at 200 ms in cubecl) on a mapped host u32 the host bumps.
+fn pipe2() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_usize("PYRE_QN_PIPE").unwrap_or(0) >= 2) }
+static PIPE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// (flag, err) mapped host words; err is checked after each window.
+fn pipe_flag(cb: &super::qn_cube::Cube) -> (usize, usize) { static F: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *F.get_or_init(|| { let p = cb.client.pyre_host_pinned(4096).expect("pinned flag"); unsafe { std::ptr::write_bytes(p as *mut u8, 0, 4096); } (p, p + 64) }) }
+fn pipe_err_check() { if let Some(&(_, er)) = PIPE_FLAG_ERR.get() { if unsafe { std::ptr::read_volatile(er as *const u32) } != 0 { if !PIPE_ERR.swap(true, std::sync::atomic::Ordering::Relaxed) { eprintln!("PYRE_QN_PIPE=2: device wait timed out; pipeline disabled, a window's output is invalid"); } } } }
+static PIPE_FLAG_ERR: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
 impl PGate {
-    fn open(&self) { *self.m.lock().unwrap() = true; self.cv.notify_all(); }
+    fn open(&self) { if let Some((fl, tg)) = self.tgt.lock().unwrap().take() { unsafe { (*(fl as *const std::sync::atomic::AtomicU32)).store(tg, std::sync::atomic::Ordering::Release); } } *self.m.lock().unwrap() = true; self.cv.notify_all(); }
     fn wait(&self) { let tmo = std::time::Duration::from_millis(env_usize("PYRE_QN_PIPE_TMO_MS").unwrap_or(2000) as u64); let dl = std::time::Instant::now() + tmo;
         let mut g = self.m.lock().unwrap(); while !*g { let now = std::time::Instant::now(); if now >= dl { PIPE_ERR.store(true, std::sync::atomic::Ordering::Relaxed); eprintln!("PYRE_QN_PIPE: host gate timed out ({tmo:?}); pipeline disabled, this window's output is invalid"); return; } g = self.cv.wait_timeout(g, dl - now).unwrap().0; } }
 }
@@ -1535,6 +1544,7 @@ impl Model {
             self.layer_cube_multi_p(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start, &mut pre);
         }
         }
+        if pipe2() { if let Some(cb) = &self.cube { let f = pipe_flag(cb); let _ = PIPE_FLAG_ERR.set(f); } pipe_err_check(); }
         let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
         let headb = env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
@@ -1815,7 +1825,7 @@ impl Model {
             let xcr = &*xcg;
             let pslot = if pipe_on() && offs.iter().any(|o| !o.is_empty()) { pipe_slot(cb, t * d * 4) } else { None };
             piped = pslot.is_some();
-            let pgate = std::sync::Arc::new(PGate { m: std::sync::Mutex::new(false), cv: std::sync::Condvar::new() });
+            let pgate = std::sync::Arc::new(PGate { m: std::sync::Mutex::new(false), cv: std::sync::Condvar::new(), tgt: std::sync::Mutex::new(None) });
             let pg_open = PGateOpen(pgate.clone());
             let stp: &mut State = st;
             let mut gpu = || {
@@ -1862,7 +1872,9 @@ impl Model {
                 if let Some(ps) = pslot {
                     // PIPE: gate + CPU-row copy + combine + next layer's dense, queued before the CPU rows exist
                     let yball = cb.empty(t * d); let g2 = pgate.clone();
-                    unsafe { cb.client.pyre_host_gate(Box::new(move || g2.wait()), ps, t * d * 4, &yball); } GATE_OPEN.with(|g| g.set(true));
+                    if pipe2() { let (fl, er) = pipe_flag(cb); let tg = PIPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1; *pgate.tgt.lock().unwrap() = Some((fl, tg));
+                        unsafe { cb.client.pyre_wait_flag(fl, tg, env_usize("PYRE_QN_PIPE_SPIN_US").unwrap_or(100_000) as u64 * 1000, er); cb.client.pyre_host_gate(None, ps, t * d * 4, &yball); } drop(g2);
+                    } else { unsafe { cb.client.pyre_host_gate(Some(Box::new(move || g2.wait())), ps, t * d * 4, &yball); } } GATE_OPEN.with(|g| g.set(true));
                     if combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
                     for ti in 0..t { let yb = at(&yball, ti * d); cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d); } }
                     if let Some(nx) = next.as_mut() { nx(&mut *stp); }
