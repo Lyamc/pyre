@@ -31,7 +31,9 @@ pub fn readnb() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceL
 pub fn natr_y() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_Y").ok().and_then(|v| v.parse().ok()).unwrap_or(4)) }
 pub fn natr() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR").map(|v| v != "0").unwrap_or(true)) }
 pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
-pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false) { 2 } else { 0 })) }
+/// NATIVE=2 profile (explicit PYRE_QN_NATIVE=2, or the default under PYRE_QN_XEXACT=1: IQ4_XS dense + LM head stay native)
+pub fn native2() -> bool { native_mode() == 2 }
 pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cube]
@@ -2615,6 +2617,7 @@ pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
     }
     out
 }
+fn xex8() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XEX8").map(|v| v != "0").unwrap_or(true)) }
 pub fn block_words(ty: u32) -> (usize, usize) { match ty { 0 => (256, 21), 1 => (256, 17), 2 => (256, 15), _ => (64, 5) } }
 
 /// h[row] = silu(gate_row . x) * (up_row . x) for one cached expert; one plane per row.
@@ -3310,6 +3313,865 @@ fn k_xdown_qt(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l
         }
     }
 }
+/// PYRE_QN_XEXACT: qdot::xround / qdot::xexp, op for op
+#[cube]
+fn xround_g(x: f32) -> f32 {
+    let v = f32::floor(f32::abs(x) + 0.5f32);
+    let mut r = v;
+    if x < 0.0f32 { r = -v; }
+    r
+}
+#[cube]
+fn xexp_g(x0: f32) -> f32 {
+    let x = f32::min(f32::max(x0, -87.0f32), 88.0f32);
+    let n = f32::floor(fma(x, f32::reinterpret(1069066811u32), 0.5f32));
+    let r1 = fma(-n, f32::reinterpret(1060205056u32), x);
+    let r = fma(-n, f32::reinterpret(901758606u32), r1);
+    let mut p = f32::reinterpret(961547521u32);
+    p = fma(p, r, f32::reinterpret(985008993u32)); p = fma(p, r, f32::reinterpret(1007192201u32)); p = fma(p, r, f32::reinterpret(1026206379u32)); p = fma(p, r, f32::reinterpret(1042983595u32)); p = fma(p, r, 0.5f32); p = fma(p, r, 1.0f32); p = fma(p, r, 1.0f32);
+    p * f32::reinterpret(u32::cast_from(i32::cast_from(n) + 127i32) << 23u32)
+}
+/// PYRE_QN_XEXACT: Q8K activation quantization exactly as qdot::quantize_k_into (one scale per 256, sequential amax,
+/// d = amax/127, id = 1/d, q = round(x * id)); CUBE_POS_Y = token (row stride sst), one thread per 256-block.
+#[cube(launch_unchecked)]
+fn k_q8k_m(src: &[f32], q: &mut [u32], sc: &mut [f32], sst: u32, nb: u32) {
+    let b = ABSOLUTE_POS_X;
+    let c = CUBE_POS_Y;
+    if b < nb {
+        let base = c * sst + b * 256;
+        let mut amax = 0.0f32;
+        for i in 0..256u32 { amax = f32::max(amax, f32::abs(src[(base + i) as usize])); }
+        let d = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if d > 0.0f32 { id = 1.0f32 / d; }
+        sc[(c * nb + b) as usize] = d;
+        for w in 0..64u32 {
+            let mut word = 0u32;
+            #[unroll]
+            for j in 0..4u32 {
+                let v = i32::cast_from(xround_g(src[(base + w * 4 + j) as usize] * id));
+                word |= (u32::cast_from(v) & 255u32) << (8 * j);
+            }
+            q[(c * nb * 64 + b * 64 + w) as usize] = word;
+        }
+    }
+}
+/// PYRE_QN_XEXACT: Q8D quantization of n values (one scale per 64, as qdot::quantize_d_into) kept in natural order,
+/// with the per-block integer sums; one thread per 64-block.
+#[cube(launch_unchecked)]
+fn k_q8d(src: &[f32], q: &mut [u32], sc: &mut [f32], ss: &mut [u32], nb: u32) {
+    let b = ABSOLUTE_POS_X;
+    if b < nb {
+        let base = b * 64;
+        let mut amax = 0.0f32;
+        for i in 0..64u32 { amax = f32::max(amax, f32::abs(src[(base + i) as usize])); }
+        let d = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if d > 0.0f32 { id = 1.0f32 / d; }
+        sc[b as usize] = d;
+        let mut sm = 0i32;
+        for w in 0..16u32 {
+            let mut word = 0u32;
+            #[unroll]
+            for j in 0..4u32 {
+                let v = i32::cast_from(xround_g(src[(base + w * 4 + j) as usize] * id));
+                sm += v;
+                word |= (u32::cast_from(v) & 255u32) << (8 * j);
+            }
+            q[(b * 16 + w) as usize] = word;
+        }
+        ss[b as usize] = u32::cast_from(sm);
+    }
+}
+/// signed byte k of a packed word
+#[cube]
+fn sbyte(w: u32, k: u32) -> i32 {
+    let v = i32::cast_from((w >> (8 * k)) & 255u32);
+    let mut r = v;
+    if v >= 128 { r = v - 256; }
+    r
+}
+/// The integer part of qdot's IQ2 AVX lane L (values 4L..4L+3 of every 32-chunk, times 2*ls+1) for one 256-block.
+#[cube]
+fn iq2_lane_int(w: &[u32], blk: u32, xq: &[u32], xo: u32, s: u32, lane: u32, grid: &Shared<[u32]>, #[comptime] ty: u32) -> i32 {
+    let l = lane / 2;
+    let hf = lane % 2;
+    let mut acc = 0i32;
+    for ib in 0..8u32 {
+        let xw = i32::cast_from(xq[(xo + (s * 8 + ib) * 8 + l * 2 + hf) as usize]);
+        let mut g = 0i32;
+        let mut scl = 0i32;
+        if comptime!(ty == 0) {
+            let qs = w[(blk + 1 + ib) as usize];
+            let sg = w[(blk + 9 + ib) as usize];
+            let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+            let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+            let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+            let s8 = (sg >> (8 * l)) & 255u32;
+            let m = smask4(s8 >> (4 * hf));
+            g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+            scl = 2 * i32::cast_from(sc & 15u32) + 1;
+            if lane >= 4 { scl = 2 * i32::cast_from(sc >> 4) + 1; }
+        }
+        if comptime!(ty == 1) {
+            let qw = w[(blk + 1 + 2 * ib) as usize];
+            let a1 = w[(blk + 2 + 2 * ib) as usize];
+            scl = 2 * i32::cast_from(a1 >> 28) + 1;
+            let idx = (qw >> (8 * l)) & 255u32;
+            let k7 = (a1 >> (7 * l)) & 127u32;
+            let s8 = k7 | ((u32::count_ones(k7) & 1u32) << 7);
+            let m = smask4(s8 >> (4 * hf));
+            g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+        }
+        acc += dp4a(g, xw, 0i32) * scl;
+    }
+    acc
+}
+/// iq2_lane_int reading staged (shared) weights and activations: the same integer ops
+#[cube]
+fn iq2_lane_int_s(w: &Shared<[u32]>, blk: u32, xq: &Shared<[u32]>, xo: u32, s: u32, lane: u32, grid: &Shared<[u32]>, #[comptime] ty: u32) -> i32 {
+    let l = lane / 2;
+    let hf = lane % 2;
+    let mut acc = 0i32;
+    for ib in 0..8u32 {
+        let xw = i32::cast_from(xq[(xo + (s * 8 + ib) * 8 + l * 2 + hf) as usize]);
+        let mut g = 0i32;
+        let mut scl = 0i32;
+        if comptime!(ty == 0) {
+            let qs = w[(blk + 1 + ib) as usize];
+            let sg = w[(blk + 9 + ib) as usize];
+            let qh = (w[(blk + 17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+            let sc = (w[(blk + 19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+            let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+            let s8 = (sg >> (8 * l)) & 255u32;
+            let m = smask4(s8 >> (4 * hf));
+            g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+            scl = 2 * i32::cast_from(sc & 15u32) + 1;
+            if lane >= 4 { scl = 2 * i32::cast_from(sc >> 4) + 1; }
+        }
+        if comptime!(ty == 1) {
+            let qw = w[(blk + 1 + 2 * ib) as usize];
+            let a1 = w[(blk + 2 + 2 * ib) as usize];
+            scl = 2 * i32::cast_from(a1 >> 28) + 1;
+            let idx = (qw >> (8 * l)) & 255u32;
+            let k7 = (a1 >> (7 * l)) & 127u32;
+            let s8 = k7 | ((u32::count_ones(k7) & 1u32) << 7);
+            let m = smask4(s8 >> (4 * hf));
+            g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+        }
+        acc += dp4a(g, xw, 0i32) * scl;
+    }
+    acc
+}
+/// k_xgu_ex16 with the cube's 16 gate and up rows and the activations staged in shared memory by coalesced loads;
+/// identical integer sums and fma order.
+#[cube(launch_unchecked)]
+fn k_xgu_ex16s(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, nsb: u32, nx: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let mut ws = Shared::<[u32]>::new_slice(6720usize);
+    let mut xs = Shared::<[u32]>::new_slice(2560usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let lr = wy * 2u32 + half;
+    let row = CUBE_POS_X * 16u32 + lr;
+    let ein = e < oc[3];
+    let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+    let seg = nsb * bw;
+    let mut sel = 0u32;
+    if ein {
+        let m0 = meta[(e * 4) as usize];
+        sel = m0 >> 31;
+        let g0 = (m0 & 2147483647u32) + CUBE_POS_X * 16u32 * rbg;
+        let u0 = meta[(e * 4 + 1) as usize] + CUBE_POS_X * 16u32 * rbu;
+        let mut k = UNIT_POS;
+        while k < 32u32 * seg {
+            let sg = k / seg;
+            let c = k - sg * seg;
+            let rr = sg / 2u32;
+            let mut src = g0 + rr * rbg + c;
+            if sg % 2u32 == 1u32 { src = u0 + rr * rbu + c; }
+            if CUBE_POS_X * 16u32 + rr < rows {
+                if sel == 0u32 { ws[k as usize] = ar[src as usize]; } else { ws[k as usize] = ar1[src as usize]; }
+            }
+            k += CUBE_DIM;
+        }
+        let mut k2 = UNIT_POS;
+        while k2 < nx { xs[k2 as usize] = xq[k2 as usize]; k2 += CUBE_DIM; }
+    }
+    sync_cube();
+    let act = ein && row < rows;
+    if act {
+        let mut ti = 0u32;
+        if e >= oc[0] { ti += 1u32; }
+        if e >= oc[1] { ti += 1u32; }
+        if e >= oc[2] { ti += 1u32; }
+        let xo = ti * nsb * 64;
+        let isu = r / 8u32;
+        let base = (lr * 2u32 + isu) * seg;
+        let lane = r % 8u32;
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let iv = iq2_lane_int_s(&ws, base + s * bw, &xs, xo, s, lane, &grid, ty);
+            let w0 = f32::reinterpret(ws[(base + s * bw) as usize]);
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(iv), d, acc);
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg2 = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg2;
+        h[(e * rows + row) as usize] = sl * u;
+    }
+}
+/// PYRE_QN_XEXACT gate/up: h = silu(g) * u with g, u computed as qdot::iq2s_k_b / iq2xxs_k_b do (8 integer lanes per
+/// 256-block, lane-wise fma over the blocks in order, the AVX horizontal-sum tree), silu as x * (1 / (1 + exp(-x))).
+/// One 32-thread cube per (row, entry); CUBE_POS_Y = entry; entries >= oc[3] are padding.
+#[cube(launch_unchecked)]
+fn k_xgu_ex(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut ig = Shared::<[i32]>::new_slice(256usize);
+    let mut fa = Shared::<[f32]>::new_slice(16usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X;
+    let act = e < oc[3];
+    let mut ti = 0u32;
+    if e >= oc[0] { ti += 1u32; }
+    if e >= oc[1] { ti += 1u32; }
+    if e >= oc[2] { ti += 1u32; }
+    let xo = ti * nsb * 64;
+    let mut go = 0u32;
+    let mut uo = 0u32;
+    let mut sel = 0u32;
+    if act {
+        let m0 = meta[(e * 4) as usize];
+        sel = m0 >> 31;
+        go = (m0 & 2147483647u32) + row * rbg;
+        uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let lane = UNIT_POS % 8;
+        let mut s = UNIT_POS / 8;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        while s < nsb {
+            if sel == 0u32 {
+                ig[(s * 8 + lane) as usize] = iq2_lane_int(ar, go + s * bw, xq, xo, s, lane, &grid, ty);
+                ig[(128 + s * 8 + lane) as usize] = iq2_lane_int(ar, uo + s * bw, xq, xo, s, lane, &grid, ty);
+            } else {
+                ig[(s * 8 + lane) as usize] = iq2_lane_int(ar1, go + s * bw, xq, xo, s, lane, &grid, ty);
+                ig[(128 + s * 8 + lane) as usize] = iq2_lane_int(ar1, uo + s * bw, xq, xo, s, lane, &grid, ty);
+            }
+            s += 4u32;
+        }
+    }
+    sync_cube();
+    if act && UNIT_POS < 16 {
+        let lane = UNIT_POS % 8;
+        let isu = UNIT_POS / 8;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut base = go;
+        if isu == 1u32 { base = uo; }
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[(base + s * bw) as usize]); } else { w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(ig[(isu * 128 + s * 8 + lane) as usize]), d, acc);
+        }
+        fa[UNIT_POS as usize] = acc;
+    }
+    sync_cube();
+    if act && UNIT_POS == 0 {
+        let g = ((fa[0] + fa[4]) + (fa[2] + fa[6])) + ((fa[1] + fa[5]) + (fa[3] + fa[7]));
+        let u = ((fa[8] + fa[12]) + (fa[10] + fa[14])) + ((fa[9] + fa[13]) + (fa[11] + fa[15]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        h[(e * rows + row) as usize] = sl * u;
+    }
+}
+/// PYRE_QN_XEXACT down (Q2_0 rows, Q8D h): as qdot::q2_0_d_avx2 (8 integer lanes per 64-block, lane-wise fma, the
+/// correction term subtracted block by block, corr + hsum), times the routing weight; one output per (entry, row).
+#[cube(launch_unchecked)]
+fn k_xdown_ex(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    let mut pi = Shared::<[i32]>::new_slice(512usize);
+    let mut fa = Shared::<[f32]>::new_slice(9usize);
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X;
+    let act = e < oc[3];
+    let mut dof = 0u32;
+    let mut sel = 0u32;
+    if act {
+        let m2 = meta[(e * 4 + 2) as usize];
+        sel = m2 >> 31;
+        dof = (m2 & 2147483647u32) + row * rbd;
+        let m = UNIT_POS % 8;
+        let mut i = UNIT_POS / 8;
+        let k0 = m / 4;
+        let j0 = (m % 4) * 4;
+        while i < nb {
+            let blk = dof + i * 5;
+            let mut p = 0i32;
+            let mut wq = 0u32;
+            if sel == 0u32 { wq = ar[(blk + 1 + j0 / 4) as usize]; } else { wq = ar1[(blk + 1 + j0 / 4) as usize]; }
+            for jj in 0..4u32 {
+                let j = j0 + jj;
+                let qv = (wq >> (8 * (j % 4))) & 255u32;
+                let xw = hq[(e * nb * 16 + i * 16 + j) as usize];
+                let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+            }
+            pi[(i * 8 + m) as usize] = p;
+            i += 4u32;
+        }
+    }
+    sync_cube();
+    if act && UNIT_POS < 9 {
+        let mut acc = 0.0f32;
+        for i in 0..nb {
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[(dof + i * 5) as usize]); } else { w0 = f32::reinterpret(ar1[(dof + i * 5) as usize]); }
+            let dd = w0 * hd[(e * nb + i) as usize];
+            if UNIT_POS < 8 {
+                acc = fma(f32::cast_from(pi[(i * 8 + UNIT_POS) as usize]), dd, acc);
+            } else {
+                let pr = fma(dd, f32::cast_from(i32::cast_from(hs[(e * nb + i) as usize])), 0.0f32);
+                acc = acc - pr;
+            }
+        }
+        fa[UNIT_POS as usize] = acc;
+    }
+    sync_cube();
+    if act && UNIT_POS == 0 {
+        let hsum = ((fa[0] + fa[4]) + (fa[2] + fa[6])) + ((fa[1] + fa[5]) + (fa[3] + fa[7]));
+        let v = fa[8] + hsum;
+        let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+        y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
+    }
+}
+/// k_xgu_ex / k_xdown_ex with 8 rows (one warp each) per cube: same per-row lane order and float steps.
+#[cube(launch_unchecked)]
+fn k_xgu_ex8(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut ig = Shared::<[i32]>::new_slice(4096usize);
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let act = e < oc[3] && row < rows;
+    let mut ti = 0u32;
+    if e >= oc[0] { ti += 1u32; }
+    if e >= oc[1] { ti += 1u32; }
+    if e >= oc[2] { ti += 1u32; }
+    let xo = ti * nsb * 64;
+    let mut go = 0u32;
+    let mut uo = 0u32;
+    let mut sel = 0u32;
+    if act {
+        let m0 = meta[(e * 4) as usize];
+        sel = m0 >> 31;
+        go = (m0 & 2147483647u32) + row * rbg;
+        uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let lane = ux % 8;
+        let mut s = ux / 8;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        while s < nsb {
+            if sel == 0u32 {
+                ig[(wy * 256 + s * 8 + lane) as usize] = iq2_lane_int(ar, go + s * bw, xq, xo, s, lane, &grid, ty);
+                ig[(wy * 256 + 128 + s * 8 + lane) as usize] = iq2_lane_int(ar, uo + s * bw, xq, xo, s, lane, &grid, ty);
+            } else {
+                ig[(wy * 256 + s * 8 + lane) as usize] = iq2_lane_int(ar1, go + s * bw, xq, xo, s, lane, &grid, ty);
+                ig[(wy * 256 + 128 + s * 8 + lane) as usize] = iq2_lane_int(ar1, uo + s * bw, xq, xo, s, lane, &grid, ty);
+            }
+            s += 4u32;
+        }
+    }
+    sync_cube();
+    if act && ux < 16 {
+        let lane = ux % 8;
+        let isu = ux / 8;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut base = go;
+        if isu == 1u32 { base = uo; }
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[(base + s * bw) as usize]); } else { w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(ig[(wy * 256 + isu * 128 + s * 8 + lane) as usize]), d, acc);
+        }
+        fa[(wy * 16 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && ux == 0 {
+        let f = wy * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        h[(e * rows + row) as usize] = sl * u;
+    }
+}
+/// PYRE_QN_XGU_ROWS (8 or 16, default 8; 16 was slower in nsys e9): rows per cube of k_xgu_ex8
+fn xgu_rows() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU_ROWS").ok().and_then(|v| v.parse().ok()).filter(|&v: &u32| v == 8 || v == 16).unwrap_or(8)) }
+/// PYRE_QN_XEXACT gate/up, two rows per warp (16 lanes each: 8 integer lanes x gate/up), no shared integer stage:
+/// each lane does its own blocks in order and accumulates at once, the same per-lane fma order and hsum as k_xgu_ex8.
+#[cube(launch_unchecked)]
+fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let row = (CUBE_POS_X * CUBE_DIM_Y + wy) * 2u32 + half;
+    let act = e < oc[3] && row < rows;
+    if act {
+        let mut ti = 0u32;
+        if e >= oc[0] { ti += 1u32; }
+        if e >= oc[1] { ti += 1u32; }
+        if e >= oc[2] { ti += 1u32; }
+        let xo = ti * nsb * 64;
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let mut base = (m0 & 2147483647u32) + row * rbg;
+        if r >= 8u32 { base = meta[(e * 4 + 1) as usize] + row * rbu; }
+        let lane = r % 8u32;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut iv = 0i32;
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { iv = iq2_lane_int(ar, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar[(base + s * bw) as usize]); }
+            else { iv = iq2_lane_int(ar1, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(iv), d, acc);
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        h[(e * rows + row) as usize] = sl * u;
+    }
+}
+/// PYRE_QN_XGU2: 1 (default) k_xgu_ex16, 5 k_xgu_ex16s (staged; e16 same trace 172 vs 114 us, slower), 6 alternate ex16s/ex16, 3 k_xgu_ex64 (fused Q8D; e14 same trace 129 us vs 114+9 us, not faster), 0 k_xgu_ex8, 2 alternate ex16/ex8, 4 alternate ex64/ex16 (one trace)
+fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
+static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// PYRE_QN_XEXACT down, two rows per warp (16 lanes each: lanes 0..7 the q2_0_d_avx2 lanes, lane 8 the block correction),
+/// each lane accumulating its blocks in order (same per-lane fma order and final sum as k_xdown_ex8), no shared integer stage.
+#[cube(launch_unchecked)]
+fn k_xdown_ex16(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let row = (CUBE_POS_X * CUBE_DIM_Y + wy) * 2u32 + half;
+    let act = e < oc[3] && row < rows;
+    if act && r < 9u32 {
+        let m2 = meta[(e * 4 + 2) as usize];
+        let sel = m2 >> 31;
+        let dof = (m2 & 2147483647u32) + row * rbd;
+        let k0 = (r % 8u32) / 4u32;
+        let j0 = (r % 4u32) * 4u32;
+        let mut acc = 0.0f32;
+        for i in 0..nb {
+            let blk = dof + i * 5;
+            let mut w0 = 0.0f32;
+            let mut wq = 0u32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[blk as usize]); wq = ar[(blk + 1 + j0 / 4) as usize]; } else { w0 = f32::reinterpret(ar1[blk as usize]); wq = ar1[(blk + 1 + j0 / 4) as usize]; }
+            let dd = w0 * hd[(e * nb + i) as usize];
+            if r < 8u32 {
+                let mut p = 0i32;
+                for jj in 0..4u32 {
+                    let j = j0 + jj;
+                    let qv = (wq >> (8 * (j % 4))) & 255u32;
+                    let xw = hq[(e * nb * 16 + i * 16 + j) as usize];
+                    let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                    p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+                }
+                acc = fma(f32::cast_from(p), dd, acc);
+            } else {
+                let pr = fma(dd, f32::cast_from(i32::cast_from(hs[(e * nb + i) as usize])), 0.0f32);
+                acc = acc - pr;
+            }
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let hsum = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let v = fa[(f + 8) as usize] + hsum;
+        let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+        y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
+    }
+}
+/// PYRE_QN_XDN2: 1 (default) k_xdown_ex16, 3 k_xdown_ex16s (staged; e15 same trace 116 vs 93 us, slower), 0 k_xdown_ex8, 2 alternate ex16/ex8, 4 alternate ex16s/ex16
+fn xdn2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XDN2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
+static XDN2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// k_xgu_ex16 with 64 rows per cube (grid table loaded once per 64 rows) and the Q8D quantize of those 64 h values
+/// (one block, exactly k_q8d's ops) fused into the epilogue, so k_q8d is not launched.
+#[cube(launch_unchecked)]
+fn k_xgu_ex64(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], hq: &mut [u32], hd: &mut [f32], hs: &mut [u32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut fa = Shared::<[f32]>::new_slice(1024usize);
+    let mut hv = Shared::<[f32]>::new_slice(64usize);
+    let mut si = Shared::<[i32]>::new_slice(16usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let lr = wy * 2u32 + half;
+    let row = CUBE_POS_X * 64u32 + lr;
+    let act = e < oc[3];
+    if act {
+        let mut ti = 0u32;
+        if e >= oc[0] { ti += 1u32; }
+        if e >= oc[1] { ti += 1u32; }
+        if e >= oc[2] { ti += 1u32; }
+        let xo = ti * nsb * 64;
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let mut base = (m0 & 2147483647u32) + row * rbg;
+        if r >= 8u32 { base = meta[(e * 4 + 1) as usize] + row * rbu; }
+        let lane = r % 8u32;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut iv = 0i32;
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { iv = iq2_lane_int(ar, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar[(base + s * bw) as usize]); }
+            else { iv = iq2_lane_int(ar1, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(iv), d, acc);
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        let hvv = sl * u;
+        hv[lr as usize] = hvv;
+        h[(e * rows + row) as usize] = hvv;
+    }
+    sync_cube();
+    let tq = UNIT_POS;
+    if act && tq < 16u32 {
+        let b = e * (rows / 64u32) + CUBE_POS_X;
+        let mut amax = 0.0f32;
+        for k in 0..64u32 { amax = f32::max(amax, f32::abs(hv[k as usize])); }
+        let dq = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if dq > 0.0f32 { id = 1.0f32 / dq; }
+        if tq == 0u32 { hd[b as usize] = dq; }
+        let mut word = 0u32;
+        let mut sm = 0i32;
+        #[unroll]
+        for j in 0..4u32 {
+            let v = i32::cast_from(xround_g(hv[(tq * 4 + j) as usize] * id));
+            sm += v;
+            word |= (u32::cast_from(v) & 255u32) << (8 * j);
+        }
+        hq[(b * 16 + tq) as usize] = word;
+        si[tq as usize] = sm;
+    }
+    sync_cube();
+    if act && UNIT_POS == 0u32 {
+        let b = e * (rows / 64u32) + CUBE_POS_X;
+        let mut t = 0i32;
+        for k in 0..16u32 { t += si[k as usize]; }
+        hs[b as usize] = u32::cast_from(t);
+    }
+}
+/// k_xdown_ex16 with the cube's 16 weight rows, the entry's hq words and hd/hs staged in shared memory by coalesced
+/// loads (all 256 threads, consecutive words) first; then the identical per-lane integer sums and fma order.
+#[cube(launch_unchecked)]
+fn k_xdown_ex16s(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let mut ws = Shared::<[u32]>::new_slice(5120usize);
+    let mut xs = Shared::<[u32]>::new_slice(1024usize);
+    let mut ds = Shared::<[f32]>::new_slice(64usize);
+    let mut ss = Shared::<[u32]>::new_slice(64usize);
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let lr = wy * 2u32 + half;
+    let row = CUBE_POS_X * 16u32 + lr;
+    let ein = e < oc[3];
+    let rw = nb * 5u32;
+    if ein {
+        let m2 = meta[(e * 4 + 2) as usize];
+        let sel = m2 >> 31;
+        let b0 = (m2 & 2147483647u32) + CUBE_POS_X * 16u32 * rbd;
+        let mut k = UNIT_POS;
+        while k < 16u32 * rw {
+            let rr = k / rw;
+            let c = k - rr * rw;
+            if CUBE_POS_X * 16u32 + rr < rows {
+                if sel == 0u32 { ws[k as usize] = ar[(b0 + rr * rbd + c) as usize]; } else { ws[k as usize] = ar1[(b0 + rr * rbd + c) as usize]; }
+            }
+            k += CUBE_DIM;
+        }
+        let mut k2 = UNIT_POS;
+        while k2 < nb * 16u32 { xs[k2 as usize] = hq[(e * nb * 16 + k2) as usize]; k2 += CUBE_DIM; }
+        let mut k3 = UNIT_POS;
+        while k3 < nb { ds[k3 as usize] = hd[(e * nb + k3) as usize]; ss[k3 as usize] = hs[(e * nb + k3) as usize]; k3 += CUBE_DIM; }
+    }
+    sync_cube();
+    let act = ein && row < rows;
+    if act && r < 9u32 {
+        let k0 = (r % 8u32) / 4u32;
+        let j0 = (r % 4u32) * 4u32;
+        let mut acc = 0.0f32;
+        for i in 0..nb {
+            let blk = lr * rw + i * 5;
+            let w0 = f32::reinterpret(ws[blk as usize]);
+            let wq = ws[(blk + 1 + j0 / 4) as usize];
+            let dd = w0 * ds[i as usize];
+            if r < 8u32 {
+                let mut p = 0i32;
+                for jj in 0..4u32 {
+                    let j = j0 + jj;
+                    let qv = (wq >> (8 * (j % 4))) & 255u32;
+                    let xw = xs[(i * 16 + j) as usize];
+                    let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                    p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+                }
+                acc = fma(f32::cast_from(p), dd, acc);
+            } else {
+                let pr = fma(dd, f32::cast_from(i32::cast_from(ss[i as usize])), 0.0f32);
+                acc = acc - pr;
+            }
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let hsum = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let v = fa[(f + 8) as usize] + hsum;
+        let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+        y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
+    }
+}
+#[cube(launch_unchecked)]
+fn k_xdown_ex8(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    let mut pi = Shared::<[i32]>::new_slice(4096usize);
+    let mut fa = Shared::<[f32]>::new_slice(72usize);
+    let e = CUBE_POS_Y;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let act = e < oc[3] && row < rows;
+    let mut dof = 0u32;
+    let mut sel = 0u32;
+    if act {
+        let m2 = meta[(e * 4 + 2) as usize];
+        sel = m2 >> 31;
+        dof = (m2 & 2147483647u32) + row * rbd;
+        let m = ux % 8;
+        let mut i = ux / 8;
+        let k0 = m / 4;
+        let j0 = (m % 4) * 4;
+        while i < nb {
+            let blk = dof + i * 5;
+            let mut p = 0i32;
+            let mut wq = 0u32;
+            if sel == 0u32 { wq = ar[(blk + 1 + j0 / 4) as usize]; } else { wq = ar1[(blk + 1 + j0 / 4) as usize]; }
+            for jj in 0..4u32 {
+                let j = j0 + jj;
+                let qv = (wq >> (8 * (j % 4))) & 255u32;
+                let xw = hq[(e * nb * 16 + i * 16 + j) as usize];
+                let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+            }
+            pi[(wy * 512 + i * 8 + m) as usize] = p;
+            i += 4u32;
+        }
+    }
+    sync_cube();
+    if act && ux < 9 {
+        let mut acc = 0.0f32;
+        for i in 0..nb {
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[(dof + i * 5) as usize]); } else { w0 = f32::reinterpret(ar1[(dof + i * 5) as usize]); }
+            let dd = w0 * hd[(e * nb + i) as usize];
+            if ux < 8 {
+                acc = fma(f32::cast_from(pi[(wy * 512 + i * 8 + ux) as usize]), dd, acc);
+            } else {
+                let pr = fma(dd, f32::cast_from(i32::cast_from(hs[(e * nb + i) as usize])), 0.0f32);
+                acc = acc - pr;
+            }
+        }
+        fa[(wy * 9 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && ux == 0 {
+        let f = wy * 9;
+        let hsum = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let v = fa[(f + 8) as usize] + hsum;
+        let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+        y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
+    }
+}
+/// PYRE_QN_XEXACT: per token, its routed experts' weighted rows summed in routing order from 0 (as the CPU's
+/// per-token accumulation), each row from the GPU entry rows (gy) or the CPU rows (cy, code bit 31).
+#[cube(launch_unchecked)]
+fn k_rsum_ex(gy: &[f32], cy: &[f32], tab: &[u32], y: &mut [f32], d: u32, kk: u32) {
+    let r = ABSOLUTE_POS_X;
+    let ti = CUBE_POS_Y;
+    if r < d {
+        let b = ti * (kk + 1);
+        let n = tab[b as usize];
+        let mut acc = 0.0f32;
+        for k in 0..n {
+            let cd = tab[(b + 1 + k) as usize];
+            let ix = cd & 2147483647u32;
+            if (cd >> 31) == 1u32 { acc = acc + cy[(ix * d + r) as usize]; } else { acc = acc + gy[(ix * d + r) as usize]; }
+        }
+        y[(ti * d + r) as usize] = acc;
+    }
+}
+/// PYRE_QN_MOEGRAPH: k_xgu_st / k_xdown_qt with the cumulative entry counts o1..o4 read from `oc` (device) instead of
+/// launch scalars and a grid sized for the window's maximum entries; entries e >= o4 are padding and skipped, so one
+/// captured launch serves every routing. Same per-entry/per-row arithmetic as the originals.
+#[cube(launch_unchecked)]
+fn k_xgu_stg(xq: &[u32], xs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32, oc: &[u32], dq: u32,
+    #[comptime] ng: u32, #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let lane = UNIT_POS_X;
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let o1 = oc[0];
+    let o2 = oc[1];
+    let o3 = oc[2];
+    let o4 = oc[3];
+    let mut ti = 0u32;
+    if e >= o1 { ti += 1u32; }
+    if e >= o2 { ti += 1u32; }
+    if e >= o3 { ti += 1u32; }
+    let xo = ti * dq;
+    let so = ti * (dq / 8);
+    if row < rows && e < o4 {
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let go = (m0 & 2147483647u32) + row * rbg;
+        let uo = meta[(e * 4 + 1) as usize] + row * rbu;
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        #[unroll]
+        for k in 0..ng {
+            let q = lane + 32 * k;
+            let x0 = i32::cast_from(xq[(xo + q * 2) as usize]);
+            let x1 = i32::cast_from(xq[(xo + q * 2 + 1) as usize]);
+            let xsc = xs[(so + q / 4) as usize];
+            if sel == 0u32 {
+                gs += gdot8s(ar, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar, uo, q, x0, x1, xsc, &grid, ty);
+            } else {
+                gs += gdot8s(ar1, go, q, x0, x1, xsc, &grid, ty);
+                us += gdot8s(ar1, uo, q, x0, x1, xsc, &grid, ty);
+            }
+        }
+        let g = plane_sum(gs);
+        let u = plane_sum(us);
+        if lane == 0 {
+            h[(e * rows + row) as usize] = g / (1.0f32 + f32::exp(-g)) * u;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn k_xdown_qtg(hq: &[u32], hs: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], q2l: &[u32], y: &mut [f32], rows: u32, cols: u32, rbd: u32, oc: &[u32]) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let ti = CUBE_POS_Y;
+    let o1 = oc[0];
+    let o2 = oc[1];
+    let o3 = oc[2];
+    let o4 = oc[3];
+    let mut e0 = 0u32;
+    let mut e1 = o1;
+    if ti == 1u32 { e0 = o1; e1 = o2; } else if ti == 2u32 { e0 = o2; e1 = o3; } else if ti == 3u32 { e0 = o3; e1 = o4; }
+    if row < rows {
+        let nsb = cols / 8;
+        let tot = (e1 - e0) * nsb;
+        let mut s = 0.0f32;
+        let mut j = UNIT_POS_X;
+        while j < tot {
+            let el = j / nsb;
+            let q = j - el * nsb;
+            let e = e0 + el;
+            let sb = q / 4;
+            let l = q % 4;
+            let m2 = meta[(e * 4 + 2) as usize];
+            let blk = (m2 & 2147483647u32) + row * rbd + (sb / 2) * 5;
+            let wi = blk + 1 + 2 * (sb % 2) + l / 2;
+            let mut d = 0.0f32;
+            let mut qw = 0u32;
+            if (m2 >> 31) == 0u32 { d = f32::reinterpret(ar[blk as usize]); qw = ar[wi as usize]; } else { d = f32::reinterpret(ar1[blk as usize]); qw = ar1[wi as usize]; }
+            let half = (qw >> (16 * (l % 2))) & 65535u32;
+            let xw = e * cols / 4 + q * 2;
+            let x0 = i32::cast_from(hq[xw as usize]);
+            let x1 = i32::cast_from(hq[(xw + 1) as usize]);
+            let v = dp4a(i32::cast_from(q2l[(half >> 8) as usize]), x1, dp4a(i32::cast_from(q2l[(half & 255u32) as usize]), x0, 0i32));
+            let ones = dp4a(16843009i32, x1, dp4a(16843009i32, x0, 0i32));
+            s += f32::reinterpret(meta[(e * 4 + 3) as usize]) * d * hs[((e * cols) / 32 + q / 4) as usize] * f32::cast_from(v - ones);
+            j += 32u32;
+        }
+        let t = plane_sum(s);
+        if UNIT_POS_X == 0 {
+            y[(ti * rows + row) as usize] = t;
+        }
+    }
+}
 /// y[row] += sum_e wgt_e * (down_e row . h_e); down offset meta[4e+2], weight bits meta[4e+3].
 #[cube(launch_unchecked)]
 fn k_xdown_b(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks: &[u32], g1: &[u32], y: &mut [f32], ne: u32, rows: u32, cols: u32, rbd: u32, #[comptime] td: u32) {
@@ -3893,13 +4755,17 @@ impl Cube {
         self.client.write(&hd, cubecl::bytes::Bytes::from_elems(v));
         XUP_NS[0].fetch_add((t1 - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XUP_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
-        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
+        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot: base / slot_bytes.max(1), bytes: slot_bytes }
     }
     /// Upload one pre-packed expert (`xpacked`: gate words, then up at `uo`, down at `dof`) into slot `slot`.
     #[allow(clippy::too_many_arguments)]
     pub fn xupload_pk(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, v: &cubecl::bytes::Bytes, uo: usize, dof: usize) -> XEnt {
+        self.xupload_at(ar, ar_bytes, slot * slot_bytes, slot_bytes, v, uo, dof)
+    }
+    /// xupload_pk at a byte offset with a given capacity (PYRE_QN_XCLASS per-class slots)
+    pub fn xupload_at(&self, ar: &Handle, ar_bytes: usize, base: usize, slot_bytes: usize, v: &cubecl::bytes::Bytes, uo: usize, dof: usize) -> XEnt {
         let t0 = std::time::Instant::now();
-        let base = slot * slot_bytes; let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
+        let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         // pinned staging (CubeCL's page-locked pool) so the copy is a real async DMA, like Strata's staging memcpyAsync
         let mut by = v.clone(); if xpin() { self.client.staging(std::iter::once(&mut by), false); }
@@ -3916,7 +4782,7 @@ impl Cube {
         } else { self.client.write(&hd, by); }
         XUP_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
-        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
+        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot: base / slot_bytes.max(1), bytes: slot_bytes }
     }
     /// All cached experts of one layer: h[e] = silu(G_e x) * (U_e x) -> Q8 grid -> y += sum_e w_e D_e h[e].
     #[allow(clippy::too_many_arguments)]
@@ -4025,6 +4891,80 @@ impl Cube {
             k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
             k_xdown_qt8::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
                 a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, a(&eo, 9));
+        }
+        true
+    }
+    /// xrun_fast_multi with a fixed shape (PYRE_QN_MOEGRAPH): `mh` holds max_ne entries (padding allowed past the
+    /// real ones), `oc` the 4 cumulative per-token entry counts, both written by the host before the launch, so the
+    /// launches (grid max_ne, buffer sizes) do not depend on the routing and can be captured once and replayed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_graph_multi(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, max_ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+        let ne = max_ne;
+        if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 || ars.is_empty() || ars.len() > 2 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32; let ml = ne * 4;
+        let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
+        let (ar, ar1) = (&ars[0], ars.last().unwrap());
+        let (xq, xs) = (self.empty(t * d / 4), self.empty(t * d / 32)); let h = self.empty(ne * ff); let (hq, hs) = (self.empty(ne * ff / 4), self.empty(ne * ff / 32));
+        let nb = (d / 32) as u32;
+        unsafe {
+            k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static(nb.div_ceil(64), t as u32, 1), CubeDim::new_1d(64), a(src, sn), a(&xq, t * d / 4), a(&xs, t * d / 32), 0, sn as u32 / t as u32, nb);
+            k_xgu_stg::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(rp), ne as u32, 1), CubeDim::new_2d(32, rp),
+                a(&xq, t * d / 4), a(&xs, t * d / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, a(oc, 4), (d / 4) as u32, (d / 256) as u32, gn, tys.0);
+            k_q8pack::launch_unchecked(&self.client, CubeCount::Static(((ne * ff) as u32 / 32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), 0, (ne * ff / 32) as u32);
+            k_xdown_qtg::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(rpc), t as u32, 1), CubeDim::new_2d(32, rpc),
+                a(&hq, ne * ff / 4), a(&hs, ne * ff / 32), a(ar, aw), a(ar1, aw), a(mh, ml), a(&tb.q2l, 256), a(y, t * d), d as u32, ff as u32, rbs.2 as u32, a(oc, 4));
+        }
+        true
+    }
+    /// PYRE_QN_XEXACT: the cached experts of up to 4 tokens with the CPU's arithmetic (see k_xgu_ex / k_xdown_ex);
+    /// `y` gets one row per entry (entry e at e * d, weighted, not summed). `mh` holds ne entries, `oc` the cumulative
+    /// per-token counts. Only IQ2_S/IQ2_XXS gate+up with Q2_0 down.
+    #[allow(clippy::too_many_arguments)]
+    /// PYRE_QN_XEX8=0: the one-row-per-cube exact kernels (reference for the 8-row ones)
+    pub fn rsum_ex(&self, gy: &Handle, cy: &Handle, tab: &Handle, y: &Handle, d: usize, kk: usize, t: usize) {
+        let a = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };
+        unsafe { k_rsum_ex::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), a(gy), a(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(y.clone(), t * d), d as u32, kk as u32) }
+    }
+    pub fn xrun_exact(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle, scr: Option<&XScr>) -> bool {
+        if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 64 != 0 || d / 256 > 16 || ff / 64 > 64 || ars.is_empty() || ars.len() > 2 { return false; }
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
+        let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let ml = ne * 4;
+        let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) };
+        let (ar, ar1) = (&ars[0], ars.last().unwrap());
+        let nsb = d / 256; let nb = ff / 64;
+        // PYRE_QN_XEXACT decode: the persistent XScr buffers (sizes checked: xs d/32 >= nsb, hs holds hd and hs) instead of six pool allocations
+        let (xq, xd, h, hq, hd, hs) = match scr { Some(sc) if t == 1 && ne <= sc.max_ne => (sc.xq.clone(), sc.xs.clone(), sc.h.clone(), sc.hq.clone(), sc.hs.clone(), sc.hs.clone().offset_start((ne * nb * 4) as u64)),
+            _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
+        unsafe {
+            k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
+            let alt = || XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
+            let (g64, g2) = match xgu2() { 0 => (false, false), 2 => (false, alt()), 3 => (ff % 64 == 0, true), 4 => (ff % 64 == 0 && alt(), true), _ => (false, true) };
+            let fits = { let bw = if tys.0 == 0 { 21 } else { 17 }; 32 * nsb * bw <= 6720 && t * d / 4 <= 2560 };
+            let g16s = fits && match xgu2() { 5 => true, 6 => alt(), _ => false };
+            if xex8() && g16s { k_xgu_ex16s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, (t * d / 4) as u32, gn, tys.0); } else
+            if xex8() && g64 { k_xgu_ex64::launch_unchecked(&self.client, CubeCount::Static((ff / 64) as u32, ne as u32, 1), CubeDim::new_2d(32, 32),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
+            if xex8() && g2 { k_xgu_ex16::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
+            if xex8() { let ry = xgu_rows(); k_xgu_ex8::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(ry), ne as u32, 1), CubeDim::new_2d(32, ry),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else {
+            k_xgu_ex::launch_unchecked(&self.client, CubeCount::Static(ff as u32, ne as u32, 1), CubeDim::new_1d(32),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); }
+            if !(xex8() && g64) { k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32); }
+            let alt2 = || XDN2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
+            let (d2s, d2) = match xdn2() { 0 => (false, false), 2 => (false, alt2()), 3 => (nb <= 64, true), 4 => (nb <= 64 && alt2(), true), _ => (false, true) };
+            if xex8() && d2s { k_xdown_ex16s::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else
+            if xex8() && d2 { k_xdown_ex16::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else
+            if xex8() { k_xdown_ex8::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else {
+            k_xdown_ex::launch_unchecked(&self.client, CubeCount::Static(d as u32, ne as u32, 1), CubeDim::new_1d(32),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); }
         }
         true
     }

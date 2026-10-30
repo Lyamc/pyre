@@ -14,7 +14,7 @@ static DRAFT_MIN_P: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Later-draft confidence gate set by the high-acceptance mode for this round (None = the drafter default)
 pub fn draft_min_p() -> Option<f32> { let v = DRAFT_MIN_P.load(Relaxed); if v == u32::MAX { None } else { Some(f32::from_bits(v)) } }
 // with PYRE_QN_NATIVE=2 (the VRAM-light profile) long drafts default on: 0.5 / up to 6 drafts, verified greedy-identical
-fn native2() -> bool { std::env::var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false) }
+fn native2() -> bool { crate::model::qn_cube::native2() }
 fn hi_acc() -> f32 { std::env::var("PYRE_SPEC_HI").ok().and_then(|v| v.parse().ok()).unwrap_or(if native2() { 0.5 } else { 0.0 }) }
 static DRAFT: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = not set yet -> env/default
 static NGRAM: AtomicBool = AtomicBool::new(true);
