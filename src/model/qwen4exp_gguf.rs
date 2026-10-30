@@ -339,6 +339,8 @@ impl Model {
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
+                    if env_var("PYRE_QN_XSTAT").is_ok() { let mut sz: std::collections::BTreeMap<usize, usize> = Default::default(); for l in &self.layers { if let (Some(a), Some(b), Some(c2)) = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { let w = super::qn_cube::xwords((a, b, c2), self.cfg.d, self.cfg.ff_exp); *sz.entry(4 * (w.0 + w.1 + w.2)).or_default() += 1; } }
+                        eprintln!("xstat: slot {slot} B, expert bytes by layer count {sz:?}, raw gguf expert bytes l0 {}", self.layers[0].gate_e.row_bytes() * self.cfg.ff_exp * 2 + self.layers[0].down_e.row_bytes() * self.cfg.d); }
                     let nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); self.xpk_prefill(nslot, Some(&cb)); }
                 // PYRE_QN_XSTREAM=K: K cache slots kept free for streaming missed experts to the GPU per layer
@@ -691,7 +693,11 @@ impl Model {
         for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c = (*c as f32 * dec) as u32; } }
     }
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
-        xc.calls += 1; if xc.calls <= 3 || xc.calls % 32 == 0 { crate::limits::vlog(&format!("refill call {} (cache {} experts)", xc.calls, xc.map.len())); }
+        xc.calls += 1;
+        // PYRE_QN_XSTAT=1: cache hit rate and misses per layer per token so far (every 16 calls)
+        if xc.calls % 16 == 0 && env_var("PYRE_QN_XSTAT").is_ok() { let nl = xc.cnt.len().max(1); let tok = (xc.total as f64 / (nl as f64 * self.cfg.top_k as f64)).max(1.0);
+            eprintln!("xstat: call {} hit {:.1}% misses/layer/token {:.2} resident {} slots {} slot {:.3} MB", xc.calls, 100.0 * xc.hits as f64 / xc.total.max(1) as f64, (xc.total - xc.hits) as f64 / (tok * nl as f64), xc.map.len(), xc.map.len() + xc.free.len(), xc.slot as f64 / 1e6); }
+        if xc.calls <= 3 || xc.calls % 32 == 0 { crate::limits::vlog(&format!("refill call {} (cache {} experts)", xc.calls, xc.map.len())); }
         if adapt_on() && xc.calls != 1 && !xc.map.is_empty() { if xc.calls % adapt_every() == 0 { self.xadapt(cb, xc); } return; }
         let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
         // an empty cache fills right away (the call before prefill has no routing counts yet, so the first
