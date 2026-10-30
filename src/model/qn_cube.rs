@@ -2837,8 +2837,8 @@ fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc:
         h[(e * rows + row) as usize] = sl * u;
     }
 }
-/// PYRE_QN_XGU2: 1 (default) k_xgu_ex16, 0 k_xgu_ex8, 2 alternate per call (both in one trace)
-fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
+/// PYRE_QN_XGU2: 3 (default) k_xgu_ex64 (fused Q8D), 1 k_xgu_ex16, 0 k_xgu_ex8, 2 alternate ex16/ex8, 4 alternate ex64/ex16 (one trace)
+fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(3)) }
 static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// PYRE_QN_XEXACT down, two rows per warp (16 lanes each: lanes 0..7 the q2_0_d_avx2 lanes, lane 8 the block correction),
 /// each lane accumulating its blocks in order (same per-lane fma order and final sum as k_xdown_ex8), no shared integer stage.
@@ -2894,6 +2894,90 @@ fn k_xdown_ex16(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], met
 /// PYRE_QN_XDN2: 1 (default) k_xdown_ex16, 0 k_xdown_ex8, 2 alternate per call
 fn xdn2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XDN2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
 static XDN2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// k_xgu_ex16 with 64 rows per cube (grid table loaded once per 64 rows) and the Q8D quantize of those 64 h values
+/// (one block, exactly k_q8d's ops) fused into the epilogue, so k_q8d is not launched.
+#[cube(launch_unchecked)]
+fn k_xgu_ex64(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], hq: &mut [u32], hd: &mut [f32], hs: &mut [u32], rows: u32, rbg: u32, rbu: u32, nsb: u32,
+    #[comptime] gn: u32, #[comptime] ty: u32) {
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut fa = Shared::<[f32]>::new_slice(1024usize);
+    let mut hv = Shared::<[f32]>::new_slice(64usize);
+    let mut si = Shared::<[i32]>::new_slice(16usize);
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let lr = wy * 2u32 + half;
+    let row = CUBE_POS_X * 64u32 + lr;
+    let act = e < oc[3];
+    if act {
+        let mut ti = 0u32;
+        if e >= oc[0] { ti += 1u32; }
+        if e >= oc[1] { ti += 1u32; }
+        if e >= oc[2] { ti += 1u32; }
+        let xo = ti * nsb * 64;
+        let m0 = meta[(e * 4) as usize];
+        let sel = m0 >> 31;
+        let mut base = (m0 & 2147483647u32) + row * rbg;
+        if r >= 8u32 { base = meta[(e * 4 + 1) as usize] + row * rbu; }
+        let lane = r % 8u32;
+        let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+        let mut acc = 0.0f32;
+        for s in 0..nsb {
+            let mut iv = 0i32;
+            let mut w0 = 0.0f32;
+            if sel == 0u32 { iv = iq2_lane_int(ar, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar[(base + s * bw) as usize]); }
+            else { iv = iq2_lane_int(ar1, base + s * bw, xq, xo, s, lane, &grid, ty); w0 = f32::reinterpret(ar1[(base + s * bw) as usize]); }
+            let d = (w0 * 0.5f32) * xd[(ti * nsb + s) as usize];
+            acc = fma(f32::cast_from(iv), d, acc);
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+        let ex = xexp_g(-g);
+        let sg = 1.0f32 / (1.0f32 + ex);
+        let sl = g * sg;
+        let hvv = sl * u;
+        hv[lr as usize] = hvv;
+        h[(e * rows + row) as usize] = hvv;
+    }
+    sync_cube();
+    let tq = UNIT_POS;
+    if act && tq < 16u32 {
+        let b = e * (rows / 64u32) + CUBE_POS_X;
+        let mut amax = 0.0f32;
+        for k in 0..64u32 { amax = f32::max(amax, f32::abs(hv[k as usize])); }
+        let dq = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if dq > 0.0f32 { id = 1.0f32 / dq; }
+        if tq == 0u32 { hd[b as usize] = dq; }
+        let mut word = 0u32;
+        let mut sm = 0i32;
+        #[unroll]
+        for j in 0..4u32 {
+            let v = i32::cast_from(xround_g(hv[(tq * 4 + j) as usize] * id));
+            sm += v;
+            word |= (u32::cast_from(v) & 255u32) << (8 * j);
+        }
+        hq[(b * 16 + tq) as usize] = word;
+        si[tq as usize] = sm;
+    }
+    sync_cube();
+    if act && UNIT_POS == 0u32 {
+        let b = e * (rows / 64u32) + CUBE_POS_X;
+        let mut t = 0i32;
+        for k in 0..16u32 { t += si[k as usize]; }
+        hs[b as usize] = u32::cast_from(t);
+    }
+}
 #[cube(launch_unchecked)]
 fn k_xdown_ex8(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
     let mut pi = Shared::<[i32]>::new_slice(4096usize);
@@ -3742,14 +3826,17 @@ impl Cube {
             _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
         unsafe {
             k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
-            let g2 = match xgu2() { 0 => false, 2 => XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0, _ => true };
+            let alt = || XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
+            let (g64, g2) = match xgu2() { 0 => (false, false), 2 => (false, alt()), 3 => (ff % 64 == 0 && t == 1, true), 4 => (ff % 64 == 0 && t == 1 && alt(), true), _ => (false, true) };
+            if xex8() && g64 { k_xgu_ex64::launch_unchecked(&self.client, CubeCount::Static((ff / 64) as u32, ne as u32, 1), CubeDim::new_2d(32, 32),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
             if xex8() && g2 { k_xgu_ex16::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
             if xex8() { let ry = xgu_rows(); k_xgu_ex8::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(ry), ne as u32, 1), CubeDim::new_2d(32, ry),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else {
             k_xgu_ex::launch_unchecked(&self.client, CubeCount::Static(ff as u32, ne as u32, 1), CubeDim::new_1d(32),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); }
-            k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32);
+            if !(xex8() && g64) { k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32); }
             let d2 = match xdn2() { 0 => false, 2 => XDN2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0, _ => true };
             if xex8() && d2 { k_xdown_ex16::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
                 a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else
