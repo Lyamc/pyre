@@ -18,8 +18,7 @@ fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
     let mut part = 0.0f32;
     #[unroll]
     for j in 0..4u32 {
-        let raw = (word >> (j * 8)) & 255u32;
-        let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
+        let v = dec(word, j);
         part += v * x[(base + j) as usize];
     }
     part
@@ -963,8 +962,7 @@ fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32,
                 let mut part = 0.0f32;
                 #[unroll]
                 for jj in 0..4u32 {
-                    let raw = (word >> (jj * 8)) & 255u32;
-                    let v = f32::cast_from(raw) - f32::cast_from(((raw >> 7) & 1u32) << 8);
+                    let v = dec(word, jj);
                     part += v * lo[(wi * 4 + jj) as usize];
                 }
                 g += part * s[(row * nb + wi / 8) as usize];
