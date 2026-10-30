@@ -178,6 +178,8 @@ fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 thread_local! { static EXACT_PARTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// PYRE_QN_XALLCPU=1 (test): every routed expert runs on the CPU (placement-invariance checks)
 fn xallcpu() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XALLCPU").map(|v| v == "1").unwrap_or(false)) }
+/// PYRE_QN_XEXACT: layers whose expert types have no exact GPU kernel (only IQ2_S/IQ2_XXS + Q2_0 do) run all experts on the CPU
+fn xexact_types(l: &Layer) -> bool { let t = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9)); t.0 == t.1 && t.0 <= 1 && t.2 == 3 }
 fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
 pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -483,7 +485,7 @@ impl Model {
             let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg)); let seln: Vec<usize> = sel.iter().map(|x| x.0).collect();
             for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); }
             xcg.total += sel.len() as u64;
-            let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| !xallcpu() && xcg.map.contains_key(&(il, *e)));
+            let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| !xallcpu() && !(xexact() && !xexact_types(l)) && xcg.map.contains_key(&(il, *e)));
             tail_skip(&mut off, &on);
             // Strata-style PCIe share: the first few misses are copied into the stream slots and run on the GPU
             // with the cached ones, while the CPU pool takes the rest
@@ -1796,7 +1798,7 @@ impl Model {
                 let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg)); sels.push(sel.iter().map(|x| x.0).collect());
                 for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
                 xcg.total += sel.len() as u64;
-                let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| !xallcpu() && xcg.map.contains_key(&(il, *e)));
+                let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| !xallcpu() && !(xexact() && !xexact_types(l)) && xcg.map.contains_key(&(il, *e)));
             tail_skip(&mut off, &on);
             // Strata-style PCIe share: the first few misses are copied into the stream slots and run on the GPU
             // with the cached ones, while the CPU pool takes the rest
