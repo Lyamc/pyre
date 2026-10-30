@@ -1459,7 +1459,7 @@ fn k_delta(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mu
 /// rollback checkpoints written from registers instead of a separate copy). Per token the arithmetic and its order
 /// are k_delta's, so the results are the same.
 #[cube(launch_unchecked)]
-fn k_delta_m(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32], c0: &mut [f32], c1: &mut [f32], c2: &mut [f32],
+fn k_delta_m(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32], c0: &mut [f32], c1: &mut [f32], c2: &mut [f32], c3: &mut [f32],
     nk: u32, ch: u32, pn: u32, ostr: u32, ckm: u32, zoff: u32, boff: u32, aoff: u32, eps: f32, #[comptime] dk: u32, #[comptime] nt: u32) {
     let h = CUBE_POS_X;
     let j = UNIT_POS_X;
@@ -1510,7 +1510,7 @@ fn k_delta_m(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &
             #[unroll]
             for i in 0..dk {
                 let idx = (base + i * dk + j) as usize;
-                if t == 0u32 { c0[idx] = st[i as usize]; } else if t == 1u32 { c1[idx] = st[i as usize]; } else { c2[idx] = st[i as usize]; }
+                if t == 0u32 { c0[idx] = st[i as usize]; } else if t == 1u32 { c1[idx] = st[i as usize]; } else if t == 2u32 { c2[idx] = st[i as usize]; } else { c3[idx] = st[i as usize]; }
             }
         }
         let so = cube_sum(o * o, &mut red, comptime!(dk / 32));
@@ -2739,11 +2739,11 @@ impl Cube {
     pub fn delta_m(&self, co: &Handle, ch: usize, proj: &Handle, pn: usize, w: &GdnW, s: &Handle, out: &Handle, ostr: usize, cks: &[Option<Handle>], ckm: u32, nk: usize, nv: usize, dk: usize, zoff: usize, boff: usize, aoff: usize, eps: f32, nt: usize) {
         let sn = nv * dk * dk; let dummy = self.empty(1);
         let ck = |i: usize| match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => (h.clone(), sn), _ => (dummy.clone(), 1) };
-        let (k0, k1, k2) = (ck(0), ck(1), ck(2));
+        let (k0, k1, k2, k3) = (ck(0), ck(1), ck(2), ck(3));
         unsafe { k_delta_m::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
             BufferArg::from_raw_parts(co.clone(), nt * ch), BufferArg::from_raw_parts(proj.clone(), nt * pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
             BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), sn), BufferArg::from_raw_parts(out.clone(), nt * ostr),
-            BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1),
+            BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1), BufferArg::from_raw_parts(k3.0, k3.1),
             nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
     }
     /// Decode attention for one token (see k_attn_prep / k_attn); `p` = the fused q|k|v projection.

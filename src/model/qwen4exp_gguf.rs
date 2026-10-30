@@ -54,6 +54,7 @@ fn mtp_cpu<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 fn xmeta1() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XMETA1").map(|v| v != "0").unwrap_or(true)) }
 fn xcopys() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCOPYS").map(|v| v == "1").unwrap_or(false)) }
 fn xarena_pin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PIN").map(|v| v == "1").unwrap_or(false)) }
+static RTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); static RTN2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn xshare() -> f32 { static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)) }
 pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, stream: Vec<usize>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
 
@@ -1388,8 +1389,11 @@ impl Model {
         // PYRE_QN_WAVE=1: the window in two token groups, pipelined so the GPU runs one group's dense part while
         // the CPU runs the other's routed experts (each token's arithmetic is unchanged; Strata overlaps the
         // same two phases across its batch groups)
-        if t >= 2 && env_var("PYRE_QN_WAVE").map(|v| v != "0").unwrap_or(false) {
-            let ta = t.div_ceil(2); let grp = [(0usize, ta), (ta, t)];
+        // windows of 5..8 tokens run as two groups (4 + rest) the same way, so every group stays on the 2..4-token
+        // kernels (one-token kernels per token were ~2x the cost of a 3-token window); PYRE_QN_WAVE8=0 reverts
+        let wave8 = t > 4 && t <= 8 && env_var("PYRE_QN_WAVE8").map(|v| v != "0").unwrap_or(true);
+        if (t >= 2 && env_var("PYRE_QN_WAVE").map(|v| v != "0").unwrap_or(false)) || wave8 {
+            let ta = if wave8 { 4 } else { t.div_ceil(2) }; let grp = [(0usize, ta), (ta, t)];
             let mut ctr = vec![]; { let (mut a, mut b) = (0, 0); for l in &self.layers { ctr.push((a, b)); match l.mix { Mixer::Attn { .. } => a += 1, Mixer::Lin { .. } => b += 1 } } }
             let stages: Vec<(usize, usize)> = (0..self.layers.len()).flat_map(|il| [(il, 0usize), (il, 1usize)]).collect();
             let mut dq: [Option<(H, H, H)>; 2] = [None, None];
@@ -1442,7 +1446,7 @@ impl Model {
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
-            eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
+            eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("route-to-meta {:.1} route {:.1} | ", RTN.swap(0, Relaxed) as f64 / 1e6, RTN2.swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }
@@ -1529,7 +1533,7 @@ impl Model {
             cb.gemv_m(&cl.min, &b.mixed, t * d, 0, d, &b.proj, t * pr, 0, pr, t);
             let (mut cks, mut ckm) = (vec![], 0u32);
             for ti in 0..t { let pj = at(&b.proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&b.co, ti * ch), ch, c.conv_k);
-                if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 3 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } }
+                if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } }
             cb.delta_m(&b.co, ch, &b.proj, pr, gw, &ss, &b.core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             cb.gemv_m(&cl.mout, &b.core, t * core_n, 0, core_n, &b.o, t * d, 0, d, t);
             for ti in 0..t { cb.comb(&xs[ti], &at(&b.o, ti * d), None, None, &at(&b.da, ti * dar), lra, hc, d); } cb.rms_t(xs, &cl.hcf.norm, &b.xn, hc, d, c.eps);
@@ -1580,7 +1584,7 @@ impl Model {
             let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv);
             let (mut cks, mut ckm) = (vec![], 0u32);
             for ti in 0..t { let pj = at(&proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&co_all, ti * ch), ch, c.conv_k);
-                if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 3 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
+                if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
             cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             dm_done = true;
         } }
@@ -1630,7 +1634,7 @@ impl Model {
         let lrf = cl.hcf.up.cols; let rn = d + cl.fin.rows; let dfr = cl.hcf.di.rows;
         let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
         let (rd, df, _da) = dd;
-        let rvs: Vec<Vec<f32>> = (0..t).map(|ti| rall[ti * rn..(ti + 1) * rn].to_vec()).collect();
+        let q_rt = std::time::Instant::now(); let rvs: Vec<Vec<f32>> = (0..t).map(|ti| rall[ti * rn..(ti + 1) * rn].to_vec()).collect();
         let dfs: Vec<H> = (0..t).map(|ti| at(&df, ti * dfr)).collect();
         let rds: Vec<H> = (0..t).map(|ti| at(&rd, ti * rn)).collect();
         let q5 = std::time::Instant::now();
@@ -1655,6 +1659,7 @@ impl Model {
             let _ = tys0;
                 xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64); ons.push(on); offs.push(off);
             }
+            RTN2.fetch_add(q_rt.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             // Strata's verify dispatch (expert_pool_dispatch_multi): the distinct misses of the whole window, and a
             // PCIe share of them (here the ones most tokens use) uploaded once and run on the GPU for every token
             let mut sins: Vec<(usize, usize)> = vec![];
@@ -1685,6 +1690,7 @@ impl Model {
                 if xmeta1() && xfast() && xcr.arena.len() <= 2 {
                     let mut all: Vec<u32> = vec![];
                     for ti in 0..t { if ons[ti].is_empty() { continue; } let ents: Vec<(&super::qn_cube::XEnt, f32)> = ons[ti].iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); moff[ti] = all.len(); all.extend(super::qn_cube::Cube::xmeta(&xcr.arena, &ents)); }
+                    RTN.fetch_add(q_rt.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     if !all.is_empty() { mall = Some(cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&all))); }
                 }
                 for ti in 0..t {
