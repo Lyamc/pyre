@@ -150,6 +150,8 @@ fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_CONVM").map(|v| v != "0").unwrap_or(true)) }
 // PYRE_QN_COMBM=0: per-token k_comb after the verify mixer instead of one k_comb_m
 fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_COMBM").map(|v| v != "0").unwrap_or(true)) }
+// PYRE_QN_XBATCH=0: the window's GPU expert hits token by token
+fn xbatch() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XBATCH").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -1711,17 +1713,24 @@ impl Model {
                     RTN.fetch_add(q_rt.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     if !all.is_empty() { mall = Some(cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&all))); }
                 }
+                // PYRE_QN_XBATCH (default on): the GPU expert hits of all window tokens in 4 launches, not 4 per token
+                let mut done_b = false;
+                if xbatch() && t <= 4 { if let Some(mh) = &mall {
+                    let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
+                    let cnt: Vec<usize> = ons.iter().map(|o| o.len()).collect(); let yall = cb.empty(t * d);
+                    if cb.xrun_fast_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &cnt, mh, &rd, t * rn, d, c.ff_exp, tyf, &yall) { for ti in 0..t { if !ons[ti].is_empty() { ygs[ti] = Some(at(&yall, ti * d)); } } done_b = true; }
+                } }
                 for ti in 0..t {
                     let (rd, on) = (&rds[ti], &ons[ti]);
                     let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
-                    let fast = !on.is_empty() && xfast() && tyf.0 == tyf.1 && tyf.0 <= 1 && tyf.2 == 3 && {
+                    let fast = !on.is_empty() && (done_b || xfast() && tyf.0 == tyf.1 && tyf.0 <= 1 && tyf.2 == 3 && {
                         let y0 = cb.empty(d);
                         let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect();
                         let mut first = true; let mut ok = true;
                         if xcr.arena.len() <= 2 { let q = std::time::Instant::now(); ok = cb.xrun_fast_to_m(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &ents, rd, rn, d, c.ff_exp, tyf, &xcr.scr, false, &y0, mall.as_ref().filter(|_| moff[ti] != usize::MAX).map(|h| h.clone().offset_start((moff[ti] * 4) as u64))); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } else {
                         for ar in 0..xcr.arena.len() { let grp: Vec<(&super::qn_cube::XEnt, f32)> = ents.iter().filter(|(e, _)| e.arena == ar).cloned().collect(); if grp.is_empty() { continue; }
                             ok &= cb.xrun_fast_to(&xcr.tabs, std::slice::from_ref(&xcr.arena[ar]), xcr.ar_bytes, &grp, rd, rn, d, c.ff_exp, tyf, &xcr.scr, !first, &y0); first = false; } }
-                        if ok { ygs[ti] = Some(y0); } ok };
+                        if ok { ygs[ti] = Some(y0); } ok });
                     if !on.is_empty() && !fast {
                         let xb = cb.empty(d); let y0 = cb.empty(d);
                         cb.q8copy(rd, rn, 0, &xb, &y0, d);
