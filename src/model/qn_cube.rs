@@ -2185,6 +2185,44 @@ fn k_gemv_q8d(xq: &[u32], xs: &[f32], w: &[u32], s: &[f32], out: &mut [f32], row
         if UNIT_POS_X == 0 { out[row as usize] = t; }
     }
 }
+/// Draft-head argmax + top probability (mtp::best on the GPU, one 1024-thread cube): out[0] = index (as f32, exact
+/// below 2^24; ties keep the lowest index like best()), out[1] = 1 / sum exp(v - max).
+#[cube(launch_unchecked)]
+fn k_best(lg: &[f32], out: &mut [f32], n: u32) {
+    let mut sv = Shared::<[f32]>::new_slice(1024usize);
+    let mut si = Shared::<[u32]>::new_slice(1024usize);
+    let tid = UNIT_POS_X;
+    let mut bv = f32::new(-3.0e38);
+    let mut bi = 0u32;
+    let mut i = tid;
+    while i < n { let v = lg[i as usize]; if v > bv { bv = v; bi = i; } i += 1024u32; }
+    sv[tid as usize] = bv; si[tid as usize] = bi;
+    sync_cube();
+    let mut h = 512u32;
+    while h > 0u32 {
+        if tid < h {
+            let (a, b) = (sv[tid as usize], sv[(tid + h) as usize]);
+            if b > a || (b == a && si[(tid + h) as usize] < si[tid as usize]) { sv[tid as usize] = b; si[tid as usize] = si[(tid + h) as usize]; }
+        }
+        sync_cube();
+        h = h / 2u32;
+    }
+    let mx = sv[0];
+    let bix = si[0];
+    sync_cube();
+    let mut z = 0.0f32;
+    let mut j = tid;
+    while j < n { z += f32::exp(lg[j as usize] - mx); j += 1024u32; }
+    sv[tid as usize] = z;
+    sync_cube();
+    let mut h2 = 512u32;
+    while h2 > 0u32 {
+        if tid < h2 { sv[tid as usize] = sv[tid as usize] + sv[(tid + h2) as usize]; }
+        sync_cube();
+        h2 = h2 / 2u32;
+    }
+    if tid == 0u32 { out[0] = f32::cast_from(bix); out[1] = 1.0f32 / sv[0]; }
+}
 #[cube(launch_unchecked)]
 fn k_q8pack(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, nb: u32) {
     let b = ABSOLUTE_POS_X;
@@ -2868,6 +2906,11 @@ impl Cube {
             BufferArg::from_raw_parts(xq, m.cols / 4), BufferArg::from_raw_parts(xs, nb), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
             BufferArg::from_raw_parts(out.clone(), m.rows), m.rows as u32, m.cols as u32) }
         true
+    }    /// mtp::best on the GPU: (argmax, 1/sum exp(v-max)) of lg[0..n] with an 8-byte readback
+    pub fn best(&self, lg: &Handle, n: usize) -> (usize, f32) {
+        let o = self.empty(2);
+        unsafe { k_best::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), BufferArg::from_raw_parts(lg.clone(), n), BufferArg::from_raw_parts(o.clone(), 2), n as u32) }
+        let r = self.read(&o); (r[0] as usize, r[1])
     }    /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
     pub fn gemv(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, out: &Handle, on: usize, ooff: usize) {
         if !m.nat.is_empty() && native_mode() == 3 {
