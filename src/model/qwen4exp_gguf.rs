@@ -263,6 +263,11 @@ impl Model {
                     bench(&format!("gemv fin {}x{}", c0.fin.rows, c0.fin.cols), &|| cb.gemv(&c0.fin, &x, hc * d, 0, &o, 20000, 0));
                     bench(&format!("gemv mout {}x{}", c0.mout.rows, c0.mout.cols), &|| cb.gemv(&c0.mout, &x, hc * d, 0, &o, 20000, 0));
                     bench("rms", &|| cb.rms(&x, &c0.hca.norm, &xn, hc, d, 1e-6));
+                    { let x3 = cb.buf(&vec![0.01f32; 3 * hc * d]); let o3 = cb.empty(3 * 20000);
+                      for (nm, m) in [("min", &c0.min), ("hca.di", &c0.hca.di), ("hca.up", &c0.hca.up), ("mout", &c0.mout), ("fin", &c0.fin), ("sdown", &c0.sdown)] {
+                        let gb = (m.rows * m.cols) as f64 * 9.0 / 8.0 / 1e9;
+                        cb.gemv_m(m, &x3, 3 * hc * d, 0, m.cols, &o3, 3 * 20000, 0, m.rows.min(20000), 3); cb.read(&o3); let t1 = std::time::Instant::now(); for _ in 0..50 { cb.gemv_m(m, &x3, 3 * hc * d, 0, m.cols, &o3, 3 * 20000, 0, m.rows.min(20000), 3); } cb.read(&o3); let us = t1.elapsed().as_secs_f64() * 1e6 / 50.0;
+                        eprintln!("cubebench gemv_m T=3 {nm} {}x{}: {us:.1} us ({:.0} GB/s)", m.rows, m.cols, gb / (us * 1e-6)); } }
                     bench("gate", &|| cb.gate(&x, &dn, &c0.hca.up, &o, 20000, 0, hc, d));
                     bench("comb", &|| cb.comb(&xn, &o, None, None, &dn, 320, hc, d));
                 } }
@@ -1452,7 +1457,7 @@ impl Model {
         // attention hyper-connection read + mixer input projection, the big GEMVs batched over the t tokens
         let (dar, dfr) = (cl.hca.di.rows, cl.hcf.di.rows);
         let xn = cb.empty(t * w); let da = cb.empty(t * dar); let mixed = cb.empty(t * d); let proj = cb.empty(t * pr);
-        for ti in 0..t { cb.rms(&xs[ti], &cl.hca.norm, &at(&xn, ti * w), hc, d, c.eps); }
+        cb.rms_t(xs, &cl.hca.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
         if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
         cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
@@ -1503,7 +1508,7 @@ impl Model {
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
         let df = cb.empty(t * dfr); let rd = cb.empty(t * rn);
-        for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); cb.rms(&xs[ti], &cl.hcf.norm, &at(&xn, ti * w), hc, d, c.eps); }
+        for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);

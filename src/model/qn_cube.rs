@@ -9,6 +9,10 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 const ROWS_PER_CUBE: u32 = 8;
+/// warps per cube of k_gemv4r: 8, or fewer for short matrices (the HC down projections' 324 rows filled only 11 of the
+/// 3060's 28 SMs) so every SM gets work; each warp's rows and lane order are unchanged, so the bits are too.
+/// PYRE_QN_GEMV_RPC=0 keeps 8 everywhere.
+fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); let thr = *T.get_or_init(|| std::env::var("PYRE_QN_GEMV_RPC").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)); if rows >= thr { ROWS_PER_CUBE } else if rows >= 1024 { 4 } else { 2 } }
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
 pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -905,7 +909,38 @@ fn k_gemv_iq4(x: &[f32], w: &[u32], kv: &[f32], out: &mut [f32], rows: u32, cols
     }
 }
 /// One cube (256 units) per stream: xn = x * rsqrt(mean(x^2) + eps) * norm.
+/// k_rms for up to 4 tokens in one launch (cube (stream, token)); each cube does exactly k_rms's operations in its
+/// order, so the bits are k_rms's (Strata's split norm, src/kernels/cuda/fused_gr.cu: one block per token AND stream).
 #[cube(launch_unchecked)]
+fn k_rms4(x0: &[f32], x1: &[f32], x2: &[f32], x3: &[f32], norm: &[f32], xn: &mut [f32], d: u32, w: u32, eps: f32) {
+    let base = CUBE_POS_X * d; let tk = CUBE_POS_Y; let ob = tk * w;
+    let mut acc = 0.0f32;
+    let mut i = UNIT_POS_X;
+    while i < d {
+        let j = (base + i) as usize;
+        let mut v = x0[j]; if tk == 1u32 { v = x1[j]; } if tk == 2u32 { v = x2[j]; } if tk == 3u32 { v = x3[j]; }
+        acc += v * v;
+        i += CUBE_DIM_X;
+    }
+    let p = plane_sum(acc);
+    let mut sh = Shared::<[f32]>::new_slice(8usize);
+    if UNIT_POS_X % 32 == 0 {
+        sh[(UNIT_POS_X / 32) as usize] = p;
+    }
+    sync_cube();
+    let mut tot = 0.0f32;
+    for j in 0..8u32 {
+        tot += sh[j as usize];
+    }
+    let r = 1.0f32 / f32::sqrt(tot / f32::cast_from(d) + eps);
+    let mut i2 = UNIT_POS_X;
+    while i2 < d {
+        let k = (base + i2) as usize;
+        let mut v = x0[k]; if tk == 1u32 { v = x1[k]; } if tk == 2u32 { v = x2[k]; } if tk == 3u32 { v = x3[k]; }
+        xn[(ob + base + i2) as usize] = v * r * norm[k];
+        i2 += CUBE_DIM_X;
+    }
+}#[cube(launch_unchecked)]
 fn k_rms(x: &[f32], norm: &[f32], xn: &mut [f32], d: u32, eps: f32) {
     let base = CUBE_POS_X * d;
     let mut acc = 0.0f32;
@@ -2286,7 +2321,7 @@ impl Cube {
         }
         // PYRE_QN_GEMV1R=1: one-column k_gemv4r (4 rows per warp share each activation load; same per-row order)
         if gemv1r() {
-            unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE * 4), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            let rpc = gemv_rpc(m.rows); unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, xoff as u32, 0u32, ooff as u32, 0u32, 1u32, false, false, false) }
             return;
@@ -2323,7 +2358,7 @@ impl Cube {
         }
         if std::env::var("PYRE_QN_GEMV4R").map(|v| v != "0").unwrap_or(true) {
             while c0 < nt { let n = (nt - c0).min(4);
-                unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE * 4), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                let rpc = gemv_rpc(m.rows); unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
                     BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
                     BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32, n > 1, n > 2, n > 3) }
                 c0 += n; }
@@ -2334,6 +2369,18 @@ impl Cube {
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
             c0 += n; }
+    }
+    /// rms of t tokens (separate x buffers) into xn at token stride hc*d; one launch for up to 4 (PYRE_QN_RMS4=0: per token)
+    pub fn rms_t(&self, xs: &[Handle], norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
+        let t = xs.len(); let w = hc * d;
+        if t >= 2 && t <= 4 && std::env::var("PYRE_QN_RMS4").map(|v| v != "0").unwrap_or(true) {
+            let g = |i: usize| xs[i.min(t - 1)].clone();
+            unsafe { k_rms4::launch_unchecked(&self.client, CubeCount::Static(hc as u32, t as u32, 1), CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(g(0), w), BufferArg::from_raw_parts(g(1), w), BufferArg::from_raw_parts(g(2), w), BufferArg::from_raw_parts(g(3), w),
+                BufferArg::from_raw_parts(norm.clone(), w), BufferArg::from_raw_parts(xn.clone(), t * w), d as u32, w as u32, eps) }
+            return;
+        }
+        for (ti, x) in xs.iter().enumerate() { self.rms(x, norm, &xn.clone().offset_start((ti * w * 4) as u64), hc, d, eps); }
     }
     pub fn rms(&self, x: &Handle, norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
         unsafe { k_rms::launch_unchecked(&self.client, CubeCount::Static(hc as u32, 1, 1), CubeDim::new_1d(256),
