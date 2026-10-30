@@ -108,6 +108,20 @@ static VGRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 pub static VG_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[allow(clippy::type_complexity)]
 static VG_STATE: std::sync::Mutex<(Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>, Vec<Vec<(burn_cubecl::cubecl::server::Handle, burn_cubecl::cubecl::server::Handle)>>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+/// PYRE_QN_VGRAPH attention layers: captured graphs of the pre-mixer and post-mixer halves, per (part, layer, T)
+#[allow(clippy::type_complexity)]
+static VG2: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Option<burn_cubecl::cubecl::client::Graph>, String)>>> = std::sync::LazyLock::new(Default::default);
+fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: &(dyn Fn() + Sync)) {
+    // one graph per distinct input set too: prewarm T=5..7 windows run as 4+rest groups on slices of other buffers
+    let slot = (slot.0 + 4 * { use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut h); (h.finish() as usize) & 0xffff_ffff }, slot.1, slot.2);
+    let mut m = VG2.lock().unwrap(); let e = m.entry(slot).or_insert((None, String::new()));
+    if e.0.is_some() && e.1 == key { unsafe { e.0.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
+    if !e.1.is_empty() && env_var("PYRE_QN_XDEBUG").is_ok() { static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("vgraph2 recapture {slot:?}: {} -> {}", e.1, key); } }
+    e.0 = None; if VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) || cb.client.graph_prepare().is_err() { f(); return; }
+    cb.client.memory_persistent_allocation((), |_| f());
+    match cb.client.start_capture() { Ok(()) => { cb.client.memory_persistent_allocation((), |_| f()); match cb.client.stop_capture() { Ok(gr) => { e.0 = Some(gr); e.1 = key.to_string(); VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } Err(er) => { eprintln!("vgraph2: capture failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
+        Err(er) => { eprintln!("vgraph2: start failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
+}
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // no explicit flush after enqueueing the next wave group: the device thread launches queued work anyway, and the blocking flush cost the main thread ~21 ms per 5-token round (PYRE_QN_WFLUSH=1 restores it)
 fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_WFLUSH").map(|v| v == "1").unwrap_or(false)) }
@@ -1613,14 +1627,22 @@ impl Model {
         let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
         // attention hyper-connection read + mixer input projection, the big GEMVs batched over the t tokens
         let (dar, dfr) = (cl.hca.di.rows, cl.hcf.di.rows);
-        let xn = cb.empty(t * w); let da = cb.empty(t * dar); let mixed = cb.empty(t * d); let proj = cb.empty(t * pr);
+        let core_n = match l.mix { Mixer::Attn { .. } => c.n_head * c.hd, Mixer::Lin { .. } => c.lin_nv * c.lin_dk };
+        // PYRE_QN_VGRAPH: attention layers of a verify window run their pre/post-mixer halves as captured graphs on
+        // persistent per-(layer, T) buffers (the mixer itself, position-dependent, stays eager)
+        let ag = vgraph_on() && env_var("PYRE_QN_VGATTN").map(|v| v == "1").unwrap_or(false) && matches!(l.mix, Mixer::Attn { .. }) && !st.pf && (2..=4).contains(&t);
+        let gk: String = if ag { xs.iter().map(|h| format!("{:?}/{:?};", h.memory.descriptor().id, h.offset_start)).collect() } else { String::new() };
+        let (xn, da, mixed, proj, core, o, df, rd) = if ag { let mut gm = self.vg.lock().unwrap(); let b = gm.entry((1000 + il, t)).or_insert_with(|| cb.client.memory_persistent_allocation((), |_| VGraph { xn: cb.empty(t * w), da: cb.empty(t * dar), mixed: cb.empty(t * d), proj: cb.empty(t * pr), core: cb.empty(t * core_n), co: cb.empty(1), o: cb.empty(t * d), df: cb.empty(t * dfr), rd: cb.empty(t * rn), g: None, key: String::new(), keep: vec![] }));
+            (b.xn.clone(), b.da.clone(), b.mixed.clone(), b.proj.clone(), b.core.clone(), b.o.clone(), b.df.clone(), b.rd.clone()) }
+            else { (cb.empty(t * w), cb.empty(t * dar), cb.empty(t * d), cb.empty(t * pr), cb.empty(t * core_n), cb.empty(t * d), cb.empty(t * dfr), cb.empty(t * rn)) };
+        let pre = || {
         cb.rms_t(xs, &cl.hca.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
         if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
         cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
+        };
+        if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); }
         // the mixer, token by token (recurrent / causal state)
-        let core_n = match l.mix { Mixer::Attn { .. } => c.n_head * c.hd, Mixer::Lin { .. } => c.lin_nv * c.lin_dk };
-        let core = cb.empty(t * core_n);
         // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
         // and their state checkpoints stay per token, in the same order)
         let mut dm_done = false;
@@ -1667,14 +1689,15 @@ impl Model {
                 let cbuf = cb.buf(&cv); cb.copy(&cbuf, core_n, 0, &core, t * core_n, ti * core_n, core_n);
             }
         }
-        let o = cb.empty(t * d);
+        let post = || {
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
-        let df = cb.empty(t * dfr); let rd = cb.empty(t * rn);
         if combm() && t <= 4 { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);
+        };
+        if ag { vg_run(cb, (2, il, t), &gk, &post); } else { post(); }
         HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         (rd, df, da)
     }
