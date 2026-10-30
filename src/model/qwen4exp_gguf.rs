@@ -1522,7 +1522,7 @@ impl Model {
                 HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 WV[g].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); WV[2].fetch_add((q4b - q4).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 // PIPE: this group's next stage (same group, next layer) is queued behind this stage's host gate
-                if pipe_on() && env_var("PYRE_QN_PIPE_WAVE").map(|v| v != "0").unwrap_or(true) && i + 2 < stages.len() && stages[i + 2].1 == g && self.layers[stages[i + 2].0].ple.is_none() {
+                if pipe_on() && env_var("PYRE_QN_PIPE_WAVE").map(|v| v == "1").unwrap_or(false) && i + 2 < stages.len() && stages[i + 2].1 == g && self.layers[stages[i + 2].0].ple.is_none() {
                     let nl = stages[i + 2].0; let xsr = xs.as_ref().unwrap(); let ctrn = ctr[nl]; let slot = &mut dq[g];
                     let mut f = |s: &mut State| { *slot = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xsr[o0..o1], s, ctrn.0, ctrn.1, start + o0, o0, t)); };
                     self.lcm_moe_p(il, l, cl, &xsr[o0..o1], st, dd, rall, o0, Some(&mut f));
