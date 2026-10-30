@@ -789,3 +789,7 @@ cost one host copy plus the DMA. With PYRE_QN_XARENA_GB=8 the share is still a l
 pA: off 24.7 tok/s, XSHARE=0.25 12.1, XSHARE=0.5 7.2; XPIN makes no difference). Each shared expert moves
 ~2 MB over PCIe, which takes longer than the CPU pool needs to compute it, so a second stream or
 zero-copy host reads (also PCIe-bound) cannot make it pay here. It stays opt-in; no cubecl fork change.
+
+### Expert cache aging (opt-in, PYRE_QN_XDECAY=k)
+
+Before each cache refill every expert's routing count loses 1/2^k, so recently routed experts weigh more (LFU with aging). Output stays greedy-identical. Measured on HYTE (3 alternating pairs, steady tok/s): plain A 25.18/25.48/24.77 with k=5 vs 24.47/24.33/24.77 default (+2.5%); spec2 B 24.60/23.09/24.47 vs 24.07/23.68/24.45 (no change). Not consistent on both prompts, so it stays opt-in. PYRE_QN_XREFILL=8 was neutral; PYRE_QN_XSWAP=128 changed output on prompt B.
