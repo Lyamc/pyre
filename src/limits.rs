@@ -1,4 +1,4 @@
-﻿//! GPU footprint limits (on by default): a VRAM reserve kept free for other apps, and a compute
+//! GPU footprint limits (on by default): a VRAM reserve kept free for other apps, and a compute
 //! duty-cycle cap so pyre leaves some GPU time to the desktop.
 //!
 //! * `--vram-reserve 1G` / `PYRE_VRAM_RESERVE` (default: max(1 GiB, 10% of VRAM); `0` disables).
@@ -125,3 +125,26 @@ mod tests {
 
 /// PYRE_VRAMLOG=1: print NVML used VRAM at a load/run stage (for the VRAM audit).
 pub fn vlog(tag: &str) { if std::env::var("PYRE_VRAMLOG").is_ok() { if let Some(v) = vram() { eprintln!("vram {tag}: used {} MiB, free {} MiB", v.used >> 20, v.free >> 20); } } }
+
+/// PYRE_VRAM_FLOOR_MB (default 1100, 0 = off): free-VRAM floor. A watcher thread polls NVML every 25 ms and
+/// big allocations (>= 8 MiB) check before allocating; on a breach pyre prints the reason and exits (code 86),
+/// so the driver frees its memory before the device runs dry.
+pub fn vram_floor_mb() -> u64 { static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new(); *F.get_or_init(|| std::env::var("PYRE_VRAM_FLOOR_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1100)) }
+fn vram_breach(free: u64, need: u64, why: &str) -> ! {
+    eprintln!("pyre: VRAM FLOOR BREACH ({why}): free {} MiB, about to allocate {} MiB, floor {} MiB (PYRE_VRAM_FLOOR_MB); aborting", free >> 20, need >> 20, vram_floor_mb());
+    std::process::exit(86)
+}
+/// Check before allocating `bytes` on the GPU (only allocations >= 8 MiB pay for an NVML query).
+pub fn vram_check(bytes: u64) {
+    let fl = vram_floor_mb(); if fl == 0 || bytes < (8 << 20) { return; }
+    if let Some(v) = vram() { if v.free < bytes + (fl << 20) { vram_breach(v.free, bytes, "allocation"); } }
+}
+/// Start the 25 ms floor watcher once (call when the GPU is first used).
+pub fn vram_watch() {
+    static W: std::sync::Once = std::sync::Once::new();
+    W.call_once(|| { let fl = vram_floor_mb(); if fl == 0 || vram().is_none() { return; }
+        let _ = std::thread::Builder::new().name("vram-floor".into()).spawn(move || loop {
+            if let Some(v) = vram() { if v.free < (fl << 20) { vram_breach(v.free, 0, "watcher"); } }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }); });
+}

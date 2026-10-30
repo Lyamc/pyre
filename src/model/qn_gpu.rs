@@ -36,6 +36,7 @@ impl Gpu {
     pub fn new() -> Result<Self> {
         let dt = match std::env::var("PYRE_QN_GPU_DTYPE").as_deref() { Ok("bf16") => FloatDType::BF16, Ok("f16") => FloatDType::F16, _ => FloatDType::F32 };
         let (dev, _, _) = crate::backend::select("cuda", "f32", None)?;
+        crate::limits::vram_watch();
         // what may be uploaded: free VRAM above pyre's reserve, less 1.5 GiB for activations/kernels
         let v = crate::limits::vram().ok_or_else(|| anyhow!("no NVML VRAM reading"))?;
         let budget = v.free as i64 - crate::limits::reserve() as i64 - (1536i64 << 20);
@@ -48,13 +49,14 @@ impl Gpu {
         let rows: usize = ms.iter().map(|m| m.rows).sum();
         let need = (rows * cols / 32 * 34) as i64;
         if self.budget.fetch_sub(need, std::sync::atomic::Ordering::Relaxed) < need { self.budget.fetch_add(need, std::sync::atomic::Ordering::Relaxed); return Ok(None); }
+        crate::limits::vram_check(need as u64);
         let q = to_q8_0(ms);
         let ty = burn_gguf::GgmlType::Q8_0; let scheme = ty.to_quant_scheme().unwrap();
         let packed = burn_gguf::repack_to_burn(ty, &q, scheme, rows * cols).map_err(|e| anyhow!("{e}"))?;
         let mk = |packed: Vec<u8>| Tensor::<2>::from_data(TensorData::from_bytes_vec(packed, vec![rows, cols], DType::QFloat(scheme)), TensorCreationOptions::new(self.dev.clone()));
-        // PYRE_QN_XARENA_PERSIST: big weights (the ~0.7 GB Q8 lm head on the Q8 path) in CubeCL's persistent pool, so they
+        // PYRE_QN_XARENA_PERSIST: all burn weights (incl. the ~0.7 GB Q8 lm head) in CubeCL's persistent pool: a weight left in a dynamic pool that later goes outdated (page size grew) is copied by the relocation in graph_prepare (+2.4 GB transient on Q8). Big ones in CubeCL's persistent pool, so they
         // do not grow the dynamic pool's page size to their size (every later dynamic page would then be ~700 MB, mostly empty)
-        let w = if need >= (64 << 20) && std::env::var("PYRE_QN_XARENA_PERSIST").map(|v| v == "1").unwrap_or(false) {
+        let w = if std::env::var("PYRE_QN_XARENA_PERSIST").map(|v| v == "1").unwrap_or(false) {
             match burn_cubecl::cubecl::Device::cuda(0) { Ok(d) => { let cl = d.client(); let w = cl.memory_persistent_allocation(packed, |p| mk(p)); let _ = cl.flush(); w } Err(_) => mk(packed) }
         } else { mk(packed) };
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); }
