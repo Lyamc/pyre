@@ -146,6 +146,8 @@ fn rms_inplace(x: &mut [f32], w: &[f32], eps: f32) { let s = (x.iter().map(|v| v
 fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XFAST").map(|v| v != "0").unwrap_or(true)) }
 // PYRE_QN_KICKQ=1: the kick hands the queue to the device thread without waiting for it to drain
 fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICKQ").map(|v| v == "1").unwrap_or(false)) }
+// PYRE_QN_CONVM=0: per-token k_conv + k_copy in the verify window instead of one k_conv_m
+fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_CONVM").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -1590,8 +1592,15 @@ impl Model {
             let (cs, ss) = st.gdn[li0].clone(); let co_all = cb.empty(t * ch);
             let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv);
             let (mut cks, mut ckm) = (vec![], 0u32);
+            if convm() && cn == ch * (c.conv_k - 1) {
+                // one k_conv_m launch for the window's convs and conv-state checkpoints (same per-token arithmetic and order)
+                let mut cka: Vec<Option<H>> = vec![];
+                for ti in 0..t { if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cka.push(Some(a.clone())); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cka.push(None); cks.push(None); } }
+                cb.conv_m(&proj, t * pr, pr, &gw.conv, &cs, &co_all, ch, c.conv_k, t, &cka);
+            } else {
             for ti in 0..t { let pj = at(&proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&co_all, ti * ch), ch, c.conv_k);
                 if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
+            }
             cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             dm_done = true;
         } }

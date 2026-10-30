@@ -1375,6 +1375,36 @@ fn k_silu_mul(f: &[f32], h: &mut [f32], og: u32, ou: u32, n: u32) {
     }
 }
 
+/// k_conv for all t window tokens in one launch (PYRE_QN_CONVM, default on): per channel the same arithmetic in
+/// the same token order as t k_conv launches, and the state after token ti copied to its checkpoint (ckm bit ti),
+/// as the per-token k_copy did.
+#[cube(launch_unchecked)]
+fn k_conv_m(proj: &[f32], w: &[f32], cs: &mut [f32], co: &mut [f32], ck0: &mut [f32], ck1: &mut [f32], ck2: &mut [f32], ck3: &mut [f32], ch: u32, pr: u32, nt: u32, ckm: u32, #[comptime] kk: u32) {
+    let c = ABSOLUTE_POS as u32;
+    if c < ch {
+        for ti in 0..nt {
+            let cur = proj[(ti * pr + c) as usize];
+            let mut o = w[(c * kk + kk - 1) as usize] * cur;
+            #[unroll]
+            for k in 0..kk - 1 {
+                o += w[(c * kk + k) as usize] * cs[(k * ch + c) as usize];
+            }
+            co[(ti * ch + c) as usize] = o / (1.0f32 + f32::exp(-o));
+            #[unroll]
+            for k in 0..kk - 2 {
+                cs[(k * ch + c) as usize] = cs[((k + 1) * ch + c) as usize];
+            }
+            cs[((kk - 2) * ch + c) as usize] = cur;
+            if ((ckm >> ti) & 1u32) == 1u32 {
+                #[unroll]
+                for k in 0..kk - 1 {
+                    let v = cs[(k * ch + c) as usize];
+                    if ti == 0u32 { ck0[(k * ch + c) as usize] = v; } else if ti == 1u32 { ck1[(k * ch + c) as usize] = v; } else if ti == 2u32 { ck2[(k * ch + c) as usize] = v; } else { ck3[(k * ch + c) as usize] = v; }
+                }
+            }
+        }
+    }
+}
 /// Gated DeltaNet decode, step 1: causal depthwise conv + SiLU per channel, shifting the conv state.
 #[cube(launch_unchecked)]
 fn k_conv(proj: &[f32], w: &[f32], cs: &mut [f32], co: &mut [f32], ch: u32, #[comptime] kk: u32) {
@@ -2725,6 +2755,16 @@ impl Cube {
         unsafe { k_comb::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(x.clone(), hc * d), BufferArg::from_raw_parts(a.clone(), d), BufferArg::from_raw_parts(bb, d), BufferArg::from_raw_parts(cc, d), BufferArg::from_raw_parts(gb, gn),
             BufferArg::from_raw_parts(dn.clone(), lr + hc), d as u32, goff as u32, lr as u32, hc as u32, g.is_some(), b.is_some(), c3.is_some()) }
+    }
+    /// t tokens' convs in one launch; cks[ti] = Some(checkpoint) for ti < 4 (state after token ti)
+    pub fn conv_m(&self, proj: &Handle, pn: usize, pr: usize, w: &Handle, cs: &Handle, co: &Handle, ch: usize, kk: usize, t: usize, cks: &[Option<Handle>]) {
+        let cn = ch * (kk - 1); let mut ckm = 0u32; let dummy = self.empty(cn);
+        let ck = |i: usize| -> Handle { match cks.get(i) { Some(Some(h)) => h.clone(), _ => dummy.clone() } };
+        for i in 0..t.min(4) { if matches!(cks.get(i), Some(Some(_))) { ckm |= 1 << i; } }
+        unsafe { k_conv_m::launch_unchecked(&self.client, CubeCount::Static((ch as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(proj.clone(), pn), BufferArg::from_raw_parts(w.clone(), ch * kk), BufferArg::from_raw_parts(cs.clone(), cn),
+            BufferArg::from_raw_parts(co.clone(), t * ch), BufferArg::from_raw_parts(ck(0), cn), BufferArg::from_raw_parts(ck(1), cn), BufferArg::from_raw_parts(ck(2), cn), BufferArg::from_raw_parts(ck(3), cn),
+            ch as u32, pr as u32, t as u32, ckm, kk as u32) }
     }
     pub fn conv(&self, proj: &Handle, pn: usize, w: &Handle, cs: &Handle, co: &Handle, ch: usize, kk: usize) {
         unsafe { k_conv::launch_unchecked(&self.client, CubeCount::Static((ch as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256),
