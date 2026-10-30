@@ -117,6 +117,7 @@ fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: 
     let mut m = VG2.lock().unwrap(); let e = m.entry(slot).or_insert((None, String::new()));
     if e.0.is_some() && e.1 == key { unsafe { e.0.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
     if !e.1.is_empty() && env_var("PYRE_QN_XDEBUG").is_ok() { static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("vgraph2 recapture {slot:?}: {} -> {}", e.1, key); } }
+    if gate_open() { f(); return; }
     e.0 = None; if VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) || cb.client.graph_prepare().is_err() { f(); return; }
     cb.client.memory_persistent_allocation((), |_| f());
     match cb.client.start_capture() { Ok(()) => { cb.client.memory_persistent_allocation((), |_| f()); match cb.client.stop_capture() { Ok(gr) => { e.0 = Some(gr); e.1 = key.to_string(); VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } Err(er) => { eprintln!("vgraph2: capture failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
@@ -172,7 +173,10 @@ fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 /// Per MoE layer the host enqueues the GPU hits, a host gate (cuLaunchHostFunc that waits, bounded, for the CPU
 /// expert pool), a pinned->device copy of the CPU rows, the combine and the NEXT layer's dense half, all while the
 /// CPU pool runs; the GPU then starts the next layer as soon as the CPU rows land instead of after a host round trip.
-fn pipe_on() -> bool { static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *P.get_or_init(|| env_usize("PYRE_QN_PIPE").unwrap_or(0) as u32) >= 1 && !PIPE_ERR.load(std::sync::atomic::Ordering::Relaxed) && !vgraph_on() }
+fn pipe_on() -> bool { static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *P.get_or_init(|| env_usize("PYRE_QN_PIPE").unwrap_or(0) as u32) >= 1 && !PIPE_ERR.load(std::sync::atomic::Ordering::Relaxed) }
+thread_local! { static GATE_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// True while this thread has a PIPE host gate queued and not yet opened: graph capture (graph_prepare drains/syncs) must not happen then, so a missing graph runs eagerly instead.
+fn gate_open() -> bool { GATE_OPEN.with(|g| g.get()) }
 static PIPE_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Host-side latch the stream-ordered gate waits on (bounded: PYRE_QN_PIPE_TMO_MS, default 2000).
 struct PGate { m: std::sync::Mutex<bool>, cv: std::sync::Condvar }
@@ -1497,7 +1501,7 @@ impl Model {
                 let dd = dq[g].take().unwrap();
                 let q4 = std::time::Instant::now();
                 let fut = cb.read_start(&dd.0);
-                if let Some(&(nl, ng)) = stages.get(i + 1) { if !(ng == 0 && self.layers[nl].ple.is_some()) {
+                if let Some(&(nl, ng)) = stages.get(i + 1) { if !(ng == 0 && self.layers[nl].ple.is_some()) && dq[ng].is_none() {
                     let (n0, n1) = grp[ng]; let q4d = std::time::Instant::now();
                     dq[ng] = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xs.as_ref().unwrap()[n0..n1], st, ctr[nl].0, ctr[nl].1, start + n0, n0, t));
                     let q4f = std::time::Instant::now(); WV[3].fetch_add((q4f - q4d).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1508,7 +1512,14 @@ impl Model {
                 let rall = cb.read_finish(fut);
                 HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 WV[g].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); WV[2].fetch_add((q4b - q4).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                // PIPE: this group's next stage (same group, next layer) is queued behind this stage's host gate
+                if pipe_on() && i + 2 < stages.len() && stages[i + 2].1 == g && self.layers[stages[i + 2].0].ple.is_none() {
+                    let nl = stages[i + 2].0; let xsr = xs.as_ref().unwrap(); let ctrn = ctr[nl]; let slot = &mut dq[g];
+                    let mut f = |s: &mut State| { *slot = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xsr[o0..o1], s, ctrn.0, ctrn.1, start + o0, o0, t)); };
+                    self.lcm_moe_p(il, l, cl, &xsr[o0..o1], st, dd, rall, o0, Some(&mut f));
+                } else {
                 self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0);
+                }
             }
         } else {
         let mut pre: Option<(H, H, H)> = None;
@@ -1583,7 +1594,7 @@ impl Model {
         let (an, ln) = (*ai, *li); let mut nx: Option<(H, H, H)> = None;
         let nl = il + 1;
         if pipe_on() && nl < self.layers.len() && self.layers[nl].ple.is_none() {
-            let mut f = |s: &mut State| { nx = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), xs, s, an, ln, start, 0, xs.len())); };
+            let mut f = |s: &mut State| { let (ly, cn) = (&self.layers[nl], self.cl[nl].as_ref().unwrap()); nx = Some(match if vgraph_on() { self.lcm_dense_g(nl, ly, cn, xs, s, ln) } else { None } { Some(x) => x, None => self.lcm_dense(nl, ly, cn, xs, s, an, ln, start, 0, xs.len()) }); };
             self.lcm_moe_p(il, l, cl, xs, st, dd, rall, 0, Some(&mut f));
         } else { self.lcm_moe(il, l, cl, xs, st, dd, rall, 0); }
         *pre = nx;
@@ -1637,6 +1648,7 @@ impl Model {
             cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t);
         };
         if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        else if gate_open() { seg(b); }
         else {
             b.g = None; b.keep.clear();
             let vf = |s: &str| if env_var("PYRE_QN_VGDBG").is_ok() { let _ = cb.client.flush(); std::thread::sleep(std::time::Duration::from_millis(30)); if let Some(v) = crate::limits::vram() { eprintln!("vgdbg il {il} t {t} {s}: free {} MiB", v.free >> 20); } };
@@ -1850,7 +1862,7 @@ impl Model {
                 if let Some(ps) = pslot {
                     // PIPE: gate + CPU-row copy + combine + next layer's dense, queued before the CPU rows exist
                     let yball = cb.empty(t * d); let g2 = pgate.clone();
-                    unsafe { cb.client.pyre_host_gate(Box::new(move || g2.wait()), ps, t * d * 4, &yball); }
+                    unsafe { cb.client.pyre_host_gate(Box::new(move || g2.wait()), ps, t * d * 4, &yball); } GATE_OPEN.with(|g| g.set(true));
                     if combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
                     for ti in 0..t { let yb = at(&yball, ti * d); cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d); } }
                     if let Some(nx) = next.as_mut() { nx(&mut *stp); }
@@ -1874,7 +1886,7 @@ impl Model {
                 { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             } else { gpu(); }
             if let Some(ps) = pslot { unsafe { std::ptr::copy_nonoverlapping(yr.as_ptr(), ps as *mut f32, t * d); } }
-            drop(pg_open);
+            drop(pg_open); GATE_OPEN.with(|g| g.set(false));
             for k in &sins { xcg.map.remove(k); }
             drop(xcg);
         } else {
