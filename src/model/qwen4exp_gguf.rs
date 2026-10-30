@@ -1046,7 +1046,7 @@ impl Model {
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                     if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
                     for (j, &(ti, _)) in toks.iter().enumerate() {
-                        let v = if usek { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
+                        let v = if usek { let pr = if pair_on() && gm.ty == um.ty { qdot::row_dot_k_pair(gm.ty, gr, ur, &actk[ti]) } else { None }; if let Some((g, u)) = pr { silu(g) * u } else { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         }, &mut || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); });
         let z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1610,6 +1610,8 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
 }
 
 /// PYRE_QN_PREWAKE (default on; =0 off): wake the expert pool just before each layer's router readback.
+/// PYRE_QN_PAIR=1 (opt-in): gate and up rows of a CPU expert in one interleaved IQ2 kernel (same results)
+fn pair_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PAIR").map(|v| v == "1").unwrap_or(false)) }
 fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(true)) }
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();

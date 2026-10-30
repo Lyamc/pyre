@@ -308,6 +308,60 @@ pub fn quantize_k_into(x: &[f32], a: &mut Q8K) {
 pub fn gather() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_GATHER").map(|v| v == "1").unwrap_or(false)) }
 pub fn vnni() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| { #[cfg(target_arch = "x86_64")] { std::env::var("PYRE_QN_VNNI").map(|v| v != "0").unwrap_or(true) && is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") } #[cfg(not(target_arch = "x86_64"))] { false } }) }
 pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M) }
+// ---- gate+up pair: one IQ2 super-block of each row per step, sharing the activation; each row's own
+// operations are the same, in the same order, as iq2s_k_b / iq2xxs_k_b (bit-identical results)
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2_sb<const V: bool>(t: QType, rp: *const u8, i: usize, a: &Q8K, acc: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let xq = a.q.as_ptr();
+    if t == QType::IQ2S {
+        let b = rp.add(i * 82); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
+        let (qs, sg, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
+        let mut ia = _mm256_setzero_si256();
+        for ib in 0..8 { let h = *qh.add(ib) as usize;
+            let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
+            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
+            let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
+            let sbv = *sb.add(ib);
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(2 * (sbv & 0xF) as i32 + 1, 2 * (sbv >> 4) as i32 + 1)); }
+        _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc)
+    } else {
+        let s8 = sign8();
+        let b = rp.add(i * 66); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i); let qs = b.add(2);
+        let mut ia = _mm256_setzero_si256();
+        for ib in 0..8 { let a1 = (qs.add(8 * ib + 4) as *const u32).read_unaligned();
+            let gq = |l: usize| *IQ2XXS_GRID.get_unchecked(*qs.add(8 * ib + l) as usize) as i64;
+            let g = _mm256_set_epi64x(gq(3), gq(2), gq(1), gq(0));
+            let sl = |l: u32| *s8.get_unchecked(*KSIGNS_IQ2XS.get_unchecked(((a1 >> (7 * l)) & 127) as usize) as usize) as i64;
+            let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+            let sc = 2 * (a1 >> 28) as i32 + 1;
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(sc, sc)); }
+        _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc)
+    }
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq2_pair_b<const V: bool>(t: QType, ra: &[u8], rb: &[u8], a: &Q8K) -> (f32, f32) {
+    use std::arch::x86_64::*;
+    let (mut x, mut y) = (_mm256_setzero_ps(), _mm256_setzero_ps()); let n = a.q.len();
+    for i in 0..n / 256 { x = iq2_sb::<V>(t, ra.as_ptr(), i, a, x); y = iq2_sb::<V>(t, rb.as_ptr(), i, a, y); }
+    (k::hsum(x), k::hsum(y))
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq2_pair(t: QType, ra: &[u8], rb: &[u8], a: &Q8K) -> (f32, f32) { iq2_pair_b::<false>(t, ra, rb, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq2_pair_v(t: QType, ra: &[u8], rb: &[u8], a: &Q8K) -> (f32, f32) { iq2_pair_b::<true>(t, ra, rb, a) }
+/// Two rows of the same IQ2_S / IQ2_XXS type against one activation, interleaved per super-block;
+/// the same results as two row_dot_k calls. None when the type or CPU is not covered.
+pub fn row_dot_k_pair(t: QType, ra: &[u8], rb: &[u8], a: &Q8K) -> Option<(f32, f32)> {
+    #[cfg(target_arch = "x86_64")]
+    { if matches!(t, QType::IQ2S | QType::IQ2XXS) { if vnni() { return Some(unsafe { iq2_pair_v(t, ra, rb, a) }); } if avx2() { return Some(unsafe { iq2_pair(t, ra, rb, a) }); } } }
+    let _ = (t, ra, rb, a); None
+}
+
 pub fn row_dot_k(t: QType, row: &[u8], a: &Q8K) -> f32 {
     #[cfg(target_arch = "x86_64")]
     { if vnni() { return unsafe { match t { QType::IQ2S => iq2s_k_v(row, a), QType::IQ2XXS => iq2xxs_k_v(row, a), QType::IQ1M => iq1m_k_v(row, a), _ => unreachable!() } }; }
@@ -489,6 +543,14 @@ pub fn kbench() {
             }
             let el = t0.elapsed().as_secs_f64(); let per = el / (reps * ne) as f64;
             eprintln!("kbench {label} threads={th}: {:.1} us per expert gate+up, {:.1} GB/s, {:.1} ns per superblock-thread", per * 1e6, (rb * rows) as f64 / per / 1e9, el * 1e9 * th as f64 / (reps * nrow * d / 256) as f64);
+            // the same rows as interleaved pairs (gate+up style); checks bit-identity against row_dot_k
+            let t1 = std::time::Instant::now(); let half = nrow / 2;
+            for _ in 0..reps {
+                let f = |t: usize| { let mut s = 0f32; for r in t * 16..((t + 1) * 16).min(half) { let (ra, rb2) = (&w[r * rb..(r + 1) * rb], &w[(half + r) * rb..(half + r + 1) * rb]); let (g, u) = row_dot_k_pair(QType::IQ2S, ra, rb2, &a).unwrap(); s += g + u; } sink.fetch_add(s.to_bits() & 1, std::sync::atomic::Ordering::Relaxed); };
+                if th == 1 { for t in 0..half.div_ceil(16) { f(t); } } else { pool.run_side(half.div_ceil(16), &f, &mut || {}); } }
+            let el1 = t1.elapsed().as_secs_f64();
+            let same = (0..half.min(64)).all(|r| { let (ra, rb2) = (&w[r * rb..(r + 1) * rb], &w[(half + r) * rb..(half + r + 1) * rb]); let (g, u) = row_dot_k_pair(QType::IQ2S, ra, rb2, &a).unwrap(); g.to_bits() == row_dot_k(QType::IQ2S, ra, &a).to_bits() && u.to_bits() == row_dot_k(QType::IQ2S, rb2, &a).to_bits() });
+            eprintln!("kbench {label} threads={th} PAIR: {:.1} us per expert gate+up ({:.2}x), identical={same}", el1 / (reps * ne) as f64 * 1e6, el / el1);
         }
     }
 }

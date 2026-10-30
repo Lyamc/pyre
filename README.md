@@ -793,3 +793,8 @@ zero-copy host reads (also PCIe-bound) cannot make it pay here. It stays opt-in;
 ### Expert cache aging (opt-in, PYRE_QN_XDECAY=k)
 
 Before each cache refill every expert's routing count loses 1/2^k, so recently routed experts weigh more (LFU with aging). Output stays greedy-identical. Measured on HYTE (3 alternating pairs, steady tok/s): plain A 25.18/25.48/24.77 with k=5 vs 24.47/24.33/24.77 default (+2.5%); spec2 B 24.60/23.09/24.47 vs 24.07/23.68/24.45 (no change). Not consistent on both prompts, so it stays opt-in. PYRE_QN_XREFILL=8 was neutral; PYRE_QN_XSWAP=128 changed output on prompt B.
+### Gate+up pair kernel (opt-in, PYRE_QN_PAIR=1) and draft length
+
+- PYRE_QN_PAIR=1 runs a CPU expert's gate and up rows through one interleaved IQ2 kernel. Results are bit-identical to two row_dot_k calls (checked in PYRE_QN_KBENCH). KBENCH gate+up time per expert: 1 thread 198 -> 195 us; 8 threads streamed 33.2 -> 29.5 us. In the model (4 alternating pairs, steady tok/s) it averaged 24.54 vs 24.50 on plain A and 24.05 vs 23.95 on spec2 B, which is noise, so it stays opt-in.
+- Merging the down step into the gate/up tasks was not built. Down needs an expert's whole hidden vector (quantised per 64 values) before any output row, so a merged task would cover a whole expert. With ~5 misses per layer that is too coarse for 16 threads.
+- Draft length (adaptive length on, as before): --spec 3 gave 22.1 (A, 70.7% accepted) / 22.6 (B, 70.6%); --spec 4 gave 23.4 (A, 65.2%) / 19.7 (B, 60.0%). The spec2 default is ~24-24.5, so it stays.
