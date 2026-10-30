@@ -148,6 +148,8 @@ fn xfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICKQ").map(|v| v == "1").unwrap_or(false)) }
 // PYRE_QN_CONVM=0: per-token k_conv + k_copy in the verify window instead of one k_conv_m
 fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_CONVM").map(|v| v != "0").unwrap_or(true)) }
+// PYRE_QN_COMBM=0: per-token k_comb after the verify mixer instead of one k_comb_m
+fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_COMBM").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -1634,7 +1636,7 @@ impl Model {
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
         let df = cb.empty(t * dfr); let rd = cb.empty(t * rn);
-        for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
+        if combm() && t <= 4 { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);

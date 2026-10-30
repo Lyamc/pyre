@@ -1336,6 +1336,21 @@ fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32,
     }
 }
 
+/// k_comb (no gate, no b/c terms) for up to 4 tokens in one launch: token ti = CUBE_POS_Y updates x_ti from
+/// a[ti*d..] and dn[ti*ds..]; per element the same arithmetic as k_comb (PYRE_QN_COMBM, default on).
+#[cube(launch_unchecked)]
+fn k_comb_m(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], a: &[f32], dn: &[f32], d: u32, ds: u32, lr: u32, #[comptime] hc: u32) {
+    let k = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if k < d * hc {
+        let st = k / d;
+        let i = k % d;
+        let o = a[(ti * d + i) as usize];
+        let inj = dn[(ti * ds + lr + st) as usize] / f32::cast_from(hc);
+        let v = o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+        if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else { x3[k as usize] += v; }
+    }
+}
 /// x[s,i] += (a[i] * (gate? sigmoid(gb[goff]) : 1) + (b? b[i] : 0)) * 2 sigmoid(dn[lr+s]/hc)
 #[cube(launch_unchecked)]
 fn k_comb(x: &mut [f32], a: &[f32], b: &[f32], c: &[f32], gb: &[f32], dn: &[f32], d: u32, goff: u32, lr: u32, #[comptime] hc: u32, #[comptime] gate: bool, #[comptime] addb: bool, #[comptime] addc: bool) {
@@ -2747,6 +2762,13 @@ impl Cube {
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, lr, hc as u32) }
     }
     #[allow(clippy::too_many_arguments)]
+    /// k_comb for xs.len() <= 4 tokens in one launch: a = t*d contiguous, dn = t*ds contiguous
+    pub fn comb_m(&self, xs: &[Handle], a: &Handle, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone();
+        unsafe { k_comb_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
+            BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(dn.clone(), t * ds), d as u32, ds as u32, lr as u32, hc as u32) }
+    }
     pub fn comb(&self, x: &Handle, a: &Handle, b: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) { self.comb3(x, a, b, None, g, dn, lr, hc, d) }
     #[allow(clippy::too_many_arguments)]
     pub fn comb3(&self, x: &Handle, a: &Handle, b: Option<&Handle>, c3: Option<&Handle>, g: Option<(&Handle, usize, usize)>, dn: &Handle, lr: usize, hc: usize, d: usize) {
