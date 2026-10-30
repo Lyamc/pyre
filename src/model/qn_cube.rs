@@ -2736,6 +2736,7 @@ impl Cube {
     /// PYRE_QN_HPIN=1, so the driver copies by DMA instead of staging a pageable buffer on this thread.
     pub fn hup(&self, b: &[u8]) -> Handle {
         crate::limits::vram_check(b.len() as u64);
+        if b.len() >= (16 << 20) && xpersist() { return self.client.memory_persistent_allocation((), |_| self.client.create_from_slice(b)); } // PYRE_QN_XARENA_PERSIST: big uploads (weights) persistent, see qn_gpu::upload
         if hpin() && b.len() <= (1 << 20) { let mut by = cubecl::bytes::Bytes::from_bytes_vec(b.to_vec()); self.client.staging(std::iter::once(&mut by), false); return self.client.create(by); }
         self.client.create_from_slice(b)
     }
@@ -3216,3 +3217,5 @@ pub fn xbench() -> anyhow::Result<()> {
 
 /// xupload time split: [repack on the host, client.write] in ns.
 pub static XUP_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub fn xpersist() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XARENA_PERSIST").map(|v| v == "1").unwrap_or(false)) }
