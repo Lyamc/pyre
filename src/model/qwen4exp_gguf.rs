@@ -137,7 +137,7 @@ pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, 
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
+pub struct Model { mtp_gkv: std::sync::Mutex<Option<super::mtp::GRing>>, vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -280,7 +280,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
+        Ok(Model { mtp_gkv: Default::default(), vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -1385,17 +1385,17 @@ impl Model {
         if env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) && kv.end() == n - 1 && kv.n > 0 {
             if let (Some(cb), Some(map), Some(Some(hm))) = (self.cube.as_ref(), self.mtp_dense.get(), self.mtp_headc.get()) {
                 let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize));
-                let (kc, vc, mut nc) = m.kv_upload(cb, &kv, k); let cap = nc + k; let mut rh = cb.buf(&r);
+                let mut rg = self.mtp_gkv.lock().unwrap(); m.kv_sync(cb, &mut rg, &mut kv); let gr = rg.as_mut().unwrap(); let (kc, vc, cap) = (gr.k.clone(), gr.v.clone(), gr.cap); let kc0 = kv.c0; let mut rh = cb.buf(&r);
                 for j in 0..k {
                     self.embd.row(tok as usize, &mut e);
-                    let Some(gs) = m.step_gpu(cb, &g, &kc, &vc, nc, cap, &rh, &e, n - 1 + j) else { break };
-                    if j == 0 { m.kv_push(&mut kv, &gs.krow, &gs.vrow); } nc += 1;
+                    let Some(gs) = m.step_gpu(cb, &g, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j) else { break };
+                    if j == 0 { m.kv_push(&mut kv, &gs.krow, &gs.vrow); }
                     let th = std::time::Instant::now(); let o = cb.empty(hm.rows); cb.gemv(hm, &gs.s, d, 0, &o, hm.rows, 0); let (i, p) = cb.best(&o, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
                     HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     if j > 0 && p < min_p { break; }
                     out.push((id, None)); rh = gs.rr; tok = id;
                 }
-                gdone = true;
+                gr.end = gr.end.min(kv.end()).max(if kv.end() == n { n } else { 0 }); gr.gid = kv.gid; gdone = true;
             }
         }
         for j in 0..(if gdone { 0 } else { k }) {
@@ -1453,6 +1453,7 @@ impl Model {
             if t == 1 { cb.gemv(g, &xb, q.cols, 0, &o, q.rows, 0); } else { cb.gemv_m(g, &xb, t * q.cols, 0, q.cols, &o, t * q.rows, 0, q.rows, t); } let _ = cb.read(&o); } } }
             eprintln!("mtp: drafter kernels warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }
         if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }); }
+        if env_var("PYRE_MTP_GPUSTEP").map(|v| v == "1").unwrap_or(false) { if let (Some(map), Some(Some(hm))) = (self.mtp_dense.get(), self.mtp_headc.get()) { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); } }
     }
 
     // ---- speculative decoding: multi-token verify on the decode (CubeCL) path, with rollback ----

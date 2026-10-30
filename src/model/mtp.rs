@@ -76,7 +76,7 @@ fn mm(m: &Q8Mat, x: &[f32], t: usize) -> Vec<f32> {
 
 /// The drafter's K/V: cells c0..c0+n (rope position = cell), [cell][n_kv*hd].
 #[derive(Default)]
-pub struct Kv { pub c0: usize, pub n: usize, k: Vec<f32>, v: Vec<f32> }
+pub struct Kv { pub c0: usize, pub n: usize, k: Vec<f32>, v: Vec<f32>, pub gid: u64 }
 impl Kv {
     pub fn end(&self) -> usize { self.c0 + self.n }
     pub fn truncate(&mut self, end: usize, row: usize) { if end < self.end() { let n = end.saturating_sub(self.c0); self.n = n; self.k.truncate(n * row); self.v.truncate(n * row); } }
@@ -231,6 +231,7 @@ impl Mtp {
 }
 
 /// PYRE_MTP_GPUSTEP: one draft step's GPU outputs (s = final mixer output for the head, rr = drafter residual, the new K/V cell)
+pub struct GRing { pub k: H, pub v: H, pub cap: usize, pub end: usize, pub gid: u64 }
 pub struct GStep { pub s: H, pub rr: H, pub krow: Vec<f32>, pub vrow: Vec<f32> }
 type H = burn_cubecl::cubecl::server::Handle;
 type Cb = super::qn_cube::Cube;
@@ -238,6 +239,20 @@ type CM = super::qn_cube::CMat;
 impl Mtp {
     fn gw(&self, cb: &Cb) -> &Vec<H> { self.gw.get_or_init(|| vec![cb.buf(&self.pre_e), cb.buf(&self.pre_h), cb.buf(&self.hca.norm), cb.buf(&self.hcf.norm), cb.buf(&self.mix.norm), cb.buf(&self.qn), cb.buf(&self.kn), cb.buf(&self.rope_inv)]) }
     /// the K/V cells on the GPU, with room for `extra` more; returns (k, v, cells)
+    /// keep the GPU K/V ring (cell c at slot c % cap) in step with `kv`: only cells not uploaded yet are written
+    pub fn kv_sync(&self, cb: &Cb, ring: &mut Option<GRing>, kv: &mut Kv) {
+        static GID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); if kv.gid == 0 { kv.gid = GID.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        let row = self.row(); let cap = self.window + 32;
+        if ring.as_ref().map(|g| g.cap != cap).unwrap_or(true) { *ring = Some(GRing { k: cb.empty(cap * row), v: cb.empty(cap * row), cap, end: 0, gid: 0 }); }
+        let g = ring.as_mut().unwrap(); let from = if g.gid == kv.gid && g.end >= kv.c0 && g.end <= kv.end() { g.end } else { kv.c0 };
+        for c in from..kv.end() { let i = c - kv.c0; let o = ((c % cap) * row * 4) as u64;
+            cb.client.write(&g.k.clone().offset_start(o), burn_cubecl::cubecl::bytes::Bytes::from_elems(kv.k[i * row..(i + 1) * row].to_vec()));
+            cb.client.write(&g.v.clone().offset_start(o), burn_cubecl::cubecl::bytes::Bytes::from_elems(kv.v[i * row..(i + 1) * row].to_vec())); }
+        g.end = kv.end(); g.gid = kv.gid;
+    }
+    /// compile the GPU step kernels now (one throwaway step on a 1-cell K/V)
+    pub fn warm_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
+        let r = cb.buf(&vec![0.01f32; self.rdim()]); if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); } }
     pub fn kv_upload(&self, cb: &Cb, kv: &Kv, extra: usize) -> (H, H, usize) { let row = self.row(); let mut k = kv.k.clone(); k.resize((kv.n + extra) * row, 0.0); let mut v = kv.v.clone(); v.resize((kv.n + extra) * row, 0.0); (cb.buf(&k), cb.buf(&v), kv.n) }
     pub fn kv_push(&self, kv: &mut Kv, k: &[f32], v: &[f32]) { let row = self.row(); kv.k.extend_from_slice(k); kv.v.extend_from_slice(v); kv.n += 1;
         if kv.n > self.window { let drop = kv.n - self.window; kv.k.drain(..drop * row); kv.v.drain(..drop * row); kv.c0 += drop; kv.n -= drop; } }
@@ -262,7 +277,7 @@ impl Mtp {
     /// `step` on the GPU (draft-only numerics): K/V cell `ncell` of the GPU cache (capacity `cap` cells) is written,
     /// attention runs over the last `window` cells, routed experts run on the CPU after one packed readback.
     #[allow(clippy::too_many_arguments)]
-    pub fn step_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, ncell: usize, cap: usize, r: &H, emb: &[f32], pos: usize) -> Option<GStep> {
+    pub fn step_gpu<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, kc: &H, vc: &H, cap: usize, kc0: usize, r: &H, emb: &[f32], pos: usize) -> Option<GStep> {
         use super::mtp_gpu as mg; let (d, hc, nh, hd, eps) = (self.d, self.hc, self.nh, self.hd, self.eps); let w = hc * d; let row = self.row(); let gw = self.gw(cb).clone();
         let mut tt = std::time::Instant::now();
         let eb = cb.buf(emb); let en = cb.empty(d); mg::rms_seg(cb, &eb, d, &gw[0], d, &en, d, d, 1, 1, eps);
@@ -273,11 +288,11 @@ impl Mtp {
         let (m, inj) = self.hc_mix_g(cb, g, &self.hca, 2, &rr)?;
         let kf = cb.empty(row); cb.gemv(g(&self.k)?, &m, d, 0, &kf, row, 0); let vf = cb.empty(row); cb.gemv(g(&self.v)?, &m, d, 0, &vf, row, 0);
         let kn = cb.empty(row); mg::rms_seg(cb, &kf, row, &gw[6], hd, &kn, hd, hd, self.nkv, 1, eps); mg::rope_seg(cb, &kn, row, &gw[7], self.n_rot / 2, hd, self.nkv, pos);
-        mg::cp(cb, &kn, row, kc, cap * row, 0, ncell * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, ncell * row, row);
-        let n = ncell + 1; let c0 = n.saturating_sub(self.window);
+        mg::cp(cb, &kn, row, kc, cap * row, 0, (pos % cap) * row, row); mg::cp(cb, &vf, row, vc, cap * row, 0, (pos % cap) * row, row);
+        let n = pos + 1; let c0 = n.saturating_sub(self.window).max(kc0);
         let qr = self.q.rows; let qf = cb.empty(qr); cb.gemv(g(&self.q)?, &m, d, 0, &qf, qr, 0);
         let qn = cb.empty(qr); mg::rms_seg(cb, &qf, qr, &gw[5], hd, &qn, hd, 2 * hd, nh, 1, eps); mg::rope_seg(cb, &qn, qr, &gw[7], self.n_rot / 2, 2 * hd, nh, pos);
-        let att = cb.empty(nh * hd); mg::attn1(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, c0, n - c0, row, hd, nh / self.nkv, (hd as f32).sqrt().recip());
+        let att = cb.empty(nh * hd); mg::attn1(cb, &qn, &qf, qr, kc, vc, cap * row, &att, nh, c0, n - c0, row, hd, nh / self.nkv, (hd as f32).sqrt().recip(), cap);
         let bo = cb.empty(d); cb.gemv(g(&self.o)?, &att, nh * hd, 0, &bo, d, 0);
         mg::hc_comb(cb, &rr, &bo, &inj, d, hc);
         let (m2, inj2) = self.hc_mix_g(cb, g, &self.hcf, 3, &rr)?;

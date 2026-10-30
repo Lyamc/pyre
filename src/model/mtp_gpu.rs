@@ -51,18 +51,18 @@ fn k_cp(src: &[f32], dst: &mut [f32], so: u32, dof: u32, n: u32) { let i = ABSOL
 fn k_silu2(r: &[f32], g: &mut [f32], off: u32, sf: u32) { let i = ABSOLUTE_POS_X; if i < sf { let a = r[(off + i) as usize]; g[i as usize] = a * sg(a) * r[(off + sf + i) as usize]; } }
 /// one cube per head: softmax(q.k * scale) over n cells starting at cell c0, weighted v, times sigmoid(gate)
 #[cube(launch_unchecked)]
-fn k_attn1(qn: &[f32], qf: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], c0: u32, n: u32, row: u32, hd: u32, grp: u32, scale: f32) {
+fn k_attn1(qn: &[f32], qf: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], c0: u32, n: u32, row: u32, hd: u32, grp: u32, scale: f32, cap: u32) {
     let mut sc = Shared::<[f32]>::new_slice(512usize);
     let mut red = Shared::<[f32]>::new_slice(2usize);
     let h = CUBE_POS_X; let kvh = h / grp; let tid = UNIT_POS_X;
     let mut p = tid;
-    while p < n { let mut a = 0.0f32; let kb = (c0 + p) * row + kvh * hd; let mut i = 0u32; while i < hd { a += qn[(h * 2 * hd + i) as usize] * kc[(kb + i) as usize]; i += 1u32; } sc[p as usize] = a * scale; p += 256u32; }
+    while p < n { let mut a = 0.0f32; let kb = ((c0 + p) % cap) * row + kvh * hd; let mut i = 0u32; while i < hd { a += qn[(h * 2 * hd + i) as usize] * kc[(kb + i) as usize]; i += 1u32; } sc[p as usize] = a * scale; p += 256u32; }
     sync_cube();
     if tid == 0u32 { let mut mx = f32::new(-3.0e38); let mut q = 0u32; while q < n { mx = f32::max(mx, sc[q as usize]); q += 1u32; }
         let mut s = 0.0f32; let mut q2 = 0u32; while q2 < n { let e = f32::exp(sc[q2 as usize] - mx); sc[q2 as usize] = e; s += e; q2 += 1u32; } red[0] = s; }
     sync_cube();
     let mut i2 = tid;
-    while i2 < hd { let mut o = 0.0f32; let mut q3 = 0u32; while q3 < n { o += sc[q3 as usize] * vc[((c0 + q3) * row + kvh * hd + i2) as usize]; q3 += 1u32; }
+    while i2 < hd { let mut o = 0.0f32; let mut q3 = 0u32; while q3 < n { o += sc[q3 as usize] * vc[(((c0 + q3) % cap) * row + kvh * hd + i2) as usize]; q3 += 1u32; }
         out[(h * hd + i2) as usize] = o / red[0] * sg(qf[(h * 2 * hd + hd + i2) as usize]); i2 += 256u32; }
 }
 
@@ -80,6 +80,6 @@ pub fn hc_mixed(cb: &Cube, xn: &H, gate: &H, out: &H, d: usize, hc: usize) { uns
 pub fn hc_comb(cb: &Cube, rr: &H, out: &H, inj: &H, d: usize, hc: usize) { unsafe { k_hc_comb::launch_unchecked(&cb.client, g1(hc * d), CubeDim::new_1d(256), ba!(rr, hc * d), ba!(out, d), ba!(inj, hc), d as u32, (hc * d) as u32) } }
 pub fn cp(cb: &Cube, src: &H, sn: usize, dst: &H, dn: usize, so: usize, dof: usize, n: usize) { unsafe { k_cp::launch_unchecked(&cb.client, g1(n), CubeDim::new_1d(256), ba!(src, sn), ba!(dst, dn), so as u32, dof as u32, n as u32) } }
 pub fn silu2(cb: &Cube, r: &H, rn: usize, g: &H, off: usize, sf: usize) { unsafe { k_silu2::launch_unchecked(&cb.client, g1(sf), CubeDim::new_1d(256), ba!(r, rn), ba!(g, sf), off as u32, sf as u32) } }
-pub fn attn1(cb: &Cube, qn: &H, qf: &H, qlen: usize, kc: &H, vc: &H, kvn: usize, out: &H, nh: usize, c0: usize, n: usize, row: usize, hd: usize, grp: usize, scale: f32) {
-    unsafe { k_attn1::launch_unchecked(&cb.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256), ba!(qn, qlen), ba!(qf, qlen), ba!(kc, kvn), ba!(vc, kvn), ba!(out, nh * hd), c0 as u32, n as u32, row as u32, hd as u32, grp as u32, scale) }
+pub fn attn1(cb: &Cube, qn: &H, qf: &H, qlen: usize, kc: &H, vc: &H, kvn: usize, out: &H, nh: usize, c0: usize, n: usize, row: usize, hd: usize, grp: usize, scale: f32, cap: usize) {
+    unsafe { k_attn1::launch_unchecked(&cb.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256), ba!(qn, qlen), ba!(qf, qlen), ba!(kc, kvn), ba!(vc, kvn), ba!(out, nh * hd), c0 as u32, n as u32, row as u32, hd as u32, grp as u32, scale, cap as u32) }
 }
