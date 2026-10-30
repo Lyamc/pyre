@@ -840,6 +840,33 @@ fn k_q8pack_m(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, sst: u32, n
 }
 
 /// k_gemv_iq4d for up to 4 activation columns (packed by k_q8pack_m): each weight word is decoded once (levels
+/// k_q8pack_m as ggml quantize_q8_1 (PYRE_QN_NATX): q = roundf(x / d) (IEEE divide, halves away from zero), 0 for an all-zero block
+#[cube(launch_unchecked)]
+fn k_q8pack_mx(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, sst: u32, nb: u32) {
+    let b = ABSOLUTE_POS_X;
+    let c = CUBE_POS_Y;
+    if b < nb {
+        let base = soff + c * sst + b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32u32 { amax = f32::max(amax, f32::abs(src[(base + i) as usize])); }
+        let d = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if d > 0.0f32 { id = 1.0f32 / d; }
+        sc[(c * nb + b) as usize] = d;
+        for w in 0..8u32 {
+            let mut word = 0u32;
+            #[unroll]
+            for j in 0..4u32 {
+                let qv = src[(base + w * 4 + j) as usize] / d; let fa = f32::floor(f32::abs(qv)); let mut r = fa; if f32::abs(qv) - fa >= 0.5f32 { r = fa + 1.0f32; } if qv < 0.0f32 { r = 0.0f32 - r; } if d == 0.0f32 { r = 0.0f32; }
+                let v = i32::cast_from(r);
+                word |= (u32::cast_from(v) & 255u32) << (8 * j);
+            }
+            q[(c * nb * 8 + b * 8 + w) as usize] = word;
+        }
+    }
+}
+
+/// k_gemv_iq4d for up to 4 activation columns (packed by k_q8pack_m): each weight word is decoded once (levels
 /// table in shared memory) and used for every column; per column the arithmetic and its order are k_gemv_iq4d's.
 #[cube(launch_unchecked)]
 fn k_gemv_iq4d_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32) {
@@ -3673,7 +3700,7 @@ impl Cube {
         // path's per-row order). PYRE_QN_NATM=0 reverts to the per-column launches.
         if !m.nat.is_empty() && native_mode() == 2 && ((2..=4).contains(&nt) && natm() || natx() && (1..=4).contains(&nt)) {
             let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
-            unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) }
+            if natx() { unsafe { k_q8pack_mx::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) } } else { unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) } }
             if nats_on() || natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
@@ -3687,6 +3714,7 @@ impl Cube {
                 unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, xst as u32, (ooff + r0) as u32, ost as u32, nt as u32, nt > 1, nt > 2, nt > 3) } }
+            if natx() { natchk(self, m, x, xoff, xst, &xq, &xs, out, ooff, ost, nt); }
             return;
         }
         if !m.nat.is_empty() || nt == 1 || std::env::var("PYRE_QN_GEMV4").map(|v| v == "0").unwrap_or(false) {
@@ -4157,3 +4185,36 @@ pub fn xbench() -> anyhow::Result<()> {
 pub static XUP_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 pub fn xpersist() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XARENA_PERSIST").map(|v| v != "0").unwrap_or(true)) }
+
+
+/// PYRE_QN_NATCHK=N: for the first N native-IQ4 GEMV calls under PYRE_QN_NATX, recompute on the CPU in ggml/Strata
+/// native_iq4_xs_mmvq order (q8_1 quantize roundf(x/d); 128 threads per row, thread tid takes blocks tid/8 + 16k,
+/// sub-block tid%8; warps 1-3 added into warp 0 in order; xor butterfly 16..1) and compare bits.
+fn natchk(cb: &Cube, m: &CMat, x: &Handle, xoff: usize, xst: usize, xq: &Handle, xs: &Handle, out: &Handle, ooff: usize, ost: usize, nt: usize) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let lim: usize = std::env::var("PYRE_QN_NATCHK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let call = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if call >= lim { return; }
+    const LV: [i32; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+    let (cols, nb32, nb) = (m.cols, m.cols / 32, m.cols / 256);
+    let xv = cb.read(x); let gq: Vec<u32> = cb.read(xq).iter().map(|v| v.to_bits()).collect(); let gs = cb.read(xs); let ov = cb.read(out);
+    let (mut qbad, mut sbad) = (0usize, 0usize);
+    let mut q8 = vec![0i8; nt * cols]; let mut sd = vec![0f32; nt * nb32];
+    for c in 0..nt { for b in 0..nb32 { let src = &xv[xoff + c * xst + b * 32..xoff + c * xst + b * 32 + 32];
+        let amax = src.iter().fold(0f32, |a, v| a.max(v.abs())); let d = amax / 127.0; sd[c * nb32 + b] = d; if gs[c * nb32 + b].to_bits() != d.to_bits() { sbad += 1; }
+        for i in 0..32 { let q = if amax == 0.0 { 0 } else { (src[i] / d).round() as i32 } as i8; q8[c * cols + b * 32 + i] = q;
+            let gb = (gq[c * cols / 4 + b * 8 + i / 4] >> (8 * (i % 4))) as u8 as i8; if gb != q { qbad += 1; } } } }
+    let (mut tot, mut bad, mut maxu) = (0usize, 0usize, 0u32); let mut rows_nat = 0;
+    for (r0, n, w) in &m.nat { rows_nat += n; let wv: Vec<u32> = cb.read(w).iter().map(|v| v.to_bits()).collect();
+        for r in 0..*n { for c in 0..nt {
+            let blk = |kb: usize, ib: usize| -> (f32, f32) { let b0 = r * nb * 35 + kb * 35; let d = f32::from_bits(wv[b0]); let (sh, sl) = (wv[b0 + 1], wv[b0 + 2]);
+                let ls = (((sl >> (4 * ib)) & 15) | (((sh >> (2 * ib)) & 3) << 4)) as i32 - 32; let mut s = 0i32;
+                for j in 0..4 { let q = wv[b0 + 3 + ib * 4 + j]; for t in 0..4 { let by = (q >> (8 * t)) & 255; let xo = c * cols + kb * 256 + ib * 32;
+                    s += LV[(by & 15) as usize] * q8[xo + 4 * j + t] as i32 + LV[(by >> 4) as usize] * q8[xo + 16 + 4 * j + t] as i32; } }
+                let dx = half::f16::from_f32(sd[c * nb32 + kb * 8 + ib]).to_f32(); ((d * dx), ((s * ls) as f32)) };
+            let fma = std::env::var("PYRE_QN_NATCHK_FMA").map(|v| v != "0").unwrap_or(true); let mut tmp = [0f32; 128];
+            for tid in 0..128 { let mut kb = tid / 8; while kb < nb { let (dd, si) = blk(kb, tid % 8); tmp[tid] = if fma { dd.mul_add(si, tmp[tid]) } else { tmp[tid] + dd * si }; kb += 16; } }
+            let mut v = [0f32; 32]; for l in 0..32 { let mut a = tmp[l]; for wp in 1..4 { a += tmp[32 * wp + l]; } v[l] = a; }
+            for sft in [16usize, 8, 4, 2, 1] { let o = v; for l in 0..32 { v[l] = o[l] + o[l ^ sft]; } }
+            let g = ov[ooff + c * ost + r0 + r]; tot += 1; if g.to_bits() != v[0].to_bits() { bad += 1; maxu = maxu.max((g.to_bits() as i64 - v[0].to_bits() as i64).unsigned_abs() as u32); } } } }
+    eprintln!("natchk call {call}: {}x{} nt={nt} nat rows {rows_nat} q8 rows {} | q8_1 codes bad {qbad} scales bad {sbad} | out {bad}/{tot} differ (max {maxu} ulp)", m.rows, cols, m.rows - rows_nat);
+}
