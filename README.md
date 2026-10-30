@@ -823,3 +823,8 @@ Default draft length is now 1 (3 alternating pairs, steady tok/s, all greedy-ide
 
   New defaults: A 29.0, B 23.9-24.5, plain A 24.2 (A is 1.2x over plain).
 - **Prompt-B VRAM gap:** the expert cache does fill (1691 experts, 2.50 GiB, 44% hits). The lower peak reading is a sampling artifact in the bench script, not a missing cache.
+### Lookup drafting and GPU drafter matmuls (both opt-in)
+
+- **PYRE_SPEC_LOOKUP=n** (PYRE_SPEC_LOOKUP_K=3): when the last n+ tokens occurred earlier in the context, their continuation is drafted instead of running the MTP drafter (lookup mixed with MTP, after Strata's draft policy). On prompts A/B it rarely fires (0 rounds on A, 2 on B) and those drafts were rejected. Steady A 29.86/28.64 (n=6) and 29.75/28.99 (n=10) vs 27.39 (cold)/29.76 default; B 23.18/22.93 and 24.33/23.81 vs 23.68/24.29. Opt-in until tested on repetitive text.
+- **PYRE_MTP_GPU=1** uploads the drafter's 14 dense matrices (94 MB Q8) and runs them as GPU GEMVs from the main thread; experts stay on the CPU. Draft numerics differ, output does not. Steady A 29.88/30.05 vs 27.00 (cold)/28.63; B 24.12/24.60 vs 24.21/24.70. Total draft time did not drop measurably, because each matrix is one upload + readback. Opt-in; a fused GPU drafter step (no per-matrix readback) is the next step.
+- The calibrated confidence table was not ported. At p >= 0.9, A already accepts 100% of second drafts and B rarely drafts two.

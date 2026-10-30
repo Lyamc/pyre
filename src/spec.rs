@@ -44,6 +44,7 @@ pub fn set_route_prior(p: f32) { ROUTE_PRIOR.store(p.max(0.0).to_bits(), Relaxed
 
 // ---- statistics for /api/status ----
 pub static ROUNDS: AtomicU64 = AtomicU64::new(0);
+pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
 pub static DRAFTED: AtomicU64 = AtomicU64::new(0);
 pub static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 pub static EMITTED: AtomicU64 = AtomicU64::new(0);
@@ -128,8 +129,14 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         let kk = k.min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
         let mut drafts: Vec<(u32, Option<Vec<(u32, f32)>>)> = vec![];
         if kk > 0 && target.can_verify() {
+            // PYRE_SPEC_LOOKUP=n (opt-in): when the last n+ tokens already occurred earlier in the context, draft their
+            // continuation (up to PYRE_SPEC_LOOKUP_K tokens) instead of running the MTP drafter: lookup drafting mixed
+            // with MTP as in Strata (src/spec/draft_policy.cpp, MIT); verification keeps the output identical
+            let lmin = env("PYRE_SPEC_LOOKUP", 0);
+            if lmin > 0 { let kl = env("PYRE_SPEC_LOOKUP_K", 3).min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
+                let d = ngram_draft(history, kl, lmin, 32); if d.len() >= 2 { drafts = d.into_iter().map(|t| (t, None)).collect(); LOOKUPS.fetch_add(1, Relaxed); } }
             let td = std::time::Instant::now();
-            if mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; } }
+            if drafts.is_empty() && mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; } }
             tm_d += td.elapsed().as_secs_f64();
             if drafts.is_empty() && ng { drafts = ngram_draft(history, kk, ng_min, ng_max).into_iter().map(|t| (t, None)).collect(); }
         }
@@ -182,7 +189,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         if stop { break; }
         pending = nx;
     }
-    if std::env::var("PYRE_SPEC_TIME").is_ok() { eprint!("spectime: draft {:.1} ms keep {:.1} ms plain {} x {:.2} ms |", tm_d * 1e3, tm_k * 1e3, ns_, if ns_ > 0 { tm_s * 1e3 / ns_ as f64 } else { 0.0 }); for (t, &(s, n)) in tm_v.iter().enumerate() { if n > 0 { eprint!(" verify{t} {n} x {:.2} ms", s * 1e3 / n as f64); } } eprintln!(" | rounds {} draft/round {:.2} ms", out.rounds, if out.rounds > 0 { tm_d * 1e3 / out.rounds as f64 } else { 0.0 }); }
+    if std::env::var("PYRE_SPEC_TIME").is_ok() { eprint!("spectime: draft {:.1} ms keep {:.1} ms plain {} x {:.2} ms |", tm_d * 1e3, tm_k * 1e3, ns_, if ns_ > 0 { tm_s * 1e3 / ns_ as f64 } else { 0.0 }); for (t, &(s, n)) in tm_v.iter().enumerate() { if n > 0 { eprint!(" verify{t} {n} x {:.2} ms", s * 1e3 / n as f64); } } eprintln!(" | rounds {} lookup rounds {} draft/round {:.2} ms", out.rounds, LOOKUPS.load(Relaxed), if out.rounds > 0 { tm_d * 1e3 / out.rounds as f64 } else { 0.0 }); }
     LAST_DRAFT.store(k, Relaxed);
     LAST_ACC.store((if out.drafted > 0 { out.accepted as f32 / out.drafted as f32 } else { 0.0 }).to_bits(), Relaxed);
     out

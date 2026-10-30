@@ -89,7 +89,7 @@ pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, 
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
+pub struct Model { mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -186,7 +186,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { mtp_headc: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
+        Ok(Model { mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -1189,6 +1189,15 @@ impl Model {
         let m = self.mtp.as_ref()?; let n = st.tokens.len(); let pending = *history.last()?;
         if n == 0 || k == 0 { return None; }
         let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
+        // PYRE_MTP_GPU=1 (opt-in): the drafter's dense matrices (~95 MB Q8) run as GPU GEMVs on this thread; experts stay on the CPU
+        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(false)) { (Some(cb), true) => {
+            let map = self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
+                for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
+                eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp });
+            Some(Box::new(move |q: &super::qdot::Q8Mat, x: &[f32], t: usize| { let g = map.get(&(q as *const _ as usize))?; let xb = cb.buf(x); let o = cb.empty(t * q.rows);
+                if t == 1 { cb.gemv(g, &xb, x.len(), 0, &o, q.rows, 0); } else { cb.gemv_m(g, &xb, t * q.cols, 0, q.cols, &o, t * q.rows, 0, q.rows, t); }
+                Some(cb.read(&o)) })) }
+            _ => None };
         let mut kv = std::mem::take(&mut st.mtp_kv); kv.truncate(n - 1, row);
         // catch-up: cells i < n-1 whose residual is known (token i+1 is committed)
         let first = st.mtp_r.front().map(|r| r.0).unwrap_or(n);
@@ -1196,7 +1205,7 @@ impl Model {
         if lo < n - 1 {
             let mut rs = Vec::with_capacity((n - 1 - lo) * w); let mut es = vec![0f32; (n - 1 - lo) * d]; let mut ok = true;
             for (j, i) in (lo..n - 1).enumerate() { match self.mtp_r_get(st, i) { Some(r) => rs.extend_from_slice(r), None => { ok = false; break; } } self.embd.row(st.tokens[i + 1] as usize, &mut es[j * d..(j + 1) * d]); }
-            if ok { mtp_cpu(|| m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } else { kv = Default::default(); }
+            if ok { if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } else { mtp_cpu(|| m.catch_up(&mut kv, &rs, &es, n - 1 - lo, lo)); } } else { kv = Default::default(); }
         }
         let t1 = std::time::Instant::now();
         let mut r = self.mtp_r_get(st, n - 1)?.to_vec(); let mut tok = pending; let mut out = vec![];
@@ -1205,7 +1214,7 @@ impl Model {
         let mut e = vec![0f32; d];
         for j in 0..k {
             self.embd.row(tok as usize, &mut e);
-            let (s, r2) = mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)); let th = std::time::Instant::now();
+            let (s, r2) = if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.step(&mut kv, &r, &e, n - 1 + j)) } else { mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)) }; let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
             // the draft-vocabulary head on the GPU (PYRE_MTP_HEAD_GPU=0: off): ~100 MB of VRAM, a fraction of the full head's time
             let hg = if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.cube.as_ref().and_then(|cb| self.mtp_headc.get_or_init(|| { let h = m.head_q8(); let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }).as_ref().map(|hm| (cb, hm))) } else { None };

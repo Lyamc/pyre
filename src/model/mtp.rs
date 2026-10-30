@@ -59,7 +59,20 @@ struct Hc { norm: Vec<f32>, down: Q8Mat, up: Q8Mat, inject: Option<Q8Mat>, lr: u
 fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 fn silu(x: f32) -> f32 { x * sigm(x) }
 fn rms(x: &[f32], w: &[f32], eps: f32, y: &mut [f32]) { let s = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt().recip(); for i in 0..x.len() { y[i] = x[i] * s * w[i]; } }
-fn mm(m: &Q8Mat, x: &[f32], t: usize) -> Vec<f32> { let mut y = vec![0f32; t * m.rows]; m.matmul(x, t, &mut y); y }
+/// A matmul hook for the calling thread (PYRE_MTP_GPU: the dense drafter matrices on the GPU); None = CPU.
+type MmHook<'a> = &'a dyn Fn(&Q8Mat, &[f32], usize) -> Option<Vec<f32>>;
+thread_local! { static HOOK: std::cell::Cell<Option<MmHook<'static>>> = const { std::cell::Cell::new(None) }; }
+/// Run `f` with `h` deciding each drafter matmul on this thread (draft-only numerics; verify keeps the output).
+pub fn with_mm_hook<R>(h: MmHook<'_>, f: impl FnOnce() -> R) -> R {
+    // SAFETY: the hook is cleared before `h` goes out of scope (also on unwind, via the guard)
+    let hs: MmHook<'static> = unsafe { std::mem::transmute(h) };
+    struct G; impl Drop for G { fn drop(&mut self) { HOOK.with(|c| c.set(None)); } }
+    HOOK.with(|c| c.set(Some(hs))); let _g = G; f()
+}
+fn mm(m: &Q8Mat, x: &[f32], t: usize) -> Vec<f32> {
+    if let Some(h) = HOOK.with(|c| c.get()) { if let Some(y) = h(m, x, t) { return y; } }
+    let mut y = vec![0f32; t * m.rows]; m.matmul(x, t, &mut y); y
+}
 
 /// The drafter's K/V: cells c0..c0+n (rope position = cell), [cell][n_kv*hd].
 #[derive(Default)]
@@ -168,6 +181,8 @@ impl Mtp {
     pub fn warm(&self) { (0..self.ex.len()).into_par_iter().for_each(|e| { self.expert(e); }); }
     /// The draft head on the CPU over the draft vocabulary: (token, probability).
     pub fn head_q8(&self) -> &Q8Mat { &self.head }
+    /// The dense (non-expert) matrices, for a GPU copy
+    pub fn dense_mats(&self) -> Vec<&Q8Mat> { let mut v = vec![&self.fc_e, &self.fc_h, &self.q, &self.k, &self.v, &self.o, &self.rsu, &self.sd]; for h in [&self.hca, &self.hcf, &self.mix] { v.push(&h.down); v.push(&h.up); if let Some(i) = &h.inject { v.push(i); } } v }
     pub fn head_ids(&self) -> &[u32] { &self.ids }
     pub fn head_cpu(&self, s: &[f32]) -> (u32, f32) { let lg = mm(&self.head, s, 1); let (i, p) = best(&lg); (self.ids[i], p) }
     /// One full draft step at cell `pos`: returns (the final mixer's output for the head, the drafter's residual).
