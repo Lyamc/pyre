@@ -1304,6 +1304,83 @@ fn k_gate_m(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u3
     }
 }
 
+/// k_gate_m with every weight word / scale of all hc rows loaded up front (hc * ceil(words/32) independent
+/// loads in flight per lane instead of 2-3 per dependent row pass). Per (row, token) each lane accumulates the
+/// same words in the same ascending order, then plane_sum and the row sum in st order: bit-identical to k_gate_m.
+#[cube(launch_unchecked)]
+fn k_gate_m2(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, xs: u32, ds: u32, os: u32, #[comptime] lr: usize, #[comptime] hc: u32, #[comptime] t: u32) {
+    let mut lo = Shared::<[f32]>::new_slice(comptime!(lr * t as usize));
+    let hcf = f32::cast_from(hc);
+    let tid = UNIT_POS_Y * 32 + UNIT_POS_X;
+    let i = CUBE_POS_X * 8 + UNIT_POS_Y;
+    let words = comptime!(lr as u32 / 4);
+    let nb = comptime!(lr as u32 / 32);
+    let ni = comptime!((lr as u32 / 4).div_ceil(32));
+    // weights first (they do not depend on lo), so their latency overlaps the silu prologue
+    let mut wv = Array::<u32>::new(comptime!((hc * ni) as usize));
+    let mut sv = Array::<f32>::new(comptime!((hc * ni) as usize));
+    let mut ic = i; if ic >= d { ic = d - 1; }
+    #[unroll]
+    for st in 0..hc {
+        let row = st * d + ic;
+        #[unroll]
+        for it in 0..ni {
+            let wi = UNIT_POS_X + it * 32;
+            let mut wc = wi; if wc >= words { wc = words - 1; }
+            wv[(st * ni + it) as usize] = w[(row * words + wc) as usize];
+            sv[(st * ni + it) as usize] = s[(row * nb + wc / 8) as usize];
+        }
+    }
+    #[unroll]
+    for tk in 0..t {
+        let mut j = tid;
+        while (j as usize) < lr {
+            let v = dn[(tk * ds + j) as usize] / hcf;
+            lo[(tk * comptime!(lr as u32) + j) as usize] = v / (1.0f32 + f32::exp(-v));
+            j += 256u32;
+        }
+    }
+    sync_cube();
+    if i < d {
+        let mut acc = Array::<f32>::new(comptime!(t as usize));
+        #[unroll]
+        for tk in 0..t { acc[tk as usize] = 0.0f32; }
+        #[unroll]
+        for st in 0..hc {
+            let row = st * d + i;
+            let mut g = Array::<f32>::new(comptime!(t as usize));
+            #[unroll]
+            for tk in 0..t { g[tk as usize] = 0.0f32; }
+            #[unroll]
+            for it in 0..ni {
+                let wi = UNIT_POS_X + it * 32;
+                if wi < words {
+                    let word = wv[(st * ni + it) as usize];
+                    let sc = sv[(st * ni + it) as usize];
+                    #[unroll]
+                    for tk in 0..t {
+                        let mut part = 0.0f32;
+                        #[unroll]
+                        for jj in 0..4u32 {
+                            let v = dec(word, jj);
+                            part += v * lo[(tk * comptime!(lr as u32) + wi * 4 + jj) as usize];
+                        }
+                        g[tk as usize] += part * sc;
+                    }
+                }
+            }
+            #[unroll]
+            for tk in 0..t {
+                let gt = plane_sum(g[tk as usize]);
+                acc[tk as usize] += xn[(tk * xs + row) as usize] / (1.0f32 + f32::exp(-gt));
+            }
+        }
+        if UNIT_POS_X == 0 {
+            #[unroll]
+            for tk in 0..t { out[(tk * os + ooff + i) as usize] = acc[tk as usize] / hcf; }
+        }
+    }
+}
 /// mixed[i] = mean_s xn[s,i] * sigmoid(up[s*d+i] . silu(dn[0..lr]/hc)); one plane per output i.
 #[cube(launch_unchecked)]
 fn k_gate(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, #[comptime] lr: usize, #[comptime] hc: u32) {
@@ -2886,6 +2963,10 @@ impl Cube {
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
         if !(2..=4).contains(&t) { return false; }
         let lr = up.cols;
+        // PYRE_QN_GATEM2 (default on for T=2; =0 reverts): loads hoisted, bit-identical; T=2 30.8->28.8 us, T=3 47.3->54.8 us (register pressure) so T>=3 keeps k_gate_m
+        if t == 2 && std::env::var("PYRE_QN_GATEM2").map(|v| v != "0").unwrap_or(true) { unsafe { k_gate_m2::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
+            BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
+            BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) } return true; }
         unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) }
