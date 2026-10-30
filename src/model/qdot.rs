@@ -305,7 +305,24 @@ pub fn quantize_k_into(x: &[f32], a: &mut Q8K) {
 }
 /// AVX-VNNI present (Alder Lake and later) and not disabled with PYRE_QN_VNNI=0.
 /// PYRE_QN_GATHER=1: IQ2_S grid lookups with vpgatherdq (opt-in until measured).
-pub fn gather() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_GATHER").map(|v| v == "1").unwrap_or(false)) }
+/// PYRE_QN_GATHER: IQ2_S grid words with one vpgatherqq (1), scalar loads (0), or "auto": gathered only on threads
+/// running on a hybrid CPU's performance core (CPUID leaf 1Ah core type 40h), scalar on E-cores, whose gathers are
+/// slow (Strata, MIT, github.com/Niko1221/Strata: cpu_gather_fast_here, src/kernels/cpu/expert_layout.cpp). Same
+/// grid words either way (bit-identical). Per thread, decided on first use (pool workers are pinned).
+pub fn gather() -> bool {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let m = *M.get_or_init(|| match std::env::var("PYRE_QN_GATHER").as_deref() { Ok("1") => 1, Ok("auto") => 2, _ => 0 });
+    if m < 2 { return m == 1; }
+    thread_local! { static P: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+    P.with(|p| { if p.get() == 0 { p.set(if pcore_here() { 2 } else { 1 }); } p.get() == 2 })
+}
+/// The calling thread runs on a performance core of a hybrid Intel CPU (CPUID 7.EDX[15] hybrid, 1Ah EAX[31:24] = 40h).
+fn pcore_here() -> bool {
+    #[cfg(target_arch = "x86_64")] unsafe { use std::arch::x86_64::__cpuid_count;
+        if __cpuid_count(0, 0).eax < 0x1A || (__cpuid_count(7, 0).edx >> 15) & 1 == 0 { return false; }
+        return (__cpuid_count(0x1A, 0).eax >> 24) == 0x40; }
+    #[allow(unreachable_code)] false
+}
 pub fn vnni() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| { #[cfg(target_arch = "x86_64")] { std::env::var("PYRE_QN_VNNI").map(|v| v != "0").unwrap_or(true) && is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") } #[cfg(not(target_arch = "x86_64"))] { false } }) }
 pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M) }
 // ---- gate+up pair: one IQ2 super-block of each row per step, sharing the activation; each row's own
