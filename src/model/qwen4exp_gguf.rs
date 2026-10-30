@@ -1165,7 +1165,7 @@ impl Model {
         let qp = QP(hdq.as_mut_ptr()); let qp = &qp;
         let left: Vec<std::sync::atomic::AtomicUsize> = if guq { (0..work.len()).map(|_| std::sync::atomic::AtomicUsize::new(nb)).collect() } else { vec![] };
         let (t_first, t_last) = (std::sync::atomic::AtomicU64::new(u64::MAX), std::sync::atomic::AtomicU64::new(0)); let zp = std::time::Instant::now();
-        pool.run_side(work.len() * nb, &|k| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let gu = |k: usize| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
             let (wi, b) = (k / nb, k % nb); let wi = if lfo.is_empty() { wi } else { lfo[wi] }; let (e, toks) = work[wi];
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
@@ -1189,32 +1189,55 @@ impl Model {
                     for (j, &(ti, _)) in toks.iter().enumerate() {
                         let v = if usek { let pr = if pair_on() && gm.ty == um.ty { qdot::row_dot_k_pair(gm.ty, gr, ur, &actk[ti]) } else { None }; if let Some((g, u)) = pr { silu(g) * u } else { silu(qdot::row_dot_k(gm.ty, gr, &actk[ti])) * qdot::row_dot_k(um.ty, ur, &actk[ti]) } } else { silu(qdot::row_dot(gm.ty, gr, &acts[ti], sc)) * qdot::row_dot(um.ty, ur, &acts[ti], s2) };
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
-        }, &mut || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); });
-        let z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
-        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else if guq { hdq } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
-        let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
+        };
+        let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr());
+        // PYRE_QN_DGUIDE (default on): down row blocks in 3 tiers of `threads` tasks each (55% / 30% / 15% of the rows,
+        // claimed largest first), so the job tail is a small block instead of a full one; each row is still computed
+        // by one task with the same code -> identical results. PYRE_QN_DGUIDE=0: uniform SDBLK blocks.
+        let dbnd: Vec<usize> = if env_var("PYRE_QN_DGUIDE").map(|v| v != "0").unwrap_or(true) { let nt = pool.threads.max(1); let mut v = vec![0usize]; let mut acc = 0f64;
+            for f in [0.55f64, 0.30, 0.15] { for _ in 0..nt { acc += f / nt as f64; let r = (((acc * d as f64) / 8.0).round() as usize * 8).min(d); if r > *v.last().unwrap() { v.push(r); } } }
+            if *v.last().unwrap() < d { v.push(d); } v } else { (0..=d.div_ceil(dblk)).map(|b| (b * dblk).min(d)).collect() };
+        let nd = dbnd.len() - 1; let dbnd = &dbnd;
         let mut slot0 = vec![0usize; work.len()]; let mut slot_n = 0usize; for (wi, (_, toks)) in work.iter().enumerate() { slot0[wi] = slot_n; slot_n += toks.len(); } let (slot0, slot_n) = (&slot0, slot_n);
-        pool.run(d.div_ceil(dblk), &|b| {
-            let (r0, r1) = (b * dblk, ((b + 1) * dblk).min(d));
+        let down = |b: usize, hdq: &[Vec<qdot::Q8D>], hq: &[Vec<qdot::Q8Act>]| {
+            let (r0, r1) = (dbnd[b], dbnd[b + 1]);
             if let Some(ord) = ord { SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 // expert-major (sequential, prefetched) into per-(expert, token) partials, then each token
                 // sums its partials in its own expert order: the same additions as a one-token call
                 let nr = r1 - r0; let mut part = vec![0f32; slot_n * nr];
-                for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, nr);
+                for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, nr); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
                     for r in 0..nr { let dr = dm.row_raw(r); if r + 4 < nr { prefetch(dm.row_raw(r + 4)); }
-                        if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let al: Vec<&qdot::Q8D> = hdq[wi].iter().collect(); let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
+                        if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
                             for (j, &(_, w)) in toks.iter().enumerate() { part[(slot0[wi] + j) * nr + r] = w * ov[j]; } continue; }
                         for (j, &(_, w)) in toks.iter().enumerate() { part[(slot0[wi] + j) * nr + r] = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; } } }
                 for (ti, lst) in ord.iter().enumerate() { let yt = unsafe { yp.slice(ti * d + r0, nr) };
                     for &(wi, j) in lst { let pp = &part[(slot0[wi] + j) * nr..(slot0[wi] + j + 1) * nr]; for r in 0..nr { yt[r] += pp[r]; } } } }); return; }
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
-                for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0);
+                for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
                     for r in 0..r1 - r0 { let dr = dm.row_raw(r); if r + 4 < r1 - r0 { prefetch(dm.row_raw(r + 4)); }
-                        if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let al: Vec<&qdot::Q8D> = hdq[wi].iter().collect(); let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
+                        if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
                             for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } continue; }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
-        });
+        };
+        let mut sidef = || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); };
+        // PYRE_QN_CHAIN (default on with GUQ): gate/up and down in ONE pool job (down tasks after all gate/up tasks; a
+        // worker that claims a down task waits for the gate/up count), so workers start down while the caller is still
+        // in side() (GPU enqueue); same per-task code and per-row order -> identical results
+        let chain = guq && env_var("PYRE_QN_CHAIN").map(|v| v != "0").unwrap_or(true);
+        let (z1, z2);
+        if chain { let ngu = work.len() * nb; let gd = std::sync::atomic::AtomicUsize::new(0); let hqe: Vec<Vec<qdot::Q8Act>> = vec![];
+            pool.run_side(ngu + nd, &|k| { if k < ngu { gu(k); gd.fetch_add(1, std::sync::atomic::Ordering::Release); } else {
+                while gd.load(std::sync::atomic::Ordering::Acquire) < ngu { std::hint::spin_loop(); }
+                let hd: &[Vec<qdot::Q8D>] = unsafe { std::slice::from_raw_parts(qp.0 as *const Vec<qdot::Q8D>, work.len()) }; down(k - ngu, hd, &hqe); } }, &mut sidef);
+            z1 = std::time::Instant::now(); z2 = z1; TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        } else {
+        pool.run_side(work.len() * nb, &gu, &mut sidef);
+        z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
+        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else if guq { hdq } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
+        z2 = std::time::Instant::now();
+        pool.run(nd, &|b| down(b, &hdq, &hq));
+        }
         use std::sync::atomic::Ordering::Relaxed; XW2[0].fetch_add(z0.elapsed().as_nanos() as u64, Relaxed); HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
     }
 
