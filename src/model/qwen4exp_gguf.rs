@@ -1597,7 +1597,7 @@ impl Model {
             cb.gemv_m(&cl.min, &b.mixed, t * d, 0, d, &b.proj, t * pr, 0, pr, t);
             let (mut cks, mut ckm) = (vec![], 0u32);
             for ti in 0..t { let pj = at(&b.proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&b.co, ti * ch), ch, c.conv_k);
-                if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } }
+                if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 8 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } }
             cb.delta_m(&b.co, ch, &b.proj, pr, gw, &ss, &b.core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             cb.gemv_m(&cl.mout, &b.core, t * core_n, 0, core_n, &b.o, t * d, 0, d, t);
             for ti in 0..t { cb.comb(&xs[ti], &at(&b.o, ti * d), None, None, &at(&b.da, ti * dar), lra, hc, d); } cb.rms_t(xs, &cl.hcf.norm, &b.xn, hc, d, c.eps);
@@ -1652,7 +1652,7 @@ impl Model {
         // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
         // and their state checkpoints stay per token, in the same order)
         let mut dm_done = false;
-        if let (Mixer::Lin { .. }, Some(gw), true) = (&l.mix, &cl.gdn, st.gdn_gpu) { if t >= 2 && t <= 4 && c.lin_dk == c.lin_dv && env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) {
+        if let (Mixer::Lin { .. }, Some(gw), true) = (&l.mix, &cl.gdn, st.gdn_gpu) { if t >= 2 && (t <= 4 || t <= 8 && super::qn_cube::t8()) && c.lin_dk == c.lin_dv && env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) {
             let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
             let (cs, ss) = st.gdn[li0].clone(); let co_all = cb.empty(t * ch);
             let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv);
@@ -1660,11 +1660,11 @@ impl Model {
             if convm() && cn == ch * (c.conv_k - 1) {
                 // one k_conv_m launch for the window's convs and conv-state checkpoints (same per-token arithmetic and order)
                 let mut cka: Vec<Option<H>> = vec![];
-                for ti in 0..t { if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cka.push(Some(a.clone())); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cka.push(None); cks.push(None); } }
+                for ti in 0..t { if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cka.push(Some(a.clone())); if ti < 8 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cka.push(None); cks.push(None); } }
                 cb.conv_m(&proj, t * pr, pr, &gw.conv, &cs, &co_all, ch, c.conv_k, t, &cka);
             } else {
             for ti in 0..t { let pj = at(&proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&co_all, ti * ch), ch, c.conv_k);
-                if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
+                if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 8 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
             }
             cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             dm_done = true;
@@ -1698,7 +1698,7 @@ impl Model {
         let post = || {
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
-        if combm() && t <= 4 { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
+        if combm() && (t <= 4 || super::qn_cube::t8()) { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
         cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);
@@ -1835,7 +1835,7 @@ impl Model {
         }
         let q6 = std::time::Instant::now();
         let yball = cb.buf(&yr);
-        if sh_b && combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
+        if sh_b && combm() && (t <= 4 || super::qn_cube::t8()) { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
         for ti in 0..t {
             let yb = at(&yball, ti * d);
             cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d);

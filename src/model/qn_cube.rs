@@ -3375,6 +3375,7 @@ impl Cube {
     }
     /// rms of t tokens (separate x buffers) into xn at token stride hc*d; one launch for up to 4 (PYRE_QN_RMS4=0: per token)
     pub fn rms_t(&self, xs: &[Handle], norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {
+        if xs.len() > 4 && t8() { let w = hc * d; for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.rms_t(&xs[c0..c1], norm, &xn.clone().offset_start((c0 * w * 4) as u64), hc, d, eps); } return; }
         let t = xs.len(); let w = hc * d;
         if t >= 2 && t <= 4 && std::env::var("PYRE_QN_RMS4").map(|v| v != "0").unwrap_or(true) {
             let g = |i: usize| xs[i.min(t - 1)].clone();
@@ -3391,6 +3392,7 @@ impl Cube {
     }
     /// k_gate over t tokens at strides xs / ds / os (elements); false when t is not 2..=4 (caller loops k_gate)
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
+        if t > 4 && t <= 8 && t8() { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); if n == 1 { self.gate(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d); } else { self.gate_m(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d, n, xs, ds, os); } } return true; }
         if !(2..=4).contains(&t) { return false; }
         let lr = up.cols;
         unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
@@ -3407,6 +3409,7 @@ impl Cube {
     #[allow(clippy::too_many_arguments)]
     /// k_comb for xs.len() <= 4 tokens in one launch: a = t*d contiguous, dn = t*ds contiguous
     pub fn comb_m(&self, xs: &[Handle], a: &Handle, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        if xs.len() > 4 { for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.comb_m(&xs[c0..c1], &a.clone().offset_start((c0 * d * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), ds, lr, hc, d); } return; }
         let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone();
         unsafe { k_comb_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
             BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
@@ -3415,6 +3418,8 @@ impl Cube {
     /// k_comb3 (gate, b, optional per-token c) for xs.len() <= 4 tokens in one launch
     #[allow(clippy::too_many_arguments)]
     pub fn comb3_m(&self, xs: &[Handle], cs: &[Option<Handle>], a: &Handle, b: &Handle, gb: &Handle, gn: usize, gs: usize, goff: usize, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        if xs.len() > 4 { for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); let o = |h: &Handle, n: usize| h.clone().offset_start((c0 * n * 4) as u64);
+            self.comb3_m(&xs[c0..c1], &cs[c0..c1], &o(a, d), &o(b, d), &o(gb, gs), gn - c0 * gs, gs, goff, &o(dn, ds), ds, lr, hc, d); } return; }
         let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone(); let mut cm = 0u32;
         for i in 0..t { if cs[i].is_some() { cm |= 1 << i; } }
         let c = |i: usize| -> Handle { match cs.get(i) { Some(Some(h)) => h.clone(), _ => a.clone() } };
@@ -3435,6 +3440,7 @@ impl Cube {
     }
     /// t tokens' convs in one launch; cks[ti] = Some(checkpoint) for ti < 4 (state after token ti)
     pub fn conv_m(&self, proj: &Handle, pn: usize, pr: usize, w: &Handle, cs: &Handle, co: &Handle, ch: usize, kk: usize, t: usize, cks: &[Option<Handle>]) {
+        if t > 4 { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); self.conv_m(&proj.clone().offset_start((c0 * pr * 4) as u64), pn - c0 * pr, pr, w, cs, &co.clone().offset_start((c0 * ch * 4) as u64), ch, kk, n, &cks[c0.min(cks.len())..(c0 + n).min(cks.len())]); } return; }
         let cn = ch * (kk - 1); let mut ckm = 0u32; let dummy = self.empty(cn);
         let ck = |i: usize| -> Handle { match cks.get(i) { Some(Some(h)) => h.clone(), _ => dummy.clone() } };
         for i in 0..t.min(4) { if matches!(cks.get(i), Some(Some(_))) { ckm |= 1 << i; } }
@@ -3458,6 +3464,7 @@ impl Cube {
     /// `delta` for nt (1..=4) tokens: co/proj/out at strides ch/pn/ostr; checkpoint t (< 3) written to cks[t] when bit t of ckm is set.
     #[allow(clippy::too_many_arguments)]
     pub fn delta_m(&self, co: &Handle, ch: usize, proj: &Handle, pn: usize, w: &GdnW, s: &Handle, out: &Handle, ostr: usize, cks: &[Option<Handle>], ckm: u32, nk: usize, nv: usize, dk: usize, zoff: usize, boff: usize, aoff: usize, eps: f32, nt: usize) {
+        if nt > 4 { for c0 in (0..nt).step_by(4) { let n = (nt - c0).min(4); self.delta_m(&co.clone().offset_start((c0 * ch * 4) as u64), ch, &proj.clone().offset_start((c0 * pn * 4) as u64), pn, w, s, &out.clone().offset_start((c0 * ostr * 4) as u64), ostr, &cks[c0.min(cks.len())..(c0 + n).min(cks.len())], (ckm >> c0) & 15, nk, nv, dk, zoff, boff, aoff, eps, n); } return; }
         let sn = nv * dk * dk; let dummy = self.empty(1);
         let ck = |i: usize| match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => (h.clone(), sn), _ => (dummy.clone(), 1) };
         let (k0, k1, k2, k3) = (ck(0), ck(1), ck(2), ck(3));
@@ -3765,3 +3772,6 @@ fn natchk(cb: &Cube, m: &CMat, x: &Handle, xoff: usize, xst: usize, xq: &Handle,
 fn natx_fma() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_NATX_FMA").map(|v| v == "1").unwrap_or(false)) }
 
 fn gemv8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GEMV8").map(|v| v == "1").unwrap_or(false)) }
+
+/// PYRE_QN_T8 (or PYRE_QN_GEMV8=1): verify windows of 5-8 tokens keep the multi-token kernels (split 4 + rest launches)
+pub fn t8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_T8").map(|v| v == "1").unwrap_or(false) || gemv8()) }
