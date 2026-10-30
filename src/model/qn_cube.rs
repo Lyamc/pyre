@@ -3619,7 +3619,7 @@ impl Cube {
         let a = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };
         unsafe { k_rsum_ex::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), a(gy), a(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(y.clone(), t * d), d as u32, kk as u32) }
     }
-    pub fn xrun_exact(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+    pub fn xrun_exact(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, t: usize, ne: usize, mh: &Handle, oc: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle, scr: Option<&XScr>) -> bool {
         if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 64 != 0 || d / 256 > 16 || ff / 64 > 64 || ars.is_empty() || ars.len() > 2 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
         let rw = |ty: u32, cols: usize| { let (e, w) = block_words(ty); cols / e * w };
@@ -3627,8 +3627,9 @@ impl Cube {
         let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) };
         let (ar, ar1) = (&ars[0], ars.last().unwrap());
         let nsb = d / 256; let nb = ff / 64;
-        let (xq, xd) = (self.empty(t * d / 4), self.empty(t * nsb)); let h = self.empty(ne * ff);
-        let (hq, hd, hs) = (self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb));
+        // PYRE_QN_XEXACT decode: the persistent XScr buffers (sizes checked: xs d/32 >= nsb, hs holds hd and hs) instead of six pool allocations
+        let (xq, xd, h, hq, hd, hs) = match scr { Some(sc) if t == 1 && ne <= sc.max_ne => (sc.xq.clone(), sc.xs.clone(), sc.h.clone(), sc.hq.clone(), sc.hs.clone(), sc.hs.clone().offset_start((ne * nb * 4) as u64)),
+            _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
         unsafe {
             k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
             if xex8() { k_xgu_ex8::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(8), ne as u32, 1), CubeDim::new_2d(32, 8),

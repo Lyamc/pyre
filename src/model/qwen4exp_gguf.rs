@@ -180,6 +180,8 @@ thread_local! { static EXACT_PARTS: std::cell::Cell<bool> = const { std::cell::C
 fn xallcpu() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XALLCPU").map(|v| v == "1").unwrap_or(false)) }
 /// PYRE_QN_XEXACT: layers whose expert types have no exact GPU kernel (only IQ2_S/IQ2_XXS + Q2_0 do) run all experts on the CPU
 fn xexact_types(l: &Layer) -> bool { let t = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9)); t.0 == t.1 && t.0 <= 1 && t.2 == 3 }
+/// PYRE_QN_XSCR_EX=0: the exact decode kernels allocate their temporaries per call instead of using the persistent XScr
+fn xscr_ex() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSCR_EX").map(|v| v != "0").unwrap_or(true)) }
 fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
 pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -342,7 +344,7 @@ impl Model {
                 if env_var("PYRE_QN_GPUHEAD").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false)) { self.headc = cb.upload_mix(&[&self.out], &[]); if self.headc.is_some() { eprintln!("gpu: lm head on gpu"); } }
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
-                let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(5usize << 29); // default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
+                let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(if xexact() { 3usize << 30 } else { 5usize << 29 }); // XEXACT: 3 GiB (e5: +hits, C +1.6 tok/s, ~3.3 GB VRAM still free); default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(2048) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
@@ -501,15 +503,22 @@ impl Model {
             xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
             // PYRE_QN_XEXACT single token: hits with the CPU arithmetic, CPU rows unsummed, one in-order sum (as the verify path)
             if xexact() && xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 && !xcg.arena.is_empty() && d % 256 == 0 && c.ff_exp % 64 == 0 {
-                let xcr = &*xcg; let mut ex_y: Option<H> = None;
+                let kk = c.top_k; let mut tab = vec![0u32; kk + 1]; let mut n = 0usize;
+                for &e in &seln { let cd = if let Some(p2) = on.iter().position(|x| x.0 == e) { Some(p2 as u32) } else if let Some(p3) = strm.iter().position(|x| x.0 == e) { Some((on.len() + p3) as u32) } else { off.iter().position(|x| x.0 == e).map(|i| (1u32 << 31) | i as u32) };
+                    if let Some(cd) = cd { if n < kk { tab[1 + n] = cd; n += 1; } } }
+                tab[0] = n as u32;
+                let xcr = &*xcg; let mut ex_y: Option<H> = None; let mut tbh: Option<H> = None;
                 let mut gpu = || {
                     // streamed misses (XSTREAM/XSHARE) join the hits: same exact kernels, so placement cannot change output
                     let sents: Vec<(super::qn_cube::XEnt, f32)> = strm.iter().enumerate().map(|(j, &(e, w))| { let sl = xcr.stream[j];
                         let pk = self.xpacked(il, e, tys0); let mut ent = cb.xupload_pk(&xcr.arena[sl / xcr.per], xcr.ar_bytes, sl % xcr.per, xcr.slot, &pk.0, pk.1, pk.2);
                         ent.arena = sl / xcr.per; ent.slot = sl; (ent, w) }).collect();
                     if !(on.is_empty() && sents.is_empty()) { let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).chain(sents.iter().map(|(e, w)| (e, *w))).collect(); let n = ents.len() as u32;
-                        let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&super::qn_cube::Cube::xmeta(&xcr.arena, &ents))); let och = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&[n, n, n, n]));
-                        let yent = cb.empty(ents.len() * d); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, 1, ents.len(), &mh, &och, &rd, rn, d, c.ff_exp, tys0, &yent); ex_y = Some(yent); }
+                        // one upload: entry table | 4 counts | in-order sum table
+                        let mut mv = super::qn_cube::Cube::xmeta(&xcr.arena, &ents); let ml = mv.len(); mv.extend_from_slice(&[n, n, n, n]); mv.extend_from_slice(&tab);
+                        let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&mv)); let och = mh.clone().offset_start((ml * 4) as u64);
+                        tbh = Some(mh.clone().offset_start(((ml + 4) * 4) as u64));
+                        let yent = cb.empty(ents.len() * d); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, 1, ents.len(), &mh, &och, &rd, rn, d, c.ff_exp, tys0, &yent, if xscr_ex() { Some(&xcr.scr) } else { None }); ex_y = Some(yent); }
                     cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
                     cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
                     if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } }
@@ -523,13 +532,9 @@ impl Model {
                     self.routed_pool_ord(l, &rv[..d], &work, 1, &mut yp, &mut gpu, Some(&ord)); EXACT_PARTS.with(|c| c.set(false));
                     { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
                 } else { gpu(); }
-                let kk = c.top_k; let mut tab = vec![0u32; kk + 1]; let mut n = 0usize;
-                for &e in &seln { let cd = if let Some(p2) = on.iter().position(|x| x.0 == e) { Some(p2 as u32) } else if let Some(p3) = strm.iter().position(|x| x.0 == e) { Some((on.len() + p3) as u32) } else { off.iter().position(|x| x.0 == e).map(|i| (1u32 << 31) | i as u32) };
-                    if let Some(cd) = cd { if n < kk { tab[1 + n] = cd; n += 1; } } }
-                tab[0] = n as u32;
                 drop(xcg);
                 let q6 = std::time::Instant::now();
-                let yb = cb.buf(&yp); let tb = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&tab)); let ysum = cb.empty(d);
+                let yb = cb.buf(&yp); let tb = match tbh { Some(h) => h, None => cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&tab)) }; let ysum = cb.empty(d);
                 cb.rsum_ex(ex_y.as_ref().unwrap_or(&yb), &yb, &tb, &ysum, d, kk, 1);
                 cb.comb3(x, &sh, Some(&ysum), None, Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
                 let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
@@ -1820,7 +1825,7 @@ impl Model {
                     let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
                     for &(e, _) in ons[0].iter().take(3) { let ent = &xcg.map[&(il, e)];
                         let y0 = cb.empty(d); let ok = if xexact() { let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&super::qn_cube::Cube::xmeta(&xcg.arena, &[(ent, 1.0)]))); let oc = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&[1u32, 1, 1, 1]));
-                            cb.xrun_exact(&xcg.tabs, &xcg.arena, xcg.ar_bytes, 1, 1, &mh, &oc, &rds[0], rn, d, c.ff_exp, tyf, &y0) } else { cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &[(ent, 1.0)], &rds[0], rn, d, c.ff_exp, tyf, &xcg.scr, false, &y0) };
+                            cb.xrun_exact(&xcg.tabs, &xcg.arena, xcg.ar_bytes, 1, 1, &mh, &oc, &rds[0], rn, d, c.ff_exp, tyf, &y0, None) } else { cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &[(ent, 1.0)], &rds[0], rn, d, c.ff_exp, tyf, &xcg.scr, false, &y0) };
                         if !ok { eprintln!("xcmp: layer {il} expert {e}: gpu fast path not eligible"); continue; }
                         let yg = cb.read(&y0); let mut yc = vec![0f32; d]; let wv = vec![(0usize, 1.0f32)];
                         self.routed_pool_ord(l, &xin[..d], &[(e, &wv)], 1, &mut yc, &mut || {}, None);
@@ -1862,7 +1867,7 @@ impl Model {
                     let mut all: Vec<u32> = vec![]; let mut oc = [0u32; 4]; let mut acc = 0u32;
                     for (ti, o) in oc.iter_mut().enumerate() { if ti < t { let ents: Vec<(&super::qn_cube::XEnt, f32)> = ons[ti].iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); all.extend(super::qn_cube::Cube::xmeta(&xcr.arena, &ents)); acc += ents.len() as u32; } *o = acc; }
                     if acc > 0 { let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&all)); let och = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&oc)); let yent = cb.empty(acc as usize * d);
-                        let q = std::time::Instant::now(); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, acc as usize, &mh, &och, &rd, t * rn, d, c.ff_exp, tyg, &yent); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); ex_y = Some(yent); }
+                        let q = std::time::Instant::now(); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, acc as usize, &mh, &och, &rd, t * rn, d, c.ff_exp, tyg, &yent, None); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); ex_y = Some(yent); }
                     cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t);
                     cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                     for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
