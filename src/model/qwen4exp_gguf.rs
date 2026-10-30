@@ -94,11 +94,19 @@ fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
 }
 
 /// Per-layer persistent buffers and the captured CUDA graph of a DeltaNet layer's dense part (PYRE_QN_GRAPH=1).
+/// One captured verify-window graph of a DeltaNet layer's dense half (PYRE_QN_VGRAPH=1): its own buffers, kept for
+/// the session, one per (layer, window size), so a replay never needs a recapture (Strata, MIT: per-window-size
+/// verify graphs, src/core/verify.cpp). Recaptured only when the state buffers change (a new conversation).
+pub struct VGraph { xn: H, da: H, mixed: H, proj: H, core: H, co: H, o: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
+static VGRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static VG_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v == "1").unwrap_or(false)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
+pub struct Model { vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -195,7 +203,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
+        Ok(Model { vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -1360,7 +1368,7 @@ impl Model {
                         for ti in 0..t { self.ple(p, &mut h, &emb.as_ref().unwrap()[ti * ew..(ti + 1) * ew], &mut xh[ti], 1); if ti + 1 < t && !st.pf { st.ple_ck[pi].push(h.clone()); } }
                         st.ple_hist[pi] = h; pi += 1;
                     } }
-                    if xs.is_none() { xs = Some(xh.iter().map(|v| cb.buf(v)).collect()); }
+                    if xs.is_none() { xs = Some(if vgraph_on() { self.vxs_fill(cb, &xh) } else { xh.iter().map(|v| cb.buf(v)).collect() }); }
                     dq[g] = Some(self.lcm_dense(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, ctr[il].0, ctr[il].1, start + o0, o0, t));
                 }
                 let dd = dq[g].take().unwrap();
@@ -1387,7 +1395,7 @@ impl Model {
                 st.ple_hist[pi] = h; pi += 1;
             }
             let cl = self.cl[il].as_ref().unwrap();
-            if xs.is_none() { xs = Some(xh.iter().map(|v| cb.buf(v)).collect()); }
+            if xs.is_none() { xs = Some(if vgraph_on() { self.vxs_fill(cb, &xh) } else { xh.iter().map(|v| cb.buf(v)).collect() }); }
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
         }
@@ -1437,11 +1445,70 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn layer_cube_multi(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let (ai0, li0) = (*ai, *li);
-        let dd = self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len());
+        let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) };
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
         let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
+    }
+    /// `lcm_dense` of a DeltaNet layer for a whole verify window (t = 2..4, the k_delta_m path) as a replayed graph.
+    /// Same kernels, same order, same arguments as lcm_dense; only the buffers are the graph's own. None = not eligible.
+    #[allow(clippy::too_many_arguments)]
+    /// The window's residual buffers for the verify graphs: one persistent set per window size, rewritten each round.
+    fn vxs_fill(&self, cb: &super::qn_cube::Cube, xh: &[Vec<f32>]) -> Vec<H> {
+        let t = xh.len(); let n = xh[0].len();
+        let mut m = self.vxs.lock().unwrap();
+        let v = m.entry(t).or_insert_with(|| cb.client.memory_persistent_allocation((), |_| (0..t).map(|_| cb.empty(n)).collect()));
+        for (h, x) in v.iter().zip(xh) { cb.client.write(h, burn_cubecl::cubecl::bytes::Bytes::from_elems(x.clone())); }
+        v.clone()
+    }
+    fn lcm_dense_g(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[H], st: &mut State, li0: usize) -> Option<(H, H, H)> {
+        let t = xs.len(); let c = &self.cfg;
+        let gw = cl.gdn.as_ref()?;
+        if !matches!(l.mix, Mixer::Lin { .. }) || !st.gdn_gpu || st.pf || !(2..=4).contains(&t) || c.lin_dk != c.lin_dv || st.ck.len() < t - 1
+            || !env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) { return None; }
+        let cb = self.cube.as_ref().unwrap(); let (d, hc) = (c.d, c.hc); let w = hc * d;
+        let (dar, dfr) = (cl.hca.di.rows, cl.hcf.di.rows); let pr = cl.min.rows; let rn = d + cl.fin.rows; let lra = cl.hca.up.cols;
+        let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let core_n = nv * dk; let ch = cl.min.splits[1]; let sp = cl.min.splits.clone();
+        let (cs, ss) = st.gdn[li0].clone(); let cn = (c.conv_k - 1) * (2 * nk * dk + nv * c.lin_dv);
+        let cka: Vec<(H, H)> = (0..t - 1).map(|ti| st.ck[ti][li0].clone()).collect();
+        let q0 = std::time::Instant::now();
+        let key = format!("{:?}{:?}{:?}{:?}", cs, ss, cka, xs);
+        let mut gm = self.vg.lock().unwrap();
+        // the window's scratch is shared by every layer's graph of this window size (they run one after another on one
+        // stream): per-layer buffers pinned ~50 MiB of pool pages per captured graph
+        let bt = gm.entry((usize::MAX, t)).or_insert_with(|| cb.client.memory_persistent_allocation((), |_| VGraph { xn: cb.empty(t * w), da: cb.empty(t * dar), mixed: cb.empty(t * d), proj: cb.empty(t * pr),
+            core: cb.empty(t * core_n), co: cb.empty(t * ch), o: cb.empty(t * d), df: cb.empty(t * dfr), rd: cb.empty(t * rn), g: None, key: String::new(), keep: vec![] }));
+        let (xn, da, mixed, proj, core, co, o, df, rd) = (bt.xn.clone(), bt.da.clone(), bt.mixed.clone(), bt.proj.clone(), bt.core.clone(), bt.co.clone(), bt.o.clone(), bt.df.clone(), bt.rd.clone());
+        let b = gm.entry((il, t)).or_insert_with(|| VGraph { xn, da, mixed, proj, core, co, o, df, rd, g: None, key: String::new(), keep: vec![] });
+        let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
+        let seg = |b: &VGraph| {
+            cb.rms_t(xs, &cl.hca.norm, &b.xn, hc, d, c.eps);
+            cb.gemv_m(&cl.hca.di, &b.xn, t * w, 0, w, &b.da, t * dar, 0, dar, t);
+            if !(gatem() && cb.gate_m(&b.xn, &b.da, &cl.hca.up, &b.mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.da, ti * dar), &cl.hca.up, &at(&b.mixed, ti * d), d, 0, hc, d); } }
+            cb.gemv_m(&cl.min, &b.mixed, t * d, 0, d, &b.proj, t * pr, 0, pr, t);
+            let (mut cks, mut ckm) = (vec![], 0u32);
+            for ti in 0..t { let pj = at(&b.proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&b.co, ti * ch), ch, c.conv_k);
+                if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 3 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } }
+            cb.delta_m(&b.co, ch, &b.proj, pr, gw, &ss, &b.core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
+            cb.gemv_m(&cl.mout, &b.core, t * core_n, 0, core_n, &b.o, t * d, 0, d, t);
+            for ti in 0..t { cb.comb(&xs[ti], &at(&b.o, ti * d), None, None, &at(&b.da, ti * dar), lra, hc, d); } cb.rms_t(xs, &cl.hcf.norm, &b.xn, hc, d, c.eps);
+            cb.gemv_m(&cl.hcf.di, &b.xn, t * w, 0, w, &b.df, t * dfr, 0, dfr, t);
+            if !(gatem() && cb.gate_m(&b.xn, &b.df, &cl.hcf.up, &b.rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.df, ti * dfr), &cl.hcf.up, &at(&b.rd, ti * rn), rn, 0, hc, d); } }
+            cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t);
+        };
+        if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        else {
+            b.g = None; b.keep.clear();
+            if cb.client.graph_prepare().is_ok() { cb.client.memory_persistent_allocation((), |_| seg(b));
+                match cb.client.start_capture() {
+                    Ok(()) => { cb.client.memory_persistent_allocation((), |_| seg(b)); match cb.client.stop_capture() { Ok(g) => { b.g = Some(g); b.key = key; if env_var("PYRE_QN_XDEBUG").is_ok() { let n = VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed); if n < 4 || n % 12 == 0 { let r = cb.client.memory_report(burn_cubecl::cubecl::MemoryScope::CurrentStream); let s = format!("{r:?}"); crate::limits::vlog(&format!("vgraph capture {n}")); eprintln!("vgraph: captured layer {il} T={t} usage {:?} | {}", r.usage(), &s[..s.len().min(1500)]); } } let mut k = vec![cs.clone(), ss.clone()]; k.extend(xs.iter().cloned()); for (a, bb) in &cka { k.push(a.clone()); k.push(bb.clone()); } b.keep = k; VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                        Err(e) => { eprintln!("vgraph: layer {il} T={t} capture failed, verify graphs off: {e:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
+                    Err(e) => { eprintln!("vgraph: layer {il} start failed, verify graphs off: {e:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
+            } else { seg(b); }
+        }
+        HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        Some((b.rd.clone(), b.df.clone(), b.da.clone()))
     }
     /// The dense (GPU) half of a verify layer for tokens xs (window offset `off` of `ttot`, at positions start..):
     /// everything up to the router / shared-expert projection `rd`, enqueued only. Returns (rd, df, da).

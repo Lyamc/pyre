@@ -83,7 +83,7 @@ pub fn run(a: QnArgs) -> Result<()> {
     let dec = t2.elapsed().as_secs_f64();
     println!("greedy ids: {out:?}");
     if let Some(tk) = &tok { println!("text: {:?}", tk.decode(&out, false).unwrap_or_default()); }
-    crate::limits::vlog("end of decode"); { let n = crate::model::qwen4exp_gguf::ADAPT_SWAPS.load(std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("adaptive tier: {n} experts swapped in"); } } println!("prefill {} tok {:.3}s ({:.1} tok/s) | decode {} tok {:.3}s ({:.2} tok/s)", t, pre, t as f64 / pre, out.len(), dec, out.len() as f64 / dec);
+    crate::limits::vlog("end of decode"); { let n = crate::model::qwen4exp_gguf::ADAPT_SWAPS.load(std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("adaptive tier: {n} experts swapped in"); } } { use std::sync::atomic::Ordering::Relaxed; let (c, r) = (crate::model::qwen4exp_gguf::VG_CAPTURES.load(Relaxed), crate::model::qwen4exp_gguf::VG_REPLAYS.load(Relaxed)); if c + r > 0 { eprintln!("verify graphs: {c} captures, {r} replays"); } } println!("prefill {} tok {:.3}s ({:.1} tok/s) | decode {} tok {:.3}s ({:.2} tok/s)", t, pre, t as f64 / pre, out.len(), dec, out.len() as f64 / dec);
     if let Some(p) = a.dump {
         let rows: Vec<Vec<f32>> = (0..t).map(|i| all[i * v..(i + 1) * v].to_vec()).collect();
         std::fs::write(&p, serde_json::to_string(&serde_json::json!({"ids": ids, "logits": rows, "greedy": out}))?)?;
@@ -167,7 +167,7 @@ fn run_gguf(a: QnArgs) -> Result<()> {
     println!("prompt ids: {} tokens", ids.len());
     println!("greedy ids: {out:?}");
     println!("text: {:?}", tok.decode(&out, false).unwrap_or_default());
-    crate::limits::vlog("end of decode"); { let n = crate::model::qwen4exp_gguf::ADAPT_SWAPS.load(std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("adaptive tier: {n} experts swapped in"); } } println!("prefill {} tok {:.2}s ({:.2} tok/s) | decode {} tok {:.2}s ({:.2} tok/s)", ids.len(), pre, ids.len() as f64 / pre, out.len(), dec, out.len() as f64 / dec);
+    crate::limits::vlog("end of decode"); { let n = crate::model::qwen4exp_gguf::ADAPT_SWAPS.load(std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("adaptive tier: {n} experts swapped in"); } } { use std::sync::atomic::Ordering::Relaxed; let (c, r) = (crate::model::qwen4exp_gguf::VG_CAPTURES.load(Relaxed), crate::model::qwen4exp_gguf::VG_REPLAYS.load(Relaxed)); if c + r > 0 { eprintln!("verify graphs: {c} captures, {r} replays"); } } println!("prefill {} tok {:.2}s ({:.2} tok/s) | decode {} tok {:.2}s ({:.2} tok/s)", ids.len(), pre, ids.len() as f64 / pre, out.len(), dec, out.len() as f64 / dec);
     if let Some(p) = a.dump { std::fs::write(&p, serde_json::to_string(&serde_json::json!({"ids": ids, "greedy": out}))?)?; }
     Ok(())
 }
