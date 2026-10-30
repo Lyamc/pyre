@@ -781,3 +781,11 @@ Just before blocking on each layer's router readback, the main thread wakes park
 their spin window, so the layer's expert job starts on already-spinning workers. Greedy-identical (timing
 only). Steady decode, alternating runs: plain pA 23.7 -> 24.5 tok/s, spec2 pB 22.8 -> 24.1.
 PYRE_QN_GEMV4R=v re-measured on a quiet machine: no gain (stays opt-in).
+
+
+### PCIe share re-measured (arena on, single-copy uploads)
+CubeCL's write already stages pageable data through its pinned pool and copies asynchronously, so uploads
+cost one host copy plus the DMA. With PYRE_QN_XARENA_GB=8 the share is still a large loss on HYTE (plain
+pA: off 24.7 tok/s, XSHARE=0.25 12.1, XSHARE=0.5 7.2; XPIN makes no difference). Each shared expert moves
+~2 MB over PCIe, which takes longer than the CPU pool needs to compute it, so a second stream or
+zero-copy host reads (also PCIe-bound) cannot make it pay here. It stays opt-in; no cubecl fork change.
