@@ -51,7 +51,12 @@ impl Gpu {
         let q = to_q8_0(ms);
         let ty = burn_gguf::GgmlType::Q8_0; let scheme = ty.to_quant_scheme().unwrap();
         let packed = burn_gguf::repack_to_burn(ty, &q, scheme, rows * cols).map_err(|e| anyhow!("{e}"))?;
-        let w = Tensor::<2>::from_data(TensorData::from_bytes_vec(packed, vec![rows, cols], DType::QFloat(scheme)), TensorCreationOptions::new(self.dev.clone()));
+        let mk = |packed: Vec<u8>| Tensor::<2>::from_data(TensorData::from_bytes_vec(packed, vec![rows, cols], DType::QFloat(scheme)), TensorCreationOptions::new(self.dev.clone()));
+        // PYRE_QN_XARENA_PERSIST: big weights (the ~0.7 GB Q8 lm head on the Q8 path) in CubeCL's persistent pool, so they
+        // do not grow the dynamic pool's page size to their size (every later dynamic page would then be ~700 MB, mostly empty)
+        let w = if need >= (64 << 20) && std::env::var("PYRE_QN_XARENA_PERSIST").map(|v| v == "1").unwrap_or(false) {
+            match burn_cubecl::cubecl::Device::cuda(0) { Ok(d) => { let cl = d.client(); let w = cl.memory_persistent_allocation(packed, |p| mk(p)); let _ = cl.flush(); w } Err(_) => mk(packed) }
+        } else { mk(packed) };
         let mut splits = vec![0]; for m in ms { splits.push(splits.last().unwrap() + m.rows); }
         Ok(Some(GMat { w: w.transpose(), rows, cols, splits }))
     }
