@@ -1415,7 +1415,7 @@ impl Model {
         if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6);
-            eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
+            eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
             eprintln!("prof multi T={t} total {:.1} ms | dense enqueue {:.1} reads {:.1} sh+routed {:.1} (routed {:.1}: gate/up {:.1} quant {:.1} down {:.1}) ms", t_m.elapsed().as_secs_f64() * 1e3, f(0), f(1), f(3), ROUTED_NS.swap(0, Relaxed) as f64 / 1e6, f(4), f(5), f(6)); }
         lg
     }

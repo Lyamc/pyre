@@ -14,6 +14,7 @@ const ROWS_PER_CUBE: u32 = 8;
 /// PYRE_QN_GEMV_RPC=0 keeps 8 everywhere.
 fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); let thr = *T.get_or_init(|| std::env::var("PYRE_QN_GEMV_RPC").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)); if rows >= thr { ROWS_PER_CUBE } else if rows >= 1024 { 4 } else { 2 } }
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
+pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
 pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -793,6 +794,98 @@ fn k_gemv_iq4x(x: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, col
         let t = plane_sum(acc);
         if UNIT_POS_X == 0 {
             out[(ooff + row) as usize] = t;
+        }
+    }
+}
+
+/// k_q8pack for `nt` columns at once (column c read at soff + c*sst, written at c*nb blocks): the same per-block
+/// arithmetic as k_q8pack, one launch instead of nt.
+#[cube(launch_unchecked)]
+fn k_q8pack_m(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, sst: u32, nb: u32) {
+    let b = ABSOLUTE_POS_X;
+    let c = CUBE_POS_Y;
+    if b < nb {
+        let base = soff + c * sst + b * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32u32 { amax = f32::max(amax, f32::abs(src[(base + i) as usize])); }
+        let d = amax / 127.0f32;
+        let mut id = 0.0f32;
+        if d > 0.0f32 { id = 1.0f32 / d; }
+        sc[(c * nb + b) as usize] = d;
+        for w in 0..8u32 {
+            let mut word = 0u32;
+            #[unroll]
+            for j in 0..4u32 {
+                let v = i32::cast_from(f32::round(src[(base + w * 4 + j) as usize] * id));
+                word |= (u32::cast_from(v) & 255u32) << (8 * j);
+            }
+            q[(c * nb * 8 + b * 8 + w) as usize] = word;
+        }
+    }
+}
+
+/// k_gemv_iq4d for up to 4 activation columns (packed by k_q8pack_m): each weight word is decoded once (levels
+/// table in shared memory) and used for every column; per column the arithmetic and its order are k_gemv_iq4d's.
+#[cube(launch_unchecked)]
+fn k_gemv_iq4d_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    let mut tb = Shared::<[u32]>::new_slice(256usize);
+    let mut ti = UNIT_POS_Y * 32 + UNIT_POS_X;
+    while ti < 256u32 { tb[ti as usize] = t2[ti as usize]; ti += CUBE_DIM_X * CUBE_DIM_Y; }
+    sync_cube();
+    if row < rows {
+        let nb = cols / 256;
+        let rw = nb * 35;
+        let ib = UNIT_POS_X / 4;
+        let k = UNIT_POS_X % 4;
+        let cq = cols / 4;
+        let cs = cols / 32;
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut blk = 0u32;
+        while blk < nb {
+            let b0 = row * rw + blk * 35;
+            let d = f32::reinterpret(w[b0 as usize]);
+            let sh = w[(b0 + 1) as usize];
+            let sl = w[(b0 + 2) as usize];
+            let q = w[(b0 + 3 + UNIT_POS_X) as usize];
+            let xw = blk * 64 + ib * 8 + k;
+            let ls = i32::cast_from(((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4)) - 32i32;
+            let u0 = tb[(q & 255u32) as usize];
+            let u1 = tb[((q >> 8) & 255u32) as usize];
+            let u2 = tb[((q >> 16) & 255u32) as usize];
+            let u3 = tb[(q >> 24) as usize];
+            let lo = i32::cast_from((u0 & 255u32) | ((u1 & 255u32) << 8) | ((u2 & 255u32) << 16) | ((u3 & 255u32) << 24));
+            let hi = i32::cast_from(((u0 >> 8) & 255u32) | (u1 & 65280u32) | (((u2 >> 8) & 255u32) << 16) | (((u3 >> 8) & 255u32) << 24));
+            let dl = d * f32::cast_from(ls);
+            let xi = blk * 8 + ib;
+            let p0 = dp4a(hi, i32::cast_from(xq[(xw + 4) as usize]), dp4a(lo, i32::cast_from(xq[xw as usize]), 0i32));
+            a0 += dl * xs[xi as usize] * f32::cast_from(p0);
+            if nt > 1u32 {
+                let p1 = dp4a(hi, i32::cast_from(xq[(cq + xw + 4) as usize]), dp4a(lo, i32::cast_from(xq[(cq + xw) as usize]), 0i32));
+                a1 += dl * xs[(cs + xi) as usize] * f32::cast_from(p1);
+            }
+            if nt > 2u32 {
+                let p2 = dp4a(hi, i32::cast_from(xq[(2 * cq + xw + 4) as usize]), dp4a(lo, i32::cast_from(xq[(2 * cq + xw) as usize]), 0i32));
+                a2 += dl * xs[(2 * cs + xi) as usize] * f32::cast_from(p2);
+            }
+            if nt > 3u32 {
+                let p3 = dp4a(hi, i32::cast_from(xq[(3 * cq + xw + 4) as usize]), dp4a(lo, i32::cast_from(xq[(3 * cq + xw) as usize]), 0i32));
+                a3 += dl * xs[(3 * cs + xi) as usize] * f32::cast_from(p3);
+            }
+            blk += 1u32;
+        }
+        let t0 = plane_sum(a0);
+        let t1 = plane_sum(a1);
+        let t2s = plane_sum(a2);
+        let t3 = plane_sum(a3);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t0;
+            if nt > 1u32 { out[(ooff + ost + row) as usize] = t1; }
+            if nt > 2u32 { out[(ooff + 2 * ost + row) as usize] = t2s; }
+            if nt > 3u32 { out[(ooff + 3 * ost + row) as usize] = t3; }
         }
     }
 }
@@ -2333,6 +2426,21 @@ impl Cube {
     /// `gemv` for `nt` activation columns: x[c] at xoff + c*xst (xn = x buffer length), out[c] at ooff + c*ost.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_m(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, xst: usize, out: &Handle, on: usize, ooff: usize, ost: usize, nt: usize) {
+        // native IQ4_XS, 2-4 columns: one activation pack and one launch per native segment for all columns (weights
+        // read once; each column's sums as the per-column path), the Q8 rows in one k_gemv4r per segment (the all-Q8
+        // path's per-row order). PYRE_QN_NATM=0 reverts to the per-column launches.
+        if !m.nat.is_empty() && native_mode() == 2 && (2..=4).contains(&nt) && natm() {
+            let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
+            unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) }
+            for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4d_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } }
+            for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); let rpc = gemv_rpc(*n);
+                unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
+                BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, xst as u32, (ooff + r0) as u32, ost as u32, nt as u32, nt > 1, nt > 2, nt > 3) } }
+            return;
+        }
         if !m.nat.is_empty() || nt == 1 || std::env::var("PYRE_QN_GEMV4").map(|v| v == "0").unwrap_or(false) {
             for c in 0..nt { self.gemv(m, x, xn, xoff + c * xst, out, on, ooff + c * ost); }
             return;
