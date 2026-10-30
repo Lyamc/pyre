@@ -1830,7 +1830,7 @@ impl Model {
             }
             let xcr = &*xcg;
             // PYRE_QN_PIPE_MINROWS: gate only layers with at least this many CPU (token, expert) rows; below it the gate/spin overhead outweighs the overlap
-            let pslot = if pipe_on() && offs.iter().map(|o| o.len()).sum::<usize>() >= env_usize("PYRE_QN_PIPE_MINROWS").unwrap_or(1).max(1) { pipe_slot(cb, t * d * 4) } else { None };
+            let pslot = if pipe_on() && offs.iter().map(|o| o.len()).sum::<usize>() >= env_usize("PYRE_QN_PIPE_MINROWS").unwrap_or(4).max(1) { pipe_slot(cb, t * d * 4) } else { None };
             piped = pslot.is_some();
             let pgate = std::sync::Arc::new(PGate { m: std::sync::Mutex::new(false), cv: std::sync::Condvar::new(), tgt: std::sync::Mutex::new(None) });
             let pg_open = PGateOpen(pgate.clone());
