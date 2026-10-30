@@ -333,12 +333,12 @@ unsafe fn iq2_sb<const V: bool>(t: QType, rp: *const u8, i: usize, a: &Q8K, acc:
     use std::arch::x86_64::*;
     let xq = a.q.as_ptr();
     if t == QType::IQ2S {
-        let b = rp.add(i * 82); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
+        let b = rp.add(i * 82); kk::pf(b); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
         let (qs, sg, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
         let mut ia = _mm256_setzero_si256();
         for ib in 0..8 { let h = *qh.add(ib) as usize;
             let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
-            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
+            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else if gidx() { kk::g2i(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
             ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc16(sbv)); }
@@ -409,6 +409,18 @@ mod kk {
     /// IQ2_S scale byte -> the sc2 vector (lanes 0-7 = 2*(b&15)+1, 8-15 = 2*(b>>4)+1) by one load from a const table
     /// (Strata, MIT: scale_vecs.s16, src/kernels/cpu/iq_avx2.cpp); the same lanes as sc2, so bit-identical.
     #[inline(always)] pub unsafe fn sc16(b: u8) -> __m256i { if super::sc16_tab() { _mm256_loadu_si256(super::SC16.as_ptr().add(b as usize) as *const __m256i) } else { sc2(2 * (b & 0xF) as i32 + 1, 2 * (b >> 4) as i32 + 1) } }
+    /// IQ2_S grid words via 16-bit indices built with one punpcklbw: the 8 low index bytes interleaved with the qh
+    /// byte's 2-bit groups spread one per byte (HI2S); only lanes 0-3 are used. Same indices as the scalar shift/mask/or
+    /// (bit-identical). Strata (MIT, github.com/Niko1221/Strata, src/kernels/cpu/iq_avx2.cpp: hi_spread + grid_indices).
+    /// Reads 8 bytes at qs (stays inside the 82-byte block for every chunk).
+    #[inline(always)] pub unsafe fn g2i(qs: *const u8, h: usize) -> __m256i {
+        let v = _mm_unpacklo_epi8(_mm_cvtsi64_si128((qs as *const i64).read_unaligned()), _mm_cvtsi64_si128(*super::HI2S.get_unchecked(h) as i64));
+        let mut sp = [0u16; 8]; _mm_storeu_si128(sp.as_mut_ptr() as *mut __m128i, v);
+        let gq = |l: usize| *super::IQ2S_GRID.get_unchecked(sp[l] as usize) as i64;
+        _mm256_set_epi64x(gq(3), gq(2), gq(1), gq(0))
+    }
+    /// Prefetch PYRE_QN_PFB bytes (default see pfb()) ahead of an IQ2 super-block, two lines (Strata rows_ahead, MIT).
+    #[inline(always)] pub unsafe fn pf(b: *const u8) { let d = super::pfb(); if d > 0 { _mm_prefetch::<_MM_HINT_T0>(b.wrapping_add(d) as *const i8); _mm_prefetch::<_MM_HINT_T0>(b.wrapping_add(d + 64) as *const i8); } }
     #[inline(always)] pub unsafe fn sc2(lo: i32, hi: i32) -> __m256i { _mm256_set_m128i(_mm_set1_epi16(hi as i16), _mm_set1_epi16(lo as i16)) }
     /// 32 sign bytes (+1/-1) from 32 bits
     #[inline(always)] pub unsafe fn signs(bits: u32) -> __m256i {
@@ -431,12 +443,12 @@ unsafe fn iq2s_k_v(row: &[u8], a: &Q8K) -> f32 { iq2s_k_b::<true>(row, a) }
 unsafe fn iq2s_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
     use std::arch::x86_64::*;
     let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
-    for i in 0..n / 256 { let b = rp.add(i * 82); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
+    for i in 0..n / 256 { let b = rp.add(i * 82); kk::pf(b); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.125 * *a.d.get_unchecked(i);
         let (qs, sg, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
         let mut ia = _mm256_setzero_si256();
         for ib in 0..8 { let h = *qh.add(ib) as usize;
             let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
-            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
+            let g = if gather() { kk::g2s(qs.add(4 * ib), h) } else if gidx() { kk::g2i(qs.add(4 * ib), h) } else { _mm256_set_epi64x(q(3), q(2), q(1), q(0)) };
             let s = kk::signs((sg.add(4 * ib) as *const u32).read_unaligned());
             let sbv = *sb.add(ib);
             ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc16(sbv)); }
@@ -553,6 +565,7 @@ pub fn kbench() {
         for b in v.iter_mut() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; *b = s as u8; }
         for r in 0..ne * rows * d / 256 { v[r * 82] = 0x00; v[r * 82 + 1] = 0x1c; } v };
     let pool = super::spin_pool::Pool::new(8, std::time::Duration::from_micros(2000));
+    { let w = mk(8); let mut hsh = 0u64; for r in 0..8 * rows { hsh = hsh.rotate_left(5) ^ row_dot_k(QType::IQ2S, &w[r * rb..(r + 1) * rb], &a).to_bits() as u64; } eprintln!("kbench checksum {hsh:016x}"); }
     for &(ne, label) in &[(1usize, "hot 1 expert"), (300, "stream 300 experts")] {
         let w = mk(ne); let nrow = ne * rows; let reps = if ne == 1 { 200 } else { 2 };
         for &th in &[1usize, 8] {
@@ -600,9 +613,9 @@ unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out:
     let s8 = sign8();
     for i in 0..n / 256 {
         let dw = match t {
-            QType::IQ2S => { let b = rp.add(i * 82); let (qs, sgp, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
+            QType::IQ2S => { let b = rp.add(i * 82); kk::pf(b); let (qs, sgp, qh, sb) = (b.add(2), b.add(34), b.add(66), b.add(74));
                 for ib in 0..8 { let h = *qh.add(ib) as usize;
-                    if gather() { g[ib] = kk::g2s(qs.add(4 * ib), h); } else {
+                    if gather() { g[ib] = kk::g2s(qs.add(4 * ib), h); } else if gidx() { g[ib] = kk::g2i(qs.add(4 * ib), h); } else {
                     let q = |l: usize| *IQ2S_GRID.get_unchecked(*qs.add(4 * ib + l) as usize | ((h << (8 - 2 * l)) & 0x300)) as i64;
                     g[ib] = _mm256_set_epi64x(q(3), q(2), q(1), q(0)); }
                     sg[ib] = kk::signs((sgp.add(4 * ib) as *const u32).read_unaligned());
@@ -656,3 +669,10 @@ unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
 pub static SC16: [[i16; 16]; 256] = { let mut t = [[0i16; 16]; 256]; let mut b = 0; while b < 256 { let mut l = 0; while l < 8 { t[b][l] = 2 * (b & 15) as i16 + 1; t[b][l + 8] = 2 * (b >> 4) as i16 + 1; l += 1; } b += 1; } t };
 /// PYRE_QN_SC16 (default on): IQ2_S scale vectors from SC16
 pub fn sc16_tab() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_SC16").map(|v| v != "0").unwrap_or(true)) }
+
+/// IQ2_S: qh byte -> its four 2-bit groups one per byte (bits 8-9 of index k in byte k), see kk::g2i (Strata hi_spread.iq2s, MIT)
+pub static HI2S: [u64; 256] = { let mut t = [0u64; 256]; let mut h = 0; while h < 256 { let mut k = 0; while k < 4 { t[h] |= (((h >> (2 * k)) & 3) as u64) << (8 * k); k += 1; } h += 1; } t };
+/// PYRE_QN_GIDX: IQ2_S grid indices via HI2S + punpcklbw on the non-gather path (bit-identical)
+pub fn gidx() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GIDX").map(|v| v != "0").unwrap_or(false)) }
+/// PYRE_QN_PFB: IQ2 super-block prefetch distance in bytes (0 = off)
+pub fn pfb() -> usize { static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PFB").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
