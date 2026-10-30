@@ -113,14 +113,15 @@ static VG_STATE: std::sync::Mutex<(Vec<(burn_cubecl::cubecl::server::Handle, bur
 static VG2: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Option<burn_cubecl::cubecl::client::Graph>, String)>>> = std::sync::LazyLock::new(Default::default);
 fn vg_run(cb: &super::qn_cube::Cube, slot: (usize, usize, usize), key: &str, f: &(dyn Fn() + Sync)) {
     // one graph per distinct input set too: prewarm T=5..7 windows run as 4+rest groups on slices of other buffers
+    let lt = (slot.1, slot.2);
     let slot = (slot.0 + 4 * { use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut h); (h.finish() as usize) & 0xffff_ffff }, slot.1, slot.2);
     let mut m = VG2.lock().unwrap(); let e = m.entry(slot).or_insert((None, String::new()));
     if e.0.is_some() && e.1 == key { unsafe { e.0.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
     if !e.1.is_empty() && env_var("PYRE_QN_XDEBUG").is_ok() { static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("vgraph2 recapture {slot:?}: {} -> {}", e.1, key); } }
-    if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("vg eager behind gate: slot {:?} had {}", slot, if e.0.is_some() { "other key" } else { "none" }); } f(); return; }
+    if gate_open() { VG_EAGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed); VG_SKIP.lock().unwrap().insert(lt); if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("vg eager behind gate: slot {:?} had {}", slot, if e.0.is_some() { "other key" } else { "none" }); } f(); return; }
     e.0 = None; if VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) || cb.client.graph_prepare().is_err() { f(); return; }
     cb.client.memory_persistent_allocation((), |_| f());
-    match cb.client.start_capture() { Ok(()) => { cb.client.memory_persistent_allocation((), |_| f()); match cb.client.stop_capture() { Ok(gr) => { e.0 = Some(gr); e.1 = key.to_string(); VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } Err(er) => { eprintln!("vgraph2: capture failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
+    match cb.client.start_capture() { Ok(()) => { cb.client.memory_persistent_allocation((), |_| f()); match cb.client.stop_capture() { Ok(gr) => { e.0 = Some(gr); e.1 = key.to_string(); VG_SKIP.lock().unwrap().remove(&lt); VG_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } Err(er) => { eprintln!("vgraph2: capture failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); } } }
         Err(er) => { eprintln!("vgraph2: start failed, off: {er:?}"); VGRAPH_OFF.store(true, std::sync::atomic::Ordering::Relaxed); let _ = cb.client.stop_capture(); } }
 }
 pub static VG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1980,11 +1981,16 @@ fn qn_pool() -> &'static super::spin_pool::Pool {
     P.get_or_init(|| {
         // default: one worker per fast physical core, pinned (PYRE_QN_PIN="0,2,..." overrides, "none" disables)
         let auto = super::spin_pool::fast_cores();
-        let pin: Vec<usize> = match env_var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
+        let mut pin: Vec<usize> = match env_var("PYRE_QN_PIN").ok().as_deref() { Some("none") => vec![], Some(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(), None => auto.clone() };
+        // PYRE_QN_LSIB=1: the calling (launcher) thread moves to the SMT sibling of the first fast core and an extra
+        // pinned worker takes that core, so GPU launches in run_side's side closure (PIPE) no longer cost a P-core of expert work
+        let lsib = env_var("PYRE_QN_LSIB").map(|v| v == "1").unwrap_or(false) && pin.len() >= 2 && pin[1] != pin[0] + 1;
+        let auto_pin = pin == auto;
+        if lsib { let p0 = pin[0]; super::spin_pool::pin_to(p0 + 1); pin.insert(0, p0 + 1); eprintln!("expert pool: launcher pinned to sibling cpu {}", p0 + 1); }
         let n = env_usize("PYRE_QN_SPIN_THREADS").unwrap_or(if pin.len() >= 4 { pin.len() } else { rayon::current_num_threads() });
         eprintln!("expert pool: {n} workers, pinned to {:?}", pin);
         { // PYRE_QN_ETAIL: a job's last N tasks go to P-core workers only (E-cores ~2.3x slower would finish last)
-            let nf = if pin == auto { super::spin_pool::n_fast() } else { usize::MAX }; let et = env_usize("PYRE_QN_ETAIL").unwrap_or(0);
+            let nf = if auto_pin { super::spin_pool::n_fast() + lsib as usize } else { usize::MAX }; let et = env_usize("PYRE_QN_ETAIL").unwrap_or(0);
             eprintln!("expert pool: {} fast workers, E-core tail reserve {et}", nf.min(n));
             super::spin_pool::Pool::new_hybrid(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin, nf, et) }
     })

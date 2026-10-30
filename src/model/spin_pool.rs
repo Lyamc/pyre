@@ -111,12 +111,12 @@ unsafe impl Sync for SyncPtr {}
 impl SyncPtr { #[allow(clippy::mut_from_ref)] pub unsafe fn slice(&self, off: usize, n: usize) -> &mut [f32] { std::slice::from_raw_parts_mut(self.0.add(off), n) } }
 
 #[cfg(windows)]
-fn pin_to(cpu: usize) {
+pub fn pin_to(cpu: usize) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
     if cpu < usize::BITS as usize { unsafe { SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu); } }
 }
 #[cfg(not(windows))]
-fn pin_to(_cpu: usize) {}
+pub fn pin_to(_cpu: usize) {}
 
 /// One logical CPU per physical core of the fastest efficiency class (P-cores on a hybrid Intel
 /// part), or empty when that cannot be read. Strata likewise runs one pool worker per physical core.
