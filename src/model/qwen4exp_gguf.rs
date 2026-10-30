@@ -173,6 +173,9 @@ fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 /// goes in as a fixed-size device table (t * top_k entries, padded; cumulative per-token counts in a 4-word buffer)
 /// written before the replay, so the launch sequence no longer depends on which experts were picked. Idea after
 /// Strata (MIT, github.com/Niko1221/Strata: fixed verify graphs fed by device-side expert plans); reimplemented here.
+/// PYRE_QN_XEXACT=1 (opt-in, in progress): GPU cached experts with the CPU expert arithmetic (qdot Q8K/Q8D activations,
+/// integer lanes, fma order, AVX sum tree), so where an expert runs cannot change its output.
+fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
 pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// PYRE_QN_MOEGRAPH fixed buffers per window size: routing table, counts, routed-hit y, shared h and y, a copy of rd
@@ -1772,7 +1775,8 @@ impl Model {
                 if !ons[0].is_empty() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < nmax {
                     let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
                     for &(e, _) in ons[0].iter().take(3) { let ent = &xcg.map[&(il, e)];
-                        let y0 = cb.empty(d); let ok = cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &[(ent, 1.0)], &rds[0], rn, d, c.ff_exp, tyf, &xcg.scr, false, &y0);
+                        let y0 = cb.empty(d); let ok = if xexact() { let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&super::qn_cube::Cube::xmeta(&xcg.arena, &[(ent, 1.0)]))); let oc = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&[1u32, 1, 1, 1]));
+                            cb.xrun_exact(&xcg.tabs, &xcg.arena, xcg.ar_bytes, 1, 1, &mh, &oc, &rds[0], rn, d, c.ff_exp, tyf, &y0) } else { cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &[(ent, 1.0)], &rds[0], rn, d, c.ff_exp, tyf, &xcg.scr, false, &y0) };
                         if !ok { eprintln!("xcmp: layer {il} expert {e}: gpu fast path not eligible"); continue; }
                         let yg = cb.read(&y0); let mut yc = vec![0f32; d]; let wv = vec![(0usize, 1.0f32)];
                         self.routed_pool_ord(l, &xin[..d], &[(e, &wv)], 1, &mut yc, &mut || {}, None);
