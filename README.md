@@ -873,3 +873,11 @@ PYRE_VRAMLOG=1 prints NVML VRAM at each load stage and during decode. Finding: w
 - Tried, no gain (all within run-to-run noise of +-2 tok/s): expert pool ETAIL/PAIR/ECORES=0 (E-cores off is -4 tok/s), bigger expert cache (PYRE_QN_XCACHE_GB 3.0/3.5), PYRE_SPEC_HI_K 4/5 and PYRE_SPEC_HI 0.3/0.7, PYRE_MTP_THREADS 2/4/16, PYRE_QN_SPIN_US=20, fused q/k/v GEMV in the drafter step.
 - Profile (NATIVE=2, prompt A): drafting is ~27 ms per round (C ~41 ms), ~4 ms per draft step independent of thread count or CPU-vs-GPU dense matrices; this is now the largest non-verify cost. Next lever: whole drafter step on the GPU as one submission (no per-matmul readbacks/CPU glue).
 - NATIVE=2 not made default: its output matches the Q8 references on A/C (64 tokens) and B (42) in most runs, but one B run diverged at token 32 (verify batch size changes numerics), so it is not strictly greedy-identical.
+
+### Oct 30 (morning) results
+Steady tok/s, n=96, one run each (Q8 default / PYRE_QN_NATIVE=2): A 31.8 / 35.0, B 25.4 / 27.6, C 28.5 / 36.3 (overall 30.4/23.0/27.4 and 27.3/25.2/34.5). Q8 default identical to the references on A/B/C; NATIVE=2 differs at near-ties (B token 32, C token 76).
+- Drafter: GPU copies uploaded at load (d3f78e2), attention window 128 (c8cf071), GEMV kernels compiled at load (b2b9d5a; removed a ~180 ms mid-decode JIT stall).
+- PYRE_QN_NATX=1 (opt-in): native IQ4_XS GEMVs with Strata's / ggml's vec_dot_iq4_xs_q8_1 arithmetic. Strata's exact mode computes dense layers natively in IQ4 (its pack serves quantized dense tensors from the GGUF), so it is a different computation from pyre's Q8_0 path; near-tie tokens move with any rounding change, so NATIVE=2 cannot be made reference-identical by precision fixes.
+- PYRE_QN_PREWARM=1 (opt-in): decode/verify kernels compiled at load; no clear gain.
+- Q8 with 3-token drafts needs a smaller expert cache to stay inside the VRAM reserve (2.0 GiB fits) and is then slower than the default.
+- Remaining lever (not started): Strata's verify pipeline waits on host-mapped flags on the GPU (no per-layer host readback) and streams ~55% of expert misses over PCIe with a copy kernel; see C:\Temp\qnx\overnight.md for the design notes.
