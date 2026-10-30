@@ -9,7 +9,14 @@ use std::time::{Duration, Instant};
 fn wbusy() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_WBUSY").map(|v| v == "1").unwrap_or(false)) }
 static WB: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64]; static WJ: AtomicU64 = AtomicU64::new(0); static WN: AtomicU64 = AtomicU64::new(0);
 thread_local! { static WID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[inline] fn call(f: &(dyn Fn(usize) + Sync), i: usize) { if wbusy() { let t = Instant::now(); f(i); WB[WID.with(|w| w.get()).min(63)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); } else { f(i) } }
+/// PYRE_QN_JPROF=1: per job (split: with side / plain), mean us from publish to: first worker claim, caller side end,
+/// caller own work end, last task claim, last task finish, caller return; plus busy % of (threads x wall)
+fn jprof() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_JPROF").map(|v| v == "1").unwrap_or(false)) }
+static EP: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+fn now_ns() -> u64 { EP.get_or_init(Instant::now).elapsed().as_nanos() as u64 }
+static JFC: AtomicU64 = AtomicU64::new(0); static JLC: AtomicU64 = AtomicU64::new(0); static JLF: AtomicU64 = AtomicU64::new(0); static JB: AtomicU64 = AtomicU64::new(0);
+static JA: [[AtomicU64; 8]; 2] = [const { [const { AtomicU64::new(0) }; 8] }; 2];
+#[inline] fn call(f: &(dyn Fn(usize) + Sync), i: usize) { if jprof() { let t = now_ns(); if WID.with(|w| w.get()) != 0 { JFC.fetch_min(t, Relaxed); } JLC.fetch_max(t, Relaxed); f(i); let e = now_ns(); JLF.fetch_max(e, Relaxed); JB.fetch_add(e - t, Relaxed); return; } if wbusy() { let t = Instant::now(); f(i); WB[WID.with(|w| w.get()).min(63)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); } else { f(i) } }
 struct Job<'a> { f: &'a (dyn Fn(usize) + Sync), n: usize }
 
 struct Shared {
@@ -52,11 +59,13 @@ impl Pool {
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
     }
     /// Run f(0..n) across the pool (the caller works too) and return when all are done.
-    pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) { self.run_side(n, f, &mut || {}) }
+    pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) { self.run_impl(n, f, &mut || {}, false) }
     /// Like `run`, but the caller first does `side` (e.g. enqueueing GPU work) while the workers start.
-    pub fn run_side(&self, n: usize, f: &(dyn Fn(usize) + Sync), side: &mut dyn FnMut()) {
+    pub fn run_side(&self, n: usize, f: &(dyn Fn(usize) + Sync), side: &mut dyn FnMut()) { self.run_impl(n, f, side, true) }
+    fn run_impl(&self, n: usize, f: &(dyn Fn(usize) + Sync), side: &mut dyn FnMut(), has_side: bool) {
         if n == 0 { side(); return; }
         let sh = &*self.sh;
+        let js = if jprof() { let t = now_ns(); JFC.store(u64::MAX, Relaxed); JLC.store(0, Relaxed); JLF.store(0, Relaxed); JB.store(0, Relaxed); t } else { 0 };
         let job = Job { f, n };
         let g = sh.gen.load(Relaxed) + 1;
         sh.done.store(0, Relaxed);
@@ -66,9 +75,14 @@ impl Pool {
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
         let tj = Instant::now();
-        side();
-        work(sh, g, &job, false);
+        side(); let ts = if jprof() { now_ns() } else { 0 };
+        work(sh, g, &job, false); let tc = if jprof() { now_ns() } else { 0 };
         while sh.done.load(Acquire) < n { std::hint::spin_loop(); }
+        if jprof() { let te = now_ns(); let a = &JA[has_side as usize]; let fc = JFC.load(Relaxed); let fc = if fc == u64::MAX { te } else { fc };
+            let v = [fc.saturating_sub(js), ts - js, tc - js, JLC.load(Relaxed).saturating_sub(js), JLF.load(Relaxed).saturating_sub(js), te - js, 1, JB.load(Relaxed)];
+            for k in 0..8 { a[k].fetch_add(v[k], Relaxed); }
+            if a[6].load(Relaxed) % 500 == 0 { let c = a[6].load(Relaxed) as f64; let m = |k: usize| a[k].load(Relaxed) as f64 / c / 1000.0;
+                eprintln!("jprof side={} n={} tasks={} us: firstclaim {:.1} sideEnd {:.1} callerWorkEnd {:.1} lastClaim {:.1} lastFinish {:.1} wall {:.1} busy% {:.0}", has_side, c, n, m(0), m(1), m(2), m(3), m(4), m(5), a[7].load(Relaxed) as f64 * 100.0 / (a[5].load(Relaxed) as f64 * self.threads as f64)); } }
         if wbusy() { WJ.fetch_add(tj.elapsed().as_nanos() as u64, Relaxed); if WN.fetch_add(1, Relaxed) % 2000 == 1999 { let j = WJ.load(Relaxed).max(1) as f64;
             eprintln!("wbusy % of job wall ({} ms, side incl.): {}", j as u64 / 1_000_000, (0..self.threads.min(64)).map(|w| format!("{:.0}", WB[w].load(Relaxed) as f64 * 100.0 / j)).collect::<Vec<_>>().join(" ")); } }
     }
