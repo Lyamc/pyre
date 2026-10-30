@@ -3592,6 +3592,11 @@ impl Cube {
     /// y = t * d outputs (token ti at ti * d; a token without entries gets zeros, which callers ignore).
     #[allow(clippy::too_many_arguments)]
     pub fn xrun_fast_multi(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, cnt: &[usize], mh: &Handle, src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), y: &Handle) -> bool {
+        if cnt.len() > 4 && cnt.len() <= 8 && t8() { let t = cnt.len(); let rs = sn / t; let mut e0 = 0usize; let mut ok = true;
+            for c0 in (0..t).step_by(4) { let c1 = (c0 + 4).min(t); let ne: usize = cnt[c0..c1].iter().sum();
+                if ne > 0 { ok &= self.xrun_fast_multi(tb, ars, ar_bytes, &cnt[c0..c1], &mh.clone().offset_start((e0 * 4 * 4) as u64), &src.clone().offset_start((c0 * rs * 4) as u64), (c1 - c0) * rs, d, ff, tys, &y.clone().offset_start((c0 * d * 4) as u64)); }
+                e0 += ne; }
+            return ok; }
         let t = cnt.len(); let ne: usize = cnt.iter().sum();
         if t == 0 || t > 4 || ne == 0 || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 || ars.is_empty() || ars.len() > 2 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };

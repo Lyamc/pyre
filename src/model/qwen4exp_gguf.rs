@@ -1501,6 +1501,7 @@ impl Model {
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
         }
+        if env_var("PYRE_QN_VGCOUNT").is_ok() { static W: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0); if W.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10 == 9 { eprintln!("vgcount (graph/eager layers by T): {}", (2..=8).map(|t| format!("T{t} {}/{}", VGT[t][0].load(std::sync::atomic::Ordering::Relaxed), VGT[t][1].load(std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>().join(" ")); } }
         let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
         let headb = env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
@@ -1551,7 +1552,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn layer_cube_multi(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
         let (ai0, li0) = (*ai, *li);
-        let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) };
+        let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => { VGT[xs.len().min(8)][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); x }, None => { VGT[xs.len().min(8)][1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) } };
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
         let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.xwarm_read(il, l, &dd.0);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1571,7 +1572,7 @@ impl Model {
     fn lcm_dense_g(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[H], st: &mut State, li0: usize) -> Option<(H, H, H)> {
         let t = xs.len(); let c = &self.cfg;
         let gw = cl.gdn.as_ref()?;
-        if !matches!(l.mix, Mixer::Lin { .. }) || !st.gdn_gpu || st.pf || !(2..=4).contains(&t) || c.lin_dk != c.lin_dv || st.ck.len() < t - 1
+        if !matches!(l.mix, Mixer::Lin { .. }) || !st.gdn_gpu || st.pf || !((2..=4).contains(&t) || t <= 8 && super::qn_cube::t8()) || c.lin_dk != c.lin_dv || st.ck.len() < t - 1
             || !env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) { return None; }
         let cb = self.cube.as_ref().unwrap(); let (d, hc) = (c.d, c.hc); let w = hc * d;
         let (dar, dfr) = (cl.hca.di.rows, cl.hcf.di.rows); let pr = cl.min.rows; let rn = d + cl.fin.rows; let lra = cl.hca.up.cols;
@@ -1777,7 +1778,7 @@ impl Model {
                 }
                 // PYRE_QN_XBATCH (default on): the GPU expert hits of all window tokens in 4 launches, not 4 per token
                 let mut done_b = false;
-                if xbatch() && t <= 4 { if let Some(mh) = &mall {
+                if xbatch() && (t <= 4 || super::qn_cube::t8()) { if let Some(mh) = &mall {
                     let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
                     let cnt: Vec<usize> = ons.iter().map(|o| o.len()).collect(); let yall = cb.empty(t * d);
                     if cb.xrun_fast_multi(&xcr.tabs, &xcr.arena, xcr.ar_bytes, &cnt, mh, &rd, t * rn, d, c.ff_exp, tyf, &yall) { for ti in 0..t { if !ons[ti].is_empty() { ygs[ti] = Some(at(&yall, ti * d)); } } done_b = true; }
@@ -1941,3 +1942,5 @@ fn env_var(k: &str) -> Result<String, std::env::VarError> {
 
 /// PYRE_QN_DMULTI (default on): verify down projection decodes a Q2_0 row once for all tokens sharing the expert
 fn dmulti() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_DMULTI").map(|v| v != "0").unwrap_or(true)) }
+
+static VGT: [[std::sync::atomic::AtomicU64; 2]; 9] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 9];
