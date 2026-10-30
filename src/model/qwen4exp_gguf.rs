@@ -1200,7 +1200,8 @@ impl Model {
         }
         let t1 = std::time::Instant::now();
         let mut r = self.mtp_r_get(st, n - 1)?.to_vec(); let mut tok = pending; let mut out = vec![];
-        let min_p: f32 = env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        // a later draft is kept only when the drafter is this sure of it (Strata gates draft length on the MTP probability too; PYRE_MTP_MIN_P=0 drafts the full length)
+        let min_p: f32 = env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9);
         let mut e = vec![0f32; d];
         for j in 0..k {
             self.embd.row(tok as usize, &mut e);
@@ -1229,7 +1230,7 @@ impl Model {
     /// Load the MTP drafter (scripts/mtp_fetch.py's file) when speculative MTP drafting is enabled.
     /// Default draft length: 2 (MTP spec2, greedy-identical and measured faster) when the MTP drafter
     /// loaded and multi-token verify can run; otherwise 0 (plain decode).
-    pub fn spec_default(&self) -> usize { if self.mtp.is_some() && self.multi_ok() { 1 } else { 0 } }
+    pub fn spec_default(&self) -> usize { if self.mtp.is_some() && self.multi_ok() { 2 } else { 0 } }
     pub fn load_mtp(&mut self) -> Result<()> {
         if !crate::spec::mtp_on() { return Ok(()); }
         let Some(p) = super::mtp::find() else { return Ok(()) };

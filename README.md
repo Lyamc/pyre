@@ -807,3 +807,19 @@ PYRE_SPEC_TIME=1 prints wall time per phase (draft, verify by window size, keep,
 - The tokens of a window route to mostly different experts, so CPU work grows almost linearly with the window. A 2-token verify costs less per accepted token than a 3-token one.
 
 Default draft length is now 1 (3 alternating pairs, steady tok/s, all greedy-identical): A 26.24/26.15/26.03 vs 25.41/25.39/25.53 with k=2; B 23.70/22.68/24.08 vs 22.79/23.02/23.92. Acceptance is 87.5% / 86.4% at k=1. --spec 2 still works.
+### Multi-token gate kernel and confidence-gated drafts (default)
+
+- **Per-kernel nsys, plain token vs 3-token verify (prompt A, per round):** gemv 11.8 -> ~16.4 ms (k_gemv4r reads the weights once, 1.4x). Cached-expert kernels k_xgu_s / k_xdown ~3.3x (GPU hits grow with the window's distinct experts). k_gate 1.6 -> 5.4 ms (3.4x: it ran once per token).
+- **k_gate_m** (default on, PYRE_QN_GATEM=0 off) runs the hyper-connection gate for 2-4 window tokens in one launch. Each weight word is read once; each token's arithmetic is unchanged, so output is identical. Measured +0.5-1%.
+- **Confidence-gated draft length** (after Strata's draft policy, src/spec/draft_policy.cpp, MIT): the default is draft length 2 again, but the second draft is kept only when the drafter's probability is at least 0.9 (PYRE_MTP_MIN_P, 0 = always draft the full length). The sweep (2 runs each, steady tok/s, all identical):
+
+| | A | B |
+|---|---|---|
+| k=1 | 27.81 / 27.72 | 24.32 / 23.97 |
+| k=2, p>=0.6 | 28.70 / 28.31 | 23.85 / 23.71 |
+| k=2, p>=0.8 | 28.79 / 29.01 | 23.61 / 24.41 |
+| k=2, p>=0.9 | 29.52 / 29.38 | 23.37 / 24.64 |
+| k=3, p>=0.8 | 27.52 / 27.87 | 24.84 / 24.40 |
+
+  New defaults: A 29.0, B 23.9-24.5, plain A 24.2 (A is 1.2x over plain).
+- **Prompt-B VRAM gap:** the expert cache does fill (1691 experts, 2.50 GiB, 44% hits). The lower peak reading is a sampling artifact in the bench script, not a missing cache.
