@@ -1143,8 +1143,9 @@ impl Model {
         use super::qdot; use super::spin_pool::SyncPtr;
         let (d, ff) = (self.cfg.d, self.cfg.ff_exp);
         let pool = qn_pool(); let z0 = std::time::Instant::now();
-        let acts: Vec<qdot::Q8Act> = (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect();
         let usek = qdot::supports_k(l.gate_e.ty) && qdot::supports_k(l.up_e.ty) && env_var("PYRE_QN_Q8K").map(|v| v != "0").unwrap_or(true);
+        // the plain Q8 activations are only read when the K path is off
+        let acts: Vec<qdot::Q8Act> = if usek { vec![] } else { (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect() };
         let actk: Vec<qdot::Q8K> = if usek { (0..t).map(|ti| { let mut a = qdot::Q8K::default(); qdot::quantize_k_into(&x[ti * d..(ti + 1) * d], &mut a); a }).collect() } else { vec![] };
         let blk = env_usize("PYRE_QN_SBLK").unwrap_or(32); let nb = ff.div_ceil(blk);
         { let np: usize = work.iter().map(|w| w.1.len()).sum(); XW2[1].fetch_add(np as u64, std::sync::atomic::Ordering::Relaxed); XW2[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
@@ -1155,12 +1156,25 @@ impl Model {
         // PYRE_QN_LFIRST=1: gate/up tasks of the experts with the most window tokens first (task order only; every
         // hidden row is computed by the same code, so results are unchanged)
         let lfo: Vec<usize> = if env_var("PYRE_QN_LFIRST").map(|v| v == "1").unwrap_or(false) && work.len() > 1 { let mut o: Vec<usize> = (0..work.len()).collect(); o.sort_by_key(|&i| std::cmp::Reverse(work[i].1.len())); o } else { vec![] };
+        // PYRE_QN_GUQ (default on): the task finishing an expert's last gate/up block quantizes that expert's hidden
+        // rows for down (same function, same input -> identical), instead of a serial pass between the two rounds
+        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
+        let guq = used && env_var("PYRE_QN_GUQ").map(|v| v != "0").unwrap_or(true);
+        let mut hdq: Vec<Vec<qdot::Q8D>> = if guq { work.iter().map(|(_, toks)| (0..toks.len()).map(|_| qdot::Q8D::default()).collect()).collect() } else { vec![] };
+        struct QP(*mut Vec<qdot::Q8D>); unsafe impl Sync for QP {} unsafe impl Send for QP {}
+        let qp = QP(hdq.as_mut_ptr()); let qp = &qp;
+        let left: Vec<std::sync::atomic::AtomicUsize> = if guq { (0..work.len()).map(|_| std::sync::atomic::AtomicUsize::new(nb)).collect() } else { vec![] };
         let (t_first, t_last) = (std::sync::atomic::AtomicU64::new(u64::MAX), std::sync::atomic::AtomicU64::new(0)); let zp = std::time::Instant::now();
         pool.run_side(work.len() * nb, &|k| { let tb = std::time::Instant::now(); t_first.fetch_min((tb - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             struct B<'a>(std::time::Instant, std::time::Instant, &'a std::sync::atomic::AtomicU64); impl Drop for B<'_> { fn drop(&mut self) { BUSY.fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); BUSYN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.2.fetch_max(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } } let _b = B(tb, zp, &t_last);
             let (wi, b) = (k / nb, k % nb); let wi = if lfo.is_empty() { wi } else { lfo[wi] }; let (e, toks) = work[wi];
             let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
             let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
+            struct Q<'a>(bool, &'a [std::sync::atomic::AtomicUsize], usize, &'a QP, usize, usize, &'a SyncPtr, &'a [usize]);
+            impl Drop for Q<'_> { fn drop(&mut self) { if !self.0 { return; } if self.1[self.2].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                let v = unsafe { &mut *self.3 .0.add(self.2) }; let (ff, wi) = (self.5, self.2);
+                for j in 0..self.4 { super::qdot::quantize_d_into(unsafe { self.6.slice(self.7[wi] + j * ff, ff) }, &mut v[j]); } } } }
+            let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
                 let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
                 let multi = usek && toks.len() >= 2 && toks.len() <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
@@ -1177,9 +1191,8 @@ impl Model {
                         unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = v; } } } });
         }, &mut || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); });
         let z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
-        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
+        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else if guq { hdq } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); a }).collect()).collect() };
         let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
         let mut slot0 = vec![0usize; work.len()]; let mut slot_n = 0usize; for (wi, (_, toks)) in work.iter().enumerate() { slot0[wi] = slot_n; slot_n += toks.len(); } let (slot0, slot_n) = (&slot0, slot_n);
         pool.run(d.div_ceil(dblk), &|b| {
@@ -2000,3 +2013,28 @@ fn env_var(k: &str) -> Result<String, std::env::VarError> {
 fn dmulti() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_DMULTI").map(|v| v != "0").unwrap_or(true)) }
 
 static VGT: [[std::sync::atomic::AtomicU64; 2]; 9] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 9];
+
+/// PYRE_QN_PBENCH: real expert pool wake round-trip + serial per-layer quantize cost (CPU only).
+pub fn pool_bench() {
+    use super::qdot; let pool = qn_pool(); let n = pool.threads;
+    let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); (v[v.len() / 2], v[v.len() * 9 / 10]) };
+    let noop = |_k: usize| { std::hint::black_box(0); };
+    for _ in 0..200 { pool.run(n, &noop); }
+    for (name, gap_us, pw) in [("hot", 0u64, false), ("gap500 prewake", 500, true), ("gap500 parked", 500, false), ("gap2000 parked", 2000, false)] {
+        for ntask in [n, n * 16, 1280] {
+            let mut v = vec![]; for _ in 0..400 {
+                if gap_us > 0 { let t = std::time::Instant::now(); while t.elapsed().as_micros() < (gap_us as u128) - if pw { 50 } else { 0 } { std::hint::spin_loop(); } if pw { pool.prewake(); let t = std::time::Instant::now(); while t.elapsed().as_micros() < 50 { std::hint::spin_loop(); } } }
+                let t = std::time::Instant::now(); pool.run(ntask, &noop); v.push(t.elapsed().as_secs_f64() * 1e6); }
+            let (m, p9) = med(&mut v); eprintln!("pbench wake {name} tasks={ntask}: median {m:.1} us p90 {p9:.1} us");
+        } }
+    let (d, ff) = (2560usize, 512usize); let x: Vec<f32> = (0..4 * d).map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 300.0).collect();
+    for (t, pairs) in [(1usize, 9usize), (2, 15), (4, 28)] {
+        let mut v = vec![]; for _ in 0..300 { let z = std::time::Instant::now();
+            let acts: Vec<qdot::Q8Act> = (0..t).map(|ti| qdot::quantize(&x[ti * d..(ti + 1) * d])).collect();
+            let actk: Vec<qdot::Q8K> = (0..t).map(|ti| { let mut a = qdot::Q8K::default(); qdot::quantize_k_into(&x[ti * d..(ti + 1) * d], &mut a); a }).collect();
+            let z1 = z.elapsed();
+            let hd: Vec<qdot::Q8D> = (0..pairs).map(|p| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&x[p * 64 % (3 * d)..p * 64 % (3 * d) + ff], &mut a); a }).collect();
+            std::hint::black_box((&acts, &actk, &hd)); v.push((z1.as_secs_f64() * 1e6, z.elapsed().as_secs_f64() * 1e6)); }
+        let mut a: Vec<f64> = v.iter().map(|p| p.0).collect(); let mut b: Vec<f64> = v.iter().map(|p| p.1).collect();
+        eprintln!("pbench quant t={t} pairs={pairs}: in-acts {:.1} us, total serial {:.1} us (median)", med(&mut a).0, med(&mut b).0); }
+}

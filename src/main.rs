@@ -155,6 +155,7 @@ pub enum ModelsCmd {
 
 fn main() -> Result<()> {
     if std::env::var("PYRE_QN_KBENCH").is_ok() { crate::model::qdot::kbench(); return Ok(()); }
+    if std::env::var("PYRE_QN_PBENCH").is_ok() { crate::model::qwen4exp_gguf::pool_bench(); return Ok(()); }
     if std::env::var("PYRE_QN_XBENCH").is_ok() { return crate::model::qn_cube::xbench(); }
     logbuf::init();
     kernel_cache_config();

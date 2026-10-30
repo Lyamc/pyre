@@ -5,6 +5,11 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// PYRE_QN_WBUSY=1: per-worker busy ns (inside tasks) vs summed job wall time, printed every 2000 jobs
+fn wbusy() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_WBUSY").map(|v| v == "1").unwrap_or(false)) }
+static WB: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64]; static WJ: AtomicU64 = AtomicU64::new(0); static WN: AtomicU64 = AtomicU64::new(0);
+thread_local! { static WID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[inline] fn call(f: &(dyn Fn(usize) + Sync), i: usize) { if wbusy() { let t = Instant::now(); f(i); WB[WID.with(|w| w.get()).min(63)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); } else { f(i) } }
 struct Job<'a> { f: &'a (dyn Fn(usize) + Sync), n: usize }
 
 struct Shared {
@@ -35,7 +40,7 @@ impl Pool {
             sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail, kick: AtomicU64::new(0) });
         for i in 1..threads.max(1) {
             let sh = sh.clone(); let cpu = pin.get(i).copied();
-            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { if let Some(c) = cpu { pin_to(c); } worker(&sh, i >= n_fast) }).expect("spawn pool worker");
+            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { WID.with(|w| w.set(i)); if let Some(c) = cpu { pin_to(c); } worker(&sh, i >= n_fast) }).expect("spawn pool worker");
         }
         Pool { sh, threads: threads.max(1) }
     }
@@ -57,16 +62,33 @@ impl Pool {
         sh.done.store(0, Relaxed);
         sh.n.store(n, Relaxed);
         sh.job.store(&job as *const Job as *mut Job<'static>, Relaxed);
-        sh.ticket.store(g << 32, Relaxed);
+        if tfa() && sh.etail == 0 { assert!(n < 1 << 20); sh.ticket.store(((g & 0xfffff) << 44) | ((n as u64) << 24), Release); } else { sh.ticket.store(g << 32, Relaxed); }
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
+        let tj = Instant::now();
         side();
         work(sh, g, &job, false);
         while sh.done.load(Acquire) < n { std::hint::spin_loop(); }
+        if wbusy() { WJ.fetch_add(tj.elapsed().as_nanos() as u64, Relaxed); if WN.fetch_add(1, Relaxed) % 2000 == 1999 { let j = WJ.load(Relaxed).max(1) as f64;
+            eprintln!("wbusy % of job wall ({} ms, side incl.): {}", j as u64 / 1_000_000, (0..self.threads.min(64)).map(|w| format!("{:.0}", WB[w].load(Relaxed) as f64 * 100.0 / j)).collect::<Vec<_>>().join(" ")); } }
     }
 }
 
+fn tfa() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_TFA").map(|v| v != "0").unwrap_or(true)) }
 fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
+    // PYRE_QN_TFA (default on): claim tasks with one fetch_add instead of a CAS retry loop (24 workers on one line).
+    // A worker that raced into a newer generation g2 still owns ticket i of g2: it runs that task with g2's job
+    // (job/n are published before the ticket and stay valid until all g2 tasks, including this one, are done).
+    // ticket layout under TFA: gen(20) | n(20) | index(24), so a claim carries its own generation and task count
+    if tfa() && sh.etail == 0 { let _ = slow; let gm = g & 0xfffff;
+        loop {
+            let t0 = sh.ticket.load(Acquire); if t0 >> 44 != gm || (t0 & 0xff_ffff) >= ((t0 >> 24) & 0xfffff) { return; }
+            let t = sh.ticket.fetch_add(1, AcqRel); let (tg, tn, i) = (t >> 44, ((t >> 24) & 0xfffff) as usize, (t & 0xff_ffff) as usize);
+            if i >= tn { return; }
+            if tg == gm { call(job.f, i); } else { let j = sh.job.load(Acquire); unsafe { call((*j).f, i); } }
+            sh.done.fetch_add(1, Release);
+            if tg != gm { return; }
+        } }
     loop {
         let t = sh.ticket.load(Acquire);
         if t >> 32 != g { return; }
@@ -75,7 +97,7 @@ fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
         let n = sh.n.load(Acquire);
         if i >= n || (slow && i + sh.etail >= n) { return; }
         if sh.ticket.compare_exchange_weak(t, t + 1, AcqRel, Relaxed).is_err() { continue; }
-        (job.f)(i);
+        call(job.f, i);
         sh.done.fetch_add(1, Release);
     }
 }
