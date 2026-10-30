@@ -605,3 +605,30 @@ unsafe fn iq2_k_multi_b<const V: bool>(t: QType, row: &[u8], acts: &[&Q8K], out:
     }
     for j in 0..na { out[j] = k::hsum(acc[j]); }
 }
+/// `q2_0_dot_d` of one Q2_0 row against up to 8 activations (`out[j]` = row . acts[j]): the 2-bit unpack of each
+/// block is done once for all of them; each activation's integer sums, float steps and order are the same as
+/// `q2_0_dot_d` (bit-identical). Used by the verify down projection for experts shared by several tokens.
+pub fn q2_0_dot_d_multi(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    { if avx2() && acts.len() <= 8 { unsafe { q2_0_d_multi_avx2(row, acts, out) }; return; } }
+    for (j, a) in acts.iter().enumerate() { out[j] = q2_0_dot_d(row, a); }
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q2_0_d_multi_avx2(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m3 = _mm256_set1_epi8(3); let one = _mm256_set1_epi16(1); let n = acts.len();
+    let mut acc = [_mm256_setzero_ps(); 8]; let mut corr = [0f32; 8]; let rp = row.as_ptr();
+    for i in 0..acts[0].d.len() { let b = rp.add(i * 18);
+        let h = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32();
+        let qv = _mm_loadu_si128(b.add(2) as *const __m128i);
+        let lo = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 2), qv), m3);
+        let hi = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 6), _mm_srli_epi16(qv, 4)), m3);
+        for j in 0..n { let a = acts.get_unchecked(j); let xq = a.q.as_ptr();
+            let dd = h * *a.d.get_unchecked(i);
+            let x0 = _mm256_loadu_si256(xq.add(i * 64) as *const __m256i); let x1 = _mm256_loadu_si256(xq.add(i * 64 + 32) as *const __m256i);
+            let p = _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one));
+            acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc[j]);
+            corr[j] -= dd * *a.s.get_unchecked(i) as f32; } }
+    for j in 0..n { out[j] = corr[j] + k::hsum(acc[j]); }
+}
