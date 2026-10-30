@@ -57,6 +57,8 @@ vulkan = ["burn/vulkan"]
 flex = ["burn/flex", "burn/rayon"]
 
 [dependencies]
+# cubecl-env-direct: StreamId for the expert copy stream (same crate as the [patch] below)
+cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
 burn = { workspace = true, default-features = false, features = ["std", "fusion", "autotune", "persistence"] }
 safetensors = "0.8"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }

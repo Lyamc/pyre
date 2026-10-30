@@ -2848,7 +2848,18 @@ impl Cube {
     pub fn xrun_fast(&self, tb: &XTabs, ar: &Handle, ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool) -> bool { self.xrun_fast_to(tb, std::slice::from_ref(ar), ar_bytes, ents, src, sn, d, ff, tys, scr, acc, &scr.y) }
     /// xrun_fast into a caller-owned output (multi-token verify keeps one y per token; scratch is reused in stream order).
     #[allow(clippy::too_many_arguments)]
+    /// The per-expert table xrun_fast_to uploads (gate/up/down offsets, bit 31 = second arena, weight).
+    pub fn xmeta(ars: &[Handle], ents: &[(&XEnt, f32)]) -> Vec<u32> {
+        let fl = |e: &XEnt| if ars.len() == 2 && e.arena == 1 { 1u32 << 31 } else { 0 };
+        ents.iter().flat_map(|(e, w)| [e.off[0] | fl(e), e.off[1], e.off[2] | fl(e), w.to_bits()]).collect()
+    }
     pub fn xrun_fast_to(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool, yo: &Handle) -> bool {
+        self.xrun_fast_to_m(tb, ars, ar_bytes, ents, src, sn, d, ff, tys, scr, acc, yo, None)
+    }
+    /// xrun_fast_to with its table already on the device (`mh`, e.g. a slice of one upload for the whole window):
+    /// each small host write costs tens of microseconds on the stream, so a window's tables go up in one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xrun_fast_to_m(&self, tb: &XTabs, ars: &[Handle], ar_bytes: usize, ents: &[(&XEnt, f32)], src: &Handle, sn: usize, d: usize, ff: usize, tys: (u32, u32, u32), scr: &XScr, acc: bool, yo: &Handle, mhp: Option<Handle>) -> bool {
         let ne = ents.len();
         if ne == 0 || ne > scr.max_ne || tys.0 != tys.1 || tys.0 > 1 || tys.2 != 3 || d % 256 != 0 || ff % 32 != 0 { return false; }
         let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
@@ -2856,9 +2867,7 @@ impl Cube {
         let rbs = (rw(tys.0, d), rw(tys.1, d), rw(tys.2, ff)); let aw = ar_bytes / 4; let rpc = 8u32;
         // up to two arenas in one launch: bit 31 of the gate and down offsets selects the second (with one arena, all go to it)
         if ars.is_empty() || ars.len() > 2 { return false; }
-        let fl = |e: &XEnt| if ars.len() == 2 && e.arena == 1 { 1u32 << 31 } else { 0 };
-        let meta: Vec<u32> = ents.iter().flat_map(|(e, w)| [e.off[0] | fl(e), e.off[1], e.off[2] | fl(e), w.to_bits()]).collect();
-        let mh = self.hup(u32::as_bytes(&meta)); let ml = ne * 4;
+        let mh = match mhp { Some(h) => h, None => self.hup(u32::as_bytes(&Self::xmeta(ars, ents))) }; let ml = ne * 4;
         let (gsrc, gn) = if tys.0 == 0 { (&tb.g2s, 2048u32) } else { (&tb.g2x, 512u32) }; let rp = xshr();
         let (ar, ar1) = (&ars[0], ars.last().unwrap());
         unsafe {
