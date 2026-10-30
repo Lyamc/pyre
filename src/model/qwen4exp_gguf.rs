@@ -1280,8 +1280,8 @@ impl Model {
         let m = self.mtp.as_ref()?; let n = st.tokens.len(); let pending = *history.last()?;
         if n == 0 || k == 0 { return None; }
         let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
-        // PYRE_MTP_GPU=1 (opt-in): the drafter's dense matrices (~95 MB Q8) run as GPU GEMVs on this thread; experts stay on the CPU
-        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(false)) { (Some(cb), true) => {
+        // PYRE_MTP_GPU=1 (default with PYRE_QN_NATIVE=2, whose dense weights leave the VRAM for it; =0 off): the drafter's dense matrices (~95 MB Q8) run as GPU GEMVs on this thread; experts stay on the CPU
+        let gh: Option<Box<dyn Fn(&super::qdot::Q8Mat, &[f32], usize) -> Option<Vec<f32>> + '_>> = match (&self.cube, env_var("PYRE_MTP_GPU").map(|v| v == "1").unwrap_or(env_var("PYRE_QN_NATIVE").map(|v| v == "2").unwrap_or(false))) { (Some(cb), true) => {
             let map = self.mtp_dense.get_or_init(|| { let mut mp = std::collections::HashMap::new(); let mut by = 0usize;
                 for q in m.dense_mats() { if let Some(c) = cb.upload_q8(q.rows, q.cols, q.blocks()) { by += q.blocks().len(); mp.insert(q as *const _ as usize, c); } }
                 eprintln!("mtp: {} dense drafter matrices on gpu ({:.0} MB)", mp.len(), by as f64 / 1e6); mp });
