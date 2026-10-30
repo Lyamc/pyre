@@ -854,3 +854,16 @@ Drafter time per round (PYRE_MTP_DEBUG): ~9.5 ms (head 1.3, catch-up 1.0, 1.5-1.
 Ported from Strata (MIT), src/program/generate.cpp `adapt`: every PYRE_QN_ADAPT_EVERY tokens (default 12), per layer the most-routed missing experts (decayed count >= 2) replace the least-routed resident ones when they beat them by more than PYRE_QN_ADAPT_GAIN (1.5); at most PYRE_QN_ADAPT_SWAPS (96) a round; counts then decay by PYRE_QN_ADAPT_DECAY (0.7). Quick runs (RTX 3060, busy desktop): A 26.1 vs 27.0, B 22.3 vs 21.6, C 25.0 vs 24.6 steady tok/s; B and C greedy-identical, A diverges (cache contents change GPU/CPU expert placement), so it stays opt-in.
 
 PYRE_VRAMLOG=1 prints NVML VRAM at each load stage and during decode. Finding: with PYRE_QN_GRAPH=1, VRAM grows ~2.7 GiB during decode (37 recaptures; old graphs' persistent buffers are kept), which is what left only ~1.2 GiB free; without graphs pyre peaks at ~8.2 GiB with the 2.5 GiB cache. PYRE_QN_GPUHEAD=1 no longer also uploads the burn LM head copy and no longer panics on the empty drafter subset head.
+
+### Overnight Oct 30: NATIVE=2 profile (VRAM-light, fastest; output differs from Q8 on prompt B at token 32)
+- With PYRE_QN_NATIVE=2, long drafts are on by default (PYRE_SPEC_HI 0.5, up to 6 drafts; windows 5..8 run as 4+rest waves).
+- The wave verify no longer blocks on a flush after enqueueing the next group (PYRE_QN_WFLUSH=1 restores); same output.
+- With PYRE_QN_NATIVE=2 the LM head is Q8 on the GPU by default (PYRE_QN_GPUHEAD=0 off), and the verify head runs as one
+  batched gemv_m per 4 tokens (the burn f16 head GEMV took 5-11 ms per round). Same output on A/B/C. The MTP drafter keeps its
+  draft-vocabulary GPU head (PYRE_MTP_HEAD_FULL=1 drafts with the full head instead).
+- Steady tok/s, 64 tokens, single runs (A/B/C): Q8 default ~30/22/26; NATIVE=2 now 32-33/25/33-35 (all identical to their own baselines).
+- Tried, no gain (opt-in or reverted): PYRE_QN_KICKQ / PYRE_QN_READNB (non-blocking queue hand-off and readback request via new
+  cubecl ComputeClient::flush_queue / read_async_nb: the wait just moves to the next blocking call), CUBECL_DROPQ_ASYNC, 3+2 wave
+  split, PYRE_QN_NATR_MIN, a 3.5 GiB expert cache, PCIe share with the pinned arena (rarely fires: type-limited), draft cap 3 vs 6.
+  GPUHEAD on the Q8 dense profile hits a ~10.3 GB VRAM transient on A, so it stays NATIVE=2-only.
+- nsys (NATIVE=2, A): GPU busy ~46% of decode wall; k_gemv_iq4d_r is ~25% of GPU time; ~23 launches/ms at ~9 us each on the device thread.

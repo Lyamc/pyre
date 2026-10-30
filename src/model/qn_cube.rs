@@ -21,6 +21,8 @@ pub static NATS_OV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 fn nats_on() -> bool { match NATS_OV.load(std::sync::atomic::Ordering::Relaxed) { 1 | 3 => false, 2 => true, _ => nats() } }
 /// PYRE_QN_NATR_MIN=rows: segments with fewer rows use k_gemv_iq4d_m (1 row per warp, more warps; same per-row arithmetic)
 pub fn natr_min() -> usize { static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+/// PYRE_QN_READNB=1: read_start queues the readback without waiting for the device thread to drain
+pub fn readnb() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_READNB").map(|v| v == "1").unwrap_or(false)) }
 pub fn natr() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR").map(|v| v != "0").unwrap_or(true)) }
 pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
@@ -2562,7 +2564,7 @@ impl Cube {
     }
     /// Start a readback now (its fence follows the work enqueued so far) and finish it later with `read_finish`,
     /// so work enqueued in between does not delay it (the verify wavefront).
-    pub fn read_start(&self, h: &Handle) -> impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>> + Send + '_ { self.client.read_async(vec![h.clone()]) }
+    pub fn read_start(&self, h: &Handle) -> impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>> + Send + '_ { let f: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>> + Send + '_>> = if readnb() { self.client.read_async_nb(vec![h.clone()]) } else { Box::pin(self.client.read_async(vec![h.clone()])) }; f }
     pub fn read_finish(&self, f: impl std::future::Future<Output = Result<Vec<burn_cubecl::cubecl::bytes::Bytes>, burn_cubecl::cubecl::server::ServerError>>) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         struct W(std::thread::Thread); impl std::task::Wake for W { fn wake(self: std::sync::Arc<Self>) { self.0.unpark(); } }
