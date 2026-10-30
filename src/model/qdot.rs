@@ -701,7 +701,7 @@ unsafe fn iq2_kn_b<const V: bool, const N: usize>(t: QType, row: &[u8], acts: &[
 /// `q2_0_dot_d` (bit-identical). Used by the verify down projection for experts shared by several tokens.
 pub fn q2_0_dot_d_multi(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
-    { if avx2() && acts.len() <= 8 { unsafe { q2_0_d_multi_avx2(row, acts, out) }; return; } }
+    { if avx2() && acts.len() <= 8 { unsafe { if dkn() && (2..=4).contains(&acts.len()) { match (dvnni(), acts.len()) { (true, 2) => q2_0_dn_v::<2>(row, acts, out), (true, 3) => q2_0_dn_v::<3>(row, acts, out), (true, _) => q2_0_dn_v::<4>(row, acts, out), (false, 2) => q2_0_dn::<2>(row, acts, out), (false, 3) => q2_0_dn::<3>(row, acts, out), (false, _) => q2_0_dn::<4>(row, acts, out) } } else { q2_0_d_multi_avx2(row, acts, out) } }; return; } }
     for (j, a) in acts.iter().enumerate() { out[j] = q2_0_dot_d(row, a); }
 }
 #[cfg(target_arch = "x86_64")]
@@ -728,6 +728,35 @@ unsafe fn q2_0_d_multi_b<const V: bool>(row: &[u8], acts: &[&Q8D], out: &mut [f3
             acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc[j]);
             corr[j] -= dd * *a.s.get_unchecked(i) as f32; } }
     for j in 0..n { out[j] = corr[j] + k::hsum(acc[j]); }
+}
+/// PYRE_QN_DKN (default on): q2_0_dot_d_multi for 2..4 activations with a const token count (acc/corr in
+/// registers, activation pointers hoisted). Same per-activation integer sums, float steps and order -> bit-identical.
+pub fn dkn() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_DKN").map(|v| v != "0").unwrap_or(true)) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q2_0_dn<const N: usize>(row: &[u8], acts: &[&Q8D], out: &mut [f32]) { q2_0_dn_b::<false, N>(row, acts, out) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn q2_0_dn_v<const N: usize>(row: &[u8], acts: &[&Q8D], out: &mut [f32]) { q2_0_dn_b::<true, N>(row, acts, out) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q2_0_dn_b<const V: bool, const N: usize>(row: &[u8], acts: &[&Q8D], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m3 = _mm256_set1_epi8(3); let one = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); N]; let mut corr = [0f32; N]; let rp = row.as_ptr();
+    let mut xq = [std::ptr::null::<i8>(); N]; let mut ad = [std::ptr::null::<f32>(); N]; let mut asp = [std::ptr::null::<i32>(); N];
+    for j in 0..N { xq[j] = acts[j].q.as_ptr(); ad[j] = acts[j].d.as_ptr(); asp[j] = acts[j].s.as_ptr(); }
+    for i in 0..acts[0].d.len() { let b = rp.add(i * 18);
+        let h = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32();
+        let qv = _mm_loadu_si128(b.add(2) as *const __m128i);
+        let lo = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 2), qv), m3);
+        let hi = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(qv, 6), _mm_srli_epi16(qv, 4)), m3);
+        for j in 0..N { let dd = h * *ad[j].add(i);
+            let x0 = _mm256_loadu_si256(xq[j].add(i * 64) as *const __m256i); let x1 = _mm256_loadu_si256(xq[j].add(i * 64 + 32) as *const __m256i);
+            let p = if V { _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), lo, x0), hi, x1) } else { _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), one), _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), one)) };
+            acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dd), acc[j]);
+            corr[j] -= dd * *asp[j].add(i) as f32; } }
+    for j in 0..N { out[j] = corr[j] + k::hsum(acc[j]); }
 }
 /// (2s+1) scale vectors of an IQ2_S scale byte, see kk::sc16
 pub static SC16: [[i16; 16]; 256] = { let mut t = [[0i16; 16]; 256]; let mut b = 0; while b < 256 { let mut l = 0; while l < 8 { t[b][l] = 2 * (b & 15) as i16 + 1; t[b][l + 8] = 2 * (b >> 4) as i16 + 1; l += 1; } b += 1; } t };
