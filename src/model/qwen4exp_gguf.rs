@@ -191,7 +191,8 @@ fn xexact_types(l: &Layer) -> bool { let t = (super::qn_cube::xtype(l.gate_e.ty)
 /// PYRE_QN_XSCR_EX=0: the exact decode kernels allocate their temporaries per call instead of using the persistent XScr
 fn xscr_ex() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSCR_EX").map(|v| v != "0").unwrap_or(true)) }
 /// XEXACT default expert cache (GiB): native IQ4_XS dense + native LM head leave room for more experts
-fn xexact_cache_gb() -> f64 { 5.4 } // e20/e21: ~3480 slots, min free ~1.5 GB
+pub fn xwmax() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_XWMAX").unwrap_or(3).clamp(1, 4)) }
+fn xexact_cache_gb() -> f64 { 5.6 } // e22: 2 arenas of 2900 MiB hold 5.66 GiB; 4-7 token window buffers gone (XWMAX=3) freed ~0.6 GB
 fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 fn moegraph() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_MOEGRAPH").map(|v| v == "1").unwrap_or(false)) }
 pub static MG_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -361,7 +362,11 @@ impl Model {
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
                     if env_var("PYRE_QN_XSTAT").is_ok() { let mut sz: std::collections::BTreeMap<usize, usize> = Default::default(); for l in &self.layers { if let (Some(a), Some(b), Some(c2)) = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { let w = super::qn_cube::xwords((a, b, c2), self.cfg.d, self.cfg.ff_exp); *sz.entry(4 * (w.0 + w.1 + w.2)).or_default() += 1; } }
                         eprintln!("xstat: slot {slot} B, expert bytes by layer count {sz:?}, raw gguf expert bytes l0 {}", self.layers[0].gate_e.row_bytes() * self.cfg.ff_exp * 2 + self.layers[0].down_e.row_bytes() * self.cfg.d); }
-                    let mut nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
+                    let mut nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(if xexact() { 2900 } else { 2560 }) << 20) / slot;
+                    // e22: the exact kernels (and the t=1 / verify fast paths) take at most 2 arenas; at 5.4 GiB with 2.5 GiB arenas the cache
+                    // had 3, so XEXACT silently fell back to the non-exact per-arena path (slower, and C diverged at token 76)
+                    if xexact() && nslot > 2 * maxper { eprintln!("gpu: XEXACT expert cache capped at {} slots (2 arenas of {} MiB; the exact kernels take at most 2)", 2 * maxper, (maxper * slot) >> 20); nslot = 2 * maxper; }
+                    let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k), sloc: vec![] }));
                     if xclass() { let xm = self.xc.as_ref().unwrap(); let mut x = xm.lock().unwrap();
                         // classes: expert bytes (256-aligned) -> layer count; each layer gets q slots of its class, largest first
@@ -561,7 +566,7 @@ impl Model {
                 cb.rsum_ex(ex_y.as_ref().unwrap_or(&yb), &yb, &tb, &ysum, d, kk, 1);
                 cb.comb3(x, &sh, Some(&ysum), None, Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
                 let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
-                HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
+                HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); XW[9].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
                 return;
             }
             // CPU workers start on the missed experts while this thread enqueues the GPU side
@@ -611,7 +616,7 @@ impl Model {
         let yb = cb.buf(&yr);
         cb.comb3(x, &sh, Some(&yb), yg.as_ref(), Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
-        HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed); crate::metrics::add_gpu_ns(ns(q1, q2) + ns(q4, q5));
+        HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); XW[9].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed); crate::metrics::add_gpu_ns(ns(q1, q2) + ns(q4, q5));
     }
 
     fn gdn_bufs(&self, st: &State) -> Vec<(H, H)> {
@@ -1337,12 +1342,12 @@ impl Model {
     }
 }
 fn xwin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XWIN").map(|v| v == "1").unwrap_or(false)) }
-static XW: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static XW: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16]; // 9 dense read wait ns, 10 refill ns, 11 head ns, 12 GPU expert enqueue ns
 thread_local! { static XW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
 fn xwin_begin() -> Option<std::time::Instant> { if !xwin() { return None; } let d = XW_DEPTH.with(|c| { let v = c.get(); c.set(v + 1); v }); if d == 0 { for a in XW.iter() { a.store(0, std::sync::atomic::Ordering::Relaxed); } Some(std::time::Instant::now()) } else { None } }
 fn xwin_end(w: Option<std::time::Instant>, t: usize) { if !xwin() { return; } XW_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
-    if let Some(w) = w { if t <= 4 { let g = |i: usize| XW[i].load(std::sync::atomic::Ordering::Relaxed); let ms = |v: u64| v as f64 / 1e6;
-        eprintln!("xwin T={t} wall {:.2} cpu_pairs {} cpu_exp {} lay {} pool {:.2} maxlay {:.3} gu {:.2} q {:.2} dn {:.2} gpu {}", w.elapsed().as_secs_f64() * 1e3, g(0), g(8), g(2), ms(g(3)), ms(g(4)), ms(g(5)), ms(g(6)), ms(g(7)), g(1)); } } }
+    if let Some(w) = w { if t <= 8 { let g = |i: usize| XW[i].load(std::sync::atomic::Ordering::Relaxed); let ms = |v: u64| v as f64 / 1e6;
+        eprintln!("xwin T={t} wall {:.2} cpu_pairs {} cpu_exp {} lay {} pool {:.2} maxlay {:.3} gu {:.2} q {:.2} dn {:.2} gpu {} rdwait {:.2} refill {:.2} head {:.2} xenq {:.2} rest {:.2}", w.elapsed().as_secs_f64() * 1e3, g(0), g(8), g(2), ms(g(3)), ms(g(4)), ms(g(5)), ms(g(6)), ms(g(7)), g(1), ms(g(9)), ms(g(10)), ms(g(11)), ms(g(12)), w.elapsed().as_secs_f64() * 1e3 - ms(g(3)) - ms(g(9)) - ms(g(10)) - ms(g(11))); } } }
 impl Model {
     #[allow(dead_code)] fn _xwin_dummy(&self) {}
 
@@ -1377,7 +1382,7 @@ impl Model {
         let mut xc: Option<burn_cubecl::cubecl::server::Handle> = None;
         let gdn_ok = t == 1 && self.cube.is_some() && env_var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)
             && self.cl.len() == self.layers.len() && self.cl.iter().zip(&self.layers).all(|(c, l)| c.as_ref().is_some_and(|c| c.gdn.is_some() || !matches!(l.mix, Mixer::Lin { .. })));
-        if let (Some(cb), Some(xm), 1) = (&self.cube, &self.xc, t) { let mut g = xm.lock().unwrap(); if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } }
+        { let qr = std::time::Instant::now(); if let (Some(cb), Some(xm), 1) = (&self.cube, &self.xc, t) { let mut g = xm.lock().unwrap(); if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } XW[10].fetch_add(qr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
         if let Some(cb) = &self.cube {
             if gdn_ok && !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
             if !gdn_ok && st.gdn_gpu { for (i, (a, b)) in st.gdn.iter().enumerate() { st.conv[i] = cb.read(a); st.ssm[i] = cb.read(b); } st.gdn.clear(); st.gdn_gpu = false; }
@@ -1582,7 +1587,7 @@ impl Model {
         let cb = self.cube.as_ref().unwrap();
         st.tokens.extend_from_slice(ids);
         st.spec_sel = vec![vec![]; t];
-        if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); for _ in 0..t { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } }
+        { let qr = std::time::Instant::now(); if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); for _ in 0..t { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } } XW[10].fetch_add(qr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
         if !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
         let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv; let (cn, sn) = ((c.conv_k - 1) * ch, c.lin_nv * c.lin_dk * c.lin_dv);
@@ -1629,7 +1634,7 @@ impl Model {
                 } }
                 let q4b = std::time::Instant::now();
                 if prewake() { qn_pool().prewake(); }
-                let rall = cb.read_finish(fut);
+                let rall = cb.read_finish(fut); XW[9].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 WV[g].fetch_add(q4b.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); WV[2].fetch_add((q4b - q4).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0);
@@ -1647,13 +1652,13 @@ impl Model {
             self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
         }
         }
-        let hs = xs.unwrap();
+        let qh = std::time::Instant::now(); let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
         let headb = env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
         for (ti, h) in hs.iter().enumerate() { if last_only && ti + 1 < t && self.mtp.is_none() { continue; } let x = cb.read(h); if self.mtp.is_some() { self.mtp_keep_r(st, start + ti, &x); } if last_only && ti + 1 < t { continue; } let (hh, _) = self.hc_mix(&self.head, &x, 1); if headb { hb.extend_from_slice(&hh); nb += 1; } else { lg.push(self.head_logits(&hh)); } }
         // one head GEMV for all verify tokens: the weights are read once; each column uses the same per-row arithmetic
         if headb && nb > 0 { let mut done = 0; while done < nb { let c = (nb - done).min(if self.headc.is_some() { 4 } else { 8 }); let y = if let Some(hm) = &self.headc { /* GPU Q8 head (PYRE_QN_GPUHEAD=1): up to 4 columns per gemv_m, weights read once */ let xb = cb.buf(&hb[done * d..(done + c) * d]); let o = cb.empty(c * hm.rows); if c == 1 { cb.gemv(hm, &xb, d, 0, &o, hm.rows, 0); } else { cb.gemv_m(hm, &xb, c * d, 0, d, &o, c * hm.rows, 0, hm.rows, c); } cb.read(&o) } else { self.mm(&[&self.out], &hb[done * d..(done + c) * d], c).pop().unwrap() }; let r = y.len() / c; for i in 0..c { lg.push(y[i * r..(i + 1) * r].to_vec()); } done += c; } }
-        if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
+        XW[11].fetch_add(qh.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); if env_var("PYRE_QN_PROFILE").is_ok() { use std::sync::atomic::Ordering::Relaxed; let f = |i: usize| HY[i].swap(0, Relaxed) as f64 / 1e6;
             eprint!("cpu distinct {} entries {} gpu hits {} | ", MISS[0].swap(0, Relaxed), MISS[1].swap(0, Relaxed), MISS[2].swap(0, Relaxed));
             eprint!("wave wait A {:.1} B {:.1} enqueue-next {:.1} (dense {:.1} flush {:.1}) | ", WV[0].swap(0, Relaxed) as f64 / 1e6, WV[1].swap(0, Relaxed) as f64 / 1e6, WV[2].swap(0, Relaxed) as f64 / 1e6, WV[3].swap(0, Relaxed) as f64 / 1e6, WV[4].swap(0, Relaxed) as f64 / 1e6);
             eprint!("xrun {:.1} upl {:.1} flush {:.1} | ", SD[0].swap(0, Relaxed) as f64 / 1e6, SD[1].swap(0, Relaxed) as f64 / 1e6, SD[2].swap(0, Relaxed) as f64 / 1e6); eprint!("gu first {:.1} last {:.1} wall {:.1} | ", TL[0].swap(0, Relaxed) as f64 / 1e6, TL[1].swap(0, Relaxed) as f64 / 1e6, TL[2].swap(0, Relaxed) as f64 / 1e6); eprint!("route-to-meta {:.1} route {:.1} | ", RTN.swap(0, Relaxed) as f64 / 1e6, RTN2.swap(0, Relaxed) as f64 / 1e6); eprint!("busy {:.1} tasks {} side {:.1} | ", BUSY.swap(0, Relaxed) as f64 / 1e6, BUSYN.swap(0, Relaxed), SIDE_NS.swap(0, Relaxed) as f64 / 1e6);
@@ -1668,7 +1673,10 @@ impl Model {
     pub fn spec_max_window(&self) -> usize {
         let Some(xm) = &self.xc else { return usize::MAX };
         let c = xm.lock().unwrap().calls; let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16).max(1);
-        (2..=every + 1).find(|j| (c + j) % every == 0).map(|j| j - 1).unwrap_or(every)
+        let w = (2..=every + 1).find(|j| (c + j) % every == 0).map(|j| j - 1).unwrap_or(every);
+        // PYRE_QN_XWMAX (XEXACT, default 3, 1..=4): longest verify window; the exact expert path covers t <= 4 only and
+        // e21 4-token windows were 124-276 ms vs 82-93 for 3 (NATIVE2 had let them grow to 7)
+        if xexact() { w.min(xwmax()) } else { w }
     }
 
     pub fn spec_keep(&self, st: &mut State, t: usize, keep: usize) {
@@ -1699,7 +1707,7 @@ impl Model {
         let (ai0, li0) = (*ai, *li);
         let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) };
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
-        let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0);
+        let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0); XW[9].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
     }
@@ -1938,7 +1946,7 @@ impl Model {
                     let mut all: Vec<u32> = vec![]; let mut oc = [0u32; 4]; let mut acc = 0u32;
                     for (ti, o) in oc.iter_mut().enumerate() { if ti < t { let ents: Vec<(&super::qn_cube::XEnt, f32)> = ons[ti].iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); all.extend(super::qn_cube::Cube::xmeta(&xcr.arena, &ents)); acc += ents.len() as u32; } *o = acc; }
                     if acc > 0 { let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&all)); let och = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&oc)); let yent = cb.empty(acc as usize * d);
-                        let q = std::time::Instant::now(); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, acc as usize, &mh, &och, &rd, t * rn, d, c.ff_exp, tyg, &yent, None); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); ex_y = Some(yent); }
+                        let q = std::time::Instant::now(); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, acc as usize, &mh, &och, &rd, t * rn, d, c.ff_exp, tyg, &yent, None); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XW[12].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); ex_y = Some(yent); }
                     cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t);
                     cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                     for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
