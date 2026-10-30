@@ -1765,6 +1765,21 @@ impl Model {
                 xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64); ons.push(on); offs.push(off);
             }
             RTN2.fetch_add(q_rt.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            // PYRE_QN_XCMP=N (diagnostic): for the first N layer calls, token 0's GPU-cached experts are also run alone
+            // through the CPU path and the GPU fast path (weight 1) on the same input row; prints how many of the d
+            // outputs differ in bits and the largest difference (placement-dependence of the expert math)
+            if let Some(nmax) = env_usize("PYRE_QN_XCMP") { static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if !ons[0].is_empty() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < nmax {
+                    let tyf = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
+                    for &(e, _) in ons[0].iter().take(3) { let ent = &xcg.map[&(il, e)];
+                        let y0 = cb.empty(d); let ok = cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &[(ent, 1.0)], &rds[0], rn, d, c.ff_exp, tyf, &xcg.scr, false, &y0);
+                        if !ok { eprintln!("xcmp: layer {il} expert {e}: gpu fast path not eligible"); continue; }
+                        let yg = cb.read(&y0); let mut yc = vec![0f32; d]; let wv = vec![(0usize, 1.0f32)];
+                        self.routed_pool_ord(l, &xin[..d], &[(e, &wv)], 1, &mut yc, &mut || {}, None);
+                        let nd = (0..d).filter(|&i| yg[i].to_bits() != yc[i].to_bits()).count();
+                        let md = (0..d).map(|i| (yg[i] - yc[i]).abs()).fold(0f32, f32::max); let my = yc.iter().fold(0f32, |m, v| m.max(v.abs()));
+                        eprintln!("xcmp: layer {il} expert {e} types {:?}/{:?}/{:?}: {nd}/{d} outputs differ, max |diff| {md:.3e} (max |y| {my:.3e}, rel {:.2e})", l.gate_e.ty, l.up_e.ty, l.down_e.ty, md / my.max(1e-30));
+                    } } }
             // Strata's verify dispatch (expert_pool_dispatch_multi): the distinct misses of the whole window, and a
             // PCIe share of them (here the ones most tokens use) uploaded once and run on the GPU for every token
             let mut sins: Vec<(usize, usize)> = vec![];
