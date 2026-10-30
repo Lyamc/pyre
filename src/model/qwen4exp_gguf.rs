@@ -1386,7 +1386,7 @@ impl Model {
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
             // the draft-vocabulary head on the GPU (PYRE_MTP_HEAD_GPU=0: off): ~100 MB of VRAM, a fraction of the full head's time
             let hg = if env_var("PYRE_MTP_HEAD_GPU").map(|v| v != "0").unwrap_or(true) { self.cube.as_ref().and_then(|cb| self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } let r = cb.upload_q8(h.rows, h.cols, h.blocks()); if r.is_some() { eprintln!("mtp: draft head on gpu ({} rows)", h.rows); } r }).as_ref().map(|hm| (cb, hm))) } else { None };
-            let (id, p) = if let Some((cb, hm)) = hg { let xb = cb.buf(&s); let o = cb.empty(hm.rows); cb.gemv(hm, &xb, s.len(), 0, &o, hm.rows, 0); let (i, p) = super::mtp::best(&cb.read(&o)); (m.head_ids()[i], p) }
+            let (id, p) = if let Some((cb, hm)) = hg { let xb = cb.buf(&s); let o = cb.empty(hm.rows); if !(env_var("PYRE_MTP_HEAD_DP4A").map(|v| v == "1").unwrap_or(false) && cb.gemv_q8d(hm, &xb, &o)) { cb.gemv(hm, &xb, s.len(), 0, &o, hm.rows, 0); } let (i, p) = super::mtp::best(&cb.read(&o)); (m.head_ids()[i], p) }
                 else if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
             HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             if j > 0 && p < min_p { break; }

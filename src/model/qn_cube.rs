@@ -2163,6 +2163,28 @@ fn k_xdown_b4(h: &[f32], ar: &[u32], meta: &[u32], g2s: &[u32], g2x: &[u32], ks:
 
 /// Q8 pack: per 32 values d = amax/127, q = round(v/d) as int8 (4 per word) - the same grid as
 /// k_q8copy / the CPU Q8 activations. One thread per 32-block.
+/// Lossy draft-head GEMV (only the MTP drafter uses it): Q8_0 weights x int8-quantised activations (k_q8pack),
+/// one lane per 32-wide block, 8 dp4a per block. Not bit-identical to k_gemv; drafts only (verify decides output).
+#[cube(launch_unchecked)]
+fn k_gemv_q8d(xq: &[u32], xs: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nb = cols / 32;
+        let wb = row * (cols / 4);
+        let sb = row * nb;
+        let mut acc = 0.0f32;
+        let mut b = UNIT_POS_X;
+        while b < nb {
+            let mut p = 0i32;
+            #[unroll]
+            for j in 0..8u32 { p = dp4a(i32::cast_from(w[(wb + b * 8 + j) as usize]), i32::cast_from(xq[(b * 8 + j) as usize]), p); }
+            acc += f32::cast_from(p) * s[(sb + b) as usize] * xs[b as usize];
+            b += 32u32;
+        }
+        let t = plane_sum(acc);
+        if UNIT_POS_X == 0 { out[row as usize] = t; }
+    }
+}
 #[cube(launch_unchecked)]
 fn k_q8pack(src: &[f32], q: &mut [u32], sc: &mut [f32], soff: u32, nb: u32) {
     let b = ABSOLUTE_POS_X;
@@ -2837,7 +2859,16 @@ impl Cube {
         super::qn_gpu::GPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); super::qn_gpu::GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     }
-    /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
+    /// lossy draft-head GEMV (k_gemv_q8d): plain Q8 CMat only (no native/qseg segments); false = not eligible
+    pub fn gemv_q8d(&self, m: &CMat, x: &Handle, out: &Handle) -> bool {
+        if !m.nat.is_empty() || !m.qseg.is_empty() || m.cols % 32 != 0 { return false; }
+        let nb = m.cols / 32; let xq = self.empty(m.cols / 4); let xs = self.empty(nb);
+        unsafe { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), m.cols), BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), 0u32, nb as u32) }
+        unsafe { k_gemv_q8d::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            BufferArg::from_raw_parts(xq, m.cols / 4), BufferArg::from_raw_parts(xs, nb), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+            BufferArg::from_raw_parts(out.clone(), m.rows), m.rows as u32, m.cols as u32) }
+        true
+    }    /// out[ooff..ooff+rows] = W x[xoff..xoff+cols]
     pub fn gemv(&self, m: &CMat, x: &Handle, xn: usize, xoff: usize, out: &Handle, on: usize, ooff: usize) {
         if !m.nat.is_empty() && native_mode() == 3 {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4x::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
