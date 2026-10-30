@@ -15,6 +15,8 @@ const ROWS_PER_CUBE: u32 = 8;
 fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); let thr = *T.get_or_init(|| std::env::var("PYRE_QN_GEMV_RPC").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)); if rows >= thr { ROWS_PER_CUBE } else if rows >= 1024 { 4 } else { 2 } }
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
 /// PYRE_QN_NATS=0: the per-8-values k_gemv_iq4d_m instead of the sub-block k_gemv_iq4s_m
+/// PYRE_QN_NATX=1: every native IQ4_XS GEMV (1-4 columns) as Strata / ggml vec_dot_iq4_xs_q8_1 arithmetic (sub-block integer sums, half activation scale)
+pub fn natx() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATX").map(|v| v == "1").unwrap_or(false)) }
 pub fn nats() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATS").map(|v| v == "1").unwrap_or(false)) }
 /// Test override for nats(): 0 = env, 1 = iq4d_m, 2 = iq4s_m.
 pub static NATS_OV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -35,7 +37,8 @@ fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
     let mut part = 0.0f32;
     #[unroll]
     for j in 0..4u32 {
-        let v = dec(word, j);
+        let v = dec(word, j);
+
         part += v * x[(base + j) as usize];
     }
     part
@@ -1007,6 +1010,12 @@ fn iq4_lookup(q4: u32) -> (u32, u32) {
 /// llama.cpp's vec_dot_iq4_xs_q8_1): a lane takes one 32-value sub-block (4 qs words), sums it in the integer
 /// domain with dp4a, applies the signed 6-bit scale as an integer, then one float multiply (d_w * d_x) * sumi.
 /// 8 lanes per 256-block, a warp per row, 4 blocks per warp step. Levels via a 256-entry shared byte table.
+/// warp_sum as Strata / ggml: xor butterfly 16, 8, 4, 2, 1
+#[cube]
+fn wsum(x: f32) -> f32 { let mut v = x; v += plane_shuffle_xor(v, 16u32); v += plane_shuffle_xor(v, 8u32); v += plane_shuffle_xor(v, 4u32); v += plane_shuffle_xor(v, 2u32); v += plane_shuffle_xor(v, 1u32); v }
+/// q8_1 keeps the activation scale as a half (ggml block_q8_1.ds): the scale as that half, back in f32
+#[cube]
+fn hround(v: f32) -> f32 { let u = u32::reinterpret(v); f32::reinterpret((u + 4095u32 + ((u >> 13) & 1u32)) & 4294959104u32) } // round-to-nearest-even to an 11-bit significand (normal half range)
 #[cube(launch_unchecked)]
 fn k_gemv_iq4s_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32) {
     let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
@@ -1044,16 +1053,16 @@ fn k_gemv_iq4s_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32],
                 if nt > 3u32 { s3 = dp4a(hi, i32::cast_from(xq[(3 * cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(3 * cq + xw + j) as usize]), s3)); }
             }
             let xi = blk * 8 + ib;
-            a0 += (d * xs[xi as usize]) * f32::cast_from(s0 * ls);
-            if nt > 1u32 { a1 += (d * xs[(cs + xi) as usize]) * f32::cast_from(s1 * ls); }
-            if nt > 2u32 { a2 += (d * xs[(2 * cs + xi) as usize]) * f32::cast_from(s2 * ls); }
-            if nt > 3u32 { a3 += (d * xs[(3 * cs + xi) as usize]) * f32::cast_from(s3 * ls); }
+            a0 += (d * hround(xs[xi as usize])) * f32::cast_from(s0 * ls);
+            if nt > 1u32 { a1 += (d * hround(xs[(cs + xi) as usize])) * f32::cast_from(s1 * ls); }
+            if nt > 2u32 { a2 += (d * hround(xs[(2 * cs + xi) as usize])) * f32::cast_from(s2 * ls); }
+            if nt > 3u32 { a3 += (d * hround(xs[(3 * cs + xi) as usize])) * f32::cast_from(s3 * ls); }
             blk += 4u32;
         }
-        let t0 = plane_sum(a0);
-        let t1 = plane_sum(a1);
-        let t2s = plane_sum(a2);
-        let t3 = plane_sum(a3);
+        let t0 = wsum(a0);
+        let t1 = wsum(a1);
+        let t2s = wsum(a2);
+        let t3 = wsum(a3);
         if UNIT_POS_X == 0 {
             out[(ooff + row) as usize] = t0;
             if nt > 1u32 { out[(ooff + ost + row) as usize] = t1; }
@@ -2762,9 +2771,12 @@ impl Cube {
         if !m.nat.is_empty() && native_mode() == 2 {
             let nb = m.cols / 32; let xq = self.empty(m.cols / 4); let xs = self.empty(nb);
             unsafe { k_q8pack::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), xoff as u32, nb as u32) }
+            if natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, 0u32, 1u32) } } } else {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4d::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
-                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32) } }
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32) } } }
             for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); unsafe { k_gemv::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, xoff as u32, (ooff + r0) as u32) } }
@@ -2796,10 +2808,10 @@ impl Cube {
         // native IQ4_XS, 2-4 columns: one activation pack and one launch per native segment for all columns (weights
         // read once; each column's sums as the per-column path), the Q8 rows in one k_gemv4r per segment (the all-Q8
         // path's per-row order). PYRE_QN_NATM=0 reverts to the per-column launches.
-        if !m.nat.is_empty() && native_mode() == 2 && (2..=4).contains(&nt) && natm() {
+        if !m.nat.is_empty() && native_mode() == 2 && ((2..=4).contains(&nt) && natm() || natx() && (1..=4).contains(&nt)) {
             let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
             unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) }
-            if nats_on() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+            if nats_on() || natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
             for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { unsafe { k_gemv_iq4d_r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
