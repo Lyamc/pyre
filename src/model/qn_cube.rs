@@ -2840,6 +2840,60 @@ fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc:
 /// PYRE_QN_XGU2: 1 (default) k_xgu_ex16, 0 k_xgu_ex8, 2 alternate per call (both in one trace)
 fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
 static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// PYRE_QN_XEXACT down, two rows per warp (16 lanes each: lanes 0..7 the q2_0_d_avx2 lanes, lane 8 the block correction),
+/// each lane accumulating its blocks in order (same per-lane fma order and final sum as k_xdown_ex8), no shared integer stage.
+#[cube(launch_unchecked)]
+fn k_xdown_ex16(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    let mut fa = Shared::<[f32]>::new_slice(256usize);
+    let e = CUBE_POS_Y;
+    let wy = UNIT_POS_Y;
+    let ux = UNIT_POS_X;
+    let half = ux / 16u32;
+    let r = ux % 16u32;
+    let row = (CUBE_POS_X * CUBE_DIM_Y + wy) * 2u32 + half;
+    let act = e < oc[3] && row < rows;
+    if act && r < 9u32 {
+        let m2 = meta[(e * 4 + 2) as usize];
+        let sel = m2 >> 31;
+        let dof = (m2 & 2147483647u32) + row * rbd;
+        let k0 = (r % 8u32) / 4u32;
+        let j0 = (r % 4u32) * 4u32;
+        let mut acc = 0.0f32;
+        for i in 0..nb {
+            let blk = dof + i * 5;
+            let mut w0 = 0.0f32;
+            let mut wq = 0u32;
+            if sel == 0u32 { w0 = f32::reinterpret(ar[blk as usize]); wq = ar[(blk + 1 + j0 / 4) as usize]; } else { w0 = f32::reinterpret(ar1[blk as usize]); wq = ar1[(blk + 1 + j0 / 4) as usize]; }
+            let dd = w0 * hd[(e * nb + i) as usize];
+            if r < 8u32 {
+                let mut p = 0i32;
+                for jj in 0..4u32 {
+                    let j = j0 + jj;
+                    let qv = (wq >> (8 * (j % 4))) & 255u32;
+                    let xw = hq[(e * nb * 16 + i * 16 + j) as usize];
+                    let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                    p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+                }
+                acc = fma(f32::cast_from(p), dd, acc);
+            } else {
+                let pr = fma(dd, f32::cast_from(i32::cast_from(hs[(e * nb + i) as usize])), 0.0f32);
+                acc = acc - pr;
+            }
+        }
+        fa[(wy * 32 + ux) as usize] = acc;
+    }
+    sync_cube();
+    if act && r == 0u32 {
+        let f = wy * 32 + half * 16;
+        let hsum = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+        let v = fa[(f + 8) as usize] + hsum;
+        let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
+        y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
+    }
+}
+/// PYRE_QN_XDN2: 1 (default) k_xdown_ex16, 0 k_xdown_ex8, 2 alternate per call
+fn xdn2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XDN2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
+static XDN2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cube(launch_unchecked)]
 fn k_xdown_ex8(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
     let mut pi = Shared::<[i32]>::new_slice(4096usize);
@@ -3532,13 +3586,17 @@ impl Cube {
         self.client.write(&hd, cubecl::bytes::Bytes::from_elems(v));
         XUP_NS[0].fetch_add((t1 - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XUP_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
-        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
+        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot: base / slot_bytes.max(1), bytes: slot_bytes }
     }
     /// Upload one pre-packed expert (`xpacked`: gate words, then up at `uo`, down at `dof`) into slot `slot`.
     #[allow(clippy::too_many_arguments)]
     pub fn xupload_pk(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, v: &cubecl::bytes::Bytes, uo: usize, dof: usize) -> XEnt {
+        self.xupload_at(ar, ar_bytes, slot * slot_bytes, slot_bytes, v, uo, dof)
+    }
+    /// xupload_pk at a byte offset with a given capacity (PYRE_QN_XCLASS per-class slots)
+    pub fn xupload_at(&self, ar: &Handle, ar_bytes: usize, base: usize, slot_bytes: usize, v: &cubecl::bytes::Bytes, uo: usize, dof: usize) -> XEnt {
         let t0 = std::time::Instant::now();
-        let base = slot * slot_bytes; let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
+        let len = v.len(); assert!(len <= slot_bytes && base + len <= ar_bytes);
         let hd = ar.clone().offset_start(base as u64).offset_end((ar_bytes - base - len) as u64);
         // pinned staging (CubeCL's page-locked pool) so the copy is a real async DMA, like Strata's staging memcpyAsync
         let mut by = v.clone(); if xpin() { self.client.staging(std::iter::once(&mut by), false); }
@@ -3555,7 +3613,7 @@ impl Cube {
         } else { self.client.write(&hd, by); }
         XUP_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let b = (base / 4) as u32;
-        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot, bytes: slot_bytes }
+        XEnt { off: [b, b + uo as u32, b + dof as u32], arena: 0, slot: base / slot_bytes.max(1), bytes: slot_bytes }
     }
     /// All cached experts of one layer: h[e] = silu(G_e x) * (U_e x) -> Q8 grid -> y += sum_e w_e D_e h[e].
     #[allow(clippy::too_many_arguments)]
@@ -3692,6 +3750,9 @@ impl Cube {
             k_xgu_ex::launch_unchecked(&self.client, CubeCount::Static(ff as u32, ne as u32, 1), CubeDim::new_1d(32),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); }
             k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32);
+            let d2 = match xdn2() { 0 => false, 2 => XDN2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0, _ => true };
+            if xex8() && d2 { k_xdown_ex16::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else
             if xex8() { k_xdown_ex8::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), ne as u32, 1), CubeDim::new_2d(32, 8),
                 a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else {
             k_xdown_ex::launch_unchecked(&self.client, CubeCount::Static(d as u32, ne as u32, 1), CubeDim::new_1d(32),

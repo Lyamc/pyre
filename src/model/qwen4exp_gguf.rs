@@ -58,7 +58,15 @@ fn xcopys() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock:
 fn xarena_pin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XARENA_PIN").map(|v| v == "1").unwrap_or(false)) }
 static RTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); static RTN2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn xshare() -> f32 { static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)) }
-pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, stream: Vec<usize>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr }
+pub struct XCache { tabs: super::qn_cube::XTabs, arena: Vec<burn_cubecl::cubecl::server::Handle>, ar_bytes: usize, per: usize, slot: usize, free: Vec<usize>, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, cnt: Vec<Vec<u32>>, stream: Vec<usize>, used: usize, budget: usize, calls: usize, pub hits: u64, pub total: u64, scr: super::qn_cube::XScr, sloc: Vec<(usize, usize, usize)> }
+impl XCache {
+    /// slot -> (arena, byte offset, capacity): uniform slots, or the PYRE_QN_XCLASS per-class table
+    fn loc(&self, sl: usize) -> (usize, usize, usize) { if self.sloc.is_empty() { (sl / self.per, (sl % self.per) * self.slot, self.slot) } else { self.sloc[sl] } }
+    fn cap(&self, sl: usize) -> usize { self.loc(sl).2 }
+    fn up(&self, cb: &super::qn_cube::Cube, sl: usize, v: &burn_cubecl::cubecl::bytes::Bytes, uo: usize, dof: usize) -> super::qn_cube::XEnt { let (a, b, c) = self.loc(sl); cb.xupload_at(&self.arena[a], self.ar_bytes, b, c, v, uo, dof) }
+}
+/// PYRE_QN_XCLASS=1 (opt-in): cache slots sized per expert-size class (equal slots per layer), instead of every slot the largest expert
+fn xclass() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCLASS").map(|v| v == "1").unwrap_or(false)) }
 
 /// Expert-ranking profile (PYRE_QN_XPROFILE=<file>): per-layer routing counts saved from earlier runs
 /// (PYRE_QN_XPROFILE_SAVE=<file>; u32 n_layers, u32 n_exp, then n_layers*n_exp u32 counts, little endian).
@@ -351,10 +359,22 @@ impl Model {
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
                     if env_var("PYRE_QN_XSTAT").is_ok() { let mut sz: std::collections::BTreeMap<usize, usize> = Default::default(); for l in &self.layers { if let (Some(a), Some(b), Some(c2)) = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { let w = super::qn_cube::xwords((a, b, c2), self.cfg.d, self.cfg.ff_exp); *sz.entry(4 * (w.0 + w.1 + w.2)).or_default() += 1; } }
                         eprintln!("xstat: slot {slot} B, expert bytes by layer count {sz:?}, raw gguf expert bytes l0 {}", self.layers[0].gate_e.row_bytes() * self.cfg.ff_exp * 2 + self.layers[0].down_e.row_bytes() * self.cfg.d); }
-                    let nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
-                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k) })); self.xpk_prefill(nslot, Some(&cb)); }
+                    let mut nslot = budget / slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(2560) << 20) / slot; let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
+                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k), sloc: vec![] }));
+                    if xclass() { let xm = self.xc.as_ref().unwrap(); let mut x = xm.lock().unwrap();
+                        // classes: expert bytes (256-aligned) -> layer count; each layer gets q slots of its class, largest first
+                        let mut cls: std::collections::BTreeMap<usize, usize> = Default::default();
+                        for l in &self.layers { if let (Some(a), Some(b), Some(c2)) = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { let w = super::qn_cube::xwords((a, b, c2), self.cfg.d, self.cfg.ff_exp); *cls.entry((4 * (w.0 + w.1 + w.2)).next_multiple_of(256)).or_default() += 1; } }
+                        let tot: usize = x.arena.len() * ar_bytes; let per_q: usize = cls.iter().map(|(s, n)| s * n).sum::<usize>().max(1);
+                        let mut q = tot / per_q; let mut sloc = vec![];
+                        loop { sloc.clear(); let (mut ai, mut off) = (0usize, 0usize); let mut ok = true;
+                            for (&sz, &n) in cls.iter().rev() { for _ in 0..n * q { if off + sz > ar_bytes { ai += 1; off = 0; } if ai >= x.arena.len() { ok = false; break; } sloc.push((ai, off, sz)); off += sz; } if !ok { break; } }
+                            if ok || q == 0 { break; } q -= 1; }
+                        nslot = sloc.len(); x.free = (0..nslot).rev().collect(); x.budget = sloc.iter().map(|v| v.2).sum(); x.sloc = sloc;
+                        eprintln!("xcache: XCLASS {} slots ({} per layer; classes {:?}) vs {} uniform", nslot, q, cls, budget / slot); }
+                    self.xpk_prefill(nslot, Some(&cb)); }
                 // PYRE_QN_XSTREAM=K: K cache slots kept free for streaming missed experts to the GPU per layer
-                if let Some(xm) = &self.xc { let mut x = xm.lock().unwrap(); let k = xstream().min(x.free.len()); for _ in 0..k { let sl = x.free.remove(0); x.stream.push(sl); } x.budget = x.budget.saturating_sub(k * x.slot); }
+                if let Some(xm) = &self.xc { let mut x = xm.lock().unwrap(); let k = xstream().min(x.free.len()); for _ in 0..k { let mx = x.free.iter().map(|&s| x.cap(s)).max().unwrap_or(0); let i = x.free.iter().position(|&s| x.cap(s) == mx).unwrap_or(0); let sl = x.free.remove(i); let cp = x.cap(sl); x.stream.push(sl); x.budget = x.budget.saturating_sub(cp); } }
                 { let ns = super::qn_cube::NATIVE_STAT.load(std::sync::atomic::Ordering::Relaxed); if ns > 0 { eprintln!("gpu: dense native IQ4_XS {:.0} M weights, Q8_0 {:.0} M (mixed mats)", (ns & ((1u64 << 40) - 1)) as f64 / 1e6, (ns >> 40) as f64 / 1e6); } }
                 crate::limits::vlog("expert cache"); self.cube = Some(cb);
             }
@@ -511,8 +531,8 @@ impl Model {
                 let mut gpu = || {
                     // streamed misses (XSTREAM/XSHARE) join the hits: same exact kernels, so placement cannot change output
                     let sents: Vec<(super::qn_cube::XEnt, f32)> = strm.iter().enumerate().map(|(j, &(e, w))| { let sl = xcr.stream[j];
-                        let pk = self.xpacked(il, e, tys0); let mut ent = cb.xupload_pk(&xcr.arena[sl / xcr.per], xcr.ar_bytes, sl % xcr.per, xcr.slot, &pk.0, pk.1, pk.2);
-                        ent.arena = sl / xcr.per; ent.slot = sl; (ent, w) }).collect();
+                        let pk = self.xpacked(il, e, tys0); let mut ent = xcr.up(cb, sl, &pk.0, pk.1, pk.2);
+                        ent.arena = xcr.loc(sl).0; ent.slot = sl; (ent, w) }).collect();
                     if !(on.is_empty() && sents.is_empty()) { let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).chain(sents.iter().map(|(e, w)| (e, *w))).collect(); let n = ents.len() as u32;
                         // one upload: entry table | 4 counts | in-order sum table
                         let mut mv = super::qn_cube::Cube::xmeta(&xcr.arena, &ents); let ml = mv.len(); mv.extend_from_slice(&[n, n, n, n]); mv.extend_from_slice(&tab);
@@ -545,8 +565,8 @@ impl Model {
             let mut gpu = || {
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
                 let sents: Vec<(super::qn_cube::XEnt, f32)> = strm.iter().enumerate().map(|(j, &(e, w))| { let sl = xcg.stream[j]; let ff = c.ff_exp;
-                    let _ = ff; let pk = self.xpacked(il, e, tys); let mut ent = cb.xupload_pk(&xcg.arena[sl / xcg.per], xcg.ar_bytes, sl % xcg.per, xcg.slot, &pk.0, pk.1, pk.2);
-                    ent.arena = sl / xcg.per; ent.slot = sl; (ent, w) }).collect();
+                    let _ = ff; let pk = self.xpacked(il, e, tys); let mut ent = xcg.up(cb, sl, &pk.0, pk.1, pk.2);
+                    ent.arena = xcg.loc(sl).0; ent.slot = sl; (ent, w) }).collect();
                 let fast = !(on.is_empty() && sents.is_empty()) && xfast() && tys.0 == tys.1 && tys.0 <= 1 && tys.2 == 3 && {
                     let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcg.map[&(il, *e)], *w)).chain(sents.iter().map(|(e, w)| (e, *w))).collect();
                     if xcg.arena.len() <= 2 { cb.xrun_fast_to(&xcg.tabs, &xcg.arena, xcg.ar_bytes, &ents, &rd, rn, d, c.ff_exp, tys, &xcg.scr, false, &xcg.scr.y) } else {
@@ -736,8 +756,8 @@ impl Model {
         { use rayon::prelude::*;
             let pks: Vec<_> = jobs.par_iter().map(|&(il, e, _, tys)| self.xpacked(il, e, tys)).collect();
             for (&(il, e, sl, _), pk) in jobs.iter().zip(pks.iter()) {
-                let mut ent = cb.xupload_pk(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, &pk.0, pk.1, pk.2);
-                ent.arena = sl / xc.per; ent.slot = sl; xc.map.insert((il, e), ent); } }
+                let mut ent = xc.up(cb, sl, &pk.0, pk.1, pk.2);
+                ent.arena = xc.loc(sl).0; ent.slot = sl; xc.map.insert((il, e), ent); } }
         ADAPT_SWAPS.fetch_add(jobs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let dec = env_f32("PYRE_QN_ADAPT_DECAY").unwrap_or(0.7);
         for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c = (*c as f32 * dec) as u32; } }
@@ -754,7 +774,8 @@ impl Model {
         // real fill used to wait until call `every` and then add only XSWAP experts)
         if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { return; }
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
-        let slot = xc.slot; let size = |_: &Layer| slot;
+        let slot = xc.slot; let xcl = !xc.sloc.is_empty(); let (dd0, ff0) = (self.cfg.d, self.cfg.ff_exp);
+        let size = |l: &Layer| if xcl { match (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { (Some(a), Some(b), Some(c2)) => { let w = super::qn_cube::xwords((a, b, c2), dd0, ff0); (4 * (w.0 + w.1 + w.2)).next_multiple_of(256) }, _ => slot } } else { slot };
         if let Ok(pth) = env_var("PYRE_QN_XPROFILE_SAVE") { save_xprofile(&pth, &xc.cnt); }
         // PYRE_QN_XDECAY=k (opt-in): before ranking, every count loses 1/2^k, so recent routing weighs more (LFU with aging)
         if let Some(k) = env_usize("PYRE_QN_XDECAY").filter(|&k| k > 0 && k < 32) { for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c -= *c >> k; } } }
@@ -780,6 +801,14 @@ impl Model {
             if n >= max_new { break; }
             if !want.contains(&(il, e)) || xc.map.contains_key(&(il, e)) { continue; }
             let l = &self.layers[il];
+            if xcl {
+                // per-class slots: evict (least used first) only experts whose slot fits this one
+                let need = size(l);
+                while !xc.free.iter().any(|&s| xc.cap(s) >= need) { match evict.iter().rposition(|&(_, a, b)| xc.map.get(&(a, b)).map_or(false, |v| xc.cap(v.slot) >= need)) { Some(i) => { let (_, a, b) = evict.remove(i); if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; xc.free.push(v.slot); } }, None => break } }
+                let Some(i) = xc.free.iter().rposition(|&s| xc.cap(s) == need).or_else(|| xc.free.iter().rposition(|&s| xc.cap(s) >= need)) else { continue };
+                let sl = xc.free.remove(i); let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
+                xc.used += xc.cap(sl); jobs.push((il, e, sl, tys)); n += 1; continue;
+            }
             while xc.used + size(l) > xc.budget { match evict.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= v.bytes; xc.free.push(v.slot); } }, None => break } }
             if xc.used + size(l) > xc.budget || xc.free.is_empty() { break; }
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
@@ -790,8 +819,8 @@ impl Model {
         { use rayon::prelude::*; let _ = (ff, d);
             let pks: Vec<_> = jobs.par_iter().map(|&(il, e, _, tys)| self.xpacked(il, e, tys)).collect();
             for (&(il, e, sl, _), pk) in jobs.iter().zip(pks.iter()) {
-                let mut ent = cb.xupload_pk(&xc.arena[sl / xc.per], xc.ar_bytes, sl % xc.per, xc.slot, &pk.0, pk.1, pk.2);
-                ent.arena = sl / xc.per; ent.slot = sl; xc.map.insert((il, e), ent); } }
+                let mut ent = xc.up(cb, sl, &pk.0, pk.1, pk.2);
+                ent.arena = xc.loc(sl).0; ent.slot = sl; xc.map.insert((il, e), ent); } }
         if env_var("PYRE_QN_GPUBENCH").is_ok() && xc.calls == 1 { if let Some(((il, e), ent)) = xc.map.iter().next() {
             let l = &self.layers[*il]; let _ = e;
             let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap());
@@ -1849,8 +1878,8 @@ impl Model {
                     let qu = std::time::Instant::now(); for (j, &(e, _)) in v[..k].iter().enumerate() { let sl = xcg.stream[j]; let pk = self.xpacked(il, e, tyw);
                         // PYRE_QN_XCOPYS=1: the share copies go on their own CUDA stream (as Strata's copy stream); CubeCL makes the
                         // compute stream wait for the arena writes before the expert kernels read them
-                        let up = || cb.xupload_pk(&xcg.arena[sl / xcg.per], xcg.ar_bytes, sl % xcg.per, xcg.slot, &pk.0, pk.1, pk.2);
-                        let mut ent = if xcopys() { cubecl_environment::stream::StreamId { value: 0x5EED_0001 }.executes(up) } else { up() }; ent.arena = sl / xcg.per; ent.slot = sl;
+                        let up = || xcg.up(cb, sl, &pk.0, pk.1, pk.2);
+                        let mut ent = if xcopys() { cubecl_environment::stream::StreamId { value: 0x5EED_0001 }.executes(up) } else { up() }; ent.arena = xcg.loc(sl).0; ent.slot = sl;
                         xcg.map.insert((il, e), ent); sins.push((il, e)); }
                     SD[1].fetch_add(qu.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); let set: std::collections::HashSet<usize> = v[..k].iter().map(|x| x.0).collect();
                     for ti in 0..t { let (mv, keep): (Vec<(usize, f32)>, Vec<(usize, f32)>) = offs[ti].drain(..).partition(|(e, _)| set.contains(e)); offs[ti] = keep; ons[ti].extend(mv); }
