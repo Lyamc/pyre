@@ -566,6 +566,8 @@ impl Model {
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
         let slot = xc.slot; let size = |_: &Layer| slot;
         if let Ok(pth) = env_var("PYRE_QN_XPROFILE_SAVE") { save_xprofile(&pth, &xc.cnt); }
+        // PYRE_QN_XDECAY=k (opt-in): before ranking, every count loses 1/2^k, so recent routing weighs more (LFU with aging)
+        if let Some(k) = env_usize("PYRE_QN_XDECAY").filter(|&k| k > 0 && k < 32) { for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c -= *c >> k; } } }
         let mut cand: Vec<(u64, usize, usize)> = vec![];
         for (il, l) in self.layers.iter().enumerate() {
             if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
