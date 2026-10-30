@@ -480,7 +480,7 @@ impl Model {
         if let Some(xm) = &self.xc {
             // route on the host, run the cached experts on the GPU while the CPU pool runs the rest
             let mut xcg = xm.lock().unwrap();
-            let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg));
+            let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg)); let seln: Vec<usize> = sel.iter().map(|x| x.0).collect();
             for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); }
             xcg.total += sel.len() as u64;
             let (on, mut off): (Vec<(usize, f32)>, Vec<(usize, f32)>) = sel.into_iter().partition(|(e, _)| !xallcpu() && xcg.map.contains_key(&(il, *e)));
@@ -497,6 +497,39 @@ impl Model {
                 pick.sort_unstable(); let v: Vec<(usize, f32)> = pick.iter().map(|&i| off[i]).collect(); for &i in pick.iter().rev() { off.remove(i); } v
             } else { off.drain(s0..s0 + nst).collect() };
             xcg.hits += on.len() as u64; crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
+            // PYRE_QN_XEXACT single token: hits with the CPU arithmetic, CPU rows unsummed, one in-order sum (as the verify path)
+            if xexact() && strm.is_empty() && xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 && !xcg.arena.is_empty() && d % 256 == 0 && c.ff_exp % 64 == 0 {
+                let xcr = &*xcg; let mut ex_y: Option<H> = None;
+                let mut gpu = || {
+                    if !on.is_empty() { let ents: Vec<(&super::qn_cube::XEnt, f32)> = on.iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); let n = ents.len() as u32;
+                        let mh = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&super::qn_cube::Cube::xmeta(&xcr.arena, &ents))); let och = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&[n, n, n, n]));
+                        let yent = cb.empty(ents.len() * d); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, 1, ents.len(), &mh, &och, &rd, rn, d, c.ff_exp, tys0, &yent); ex_y = Some(yent); }
+                    cb.silu_mul(&rd, rn, d + ne, d + ne + sf, &hb, sf);
+                    cb.gemv(&cl.sdown, &hb, sf, 0, &sh, d, 0);
+                    if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } }
+                };
+                let mut yp = vec![0f32; off.len().max(1) * d];
+                if !off.is_empty() {
+                    let lists: Vec<(usize, Vec<(usize, f32)>)> = off.iter().map(|&(e, w)| (e, vec![(0usize, w)])).collect();
+                    let work: Vec<(usize, &Vec<(usize, f32)>)> = lists.iter().map(|(e, v)| (*e, v)).collect();
+                    let ord = vec![(0..off.len()).map(|i| (i, 0usize)).collect::<Vec<_>>()];
+                    let tr = std::time::Instant::now(); EXACT_PARTS.with(|c| c.set(true));
+                    self.routed_pool_ord(l, &rv[..d], &work, 1, &mut yp, &mut gpu, Some(&ord)); EXACT_PARTS.with(|c| c.set(false));
+                    { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
+                } else { gpu(); }
+                let kk = c.top_k; let mut tab = vec![0u32; kk + 1]; let mut n = 0usize;
+                for &e in &seln { let cd = if let Some(p2) = on.iter().position(|x| x.0 == e) { Some(p2 as u32) } else { off.iter().position(|x| x.0 == e).map(|i| (1u32 << 31) | i as u32) };
+                    if let Some(cd) = cd { if n < kk { tab[1 + n] = cd; n += 1; } } }
+                tab[0] = n as u32;
+                drop(xcg);
+                let q6 = std::time::Instant::now();
+                let yb = cb.buf(&yp); let tb = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&tab)); let ysum = cb.empty(d);
+                cb.rsum_ex(ex_y.as_ref().unwrap_or(&yb), &yb, &tb, &ysum, d, kk, 1);
+                cb.comb3(x, &sh, Some(&ysum), None, Some((&rd, rn, d + ne + 2 * sf)), &df, lrf, hc, d);
+                let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
+                HY[0].fetch_add(ns(q0, q1) + ns(q3, q4) + ns(q6, std::time::Instant::now()), Relaxed); HY[1].fetch_add(ns(q1, q2) + ns(q4, q5), Relaxed); HY[2].fetch_add(ns(q2, q3), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
+                return;
+            }
             // CPU workers start on the missed experts while this thread enqueues the GPU side
             let mut gpu = || {
                 let tys = (super::qn_cube::xtype(l.gate_e.ty).unwrap_or(9), super::qn_cube::xtype(l.up_e.ty).unwrap_or(9), super::qn_cube::xtype(l.down_e.ty).unwrap_or(9));
