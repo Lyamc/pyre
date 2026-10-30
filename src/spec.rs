@@ -10,6 +10,10 @@ use crate::sampler::Sampler;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 // ---- process-wide settings (config file / CLI / env; per-request override via the API) ----
+static DRAFT_MIN_P: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Later-draft confidence gate set by the high-acceptance mode for this round (None = the drafter default)
+pub fn draft_min_p() -> Option<f32> { let v = DRAFT_MIN_P.load(Relaxed); if v == u32::MAX { None } else { Some(f32::from_bits(v)) } }
+fn hi_acc() -> f32 { std::env::var("PYRE_SPEC_HI").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0) }
 static DRAFT: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = not set yet -> env/default
 static NGRAM: AtomicBool = AtomicBool::new(true);
 static MTP: AtomicBool = AtomicBool::new(true);
@@ -37,9 +41,12 @@ pub fn set_mtp(on: bool) { MTP.store(on, Relaxed); }
 pub fn route_prior() -> f32 {
     let v = ROUTE_PRIOR.load(Relaxed);
     if v != u32::MAX { return f32::from_bits(v); }
-    let p = std::env::var("PYRE_ROUTE_PRIOR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0f32).max(0.0);
+    let p = std::env::var("PYRE_ROUTE_PRIOR").ok().and_then(|s| s.parse().ok()).unwrap_or(if fast() { 1.5 } else { 0.0f32 }).max(0.0);
     ROUTE_PRIOR.store(p.to_bits(), Relaxed); p
 }
+/// PYRE_QN_FAST=1 (opt-in, changes outputs): Strata 0.2.7's 12 GB NVIDIA settings in one switch, the route prior 1.5
+/// and the route tail skip at rank 7 (explicit PYRE_ROUTE_PRIOR / PYRE_QN_TAIL_SKIP values win)
+pub fn fast() -> bool { std::env::var("PYRE_QN_FAST").map(|v| v == "1").unwrap_or(false) }
 pub fn set_route_prior(p: f32) { ROUTE_PRIOR.store(p.max(0.0).to_bits(), Relaxed); }
 
 // ---- statistics for /api/status ----
@@ -126,6 +133,11 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         history.push(pending); produced += 1;
         if !emit(pending) || produced >= max_new { break; }
         let left = max_new - produced; // tokens we may still emit
+        // PYRE_SPEC_HI=acc (opt-in, e.g. 0.95): while the recent acceptance is at least acc, drafts may run to
+        // PYRE_SPEC_HI_K (4) with the later-draft confidence gate at PYRE_SPEC_HI_P (0.6); otherwise the normal k and gate
+        let hi = hi_acc() > 0.0 && p_acc >= hi_acc() as f64;
+        let k = if hi { env("PYRE_SPEC_HI_K", 4).max(k) } else { k };
+        DRAFT_MIN_P.store(if hi { std::env::var("PYRE_SPEC_HI_P").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.6).to_bits() } else { u32::MAX }, Relaxed);
         let kk = k.min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
         let mut drafts: Vec<(u32, Option<Vec<(u32, f32)>>)> = vec![];
         if kk > 0 && target.can_verify() {

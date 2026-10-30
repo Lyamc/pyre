@@ -1210,7 +1210,7 @@ impl Model {
         let t1 = std::time::Instant::now();
         let mut r = self.mtp_r_get(st, n - 1)?.to_vec(); let mut tok = pending; let mut out = vec![];
         // a later draft is kept only when the drafter is this sure of it (Strata gates draft length on the MTP probability too; PYRE_MTP_MIN_P=0 drafts the full length)
-        let min_p: f32 = env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9);
+        let min_p: f32 = crate::spec::draft_min_p().unwrap_or_else(|| env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9));
         let mut e = vec![0f32; d];
         for j in 0..k {
             self.embd.row(tok as usize, &mut e);
@@ -1587,7 +1587,7 @@ impl Model {
 /// applied per verify window).
 fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
     static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let r = *R.get_or_init(|| env_usize("PYRE_QN_TAIL_SKIP").unwrap_or(0));
+    let r = *R.get_or_init(|| env_usize("PYRE_QN_TAIL_SKIP").unwrap_or(if crate::spec::fast() { 7 } else { 0 }));
     if r == 0 || off.is_empty() { return; }
     let mut ws: Vec<f32> = on.iter().chain(off.iter()).map(|x| x.1).collect();
     if r >= ws.len() { return; }

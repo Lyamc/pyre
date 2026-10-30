@@ -833,3 +833,19 @@ Default draft length is now 1 (3 alternating pairs, steady tok/s, all greedy-ide
 - Prompt C (C:\Temp\qnx\pC.txt, raw text: a Python function, then "the same function with items renamed to values"). Plain decode 22.6 tok/s; default spec 27.0-28.3 (97-98% accepted).
 - PYRE_SPEC_LOOKUP on C, 2 alternating runs, steady tok/s: default 27.72/28.28; n=6 K=3 27.71/28.58; n=8 K=6 28.84/28.10; n=4 K=4 27.78/28.68. Lookup fires in 10-15 of 34 rounds and cuts draft time per round from 15.7 to ~12 ms. The window stays capped by the adaptive length, and the MTP drafter already hits ~98% here, so the round count does not drop. It stays opt-in.
 - PYRE_MTP_TOPK=k (opt-in, draft-only) lowers the drafter's expert top-k. Warm averages, A/B/C: default 29.2/24.5/27.3; k=4 28.1/23.8/27.5; k=2 28.6/24.0/27.7; k=4 with PYRE_MTP_GPU=1 29.1/24.8/27.9. Acceptance moves slightly (A 100 -> 95-97%). Speed is all within noise, so it is not a lever here.
+### Strata-equivalent output-changing settings, PYRE_QN_FAST, high-acceptance drafts
+
+Strata 0.2.7 on a 12 GB NVIDIA card turns on STRATA_ROUTE_PRIOR=1.5 by itself. STRATA_ROUTE_TAIL_SKIP=7 is its CUDA default, but its setup turns it off when every expert is in RAM, as on HYTE. pyre on top of its defaults, steady tok/s (2 runs each) and the first token that differs from greedy:
+
+| | A | B | C |
+|---|---|---|---|
+| defaults | 28.9 (identical) | 24.2 (identical) | 27.9 (identical) |
+| PYRE_ROUTE_PRIOR=1.5 | 28.8 (from token 40) | 25.8 (from 4) | 29.9 (identical) |
+| PYRE_QN_TAIL_SKIP=7 | 30.5 (identical) | 23.9 (from 4) | 29.9 (identical) |
+| both = PYRE_QN_FAST=1 | 29.4 / 28.1 (from 40) | 26.4 / 26.5 (from 4) | 29.8 / 30.3 (identical) |
+
+PYRE_QN_FAST=1 (opt-in) sets both; explicit PYRE_ROUTE_PRIOR / PYRE_QN_TAIL_SKIP values win.
+
+PYRE_SPEC_HI=acc (opt-in): while recent acceptance is at least acc, drafts may run to PYRE_SPEC_HI_K (4) with the later-draft gate at PYRE_SPEC_HI_P (0.6). With 0.95 / 0.9: A 26.3-27.9, B 23.0-24.2, C 25.8-26.5, against default A 28.7-28.8, B 22.7-23.4, C 26.3-27.2. Longer windows cost more than their extra accepted tokens, so it stays off.
+
+Drafter time per round (PYRE_MTP_DEBUG): ~9.5 ms (head 1.3, catch-up 1.0, 1.5-1.9 steps; experts ~2.1, attention ~1.5, input ~1.3, rest ~3.3) of a ~89 ms round on A, about 11%. A full GPU drafter would save perhaps 6-7 ms (<10%), so it was not built.
