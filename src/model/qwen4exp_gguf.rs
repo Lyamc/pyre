@@ -520,7 +520,8 @@ impl Model {
                 let pk = self.xpk.lock().unwrap(); let mut pick: Vec<usize> = (0..off.len()).rev().filter(|&i| pk.map.contains_key(&(il, off[i].0))).take(nst).collect(); drop(pk);
                 pick.sort_unstable(); let v: Vec<(usize, f32)> = pick.iter().map(|&i| off[i]).collect(); for &i in pick.iter().rev() { off.remove(i); } v
             } else { off.drain(s0..s0 + nst).collect() };
-            xcg.hits += on.len() as u64; XW[1].fetch_add((on.len() + strm.len()) as u64, std::sync::atomic::Ordering::Relaxed); crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
+            xcg.hits += on.len() as u64; XW[1].fetch_add((on.len() + strm.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            if xpred() { let miss: Vec<usize> = off.iter().chain(strm.iter()).map(|x| x.0).collect(); self.xpred_step(il, &seln, &miss, &rv[..d]); } crate::metrics::expert_cache(on.len() as u64, off.len() as u64);
             // PYRE_QN_XEXACT single token: hits with the CPU arithmetic, CPU rows unsummed, one in-order sum (as the verify path)
             if xexact() && xfast() && tys0.0 == tys0.1 && tys0.0 <= 1 && tys0.2 == 3 && xcg.arena.len() <= 2 && !xcg.arena.is_empty() && d % 256 == 0 && c.ff_exp % 64 == 0 {
                 let kk = c.top_k; let mut tab = vec![0u32; kk + 1]; let mut n = 0usize;
@@ -1309,6 +1310,30 @@ impl Model {
 }
 /// PYRE_QN_XWIN=1: one stderr line per decode window: CPU expert work (expert-token pairs, distinct experts, layers with
 /// CPU work, pool wall total / max per layer / gate-up phase / quantize / down phase), GPU hits, window wall
+/// PYRE_QN_XPRED=1 (measurement): miss predictors at t=1 decode. "nl": layer l+1's router on layer l's MoE input
+/// (top 10 / top 20); "pw": the experts layer l+1 used for the previous token. Stats: share of actual experts and of
+/// actual misses (CPU-run) that the prediction covers.
+fn xpred() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XPRED").map(|v| v == "1").unwrap_or(false)) }
+static XP: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+thread_local! { static XPS: std::cell::RefCell<(Vec<Vec<usize>>, Vec<Vec<usize>>, u64)> = const { std::cell::RefCell::new((vec![], vec![], 0)) }; }
+impl Model {
+    fn xpred_step(&self, il: usize, act: &[usize], miss: &[usize], x: &[f32]) {
+        use std::sync::atomic::Ordering::Relaxed; let nl = self.layers.len(); let k = self.cfg.top_k;
+        XPS.with(|c| { let mut c = c.borrow_mut(); if c.0.len() != nl { c.0 = vec![vec![]; nl]; c.1 = vec![vec![]; nl]; }
+            let pr = std::mem::take(&mut c.0[il]);
+            if !pr.is_empty() { let a10 = pr[..k.min(pr.len())].iter().filter(|e| act.contains(e)).count(); let a20 = pr.iter().filter(|e| act.contains(e)).count();
+                let m10 = pr[..k.min(pr.len())].iter().filter(|e| miss.contains(e)).count(); let m20 = pr.iter().filter(|e| miss.contains(e)).count();
+                XP[0].fetch_add(act.len() as u64, Relaxed); XP[1].fetch_add(miss.len() as u64, Relaxed); XP[2].fetch_add(a10 as u64, Relaxed); XP[3].fetch_add(a20 as u64, Relaxed); XP[4].fetch_add(m10 as u64, Relaxed); XP[5].fetch_add(m20 as u64, Relaxed); }
+            let pw = std::mem::replace(&mut c.1[il], act.to_vec());
+            if !pw.is_empty() { XP[6].fetch_add(act.len() as u64, Relaxed); XP[7].fetch_add(miss.len() as u64, Relaxed); XP[8].fetch_add(pw.iter().filter(|e| act.contains(e)).count() as u64, Relaxed); XP[9].fetch_add(pw.iter().filter(|e| miss.contains(e)).count() as u64, Relaxed); }
+            if il + 1 < nl { let r = &self.layers[il + 1].router; let mut lg = vec![0f32; r.rows]; r.matmul(x, 1, &mut lg);
+                let mut idx: Vec<usize> = (0..lg.len()).collect(); idx.sort_by(|a, b| lg[*b].partial_cmp(&lg[*a]).unwrap()); idx.truncate(2 * k); c.0[il + 1] = idx; }
+            if il == 0 { c.2 += 1; if c.2 % 32 == 0 { let g = |i: usize| XP[i].load(Relaxed) as f64; let p = |a: f64, b: f64| 100.0 * a / b.max(1.0);
+                eprintln!("xpred tok {}: next-layer router top10 covers {:.1}% of experts / {:.1}% of misses, top20 {:.1}% / {:.1}% | prev-token same layer {:.1}% / {:.1}% | misses/layer {:.2}",
+                    c.2, p(g(2), g(0)), p(g(4), g(1)), p(g(3), g(0)), p(g(5), g(1)), p(g(8), g(6)), p(g(9), g(7)), g(1) / (g(0) / k as f64).max(1.0)); } }
+        });
+    }
+}
 fn xwin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XWIN").map(|v| v == "1").unwrap_or(false)) }
 static XW: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 thread_local! { static XW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
