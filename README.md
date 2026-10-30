@@ -774,3 +774,10 @@ With the user at the desktop, Windows' EcoQoS throttled pyre (a non-foreground c
 `qwen-next`/`serve` now ask Windows not to throttle this process (SetProcessInformation
 ProcessPowerThrottling, per-process; no system setting changes). Measured on HYTE with the desktop in use:
 plain pA 15.0 -> 22.2 tok/s, spec2 pA 16.3 -> 23.6. PYRE_ECOQOS=1 restores the old behaviour.
+
+
+### Expert-pool pre-wake (PYRE_QN_PREWAKE, default on)
+Just before blocking on each layer's router readback, the main thread wakes parked pool workers and restarts
+their spin window, so the layer's expert job starts on already-spinning workers. Greedy-identical (timing
+only). Steady decode, alternating runs: plain pA 23.7 -> 24.5 tok/s, spec2 pB 22.8 -> 24.1.
+PYRE_QN_GEMV4R=v re-measured on a quiet machine: no gain (stays opt-in).

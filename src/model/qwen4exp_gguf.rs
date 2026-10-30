@@ -1606,8 +1606,8 @@ fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
     top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()
 }
 
-/// PYRE_QN_PREWAKE=1 (opt-in until measured): wake the expert pool just before each layer's router readback.
-fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(false)) }
+/// PYRE_QN_PREWAKE (default on; =0 off): wake the expert pool just before each layer's router readback.
+fn prewake() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_PREWAKE").map(|v| v != "0").unwrap_or(true)) }
 fn qn_pool() -> &'static super::spin_pool::Pool {
     static P: std::sync::OnceLock<super::spin_pool::Pool> = std::sync::OnceLock::new();
     P.get_or_init(|| {
