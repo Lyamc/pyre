@@ -102,7 +102,7 @@ impl Mtp {
         let (ne, ff) = { let (s, _) = st.raw("mlp.experts.down_proj")?; (s[0], s[2]) };
         let half = g.n_rot / 2;
         let head = Q8Mat::from_fn(ids.len(), g.d, |r, y| head_row(ids[r] as usize, y));
-        Ok(Mtp { d: g.d, hc: g.hc, nh: g.nh, nkv: g.nkv, hd: g.hd, n_rot: g.n_rot, eps: g.eps, top_k: g.top_k, ff,
+        Ok(Mtp { d: g.d, hc: g.hc, nh: g.nh, nkv: g.nkv, hd: g.hd, n_rot: g.n_rot, eps: g.eps, top_k: std::env::var("PYRE_MTP_TOPK").ok().and_then(|v| v.parse().ok()).filter(|&k: &usize| k >= 1).map(|k| k.min(g.top_k)).unwrap_or(g.top_k), ff,
             rope_inv: (0..half).map(|i| g.rope_base.powf(-(2.0 * i as f32) / g.n_rot as f32)).collect(),
             pre_e: st.norm("pre_fc_norm_embedding.weight")?, pre_h: st.norm("pre_fc_norm_hidden.weight")?, fc_e: st.q8("fc_embedding.weight")?, fc_h: st.q8("fc_hidden.weight")?,
             hca: hcm("attn_hyper_connection", true)?, hcf: hcm("mlp_hyper_connection", true)?, mix: hcm("hyper_connection_mixer", false)?,
