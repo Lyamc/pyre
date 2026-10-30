@@ -2837,8 +2837,8 @@ fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc:
         h[(e * rows + row) as usize] = sl * u;
     }
 }
-/// PYRE_QN_XGU2: 3 (default) k_xgu_ex64 (fused Q8D), 1 k_xgu_ex16, 0 k_xgu_ex8, 2 alternate ex16/ex8, 4 alternate ex64/ex16 (one trace)
-fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(3)) }
+/// PYRE_QN_XGU2: 1 (default) k_xgu_ex16, 3 k_xgu_ex64 (fused Q8D; e14 same trace 129 us vs 114+9 us, not faster), 0 k_xgu_ex8, 2 alternate ex16/ex8, 4 alternate ex64/ex16 (one trace)
+fn xgu2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGU2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
 static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// PYRE_QN_XEXACT down, two rows per warp (16 lanes each: lanes 0..7 the q2_0_d_avx2 lanes, lane 8 the block correction),
 /// each lane accumulating its blocks in order (same per-lane fma order and final sum as k_xdown_ex8), no shared integer stage.
@@ -3827,7 +3827,7 @@ impl Cube {
         unsafe {
             k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
             let alt = || XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
-            let (g64, g2) = match xgu2() { 0 => (false, false), 2 => (false, alt()), 3 => (ff % 64 == 0 && t == 1, true), 4 => (ff % 64 == 0 && t == 1 && alt(), true), _ => (false, true) };
+            let (g64, g2) = match xgu2() { 0 => (false, false), 2 => (false, alt()), 3 => (ff % 64 == 0, true), 4 => (ff % 64 == 0 && alt(), true), _ => (false, true) };
             if xex8() && g64 { k_xgu_ex64::launch_unchecked(&self.client, CubeCount::Static((ff / 64) as u32, ne as u32, 1), CubeDim::new_2d(32, 32),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else
             if xex8() && g2 { k_xgu_ex16::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
