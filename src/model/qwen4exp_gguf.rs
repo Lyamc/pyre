@@ -167,6 +167,32 @@ fn kickq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::
 // PYRE_QN_CONVM=0: per-token k_conv + k_copy in the verify window instead of one k_conv_m
 fn convm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_CONVM").map(|v| v != "0").unwrap_or(true)) }
 // PYRE_QN_COMBM=0: per-token k_comb after the verify mixer instead of one k_comb_m
+/// PYRE_QN_PIPE=1 (opt-in): Strata-style verify pipeline, stream-ordered version (no device-side spinning).
+/// Design after Strata (github.com/Niko1221/Strata, MIT, verify.cpp wait_flag/copy_rows_from_mapped); reimplemented.
+/// Per MoE layer the host enqueues the GPU hits, a host gate (cuLaunchHostFunc that waits, bounded, for the CPU
+/// expert pool), a pinned->device copy of the CPU rows, the combine and the NEXT layer's dense half, all while the
+/// CPU pool runs; the GPU then starts the next layer as soon as the CPU rows land instead of after a host round trip.
+fn pipe_on() -> bool { static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *P.get_or_init(|| env_usize("PYRE_QN_PIPE").unwrap_or(0) as u32) >= 1 && !PIPE_ERR.load(std::sync::atomic::Ordering::Relaxed) && !vgraph_on() }
+static PIPE_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Host-side latch the stream-ordered gate waits on (bounded: PYRE_QN_PIPE_TMO_MS, default 2000).
+struct PGate { m: std::sync::Mutex<bool>, cv: std::sync::Condvar }
+impl PGate {
+    fn open(&self) { *self.m.lock().unwrap() = true; self.cv.notify_all(); }
+    fn wait(&self) { let tmo = std::time::Duration::from_millis(env_usize("PYRE_QN_PIPE_TMO_MS").unwrap_or(2000) as u64); let dl = std::time::Instant::now() + tmo;
+        let mut g = self.m.lock().unwrap(); while !*g { let now = std::time::Instant::now(); if now >= dl { PIPE_ERR.store(true, std::sync::atomic::Ordering::Relaxed); eprintln!("PYRE_QN_PIPE: host gate timed out ({tmo:?}); pipeline disabled, this window's output is invalid"); return; } g = self.cv.wait_timeout(g, dl - now).unwrap().0; } }
+}
+/// Opens the gate on drop (also on unwind), so the stream can never stay held by a lost signal.
+struct PGateOpen(std::sync::Arc<PGate>);
+impl Drop for PGateOpen { fn drop(&mut self) { self.0.open(); } }
+/// Ring of page-locked host slots for the CPU rows (8 slots: a slot is rewritten only after a later blocking routing read, i.e. after its copy ran).
+fn pipe_slot(cb: &super::qn_cube::Cube, bytes: usize) -> Option<usize> {
+    static R: std::sync::Mutex<(Vec<usize>, usize, usize)> = std::sync::Mutex::new((Vec::new(), 0, 0));
+    let mut g = R.lock().unwrap();
+    if g.0.is_empty() { let sz = bytes.max(1 << 16) * 2; for _ in 0..8 { match cb.client.pyre_host_pinned(sz) { Ok(p) => g.0.push(p), Err(e) => { eprintln!("PYRE_QN_PIPE: pinned alloc failed: {e}"); PIPE_ERR.store(true, std::sync::atomic::Ordering::Relaxed); return None; } } } g.2 = sz; }
+    if bytes > g.2 { return None; }
+    let i = g.1; g.1 = (i + 1) % g.0.len(); Some(g.0[i])
+}
+fn ns0(a: std::time::Instant, b: std::time::Instant) -> u64 { (b - a).as_nanos() as u64 }
 fn combm() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_COMBM").map(|v| v != "0").unwrap_or(true)) }
 // PYRE_QN_XBATCH=0: the window's GPU expert hits token by token
 fn xbatch() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XBATCH").map(|v| v != "0").unwrap_or(true)) }
@@ -1485,6 +1511,7 @@ impl Model {
                 self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0);
             }
         } else {
+        let mut pre: Option<(H, H, H)> = None;
         for (il, l) in self.layers.iter().enumerate() {
             if let Some(p) = &l.ple {
                 if let Some(hs) = xs.take() { xh = hs.iter().map(|h| cb.read(h)).collect(); }
@@ -1494,7 +1521,7 @@ impl Model {
             }
             let cl = self.cl[il].as_ref().unwrap();
             if xs.is_none() { xs = Some(if vgraph_on() { self.vxs_fill(cb, &xh) } else { xh.iter().map(|v| cb.buf(v)).collect() }); }
-            self.layer_cube_multi(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start);
+            self.layer_cube_multi_p(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start, &mut pre);
         }
         }
         let hs = xs.unwrap();
@@ -1545,13 +1572,21 @@ impl Model {
     /// `layer_cube` for t tokens: the dense half token by token (same kernels, positions start..start+t),
     /// then one routing pass where the CPU pool reads every missed expert once for all of its tokens.
     #[allow(clippy::too_many_arguments)]
-    fn layer_cube_multi(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai: &mut usize, li: &mut usize, start: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn layer_cube_multi_p(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, ai: &mut usize, li: &mut usize, start: usize, pre: &mut Option<(H, H, H)>) {
         let (ai0, li0) = (*ai, *li);
-        let dd = match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) };
+        let dd = if let Some(p) = pre.take() { p } else { match if vgraph_on() { self.lcm_dense_g(il, l, cl, xs, st, li0) } else { None } { Some(x) => x, None => self.lcm_dense(il, l, cl, xs, st, ai0, li0, start, 0, xs.len()) } };
         match l.mix { Mixer::Attn { .. } => *ai = ai0 + 1, Mixer::Lin { .. } => *li = li0 + 1 }
         let q4 = std::time::Instant::now(); if prewake() { qn_pool().prewake(); } let rall = self.cube.as_ref().unwrap().read(&dd.0);
         HY[1].fetch_add(q4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.lcm_moe(il, l, cl, xs, st, dd, rall, 0);
+        // PIPE: the next layer's dense half is enqueued behind this layer's host gate (not across a PLE layer, which needs the residual on the host)
+        let (an, ln) = (*ai, *li); let mut nx: Option<(H, H, H)> = None;
+        let nl = il + 1;
+        if pipe_on() && nl < self.layers.len() && self.layers[nl].ple.is_none() {
+            let mut f = |s: &mut State| { nx = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), xs, s, an, ln, start, 0, xs.len())); };
+            self.lcm_moe_p(il, l, cl, xs, st, dd, rall, 0, Some(&mut f));
+        } else { self.lcm_moe(il, l, cl, xs, st, dd, rall, 0); }
+        *pre = nx;
     }
     /// `lcm_dense` of a DeltaNet layer for a whole verify window (t = 2..4, the k_delta_m path) as a replayed graph.
     /// Same kernels, same order, same arguments as lcm_dense; only the buffers are the graph's own. None = not eligible.
@@ -1703,7 +1738,11 @@ impl Model {
     }
     /// The expert half of a verify layer: routing from `rall` (rd read back), cached experts on the GPU beside the
     /// CPU misses, and the residual update of xs.
-    fn lcm_moe(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, dd: (H, H, H), rall: Vec<f32>, off: usize) {
+    fn lcm_moe(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, dd: (H, H, H), rall: Vec<f32>, off: usize) { self.lcm_moe_p(il, l, cl, xs, st, dd, rall, off, None); }
+    /// `lcm_moe` with the PYRE_QN_PIPE continuation: `next` (the next layer's dense enqueue) runs on the host thread while the CPU pool works. Returns whether `next` ran.
+    #[allow(clippy::too_many_arguments)]
+    fn lcm_moe_p(&self, il: usize, l: &Layer, cl: &super::qn_cube::CLayer, xs: &[burn_cubecl::cubecl::server::Handle], st: &mut State, dd: (H, H, H), rall: Vec<f32>, off: usize, mut next: Option<&mut dyn FnMut(&mut State)>) -> bool {
+        let mut piped = false;
         type H = burn_cubecl::cubecl::server::Handle;
         let t = xs.len();
         let cb = self.cube.as_ref().unwrap(); let c = &self.cfg; let (d, hc, ne) = (c.d, c.hc, c.n_exp);
@@ -1760,6 +1799,11 @@ impl Model {
                 }
             }
             let xcr = &*xcg;
+            let pslot = if pipe_on() && offs.iter().any(|o| !o.is_empty()) { pipe_slot(cb, t * d * 4) } else { None };
+            piped = pslot.is_some();
+            let pgate = std::sync::Arc::new(PGate { m: std::sync::Mutex::new(false), cv: std::sync::Condvar::new() });
+            let pg_open = PGateOpen(pgate.clone());
+            let stp: &mut State = st;
             let mut gpu = || {
                 // PYRE_QN_XMETA1=0 reverts: the window's expert tables in one upload (one small write per layer, not per token)
                 let mut moff = vec![usize::MAX; t]; let mut mall: Option<H> = None;
@@ -1801,6 +1845,15 @@ impl Model {
                 if combm() { cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t); }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
                 for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
+                if let Some(ps) = pslot {
+                    // PIPE: gate + CPU-row copy + combine + next layer's dense, queued before the CPU rows exist
+                    let yball = cb.empty(t * d); let g2 = pgate.clone();
+                    unsafe { cb.client.pyre_host_gate(Box::new(move || g2.wait()), ps, t * d * 4, &yball); }
+                    if combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
+                    for ti in 0..t { let yb = at(&yball, ti * d); cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d); } }
+                    if let Some(nx) = next.as_mut() { nx(&mut *stp); }
+                    cb.client.flush_queue();
+                }
                 let qf = std::time::Instant::now(); if kick() { if kickq() { cb.client.flush_queue(); } else { let _ = cb.client.flush(); } } SD[2].fetch_add(qf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             };
             // union of the missed experts; each token keeps its own order for the accumulation
@@ -1817,6 +1870,8 @@ impl Model {
                 self.routed_pool_ord(l, &xin, &work, t, &mut yr, &mut gpu, Some(&ord));
                 { let rns = tr.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             } else { gpu(); }
+            if let Some(ps) = pslot { unsafe { std::ptr::copy_nonoverlapping(yr.as_ptr(), ps as *mut f32, t * d); } }
+            drop(pg_open);
             for k in &sins { xcg.map.remove(k); }
             drop(xcg);
         } else {
@@ -1828,6 +1883,7 @@ impl Model {
             }
         }
         let q6 = std::time::Instant::now();
+        if piped { HY[3].fetch_add(ns0(q5, q6), std::sync::atomic::Ordering::Relaxed); return true; }
         let yball = cb.buf(&yr);
         if sh_b && combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
         for ti in 0..t {
@@ -1837,6 +1893,7 @@ impl Model {
         }
         let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64; use std::sync::atomic::Ordering::Relaxed;
         HY[0].fetch_add(ns(q6, std::time::Instant::now()), Relaxed); HY[3].fetch_add(ns(q5, q6), Relaxed);
+        false
     }
 }
 

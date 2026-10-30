@@ -58,7 +58,7 @@ flex = ["burn/flex", "burn/rayon"]
 
 [dependencies]
 # cubecl-env-direct: StreamId for the expert copy stream (same crate as the [patch] below)
-cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
+cubecl-environment = { path = "../cubecl-pipe/crates/cubecl-environment" }
 burn = { workspace = true, default-features = false, features = ["std", "fusion", "autotune", "persistence"] }
 safetensors = "0.8"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
@@ -146,28 +146,28 @@ burn-vision = { path = "../burn-pyre/crates/burn-vision" }
 burn-wgpu = { path = "../burn-pyre/crates/burn-wgpu" }
 
 [patch."https://github.com/tracel-ai/cubecl"]
-cubecl-environment = { path = "../cubecl-pyre-fix/crates/cubecl-environment" }
-cubecl = { path = "../cubecl-pyre-fix/crates/cubecl" }
-cubecl-common = { path = "../cubecl-pyre-fix/crates/cubecl-common" }
-cubecl-core = { path = "../cubecl-pyre-fix/crates/cubecl-core" }
-cubecl-cpp = { path = "../cubecl-pyre-fix/crates/cubecl-cpp" }
-cubecl-cpu = { path = "../cubecl-pyre-fix/crates/cubecl-cpu" }
-cubecl-cuda = { path = "../cubecl-pyre-fix/crates/cubecl-cuda" }
-cubecl-hip = { path = "../cubecl-pyre-fix/crates/cubecl-hip" }
-cubecl-ir = { path = "../cubecl-pyre-fix/crates/cubecl-ir" }
-cubecl-llvm = { path = "../cubecl-pyre-fix/crates/cubecl-llvm" }
-cubecl-macros = { path = "../cubecl-pyre-fix/crates/cubecl-macros" }
-cubecl-macros-internal = { path = "../cubecl-pyre-fix/crates/cubecl-macros-internal" }
-cubecl-metal = { path = "../cubecl-pyre-fix/crates/cubecl-metal" }
-cubecl-monitoring = { path = "../cubecl-pyre-fix/crates/cubecl-monitoring" }
-cubecl-opt = { path = "../cubecl-pyre-fix/crates/cubecl-opt" }
-cubecl-runtime = { path = "../cubecl-pyre-fix/crates/cubecl-runtime" }
-cubecl-server = { path = "../cubecl-pyre-fix/crates/cubecl-server" }
-cubecl-spirv = { path = "../cubecl-pyre-fix/crates/cubecl-spirv" }
-cubecl-std = { path = "../cubecl-pyre-fix/crates/cubecl-std" }
-cubecl-tile = { path = "../cubecl-pyre-fix/crates/cubecl-tile" }
-cubecl-wgpu = { path = "../cubecl-pyre-fix/crates/cubecl-wgpu" }
-cubecl-zspace = { path = "../cubecl-pyre-fix/crates/cubecl-zspace" }
+cubecl-environment = { path = "../cubecl-pipe/crates/cubecl-environment" }
+cubecl = { path = "../cubecl-pipe/crates/cubecl" }
+cubecl-common = { path = "../cubecl-pipe/crates/cubecl-common" }
+cubecl-core = { path = "../cubecl-pipe/crates/cubecl-core" }
+cubecl-cpp = { path = "../cubecl-pipe/crates/cubecl-cpp" }
+cubecl-cpu = { path = "../cubecl-pipe/crates/cubecl-cpu" }
+cubecl-cuda = { path = "../cubecl-pipe/crates/cubecl-cuda" }
+cubecl-hip = { path = "../cubecl-pipe/crates/cubecl-hip" }
+cubecl-ir = { path = "../cubecl-pipe/crates/cubecl-ir" }
+cubecl-llvm = { path = "../cubecl-pipe/crates/cubecl-llvm" }
+cubecl-macros = { path = "../cubecl-pipe/crates/cubecl-macros" }
+cubecl-macros-internal = { path = "../cubecl-pipe/crates/cubecl-macros-internal" }
+cubecl-metal = { path = "../cubecl-pipe/crates/cubecl-metal" }
+cubecl-monitoring = { path = "../cubecl-pipe/crates/cubecl-monitoring" }
+cubecl-opt = { path = "../cubecl-pipe/crates/cubecl-opt" }
+cubecl-runtime = { path = "../cubecl-pipe/crates/cubecl-runtime" }
+cubecl-server = { path = "../cubecl-pipe/crates/cubecl-server" }
+cubecl-spirv = { path = "../cubecl-pipe/crates/cubecl-spirv" }
+cubecl-std = { path = "../cubecl-pipe/crates/cubecl-std" }
+cubecl-tile = { path = "../cubecl-pipe/crates/cubecl-tile" }
+cubecl-wgpu = { path = "../cubecl-pipe/crates/cubecl-wgpu" }
+cubecl-zspace = { path = "../cubecl-pipe/crates/cubecl-zspace" }
 
 
 [target.'cfg(windows)'.dependencies]
