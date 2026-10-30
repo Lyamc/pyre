@@ -14,6 +14,8 @@ const ROWS_PER_CUBE: u32 = 8;
 /// PYRE_QN_GEMV_RPC=0 keeps 8 everywhere.
 fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); let thr = *T.get_or_init(|| std::env::var("PYRE_QN_GEMV_RPC").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)); if rows >= thr { ROWS_PER_CUBE } else if rows >= 1024 { 4 } else { 2 } }
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
+/// PYRE_QN_NATS=0: the per-8-values k_gemv_iq4d_m instead of the sub-block k_gemv_iq4s_m
+pub fn nats() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATS").map(|v| v == "1").unwrap_or(false)) }
 pub fn natm() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATM").map(|v| v != "0").unwrap_or(true)) }
 pub fn native_mode() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
 pub static NATIVE_STAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -876,6 +878,91 @@ fn k_gemv_iq4d_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32],
                 a3 += dl * xs[(3 * cs + xi) as usize] * f32::cast_from(p3);
             }
             blk += 1u32;
+        }
+        let t0 = plane_sum(a0);
+        let t1 = plane_sum(a1);
+        let t2s = plane_sum(a2);
+        let t3 = plane_sum(a3);
+        if UNIT_POS_X == 0 {
+            out[(ooff + row) as usize] = t0;
+            if nt > 1u32 { out[(ooff + ost + row) as usize] = t1; }
+            if nt > 2u32 { out[(ooff + 2 * ost + row) as usize] = t2s; }
+            if nt > 3u32 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
+/// PTX prmt.b32 (CUDA __byte_perm): byte n of the result = byte sel[n] of {b:a}. The selector nibbles are masked
+/// to 3 bits, as __byte_perm does (prmt's bit 3 would sign-replicate).
+#[cube]
+fn prmt(a: u32, b: u32, sel: u32) -> u32 {
+    let s7 = sel & 0x7777u32;
+    let mut d: u32;
+    gpu_asm!("prmt.b32 {d}, {a}, {b}, {s};", a = in(_) a, b = in(_) b, s = in(_) s7, d = out(_) d, options(pure, nomem));
+    d
+}
+
+/// The IQ4_NL levels of the 8 nibbles of q4 as (low nibbles, high nibbles) int8x4, register-only: Strata's
+/// iq4_table_lookup (MIT, after llama.cpp's get_int_from_table_16), 6 byte permutes per word.
+#[cube]
+fn iq4_lookup(q4: u32) -> (u32, u32) {
+    let t0 = 0xbfad9881u32; let t1 = 0xf6eaddcfu32; let t2 = 0x26190d01u32; let t3 = 0x71594535u32;
+    let sel = 0x32103210u32 | ((q4 & 0x88888888u32) >> 1);
+    let l0 = prmt(t0, t1, q4);
+    let h0 = prmt(t2, t3, q4);
+    let m0 = prmt(l0, h0, sel);
+    let l1 = prmt(t0, t1, q4 >> 16);
+    let h1 = prmt(t2, t3, q4 >> 16);
+    let m1 = prmt(l1, h1, sel >> 16);
+    (prmt(m0, m1, 0x6420u32), prmt(m0, m1, 0x7531u32))
+}
+
+/// IQ4_XS x int8 GEMV for up to 4 columns, after Strata's native_iq4_xs_mmvq / iq4_xs_q8_dot (MIT, from
+/// llama.cpp's vec_dot_iq4_xs_q8_1): a lane takes one 32-value sub-block (4 qs words), sums it in the integer
+/// domain with dp4a, applies the signed 6-bit scale as an integer, then one float multiply (d_w * d_x) * sumi.
+/// 8 lanes per 256-block, a warp per row, 4 blocks per warp step. Levels via a 256-entry shared byte table.
+#[cube(launch_unchecked)]
+fn k_gemv_iq4s_m(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32) {
+    let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let nb = cols / 256;
+        let rw = nb * 35;
+        let ib = UNIT_POS_X % 8;
+        let cq = cols / 4;
+        let cs = cols / 32;
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut blk = UNIT_POS_X / 8;
+        while blk < nb {
+            let b0 = row * rw + blk * 35;
+            let d = f32::reinterpret(w[b0 as usize]);
+            let sh = w[(b0 + 1) as usize];
+            let sl = w[(b0 + 2) as usize];
+            let ls = i32::cast_from(((sl >> (4 * ib)) & 15u32) | (((sh >> (2 * ib)) & 3u32) << 4)) - 32i32;
+            let xw = blk * 64 + ib * 8;
+            let mut s0 = 0i32;
+            let mut s1 = 0i32;
+            let mut s2 = 0i32;
+            let mut s3 = 0i32;
+            #[unroll]
+            for j in 0..4u32 {
+                let q = w[(b0 + 3 + ib * 4 + j) as usize];
+                let (lu, hu) = iq4_lookup(q);
+                let lo = i32::cast_from(lu);
+                let hi = i32::cast_from(hu);
+                s0 = dp4a(hi, i32::cast_from(xq[(xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(xw + j) as usize]), s0));
+                if nt > 1u32 { s1 = dp4a(hi, i32::cast_from(xq[(cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(cq + xw + j) as usize]), s1)); }
+                if nt > 2u32 { s2 = dp4a(hi, i32::cast_from(xq[(2 * cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(2 * cq + xw + j) as usize]), s2)); }
+                if nt > 3u32 { s3 = dp4a(hi, i32::cast_from(xq[(3 * cq + xw + 4 + j) as usize]), dp4a(lo, i32::cast_from(xq[(3 * cq + xw + j) as usize]), s3)); }
+            }
+            let xi = blk * 8 + ib;
+            a0 += (d * xs[xi as usize]) * f32::cast_from(s0 * ls);
+            if nt > 1u32 { a1 += (d * xs[(cs + xi) as usize]) * f32::cast_from(s1 * ls); }
+            if nt > 2u32 { a2 += (d * xs[(2 * cs + xi) as usize]) * f32::cast_from(s2 * ls); }
+            if nt > 3u32 { a3 += (d * xs[(3 * cs + xi) as usize]) * f32::cast_from(s3 * ls); }
+            blk += 4u32;
         }
         let t0 = plane_sum(a0);
         let t1 = plane_sum(a1);
@@ -2432,9 +2519,12 @@ impl Cube {
         if !m.nat.is_empty() && native_mode() == 2 && (2..=4).contains(&nt) && natm() {
             let nb = m.cols / 32; let xq = self.empty(nt * m.cols / 4); let xs = self.empty(nt * nb);
             unsafe { k_q8pack_m::launch_unchecked(&self.client, CubeCount::Static((nb as u32).div_ceil(64), nt as u32, 1), CubeDim::new_1d(64), BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), xoff as u32, xst as u32, nb as u32) }
+            if nats() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
+                BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
             for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4d_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
-                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } }
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } }
             for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * m.cols) as u64, (qb * m.cols / 32 * 4) as u64); let rpc = gemv_rpc(*n);
                 unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone().offset_start(wo), n * m.cols / 4), BufferArg::from_raw_parts(m.s.clone().offset_start(so), n * m.cols / 32),
