@@ -3005,6 +3005,28 @@ pub fn gemv1r() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceL
 pub fn xs2() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XS2").map(|v| v == "1").unwrap_or(false)) }
 pub fn xpin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XPIN").map(|v| v == "1").unwrap_or(false)) }
 pub fn repack(ty: u32, raw: &[u8]) -> Vec<u32> {
+    // PYRE_QN_REPACK_OLD=1: the previous growing-Vec loop (same words; the new one only reserves the exact size up front, p3)
+    if !repack_old() { return repack_fast(ty, raw); }
+    repack_slow(ty, raw)
+}
+fn repack_old() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_REPACK_OLD").map(|v| v == "1").unwrap_or(false)) }
+/// Same output as `repack_slow`, word for word: output sized once, each block's words copied straight from the bytes.
+pub fn repack_fast(ty: u32, raw: &[u8]) -> Vec<u32> {
+    let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
+    let (bs, nw) = match ty { 0 => (82usize, 21usize), 1 => (66, 17), 2 => (56, 15), _ => (18, 5) };
+    let nb = raw.len() / bs; let mut out: Vec<u32> = vec![0; nb * nw];
+    for (b, o) in raw.chunks_exact(bs).zip(out.chunks_exact_mut(nw)) {
+        match ty {
+            0 | 1 | 3.. => { o[0] = (if ty == 0 || ty == 1 { f(b, 0) * 0.25 } else { f(b, 0) }).to_bits();
+                for (w, c) in o[1..].iter_mut().zip(b[2..].chunks_exact(4)) { *w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]); } }
+            _ => { let s = |k: usize| u16::from_le_bytes([b[48 + 2 * k], b[49 + 2 * k]]);
+                o[0] = half::f16::from_bits((s(0) >> 12) | ((s(1) >> 8) & 0x00f0) | ((s(2) >> 4) & 0x0f00) | (s(3) & 0xf000)).to_f32().to_bits();
+                for (w, c) in o[1..].iter_mut().zip(b.chunks_exact(4)) { *w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]); } }
+        }
+    }
+    out
+}
+pub fn repack_slow(ty: u32, raw: &[u8]) -> Vec<u32> {
     let f = |b: &[u8], o: usize| half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
     let wd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
     let mut out = vec![];
