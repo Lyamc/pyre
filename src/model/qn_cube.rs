@@ -62,6 +62,97 @@ fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
     part
 }
 
+/// PYRE_QN_BPF prompt-chunk GEMM (batched prefill): out[c * ost + ooff + r] = sum_k W[r, k] * x[(c0 + c) * cols + k] for a
+/// tile of 64 rows x 64 tokens per cube (256 units, 4x4 outputs each). Every 32-column step dequantizes the tile's weights
+/// (Q8_0 words + per-32 scales, or native IQ4_XS blocks when `nat`) into shared memory once for all 64 tokens, so a chunk
+/// reads each dense weight once per 64 tokens instead of once per 1-4 (gemv_m). Technique (weights read once per prompt
+/// chunk, shared-memory tiles) as in Strata's prefill (MIT, github.com/Niko1221/Strata); this kernel is pyre's own.
+#[cube(launch_unchecked)]
+fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, #[comptime] nat: bool) {
+    // tile 128 rows x 64 tokens, 256 units = 16 (rows, 8 each) x 16 (tokens, 4 each); split-K over CUBE_POS_Z (kch columns
+    // each, partial z written at out + z * pst). Shared: [k][row] 129 per k, [k][token] 65 per k (padding vs bank conflicts)
+    let mut ws = Shared::<[f32]>::new_slice(4128usize);
+    let mut xs = Shared::<[f32]>::new_slice(2080usize);
+    let mut tab = Shared::<[f32]>::new_slice(16usize);
+    let tid = UNIT_POS;
+    if nat { if tid < 16u32 { tab[tid as usize] = kv[tid as usize]; } }
+    let r0 = CUBE_POS_X * 128u32; let t0 = CUBE_POS_Y * 64u32;
+    let ty = tid / 16u32; let tx = tid % 16u32;
+    let mut acc = Array::<f32>::new(32usize);
+    #[unroll]
+    for i in 0..32u32 { acc[i as usize] = 0.0f32; }
+    let mut wv = Array::<f32>::new(8usize); let mut xv = Array::<f32>::new(4usize);
+    let lr = tid / 2u32; let lh = tid % 2u32;
+    let mut grow = r0 + lr; if grow >= rows { grow = rows - 1u32; }
+    let xr = tid / 4u32; let lq = tid % 4u32;
+    let mut tk = t0 + xr; if tk >= nt { tk = nt - 1u32; }
+    let kb = CUBE_POS_Z * kch; let mut ke = kb + kch; if ke > cols { ke = cols; }
+    let mut k0 = kb;
+    while k0 < ke {
+        sync_cube();
+        if nat {
+            let blk = k0 / 256u32; let ib = (k0 / 32u32) % 8u32;
+            let b = grow * (cols / 256u32) * 35u32 + blk * 35u32;
+            let d = f32::reinterpret(w[b as usize]); let sh = w[(b + 1u32) as usize]; let sl = w[(b + 2u32) as usize];
+            let ls = ((sl >> (4u32 * ib)) & 15u32) | (((sh >> (2u32 * ib)) & 3u32) << 4u32);
+            let dl = d * (f32::cast_from(ls) - 32.0f32);
+            #[unroll]
+            for h in 0..2u32 {
+                let wq = 2u32 * lh + h;
+                let q = w[(b + 3u32 + 4u32 * ib + wq) as usize];
+                #[unroll]
+                for j in 0..4u32 {
+                    ws[((4u32 * wq + j) * 129u32 + lr) as usize] = dl * tab[((q >> (8u32 * j)) & 15u32) as usize];
+                    ws[((16u32 + 4u32 * wq + j) * 129u32 + lr) as usize] = dl * tab[((q >> (8u32 * j + 4u32)) & 15u32) as usize];
+                }
+            }
+        } else {
+            let sc = s[(grow * (cols / 32u32) + k0 / 32u32) as usize];
+            let wb = grow * (cols / 4u32) + k0 / 4u32 + 4u32 * lh;
+            #[unroll]
+            for h in 0..4u32 {
+                let wd = w[(wb + h) as usize];
+                #[unroll]
+                for j in 0..4u32 { ws[((16u32 * lh + 4u32 * h + j) * 129u32 + lr) as usize] = sc * dec(wd, j); }
+            }
+        }
+        let xb = tk * cols + k0 + 8u32 * lq;
+        #[unroll]
+        for j in 0..8u32 { xs[((8u32 * lq + j) * 65u32 + xr) as usize] = x[(xb + j) as usize]; }
+        sync_cube();
+        #[unroll]
+        for k in 0..32u32 {
+            #[unroll]
+            for i in 0..8u32 { wv[i as usize] = ws[(k * 129u32 + ty * 8u32 + i) as usize]; }
+            #[unroll]
+            for i in 0..4u32 { xv[i as usize] = xs[(k * 65u32 + tx * 4u32 + i) as usize]; }
+            #[unroll]
+            for i in 0..8u32 {
+                #[unroll]
+                for j in 0..4u32 { acc[(i * 4u32 + j) as usize] += wv[i as usize] * xv[j as usize]; }
+            }
+        }
+        k0 += 32u32;
+    }
+    let pb = CUBE_POS_Z * pst;
+    #[unroll]
+    for i in 0..8u32 {
+        let r = r0 + ty * 8u32 + i;
+        #[unroll]
+        for j in 0..4u32 {
+            let c = t0 + tx * 4u32 + j;
+            if r < rows && c < nt { out[(pb + c * ost + ooff + r) as usize] = acc[(i * 4u32 + j) as usize]; }
+        }
+    }
+}
+/// split-K reduction of k_gemm_pf: out[i] = sum_z part[z * n + i] (z in order)
+#[cube(launch_unchecked)]
+fn k_gemm_sum(part: &[f32], out: &mut [f32], rows: u32, n: u32, ks: u32, ooff: u32, ost: u32) {
+    // part planes [z][token][row] (rows per token) -> out[token * ost + ooff + row]
+    let i = ABSOLUTE_POS_X;
+    if i < n { let mut a = 0.0f32; let mut z = 0u32; while z < ks { a += part[(z * n + i) as usize]; z += 1u32; } let c = i / rows; let r = i % rows; out[(c * ost + ooff + r) as usize] = a; }
+}
+
 #[cube]
 fn dec(word: u32, j: u32) -> f32 {
     // signed byte j as f32 through the 2^23 mantissa trick: (b ^ 0x80) + 2^23 is exact, minus 2^23 + 128 gives b
@@ -5534,6 +5625,31 @@ impl Cube {
                 BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
                 BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
             c0 += n; }
+    }
+    /// Batched-prefill GEMM (k_gemm_pf) of `t` tokens: x [t][cols] -> out [t][rows], every native / Q8 segment of m,
+    /// in launches of at most 128 tokens (each a few ms at most).
+    pub fn gemm_pf(&self, m: &CMat, x: &Handle, xn: usize, t: usize, out: &Handle, on: usize) {
+        let cols = m.cols; let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect(); let kvb = self.buf(&kv);
+        let mut c0 = 0usize; let _ = (xn, on);
+        if std::env::var("PYRE_QN_BPF_BENCH").is_ok() && t >= 128 { eprintln!("gemm_pf {}x{} t={t} nat {:?} qseg {:?}", m.rows, cols, m.nat.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>(), m.qseg.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>()); }
+        while c0 < t { let nt = (t - c0).min(256);
+            let xo = x.clone().offset_start((c0 * cols * 4) as u64); let xl = nt * cols; let oo = out.clone().offset_start((c0 * m.rows * 4) as u64); let ol = nt * m.rows;
+            // split-K (per segment) so that small-row matrices (HC down: 324 rows, 64-row Q8 segments) still fill the SMs;
+            // K ranges in whole 256 blocks; no split below 2048 columns. A split segment writes ks partial planes of its own
+            // (ks x nt x n floats, small) that k_gemm_sum adds in plane order into out.
+            let ksplit = |n: usize| -> (usize, usize) { if cols < 2048 { return (1, cols); } let cubes = n.div_ceil(128) * nt.div_ceil(64); let ks0 = (112usize.div_ceil(cubes)).clamp(1, 8).min(cols / 256).max(1);
+                let kch = (cols / 256).div_ceil(ks0) * 256; (cols.div_ceil(kch), kch) };
+            let launch = |w: Handle, wl: usize, sh: Handle, sl: usize, r0: usize, n: usize, nat: bool| { let (ks, kch) = ksplit(n);
+                let part = if ks > 1 { Some(self.empty(ks * nt * n)) } else { None };
+                let (dst, dl, ooff, ost, pst) = match &part { Some(p) => (p.clone(), ks * nt * n, 0usize, n, nt * n), None => (oo.clone(), ol, r0, m.rows, 0) };
+                unsafe { k_gemm_pf::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(128), (nt as u32).div_ceil(64), ks as u32), CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(xo.clone(), xl), BufferArg::from_raw_parts(w, wl), BufferArg::from_raw_parts(sh, sl), BufferArg::from_raw_parts(kvb.clone(), 16),
+                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) }
+                if let Some(p) = &part { unsafe { k_gemm_sum::launch_unchecked(&self.client, CubeCount::Static(((nt * n) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(p.clone(), ks * nt * n), BufferArg::from_raw_parts(oo.clone(), ol), n as u32, (nt * n) as u32, ks as u32, r0 as u32, m.rows as u32) } } };
+            if m.nat.is_empty() && m.qseg.is_empty() { launch(m.w.clone(), m.rows * cols / 4, m.s.clone(), m.rows * cols / 32, 0, m.rows, false); }
+            for (r0, n, w) in &m.nat { launch(w.clone(), n * cols / 256 * 35, kvb.clone(), 16, *r0, *n, true); }
+            for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * cols) as u64, (qb * cols / 32 * 4) as u64); launch(m.w.clone().offset_start(wo), n * cols / 4, m.s.clone().offset_start(so), n * cols / 32, *r0, *n, false); }
+            c0 += nt; }
     }
     /// rms of t tokens (separate x buffers) into xn at token stride hc*d; one launch for up to 4 (PYRE_QN_RMS4=0: per token)
     pub fn rms_t(&self, xs: &[Handle], norm: &Handle, xn: &Handle, hc: usize, d: usize, eps: f32) {

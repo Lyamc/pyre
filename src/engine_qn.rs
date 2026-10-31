@@ -24,7 +24,10 @@ pub fn spawn_init<R: Send + 'static>(init: impl FnOnce() -> anyhow::Result<(Mode
     std::thread::Builder::new().name("qn-worker".into()).spawn(move || {
         // PYRE_QN_SERVE_PF (default 8; 0 = the exact f32 CPU prefill of the CLI/refs): serve's prompt runs through the
         // decode verify path this many tokens per window (GPU dense + GPU expert cache + CPU pool), ~4x the f32 prefill
-        let pfk = std::env::var("PYRE_QN_SERVE_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize);
+        // PYRE_QN_SERVE_PF=batch: batched prompt chunks instead (qwen4exp_gguf::bpf, PYRE_QN_BPF)
+        let spf = std::env::var("PYRE_QN_SERVE_PF").unwrap_or_default();
+        if spf == "batch" { crate::model::qwen4exp_gguf::BPF_DEFAULT.store(true, Ordering::Relaxed); }
+        let pfk = if spf == "batch" { 0 } else { spf.parse().ok().unwrap_or(8usize) };
         crate::model::qwen4exp_gguf::PF_MULTI_DEFAULT.store(pfk, Ordering::Relaxed);
         let (model, tok, eos) = match init() { Ok((m, t, e, r)) => { let _ = rtx.send(Ok(r)); (m, t, e) }, Err(e) => { let _ = rtx.send(Err(e)); return; } };
         worker(&model, &tok, &eos, rx, b, q);

@@ -1216,12 +1216,41 @@ impl Model {
 
     /// Run a projection group (GPU when uploaded, else CPU); one output per member, each [t][rows_i].
     fn mm(&self, ms: &[&QMat], x: &[f32], t: usize) -> Vec<Vec<f32>> {
+        if t >= 16 && bpf() { if let Some(y) = self.bpf_mm(ms, x, t) { return y; } }
         if let (Some(g), Some(gm)) = (&self.gpu, self.gmats.get(&ms[0].key())) {
             let mut y = vec![0f32; t * gm.rows]; gm.matmul(g, x, t, &mut y);
             return ms.iter().enumerate().map(|(i, m)| { let (a, b) = (gm.splits[i], gm.splits[i + 1]); let mut o = Vec::with_capacity(t * m.rows);
                 for ti in 0..t { o.extend_from_slice(&y[ti * gm.rows + a..ti * gm.rows + b]); } o }).collect();
         }
         ms.iter().map(|m| { let mut y = vec![0f32; t * m.rows]; m.matmul(x, t, &mut y); y }).collect()
+    }
+
+    /// PYRE_QN_BPF: one prompt chunk's dense matmul on the GPU, from the matrices the decode path keeps resident (CLayer:
+    /// min/mout/fin/sdown/HC down+inject/up). Up to 4 token columns per launch (gemv_m reads the weights once per launch),
+    /// so each launch stays short; output split per sub-matrix. None (-> CPU) when the group is not resident.
+    fn bpf_mm(&self, ms: &[&QMat], x: &[f32], t: usize) -> Option<Vec<Vec<f32>>> {
+        let cb = self.cube.as_ref()?; let k0 = ms[0].key();
+        let cm = self.layers.iter().zip(self.cl.iter()).find_map(|(l, c)| { let c = c.as_ref()?;
+            let (mi, mo) = match &l.mix { Mixer::Attn { q, o, .. } => (q.key(), o.key()), Mixer::Lin { qkv, out, .. } => (qkv.key(), out.key()) };
+            [(mi, &c.min), (mo, &c.mout), (l.router.key(), &c.fin), (l.sh_down.key(), &c.sdown), (l.hc_a.down.key(), &c.hca.di), (l.hc_a.up.key(), &c.hca.up), (l.hc_f.down.key(), &c.hcf.di), (l.hc_f.up.key(), &c.hcf.up)]
+                .into_iter().find(|(k, _)| *k == k0).map(|(_, m)| m) })?;
+        if ms.len() + 1 > cm.splits.len() || cm.cols != ms[0].cols || x.len() != t * cm.cols { return None; }
+        for (i, m) in ms.iter().enumerate() { if cm.splits[i + 1] - cm.splits[i] != m.rows || m.cols != cm.cols { return None; } }
+        let tr = env_var("PYRE_QN_BPF_TRACE").is_ok(); let z0 = std::time::Instant::now(); if tr { let z = cb.empty(1); let _ = cb.read(&z); } let zq = z0.elapsed();
+        let (rows, cols) = (cm.rows, cm.cols); let xb = cb.buf(x); let o = cb.empty(t * rows); let z1 = z0.elapsed();
+        // PYRE_QN_BPF_GEMM (default on; 0 = gemv_m, 4 columns per launch): tiled GEMM, weights read once per 64 tokens
+        if env_var("PYRE_QN_BPF_BENCH").is_ok() { static SEEN: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new()); let fresh = { let mut g = SEEN.lock().unwrap(); if g.contains(&(rows, cols)) { false } else { g.push((rows, cols)); true } };
+            if fresh { let sy = || { let z = cb.empty(1); let _ = cb.read(&z); }; sy();
+                for rep in 0..3 { let b0 = std::time::Instant::now(); cb.gemm_pf(cm, &xb, t * cols, t, &o, t * rows); sy(); let g1 = b0.elapsed();
+                    let b1 = std::time::Instant::now(); let mut c0 = 0; while c0 < t { let n = (t - c0).min(4); if n == 1 { cb.gemv(cm, &xb, t * cols, c0 * cols, &o, t * rows, c0 * rows); } else { cb.gemv_m(cm, &xb, t * cols, c0 * cols, cols, &o, t * rows, c0 * rows, rows, n); } c0 += n; } sy();
+                    eprintln!("bpf_bench {rows}x{cols} t={t} rep {rep}: gemm {:.3} ms ({:.0} GFLOP/s) gemv_m {:.3} ms", g1.as_secs_f64() * 1e3, 2.0 * (rows * cols * t) as f64 / g1.as_secs_f64() / 1e9, b1.elapsed().as_secs_f64() * 1e3); } } }
+        if env_var("PYRE_QN_BPF_GEMM").map(|v| v != "0").unwrap_or(true) { cb.gemm_pf(cm, &xb, t * cols, t, &o, t * rows); } else {
+        let mut c0 = 0; while c0 < t { let n = (t - c0).min(4);
+            if n == 1 { cb.gemv(cm, &xb, t * cols, c0 * cols, &o, t * rows, c0 * rows); } else { cb.gemv_m(cm, &xb, t * cols, c0 * cols, cols, &o, t * rows, c0 * rows, rows, n); }
+            c0 += n; } }
+        let z2 = z0.elapsed(); if tr { let z = cb.empty(1); let _ = cb.read(&z); } let z3 = z0.elapsed();
+        let y = cb.read(&o); if tr { eprintln!("bpf_mm {}x{} t={t}: prior-queue {:.2} up {:.2} enq {:.2} gpu {:.2} read {:.2} ms", rows, cols, zq.as_secs_f64() * 1e3, (z1 - zq).as_secs_f64() * 1e3, (z2 - z1).as_secs_f64() * 1e3, (z3 - z2).as_secs_f64() * 1e3, (z0.elapsed() - z3).as_secs_f64() * 1e3); } BPF_MM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(ms.iter().enumerate().map(|(i, m)| { let a = cm.splits[i]; let mut v = Vec::with_capacity(t * m.rows); for ti in 0..t { v.extend_from_slice(&y[ti * rows + a..ti * rows + a + m.rows]); } v }).collect())
     }
 
     pub fn new_state(&self) -> State {
@@ -1248,7 +1277,7 @@ impl Model {
             for ti in 0..t { for i in 0..lr { lo[ti * lr + i] = silu(o[ti * nr + i] / hc as f32); } if h.inject.is_some() { for s in 0..hc { inj[ti * hc + s] = o[ti * nr + lr + s] / hc as f32; } } }
             let mut gate = vec![0f32; t * w]; up.matmul(&lo, t, &mut gate); let z2 = std::time::Instant::now();
             let mut mixed = vec![0f32; t * d];
-            for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
+            /* tokens in parallel; per element the same ops in the same order (bit-identical) */ mixed.par_chunks_mut(d).enumerate().for_each(|(ti, mr)| { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mr[i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mr[i] /= hc as f32; } });
             HY[4].fetch_add((z1 - z0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             return (mixed, inj);
         }
@@ -1259,13 +1288,14 @@ impl Model {
         if h.inject.is_some() { for v in inj.iter_mut() { *v /= hc as f32; } }
         let gate = self.mm(&[&h.up], &lo, t).pop().unwrap();
         let mut mixed = vec![0f32; t * d];
-        for ti in 0..t { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mixed[ti * d + i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mixed[ti * d + i] /= hc as f32; } }
+        /* tokens in parallel; per element the same ops in the same order (bit-identical) */ mixed.par_chunks_mut(d).enumerate().for_each(|(ti, mr)| { for s in 0..hc { for i in 0..d { let k = ti * w + s * d + i; mr[i] += xn[k] * sigm(gate[k]); } } for i in 0..d { mr[i] /= hc as f32; } });
         (mixed, inj)
     }
 
     fn hc_combine(&self, x: &mut [f32], out: &[f32], inj: &[f32], t: usize) {
         let (d, hc) = (self.cfg.d, self.cfg.hc);
-        for ti in 0..t { for s in 0..hc { let w = 2.0 * sigm(inj[ti * hc + s]); let r = &mut x[(ti * hc + s) * d..(ti * hc + s + 1) * d]; for i in 0..d { r[i] += out[ti * d + i] * w; } } }
+        // tokens in parallel (prompt chunks); per element the same ops (bit-identical)
+        x[..t * hc * d].par_chunks_mut(hc * d).enumerate().for_each(|(ti, xr)| { for s in 0..hc { let w = 2.0 * sigm(inj[ti * hc + s]); let r = &mut xr[s * d..(s + 1) * d]; for i in 0..d { r[i] += out[ti * d + i] * w; } } });
     }
 
     fn ple_rows(&self, st: &State, start: usize, t: usize) -> Vec<f32> {
@@ -1435,11 +1465,21 @@ impl Model {
         let cs = &mut st.conv[li]; let s = &mut st.ssm[li];
         // 1) causal depthwise conv + SiLU for every token (sequential in time, vectorised over channels)
         let mut co_all = vec![0f32; t * ch];
+        // channels are independent: blocks of channels in parallel, each running all tokens with the same products and
+        // sums in the same order as the token loop (window value at slot k of token ti = history[ti + k] of [state, m])
+        if t > 1 { let cop = super::spin_pool::SyncPtr(co_all.as_mut_ptr()); let csr: &[f32] = &cs[..]; let m = &m;
+            (0..ch.div_ceil(256)).into_par_iter().for_each(|b| { let (c0, c1) = (b * 256, ((b + 1) * 256).min(ch));
+                for cc in c0..c1 { for ti in 0..t { let mut o = conv[cc * kk + kk - 1] * m[ti * ch + cc];
+                    for k in 0..kk - 1 { let src = ti + k; let v = if src < kk - 1 { csr[src * ch + cc] } else { m[(src - (kk - 1)) * ch + cc] }; o += conv[cc * kk + k] * v; }
+                    unsafe { cop.slice(ti * ch + cc, 1)[0] = silu(o); } } } });
+            let mut nc = vec![0f32; (kk - 1) * ch]; for k in 0..kk - 1 { let idx = t + k; let src = if idx < kk - 1 { &cs[idx * ch..(idx + 1) * ch] } else { &m[(idx - (kk - 1)) * ch..(idx - (kk - 1) + 1) * ch] }; nc[k * ch..(k + 1) * ch].copy_from_slice(src); }
+            *cs = nc;
+        } else {
         for ti in 0..t {
             let cur = &m[ti * ch..(ti + 1) * ch]; let co = &mut co_all[ti * ch..(ti + 1) * ch];
             for cc in 0..ch { let mut o = conv[cc * kk + kk - 1] * cur[cc]; for k in 0..kk - 1 { o += conv[cc * kk + k] * cs[k * ch + cc]; } co[cc] = silu(o); }
             cs.drain(..ch); cs.extend_from_slice(cur);
-        }
+        } }
         // 2) L2-normalise q (and scale) and k per head
         co_all.par_chunks_mut(ch).for_each(|co| { let (qp, rest) = co.split_at_mut(nk * dk); let (kp, _) = rest.split_at_mut(nk * dk);
             for h in 0..nk { for (buf, sc) in [(&mut qp[h * dk..(h + 1) * dk], (dk as f32).sqrt().recip()), (&mut kp[h * dk..(h + 1) * dk], 1.0)] {
@@ -1530,7 +1570,7 @@ impl Model {
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
         // PYRE_QN_PF_POOL=1: prompt chunks also take the int8 pool path below (decode numerics, opt-in: it
         // changes the prompt's rounding against the f32 path, so greedy output can differ)
-        let pf_pool = env_var("PYRE_QN_PF_POOL").map(|v| v == "1").unwrap_or(false);
+        let pf_pool = bpf() || env_var("PYRE_QN_PF_POOL").map(|v| v == "1").unwrap_or(false);
         if !pf_pool && t * c.top_k >= work.len() * env_usize("PYRE_QN_GEMM_MIN").unwrap_or(8) { // >= 8 tokens per expert on average
             self.routed_gemm(l, x, &work, t, y);
             { let rns = t_r.elapsed().as_nanos() as u64; ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
@@ -1646,11 +1686,11 @@ impl Model {
             let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff, exq);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
                 let pf = gu_pf();
-                let multi = usek && toks.len() >= 2 && toks.len() <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
-                if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = ([0f32; 16], [0f32; 16]);
+                let multi = usek && toks.len() >= 2 && (toks.len() <= 16 || bpf()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
+                if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = (vec![0f32; toks.len()], vec![0f32; toks.len()]);
                     for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                         if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
-                        qdot::row_dot_k_multi(gm.ty, gr, &al, &mut gv); qdot::row_dot_k_multi(um.ty, ur, &al, &mut uv);
+                        /* BPF: groups of 16 tokens per decoded row (row_dot_k_multi is bit-identical to row_dot_k per token) */ for (ac, (g2, u2)) in al.chunks(16).zip(gv.chunks_mut(16).zip(uv.chunks_mut(16))) { qdot::row_dot_k_multi(gm.ty, gr, ac, g2); qdot::row_dot_k_multi(um.ty, ur, ac, u2); }
                         for j in 0..toks.len() { unsafe { hp.slice(hoff[wi] + j * ff + r0 + r, 1)[0] = sil(gv[j]) * uv[j]; } } }
                     return; }
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
@@ -1688,8 +1728,8 @@ impl Model {
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
                     for r in 0..r1 - r0 { let dr = dm.row_raw(r); { let dp = dn_pf(); if dp > 0 && r + dp < r1 - r0 { prefetch(dm.row_raw(r + dp)); } }
-                        if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
-                            for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } continue; }
+                        if used && toks.len() >= 2 && (toks.len() <= 8 || bpf()) && dmulti() { for (ac, tc) in al.chunks(8).zip(toks.chunks(8)) { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
+                            for (j, &(ti, w)) in tc.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } continue; }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         };
         let mut sidef = || { let ts = std::time::Instant::now(); side(); SIDE_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); };
@@ -1735,11 +1775,11 @@ impl Model {
         let task = |wi: usize| { let (e, toks) = work[wi]; let nt = toks.len(); let mut hid = vec![0f32; nt * ff]; let mut sc = qdot::Scratch::default();
             for b in 0..nb { let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
                 let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
-                let multi = usek && nt >= 2 && nt <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
-                if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = ([0f32; 16], [0f32; 16]);
+                let multi = usek && nt >= 2 && (nt <= 16 || bpf()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
+                if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = (vec![0f32; toks.len()], vec![0f32; toks.len()]);
                     for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                         if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
-                        qdot::row_dot_k_multi(gm.ty, gr, &al, &mut gv); qdot::row_dot_k_multi(um.ty, ur, &al, &mut uv);
+                        /* BPF: groups of 16 tokens per decoded row (row_dot_k_multi is bit-identical to row_dot_k per token) */ for (ac, (g2, u2)) in al.chunks(16).zip(gv.chunks_mut(16).zip(uv.chunks_mut(16))) { qdot::row_dot_k_multi(gm.ty, gr, ac, g2); qdot::row_dot_k_multi(um.ty, ur, ac, u2); }
                         for j in 0..nt { hid[j * ff + r0 + r] = silu(gv[j]) * uv[j]; } }
                     continue; }
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
@@ -1751,8 +1791,8 @@ impl Model {
             let hdq: Vec<qdot::Q8D> = if !used { vec![] } else { (0..nt).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[j * ff..(j + 1) * ff], &mut a); a }).collect() };
             let dm = l.down_e.slice_rows(e * d, d); let al: Vec<&qdot::Q8D> = hdq.iter().collect();
             for r in 0..d { let dr = dm.row_raw(r); if r + 4 < d { prefetch(dm.row_raw(r + 4)); }
-                if used && nt >= 2 && nt <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
-                    for (j, &(_, w)) in toks.iter().enumerate() { unsafe { pp.slice((slot0[wi] + j) * d + r, 1)[0] = w * ov[j]; } } continue; }
+                if used && nt >= 2 && (nt <= 8 || bpf()) && dmulti() { for (c, ac) in al.chunks(8).enumerate() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
+                    for (j, &(_, w)) in toks[c * 8..c * 8 + ac.len()].iter().enumerate() { unsafe { pp.slice((slot0[wi] + c * 8 + j) * d + r, 1)[0] = w * ov[j]; } } } continue; }
                 for (j, &(_, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[j]) } else { qdot::row_dot(dm.ty, dr, &hq[j], &mut sc) }; unsafe { pp.slice((slot0[wi] + j) * d + r, 1)[0] = v; } } } };
         let ser = env_usize("PYRE_QN_FUSE_SERIAL").unwrap_or(0);
         if slot_n <= ser { side(); for wi in 0..work.len() { task(wi); } } else {
@@ -2976,6 +3016,14 @@ pub fn pool_bench() {
 /// prefilling the rest of a prompt in the same absolute chunk grid gives the same state as a full prefill.
 /// Serve's default for PYRE_QN_PF_MULTI (engine_qn sets it from PYRE_QN_SERVE_PF; the CLI keeps 0 = exact f32 prefill).
 pub static PF_MULTI_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Serve's default for PYRE_QN_BPF (engine_qn sets it from PYRE_QN_SERVE_PF=batch; the CLI keeps it off).
+pub static BPF_MM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BPF_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// PYRE_QN_BPF=1 (opt-in; serve: PYRE_QN_SERVE_PF=batch): batched prompt chunks. Every dense matmul of a chunk
+/// (t >= 16) runs on the GPU from the decode path's resident matrices, 4 token columns per launch (bpf_mm); routed
+/// experts run on the int8 pool with each expert's rows decoded once per 16 (gate/up) / 8 (down) of its tokens
+/// (grouped GEMM over the tokens routed to it). Changes prompt numerics vs the exact f32 prefill -> opt-in.
+pub fn bpf() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPF").map(|v| v == "1").unwrap_or(BPF_DEFAULT.load(std::sync::atomic::Ordering::Relaxed))) }
 pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
 impl Model {
     /// Snapshot of `st` (None when the GPU holds attention rows the host copy lacks, i.e. after decode steps).
@@ -2991,7 +3039,7 @@ impl Model {
     }
     /// Prompt window of the verify-path prefill (PYRE_QN_PF_MULTI, else the serve default PF_MULTI_DEFAULT; 0 = f32 CPU prefill).
     /// That prefill gives every token decode numerics, so its state does not depend on how the prompt is split.
-    pub fn pf_multi(&self) -> usize { let k = env_usize("PYRE_QN_PF_MULTI").unwrap_or(PF_MULTI_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)); if k > 1 && self.multi_ok() { k } else { 0 } }
+    pub fn pf_multi(&self) -> usize { let k = env_usize("PYRE_QN_PF_MULTI").unwrap_or(PF_MULTI_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)); if k > 1 && !bpf() && self.multi_ok() { k } else { 0 } }
     /// A fresh State equal to the snapshot (GPU mirrors are rebuilt on demand; the MTP drafter K/V catches up from the residual window).
     pub fn restore(&self, s: &Snap) -> State {
         let mut st = self.new_state();
