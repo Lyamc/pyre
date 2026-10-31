@@ -16,6 +16,10 @@ fn gemv_rpc(rows: usize) -> u32 { static T: std::sync::OnceLock<usize> = std::sy
 /// dense IQ4_XS kernel: PYRE_QN_NATIVE=0 Q8_0 repack, 1 f32 IQ4 kernel, 2 dp4a IQ4 kernel (int8 activations), 3 = 2 with x quantised in-kernel
 /// PYRE_QN_NATS=0: the per-8-values k_gemv_iq4d_m instead of the sub-block k_gemv_iq4s_m
 /// PYRE_QN_NATX=1: every native IQ4_XS GEMV (1-4 columns) as Strata / ggml vec_dot_iq4_xs_q8_1 arithmetic (sub-block integer sums, half activation scale)
+/// PYRE_QN_GATEM2 (default on, =0 off): k_gate_m2 (one warp per (output, stream), identical results)
+pub fn gatem2() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_GATEM2").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_GEMV4RP=1 (opt-in): k_gemv4rp prefetching Q8 GEMV for < 1024 rows (identical results, no measured gain e69)
+pub fn gemv4rp() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_GEMV4RP").map(|v| v == "1").unwrap_or(false)) }
 pub fn natx() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATX").map(|v| v == "1").unwrap_or(false)) }
 pub fn nats() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATS").map(|v| v == "1").unwrap_or(false)) }
 /// Test override for nats(): 0 = env, 1 = iq4d_m, 2 = iq4s_m.
@@ -146,6 +150,84 @@ fn k_gemv4(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u3
             if nt > 1 { out[(ooff + ost + row) as usize] = t1; }
             if nt > 2 { out[(ooff + 2 * ost + row) as usize] = t2; }
             if nt > 3 { out[(ooff + 3 * ost + row) as usize] = t3; }
+        }
+    }
+}
+
+/// k_gemv4r for few rows (rows < 1024: ~2 warps per SM, latency-bound on one dependent 128-word step per
+/// iteration) with the next step's weight words, scales and activations loaded before the current step's math
+/// (software prefetch, two register sets). Per (row, column) the same products, the same dotx / `+= dotx * s`
+/// sequence in ascending word order and the same plane_sum as k_gemv4r: identical results. Needs words % 128 == 0
+/// (no k_gemv4r tail loop). PYRE_QN_GEMV4RP=0 reverts to k_gemv4r.
+#[cube(launch_unchecked)]
+fn k_gemv4rp(x: &[f32], w: &[u32], s: &[f32], out: &mut [f32], rows: u32, cols: u32, xoff: u32, xst: u32, ooff: u32, ost: u32, #[comptime] nt: u32) {
+    let row0 = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) * 4u32;
+    if row0 < rows {
+        let words = cols / 4; let nb = cols / 32;
+        let mut wb = Array::<u32>::new(4usize); let mut sb = Array::<u32>::new(4usize);
+        #[unroll]
+        for r in 0..4u32 { let mut rr = row0 + r; if rr >= rows { rr = rows - 1u32; } wb[r as usize] = rr * words; sb[r as usize] = rr * nb; }
+        let mut acc = Array::<f32>::new(comptime!((4 * nt) as usize));
+        #[unroll]
+        for i in 0..comptime!(4 * nt) { acc[i as usize] = 0.0f32; }
+        let mut cw = Array::<u32>::new(16usize); let mut cs = Array::<f32>::new(16usize); let mut cx = Array::<f32>::new(comptime!((16 * nt) as usize));
+        let mut nw = Array::<u32>::new(16usize); let mut ns = Array::<f32>::new(16usize); let mut nx = Array::<f32>::new(comptime!((16 * nt) as usize));
+        let mut wi = UNIT_POS_X;
+        {
+            let k = wi * 4;
+            #[unroll]
+            for r in 0..4u32 {
+                #[unroll]
+                for m in 0..4u32 { cw[(r * 4 + m) as usize] = w[(wb[r as usize] + wi + m * 32u32) as usize]; cs[(r * 4 + m) as usize] = s[(sb[r as usize] + k / 32 + m * 4u32) as usize]; }
+            }
+            #[unroll]
+            for c in 0..nt {
+                #[unroll]
+                for q in 0..16u32 { cx[(c * 16 + q) as usize] = x[(xoff + c * xst + k + (q / 4) * 128u32 + q % 4) as usize]; }
+            }
+        }
+        while wi < words {
+            let wn = wi + 128u32;
+            if wn < words {
+                let k = wn * 4;
+                #[unroll]
+                for r in 0..4u32 {
+                    #[unroll]
+                    for m in 0..4u32 { nw[(r * 4 + m) as usize] = w[(wb[r as usize] + wn + m * 32u32) as usize]; ns[(r * 4 + m) as usize] = s[(sb[r as usize] + k / 32 + m * 4u32) as usize]; }
+                }
+                #[unroll]
+                for c in 0..nt {
+                    #[unroll]
+                    for q in 0..16u32 { nx[(c * 16 + q) as usize] = x[(xoff + c * xst + k + (q / 4) * 128u32 + q % 4) as usize]; }
+                }
+            }
+            #[unroll]
+            for r in 0..4u32 {
+                #[unroll]
+                for m in 0..4u32 {
+                    let wd = cw[(r * 4 + m) as usize];
+                    let v0 = dec(wd, 0u32); let v1 = dec(wd, 1u32); let v2 = dec(wd, 2u32); let v3 = dec(wd, 3u32);
+                    let sc = cs[(r * 4 + m) as usize];
+                    #[unroll]
+                    for c in 0..nt {
+                        let xb = c * 16 + m * 4;
+                        acc[(r * nt + c) as usize] += dotx(v0, v1, v2, v3, cx[xb as usize], cx[(xb + 1) as usize], cx[(xb + 2) as usize], cx[(xb + 3) as usize]) * sc;
+                    }
+                }
+            }
+            #[unroll]
+            for i in 0..16u32 { cw[i as usize] = nw[i as usize]; cs[i as usize] = ns[i as usize]; }
+            #[unroll]
+            for i in 0..comptime!(16 * nt) { cx[i as usize] = nx[i as usize]; }
+            wi = wn;
+        }
+        #[unroll]
+        for r in 0..4u32 {
+            #[unroll]
+            for c in 0..nt {
+                let tv = plane_sum(acc[(r * nt + c) as usize]);
+                if UNIT_POS_X == 0 && row0 + r < rows { out[(ooff + c * ost + row0 + r) as usize] = tv; }
+            }
         }
     }
 }
@@ -1498,6 +1580,84 @@ fn k_gate_m(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u3
         if UNIT_POS_X == 0 {
             #[unroll]
             for tk in 0..t { out[(tk * os + ooff + i) as usize] = acc[tk as usize] / hcf; }
+        }
+    }
+}
+
+/// k_gate_m with one warp per (output i, stream st) instead of one warp per output looping over the hc streams
+/// (8/hc outputs per cube, hc x more warps in flight), each lane's weight words / scales loaded before the silu
+/// prologue's sync. Every (i, st, token) dot is k_gate_m's: same lane split, same per-lane order, same plane_sum;
+/// the hc stream terms xn / (1 + exp(-g)) are added in st order from 0.0 by one thread, as k_gate_m's acc
+/// (identical results). Needs 8 % hc == 0. PYRE_QN_GATEM2=0 reverts to k_gate_m.
+#[cube(launch_unchecked)]
+fn k_gate_m2(xn: &[f32], dn: &[f32], w: &[u32], s: &[f32], out: &mut [f32], d: u32, ooff: u32, xs: u32, ds: u32, os: u32, #[comptime] lr: usize, #[comptime] hc: u32, #[comptime] t: u32) {
+    let mut lo = Shared::<[f32]>::new_slice(comptime!(lr * t as usize));
+    let mut tr = Shared::<[f32]>::new_slice(comptime!(8 * t as usize));
+    let hcf = f32::cast_from(hc);
+    let tid = UNIT_POS_Y * 32 + UNIT_POS_X;
+    let words = comptime!(lr as u32 / 4);
+    let nb = comptime!(lr as u32 / 32);
+    let nk = comptime!((lr as u32 / 4).div_ceil(32));
+    let i = CUBE_POS_X * comptime!(8 / hc) + UNIT_POS_Y / hc;
+    let st = UNIT_POS_Y % hc;
+    let mut ii = i; if ii >= d { ii = d - 1u32; }
+    let row = st * d + ii;
+    let mut wv = Array::<u32>::new(comptime!(nk as usize));
+    let mut sv = Array::<f32>::new(comptime!(nk as usize));
+    #[unroll]
+    for k in 0..nk {
+        let wi = UNIT_POS_X + k * 32u32;
+        let mut wd = 0u32; let mut sc = 0.0f32;
+        if wi < words { wd = w[(row * words + wi) as usize]; sc = s[(row * nb + wi / 8) as usize]; }
+        wv[k as usize] = wd; sv[k as usize] = sc;
+    }
+    let mut xv = Array::<f32>::new(comptime!(t as usize));
+    #[unroll]
+    for tk in 0..t { xv[tk as usize] = xn[(tk * xs + row) as usize]; }
+    #[unroll]
+    for tk in 0..t {
+        let mut j = tid;
+        while (j as usize) < lr {
+            let v = dn[(tk * ds + j) as usize] / hcf;
+            lo[(tk * comptime!(lr as u32) + j) as usize] = v / (1.0f32 + f32::exp(-v));
+            j += 256u32;
+        }
+    }
+    sync_cube();
+    let mut g = Array::<f32>::new(comptime!(t as usize));
+    #[unroll]
+    for tk in 0..t { g[tk as usize] = 0.0f32; }
+    #[unroll]
+    for k in 0..nk {
+        let wi = UNIT_POS_X + k * 32u32;
+        if wi < words {
+            let word = wv[k as usize];
+            let sc = sv[k as usize];
+            #[unroll]
+            for tk in 0..t {
+                let mut part = 0.0f32;
+                #[unroll]
+                for jj in 0..4u32 {
+                    let v = dec(word, jj);
+                    part += v * lo[(tk * comptime!(lr as u32) + wi * 4 + jj) as usize];
+                }
+                g[tk as usize] += part * sc;
+            }
+        }
+    }
+    #[unroll]
+    for tk in 0..t {
+        let gt = plane_sum(g[tk as usize]);
+        if UNIT_POS_X == 0 { tr[(UNIT_POS_Y * t + tk) as usize] = xv[tk as usize] / (1.0f32 + f32::exp(-gt)); }
+    }
+    sync_cube();
+    if UNIT_POS_X == 0 && st == 0 && i < d {
+        #[unroll]
+        for tk in 0..t {
+            let mut acc = 0.0f32;
+            #[unroll]
+            for s2 in 0..hc { acc += tr[((UNIT_POS_Y + s2) * t + tk) as usize]; }
+            out[(tk * os + ooff + i) as usize] = acc / hcf;
         }
     }
 }
@@ -4060,6 +4220,12 @@ impl Cube {
         }
         if std::env::var("PYRE_QN_GEMV4R").map(|v| v != "0").unwrap_or(true) {
             while c0 < nt { let n = (nt - c0).min(4);
+                if gemv4rp() && m.rows < 1024 && (m.cols / 4) % 128 == 0 {
+                    let rpc = gemv_rpc(m.rows); unsafe { k_gemv4rp::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
+                        BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
+                        BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32) }
+                    c0 += n; continue;
+                }
                 let rpc = gemv_rpc(m.rows); unsafe { k_gemv4r::launch_unchecked(&self.client, CubeCount::Static((m.rows as u32).div_ceil(rpc * 4), 1, 1), CubeDim::new_2d(32, rpc),
                     BufferArg::from_raw_parts(x.clone(), xn), BufferArg::from_raw_parts(m.w.clone(), m.rows * m.cols / 4), BufferArg::from_raw_parts(m.s.clone(), m.rows * m.cols / 32),
                     BufferArg::from_raw_parts(out.clone(), on), m.rows as u32, m.cols as u32, (xoff + c0 * xst) as u32, xst as u32, (ooff + c0 * ost) as u32, ost as u32, n as u32, n > 1, n > 2, n > 3) }
@@ -4092,6 +4258,12 @@ impl Cube {
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
         if !(2..=4).contains(&t) { return false; }
         let lr = up.cols;
+        if gatem2() && 8 % hc == 0 && lr % 32 == 0 {
+            unsafe { k_gate_m2::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8 / hc as u32), 1, 1), CubeDim::new_2d(32, 8),
+                BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
+                BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) }
+            return true;
+        }
         unsafe { k_gate_m::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(8), 1, 1), CubeDim::new_2d(32, 8),
             BufferArg::from_raw_parts(xn.clone(), t * xs), BufferArg::from_raw_parts(dn.clone(), t * ds), BufferArg::from_raw_parts(up.w.clone(), up.rows * lr / 4),
             BufferArg::from_raw_parts(up.s.clone(), up.rows * lr / 32), BufferArg::from_raw_parts(out.clone(), on), d as u32, ooff as u32, xs as u32, ds as u32, os as u32, lr, hc as u32, t as u32) }
