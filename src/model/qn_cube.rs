@@ -4265,6 +4265,287 @@ fn k_xdown_ex16(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], met
         y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
     }
 }
+/// PYRE_QN_XGX bit 0: grouped exact gate/up. One cube per (row chunk, distinct expert): the first entry of each expert
+/// (leader; later entries with the same gate offset are the other window tokens routed to it) loads every weight word
+/// once and applies it to all its tokens. One thread per (row, gate|up) holds the 8 k_xgu_ex16 lane accumulators of
+/// each token: per lane the same integer sums and the same fma chain over the 256-blocks, then the same lane tree,
+/// so every h value is bit-identical to k_xgu_ex16 (and the CPU pool). Activations staged in shared memory.
+#[cube(launch_unchecked)]
+fn k_xgu_gx(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], gsrc: &[u32], h: &mut [f32], rows: u32, rbg: u32, rbu: u32,
+    #[comptime] nsb: u32, #[comptime] gn: u32, #[comptime] ty: u32, #[comptime] lp: u32) {
+    if CUBE_POS_Y >= oc[3] { terminate!(); }
+    let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
+    let mut xs = Shared::<[u32]>::new_slice(comptime!((4 * nsb * 64) as usize));
+    let mut gm = Shared::<[u32]>::new_slice(8usize);
+    let mut fa = Shared::<[f32]>::new_slice(4096usize);
+    let e = CUBE_POS_Y;
+    if UNIT_POS == 0u32 {
+        let n = oc[3];
+        let me = meta[(e * 4) as usize];
+        let mut lead = 1u32;
+        let mut cnt = 0u32;
+        for k in 0..n {
+            if meta[(k * 4) as usize] == me {
+                if k < e { lead = 0u32; } else { if cnt < 4u32 { gm[(1 + cnt) as usize] = k; cnt += 1u32; } }
+            }
+        }
+        gm[0] = cnt * lead;
+    }
+    let mut i = UNIT_POS;
+    while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
+    sync_cube();
+    let cnt = gm[0];
+    if cnt == 0u32 { terminate!(); }
+    let nx = nsb * 64u32;
+    let mut k = UNIT_POS;
+    while k < cnt * nx {
+        let j = k / nx;
+        let ej = gm[(1 + j) as usize];
+        let mut ti = 0u32;
+        if ej >= oc[0] { ti += 1u32; }
+        if ej >= oc[1] { ti += 1u32; }
+        if ej >= oc[2] { ti += 1u32; }
+        xs[k as usize] = xq[(ti * nx + k % nx) as usize];
+        k += CUBE_DIM;
+    }
+    sync_cube();
+    let mut et = Array::<u32>::new(4usize);
+    let mut tt = Array::<u32>::new(4usize);
+    #[unroll]
+    for j in 0..4u32 {
+        let mut ej = e;
+        if j < cnt { ej = gm[(1 + j) as usize]; }
+        let mut ti = 0u32;
+        if ej >= oc[0] { ti += 1u32; }
+        if ej >= oc[1] { ti += 1u32; }
+        if ej >= oc[2] { ti += 1u32; }
+        et[j as usize] = ej;
+        tt[j as usize] = ti;
+    }
+    // thread = (row, gate|up, lane group of lp lanes)
+    let ng = comptime!(8u32 / lp);
+    let part = UNIT_POS % 2u32;
+    let lg = (UNIT_POS / 2u32) % ng;
+    let rl = UNIT_POS / (2u32 * ng);
+    let rpc = CUBE_DIM / (2u32 * ng);
+    let row = CUBE_POS_X * rpc + rl;
+    let act = row < rows;
+    let mut rr = row;
+    if !act { rr = rows - 1u32; }
+    let m0 = meta[(e * 4) as usize];
+    let sel = m0 >> 31;
+    let mut base = (m0 & 2147483647u32) + rr * rbg;
+    if part == 1u32 { base = meta[(e * 4 + 1) as usize] + rr * rbu; }
+    let bw = comptime!(if ty == 0 { 21u32 } else { 17u32 });
+    let mut acc = Array::<f32>::new(comptime!((4 * lp) as usize));
+    #[unroll]
+    for q in 0..4 * lp { acc[q as usize] = 0.0f32; }
+    let mut iacc = Array::<i32>::new(comptime!((4 * lp) as usize));
+    let mut wv = Array::<u32>::new(comptime!(bw as usize));
+    for s in 0..nsb {
+        let b0 = base + s * bw;
+        #[unroll]
+        for q in 0..bw {
+            if sel == 0u32 { wv[q as usize] = ar[(b0 + q) as usize]; } else { wv[q as usize] = ar1[(b0 + q) as usize]; }
+        }
+        #[unroll]
+        for q in 0..4 * lp { iacc[q as usize] = 0i32; }
+        #[unroll]
+        for ib in 0..8u32 {
+            #[unroll]
+            for lq in 0..lp {
+                let ln = lg * lp + lq;
+                let l = ln / 2u32;
+                let hf = ln % 2u32;
+                let mut g = 0i32;
+                let mut scl = 0i32;
+                if comptime!(ty == 0) {
+                    let qs = wv[(1 + ib) as usize];
+                    let sg = wv[(9 + ib) as usize];
+                    let qh = (wv[(17 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+                    let sc = (wv[(19 + ib / 4) as usize] >> ((ib % 4) * 8)) & 255u32;
+                    let idx = ((qs >> (8 * l)) & 255u32) | ((qh << (8 - 2 * l)) & 768u32);
+                    let s8 = (sg >> (8 * l)) & 255u32;
+                    let m = smask4(s8 >> (4 * hf));
+                    g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+                    scl = 2 * i32::cast_from((sc >> ((ln / 4u32) * 4u32)) & 15u32) + 1;
+                }
+                if comptime!(ty == 1) {
+                    let qw = wv[(1 + 2 * ib) as usize];
+                    let a1 = wv[(2 + 2 * ib) as usize];
+                    scl = 2 * i32::cast_from(a1 >> 28) + 1;
+                    let idx = (qw >> (8 * l)) & 255u32;
+                    let k7 = (a1 >> (7 * l)) & 127u32;
+                    let s8 = k7 | ((u32::count_ones(k7) & 1u32) << 7);
+                    let m = smask4(s8 >> (4 * hf));
+                    g = i32::cast_from((grid[(idx * 2 + hf) as usize] ^ m) + (m & 16843009u32));
+                }
+                #[unroll]
+                for j in 0..4u32 {
+                    if j < cnt {
+                        let xw = i32::cast_from(xs[(j * nx + (s * 8 + ib) * 8 + ln) as usize]);
+                        iacc[(j * lp + lq) as usize] += dp4a(g, xw, 0i32) * scl;
+                    }
+                }
+            }
+        }
+        let w0 = f32::reinterpret(wv[0]);
+        #[unroll]
+        for j in 0..4u32 {
+            if j < cnt {
+                let d = (w0 * 0.5f32) * xd[(tt[j as usize] * nsb + s) as usize];
+                #[unroll]
+                for lq in 0..lp {
+                    let q = (j * lp + lq) as usize;
+                    acc[q] = fma(f32::cast_from(iacc[q]), d, acc[q]);
+                }
+            }
+        }
+    }
+    // lane values to shared: fa[((j * rpc + rl) * 2 + part) * 8 + lane], then k_xgu_ex16's lane trees per (token, row)
+    #[unroll]
+    for j in 0..4u32 {
+        if j < cnt {
+            #[unroll]
+            for lq in 0..lp { fa[(((j * rpc + rl) * 2 + part) * 8 + lg * lp + lq) as usize] = acc[(j * lp + lq) as usize]; }
+        }
+    }
+    sync_cube();
+    if act && part == 0u32 && lg == 0u32 {
+        #[unroll]
+        for j in 0..4u32 {
+            if j < cnt {
+                let f = (j * rpc + rl) * 16;
+                let g = ((fa[(f) as usize] + fa[(f + 4) as usize]) + (fa[(f + 2) as usize] + fa[(f + 6) as usize])) + ((fa[(f + 1) as usize] + fa[(f + 5) as usize]) + (fa[(f + 3) as usize] + fa[(f + 7) as usize]));
+                let u = ((fa[(f + 8) as usize] + fa[(f + 12) as usize]) + (fa[(f + 10) as usize] + fa[(f + 14) as usize])) + ((fa[(f + 9) as usize] + fa[(f + 13) as usize]) + (fa[(f + 11) as usize] + fa[(f + 15) as usize]));
+                let ex = xexp_g(-g);
+                let sg = 1.0f32 / (1.0f32 + ex);
+                let sl = g * sg;
+                h[(et[j as usize] * rows + row) as usize] = sl * u;
+            }
+        }
+    }
+}
+/// PYRE_QN_XGX bit 1: grouped exact down. One thread per output row and distinct expert, all its window tokens:
+/// the 8 k_xdown_ex16 lane accumulators + the block-correction accumulator per token, same integer sums, same fma
+/// order over the 64-blocks, same final tree and weight fma -> bit-identical y. hq/hd/hs of the group staged in shared.
+#[cube(launch_unchecked)]
+fn k_xdown_gx(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, rbd: u32, #[comptime] nb: u32) {
+    if CUBE_POS_Y >= oc[3] { terminate!(); }
+    let mut gm = Shared::<[u32]>::new_slice(8usize);
+    let mut xs = Shared::<[u32]>::new_slice(comptime!((4 * nb * 16) as usize));
+    let mut ds = Shared::<[f32]>::new_slice(comptime!((4 * nb) as usize));
+    let mut ss = Shared::<[i32]>::new_slice(comptime!((4 * nb) as usize));
+    let e = CUBE_POS_Y;
+    if UNIT_POS == 0u32 {
+        let n = oc[3];
+        let me = meta[(e * 4) as usize];
+        let mut lead = 1u32;
+        let mut cnt = 0u32;
+        for k in 0..n {
+            if meta[(k * 4) as usize] == me {
+                if k < e { lead = 0u32; } else { if cnt < 4u32 { gm[(1 + cnt) as usize] = k; cnt += 1u32; } }
+            }
+        }
+        gm[0] = cnt * lead;
+    }
+    sync_cube();
+    let cnt = gm[0];
+    if cnt == 0u32 { terminate!(); }
+    let nx = nb * 16u32;
+    let mut k = UNIT_POS;
+    while k < cnt * nx {
+        let ej = gm[(1 + k / nx) as usize];
+        xs[k as usize] = hq[(ej * nx + k % nx) as usize];
+        k += CUBE_DIM;
+    }
+    let mut k2 = UNIT_POS;
+    while k2 < cnt * nb {
+        let ej = gm[(1 + k2 / nb) as usize];
+        ds[k2 as usize] = hd[(ej * nb + k2 % nb) as usize];
+        ss[k2 as usize] = i32::cast_from(hs[(ej * nb + k2 % nb) as usize]);
+        k2 += CUBE_DIM;
+    }
+    sync_cube();
+    let row = CUBE_POS_X * CUBE_DIM + UNIT_POS;
+    if row < rows {
+        let m2 = meta[(e * 4 + 2) as usize];
+        let sel = m2 >> 31;
+        let dof = (m2 & 2147483647u32) + row * rbd;
+        let mut acc = Array::<f32>::new(36usize);
+        #[unroll]
+        for q in 0..36u32 { acc[q as usize] = 0.0f32; }
+        let mut wq = Array::<u32>::new(4usize);
+        for i in 0..nb {
+            let blk = dof + i * 5;
+            let mut w0 = 0.0f32;
+            if sel == 0u32 {
+                w0 = f32::reinterpret(ar[blk as usize]);
+                #[unroll]
+                for q in 0..4u32 { wq[q as usize] = ar[(blk + 1 + q) as usize]; }
+            } else {
+                w0 = f32::reinterpret(ar1[blk as usize]);
+                #[unroll]
+                for q in 0..4u32 { wq[q as usize] = ar1[(blk + 1 + q) as usize]; }
+            }
+            #[unroll]
+            for r in 0..8u32 {
+                let k0 = r / 4u32;
+                let wr = wq[(r % 4u32) as usize];
+                #[unroll]
+                for j in 0..4u32 {
+                    if j < cnt {
+                        let mut p = 0i32;
+                        #[unroll]
+                        for jj in 0..4u32 {
+                            let qv = (wr >> (8 * jj)) & 255u32;
+                            let xw = xs[(j * nx + i * 16 + (r % 4u32) * 4 + jj) as usize];
+                            let pk = (((qv >> (2 * k0)) & 3u32) << (8 * k0)) | (((qv >> (2 * k0 + 4)) & 3u32) << (8 * k0 + 16));
+                            p += dp4a(i32::cast_from(pk), i32::cast_from(xw), 0i32);
+                        }
+                        let dd = w0 * ds[(j * nb + i) as usize];
+                        let q = (j * 9 + r) as usize;
+                        acc[q] = fma(f32::cast_from(p), dd, acc[q]);
+                    }
+                }
+            }
+            #[unroll]
+            for j in 0..4u32 {
+                if j < cnt {
+                    let dd = w0 * ds[(j * nb + i) as usize];
+                    let pr = fma(dd, f32::cast_from(ss[(j * nb + i) as usize]), 0.0f32);
+                    let q = (j * 9 + 8) as usize;
+                    acc[q] = acc[q] - pr;
+                }
+            }
+        }
+        #[unroll]
+        for j in 0..4u32 {
+            if j < cnt {
+                let f = j * 9;
+                let hsum = ((acc[f as usize] + acc[(f + 4) as usize]) + (acc[(f + 2) as usize] + acc[(f + 6) as usize])) + ((acc[(f + 1) as usize] + acc[(f + 5) as usize]) + (acc[(f + 3) as usize] + acc[(f + 7) as usize]));
+                let v = acc[(f + 8) as usize] + hsum;
+                let ej = gm[(1 + j) as usize];
+                let wt = f32::reinterpret(meta[(ej * 4 + 3) as usize]);
+                y[(ej * rows + row) as usize] = fma(wt, v, 0.0f32);
+            }
+        }
+    }
+}
+/// PYRE_QN_XGX: bit 0 k_xgu_gx, bit 1 k_xdown_gx (grouped exact expert kernels, default 3 = both; 0 = old ex16 kernels); XEX_OVR overrides it (xbench)
+pub static XEX_OVR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// xrun_exact stage mask (xbench timing only): 1 q8k, 2 gate/up, 4 q8d, 8 down
+pub static XEX_STG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(15);
+fn xgx_mode() -> u32 { let o = XEX_OVR.load(std::sync::atomic::Ordering::Relaxed); if o != u32::MAX { return o; }
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGX").ok().and_then(|v| v.parse().ok()).unwrap_or(3)) }
+/// PYRE_QN_XGX_R: k_xgu_gx rows per cube (2 threads a row; 16..256, default 64)
+fn xgx_r() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGX_R").ok().and_then(|v| v.parse().ok()).filter(|&v: &u32| (16..=256).contains(&v) && v % 16 == 0).unwrap_or(64)) }
+/// PYRE_QN_XGX_LP: k_xgu_gx lanes per thread (8, 4, 2; default 4); XGX_LP_OVR overrides (xbench)
+pub static XGX_LP_OVR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn xgx_lp() -> u32 { let o = XGX_LP_OVR.load(std::sync::atomic::Ordering::Relaxed); if o != 0 { return o; }
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGX_LP").ok().and_then(|v| v.parse().ok()).filter(|&v: &u32| v == 8 || v == 4 || v == 2).unwrap_or(4)) }
+/// PYRE_QN_XGX_DR: k_xdown_gx rows (threads) per cube (32..512, default 128)
+fn xgx_dr() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XGX_DR").ok().and_then(|v| v.parse().ok()).filter(|&v: &u32| (32..=512).contains(&v) && v % 32 == 0).unwrap_or(128)) }
 /// PYRE_QN_XDN2: 1 (default) k_xdown_ex16, 3 k_xdown_ex16s (staged; e15 same trace 116 vs 93 us, slower), 0 k_xdown_ex8, 2 alternate ex16/ex8, 4 alternate ex16s/ex16
 fn xdn2() -> u32 { static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *K.get_or_init(|| std::env::var("PYRE_QN_XDN2").ok().and_then(|v| v.parse().ok()).unwrap_or(1)) }
 static XDN2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -5630,11 +5911,14 @@ impl Cube {
         let (xq, xd, h, hq, hd, hs) = match scr { Some(sc) if t == 1 && ne <= sc.max_ne => (sc.xq.clone(), sc.xs.clone(), sc.h.clone(), sc.hq.clone(), sc.hs.clone(), sc.hs.clone().offset_start((ne * nb * 4) as u64)),
             _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
         unsafe {
-            k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
+            let stg = XEX_STG.load(std::sync::atomic::Ordering::Relaxed); let gxm = xgx_mode(); let gx = gxm & 1 != 0 && nsb <= 16; let gxd = gxm & 2 != 0 && nb <= 64;
+            if stg & 1 != 0 { k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32); }
             let alt = || XGU2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
             let (g64, g2) = match xgu2() { 0 => (false, false), 2 => (false, alt()), 3 => (ff % 64 == 0, true), 4 => (ff % 64 == 0 && alt(), true), _ => (false, true) };
             let fits = { let bw = if tys.0 == 0 { 21 } else { 17 }; 32 * nsb * bw <= 6720 && t * d / 4 <= 2560 };
             let g16s = fits && match xgu2() { 5 => true, 6 => alt(), _ => false };
+            if stg & 2 == 0 {} else if gx { let lp = xgx_lp(); let gr = xgx_r().min(64).min(512 / (16 / lp)); k_xgu_gx::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(gr), ne as u32, 1), CubeDim::new_1d(gr * 16 / lp),
+                a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0, lp); } else
             if xex8() && g16s { k_xgu_ex16s::launch_unchecked(&self.client, CubeCount::Static((ff as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, (t * d / 4) as u32, gn, tys.0); } else
             if xex8() && g64 { k_xgu_ex64::launch_unchecked(&self.client, CubeCount::Static((ff / 64) as u32, ne as u32, 1), CubeDim::new_2d(32, 32),
@@ -5645,9 +5929,11 @@ impl Cube {
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); } else {
             k_xgu_ex::launch_unchecked(&self.client, CubeCount::Static(ff as u32, ne as u32, 1), CubeDim::new_1d(32),
                 a(&xq, t * d / 4), a(&xd, t * nsb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(gsrc, gn as usize), a(&h, ne * ff), ff as u32, rbs.0 as u32, rbs.1 as u32, nsb as u32, gn, tys.0); }
-            if !(xex8() && g64) { k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32); }
+            if stg & 4 != 0 && (gx || !(xex8() && g64)) { k_q8d::launch_unchecked(&self.client, CubeCount::Static(((ne * nb) as u32).div_ceil(64), 1, 1), CubeDim::new_1d(64), a(&h, ne * ff), a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), (ne * nb) as u32); }
             let alt2 = || XDN2_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0;
             let (d2s, d2) = match xdn2() { 0 => (false, false), 2 => (false, alt2()), 3 => (nb <= 64, true), 4 => (nb <= 64 && alt2(), true), _ => (false, true) };
+            if stg & 8 == 0 {} else if gxd { let dr = xgx_dr(); k_xdown_gx::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(dr), ne as u32, 1), CubeDim::new_1d(dr),
+                a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, rbs.2 as u32, nb as u32); } else
             if xex8() && d2s { k_xdown_ex16s::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
                 a(&hq, ne * ff / 4), a(&hd, ne * nb), a(&hs, ne * nb), a(ar, aw), a(ar1, aw), a(mh, ml), a(oc, 4), a(y, ne * d), d as u32, nb as u32, rbs.2 as u32); } else
             if xex8() && d2 { k_xdown_ex16::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(16), ne as u32, 1), CubeDim::new_2d(32, 8),
@@ -5743,6 +6029,7 @@ pub struct CLayer { pub an: Option<(Handle, Handle)>, pub gdn: Option<GdnW>, pub
 /// PYRE_QN_XBENCH: time the batched expert kernels on random IQ2_XXS/IQ2_XXS/Q2_0 experts (d 2560, ff 640),
 /// old vs new, and compare their outputs.
 pub fn xbench() -> anyhow::Result<()> {
+    if std::env::var("PYRE_QN_XBENCH").as_deref() == Ok("ex") { return xbench_ex(); }
     let cb = Cube::new()?; let tb = cb.xtabs();
     let (d, ff) = (2560usize, 640usize); for tys in [(1u32, 1u32, 3u32), (0u32, 0u32, 3u32)] {
     let mut rng = 0x9e3779b97f4a7c15u64; let mut rb = |n: usize, blk: usize| -> Vec<u8> { (0..n).map(|i| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; if i % blk < 2 { if i % blk == 0 { 0x00 } else { 0x20 } } else { rng as u8 } }).collect() };
@@ -5773,6 +6060,55 @@ pub fn xbench() -> anyhow::Result<()> {
         let md = outs[0].iter().zip(&outs[1]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max); let mx = outs[0].iter().fold(0f32, |a, b| a.max(b.abs()));
         eprintln!("xbench tys={tys:?} ne={ne}: max |old-new| {md:.3e} (max |y| {mx:.3e})");
     } }
+    Ok(())
+}
+
+/// PYRE_QN_XBENCH=ex: xrun_exact on random experts (d 2560, ff 640, both gate types), old ex16 kernels vs grouped
+/// (PYRE_QN_XGX=3): bitwise output compare and wall time per stage (q8k, +gate/up, +q8d, +down) over PYRE_QN_XBENCH_REPS.
+pub fn xbench_ex() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cb = Cube::new()?; let tb = cb.xtabs();
+    let (d, ff) = (2560usize, 640usize);
+    let reps: usize = std::env::var("PYRE_QN_XBENCH_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    for tys in [(1u32, 1u32, 3u32), (0u32, 0u32, 3u32)] {
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut rb = |n: usize, blk: usize| -> Vec<u8> { (0..n).map(|i| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; if i % blk < 2 { if i % blk == 0 { 0x00 } else { 0x20 } } else { rng as u8 } }).collect() };
+        let nexp = 40usize;
+        let (gbk, gw) = if tys.0 == 0 { (82usize, 21usize) } else { (66, 17) }; let gb = ff * d / 256 * gbk; let db = d * ff / 64 * 18;
+        let ebytes = (2 * ff * d / 256 * gw + d * ff / 64 * 5) * 4;
+        let slot = ebytes.next_multiple_of(256);
+        let ar_bytes = slot * nexp; let ar = cb.xarena(ar_bytes); let ars = vec![ar.clone()];
+        // xupload_pk (word offsets, byte payload) like the real cache fill
+        let ents: Vec<XEnt> = (0..nexp).map(|i| { let mut v = repack(tys.0, &rb(gb, gbk)); let uo = v.len(); v.extend(repack(tys.1, &rb(gb, gbk))); let dof = v.len(); v.extend(repack(tys.2, &rb(db, 18)));
+            cb.xupload_pk(&ar, ar_bytes, i, slot, &cubecl::bytes::Bytes::from_elems(v), uo, dof) }).collect();
+        for &(t, hpt, sh) in &[(1usize, 4usize, 0usize), (1, 8, 0), (2, 5, 1), (3, 5, 1), (3, 5, 3), (4, 5, 2), (4, 8, 4)] {
+            let mut sel: Vec<(&XEnt, f32)> = vec![]; let mut oc = [0u32; 4]; let mut used = std::collections::BTreeSet::new();
+            for ti in 0..t { for k in 0..hpt { let ei = if k < sh { k } else { (sh + ti * (hpt - sh) + k - sh) % nexp }; used.insert(ei); sel.push((&ents[ei], 0.05 + 0.01 * (ti * hpt + k) as f32)); } }
+            let mut acc = 0u32; for (ti, o) in oc.iter_mut().enumerate() { if ti < t { acc += hpt as u32; } *o = acc; }
+            let ne = sel.len();
+            let mh = cb.hup(u32::as_bytes(&Cube::xmeta(&ars, &sel))); let och = cb.hup(u32::as_bytes(&oc));
+            let xs: Vec<f32> = (0..t * d).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0 * (1.0 + (i % 7) as f32 * 0.1)).collect(); let src = cb.buf(&xs);
+            let mut outs = vec![];
+            for (mode, lp) in [(0u32, 0u32), (3, 8), (3, 4), (3, 2)] {
+                XEX_OVR.store(mode, Relaxed); XEX_STG.store(15, Relaxed); XGX_LP_OVR.store(lp, Relaxed);
+                let y = cb.empty(ne * d);
+                assert!(cb.xrun_exact(&tb, &ars, ar_bytes, t, ne, &mh, &och, &src, t * d, d, ff, tys, &y, None));
+                outs.push(cb.read(&y));
+                let mut st = vec![];
+                for stg in [1u32, 3, 7, 15] {
+                    XEX_STG.store(stg, Relaxed); cb.xrun_exact(&tb, &ars, ar_bytes, t, ne, &mh, &och, &src, t * d, d, ff, tys, &y, None); cb.read(&y);
+                    let t0 = std::time::Instant::now(); for _ in 0..reps { cb.xrun_exact(&tb, &ars, ar_bytes, t, ne, &mh, &och, &src, t * d, d, ff, tys, &y, None); } cb.read(&y);
+                    st.push(t0.elapsed().as_secs_f64() * 1e6 / reps as f64);
+                }
+                eprintln!("xbex ty={} t={t} ne={ne} distinct={} mode={mode} lp={lp}: wall us q8k {:.1} +gu {:.1} +q8d {:.1} +down {:.1} = {:.1} ({:.2} us/pair, {:.0} GB/s unique weights)", tys.0, used.len(), st[0], st[1] - st[0], st[2] - st[1], st[3] - st[2], st[3], st[3] / ne as f64, (used.len() * ebytes) as f64 / st[3] / 1e3);
+            }
+            XEX_STG.store(15, Relaxed); XEX_OVR.store(u32::MAX, Relaxed);
+            XGX_LP_OVR.store(0, Relaxed);
+            let a = &outs[0]; let nz = a.iter().filter(|x| **x != 0.0).count();
+            for (k, b) in outs.iter().enumerate().skip(1) { let nd = a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                eprintln!("xbex ty={} t={t} ne={ne} variant {k}: {nd}/{} outputs differ bitwise old vs grouped ({nz} nonzero)", tys.0, a.len()); }
+        }
+    }
     Ok(())
 }
 
