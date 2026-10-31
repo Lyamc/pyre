@@ -445,10 +445,12 @@ pub fn find() -> Option<std::path::PathBuf> {
 /// and k draft steps chained on the GPU (argmax -> Q8 draft-vocab embedding -> next step) with one readback per draft run.
 /// Experts not resident are skipped for that draft (weights renormalised over the resident picks); misses are uploaded
 /// after the run (up to PYRE_MTP_GX_UP per run, default 16). Draft-only numerics: verify decides every token.
-pub fn gx_on() -> bool { static M: OnceLock<bool> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GX").map(|v| v != "0").unwrap_or(false)) }
+/// PYRE_MTP_GX unset: 2 (resident drafter) under PYRE_QN_XEXACT=1 (g9/g10: same accepted drafts as the Q8 CPU drafter, draft/round 6.3-8 -> 4-5.6 ms), else 0 (off); =0 forces off
+pub fn gx_mode() -> u32 { static M: OnceLock<u32> = OnceLock::new(); *M.get_or_init(|| match std::env::var("PYRE_MTP_GX") { Ok(v) => if v == "2" { 2 } else if v != "0" { 1 } else { 0 }, Err(_) => if std::env::var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false) { 2 } else { 0 } }) }
+pub fn gx_on() -> bool { gx_mode() > 0 }
 /// PYRE_MTP_GX=2: resident drafter (all routed experts in VRAM as PYRE_MTP_GXR_BITS-bit codes, no LRU, no misses, no uploads);
 /// after Strata (MIT, github.com/Niko1221/Strata): all 512 drafter experts resident, the draft round chained on the GPU.
-pub fn gxr_on() -> bool { static M: OnceLock<bool> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GX").map(|v| v == "2").unwrap_or(false)) }
+pub fn gxr_on() -> bool { gx_mode() == 2 }
 pub fn gxr_bits() -> usize { static M: OnceLock<usize> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GXR_BITS").ok().and_then(|v| v.parse().ok()).filter(|b| *b == 2 || *b == 4).unwrap_or(2)) }
 /// VRAM the resident drafter takes for `ne` experts of d x ff (codes + scales; plus ~128 MB draft-vocab embedding and slack)
 pub fn gxr_bytes(d: usize, ff: usize, ne: usize) -> usize { ne * 3 * d * ff * (gxr_bits() * 64 + 32) / (8 * 64) + (160usize << 20) }
