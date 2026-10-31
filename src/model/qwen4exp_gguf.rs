@@ -98,8 +98,14 @@ pub static ADAPT_SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// so ties break the same way every run).
 fn xscore(xc: &XCache, il: usize, e: usize) -> u64 {
     let pr = xprofile().as_ref().and_then(|p| p.get(il)).and_then(|r| r.get(e)).copied().unwrap_or(0.0);
+    // PYRE_QN_XPROFILL=1 (opt-in): the profile only fills slots the run's own routing leaves empty (a routed expert
+    // always outranks a profile-only one; the profile orders the rest). Strata pre-fills every slot from its ranked
+    // profile at load (Strata, MIT: include/strata/core/expert_cache.hpp read_expert_profile; generate.cpp profile fill);
+    // here the prompt's own routing stays first because it measured better than a static profile (moe.md g1).
+    if xprofill() { return ((xc.cnt[il][e] as u64) << 24) | ((pr * 1000.0) as u64).min((1 << 24) - 1); }
     xc.cnt[il][e] as u64 * 1000 + (pr * 1000.0) as u64
 }
+fn xprofill() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_XPROFILL").map(|v| v == "1").unwrap_or(false)) }
 fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
     let (nl, ne) = (cnt.len(), cnt.first().map_or(0, |r| r.len()));
     let mut b = Vec::with_capacity(8 + 4 * nl * ne); b.extend((nl as u32).to_le_bytes()); b.extend((ne as u32).to_le_bytes());
