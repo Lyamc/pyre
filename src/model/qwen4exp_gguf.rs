@@ -1849,32 +1849,35 @@ impl Model {
                 if gxm { self.embd.row(tok as usize, &mut e); let th = std::time::Instant::now();
                     if let Some((bs, krow, vrow)) = m.draft_gx(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1, rid, k, &|t, o| self.embd.row(t as usize, o)) {
                         m.kv_push(&mut kv, &krow, &vrow);
-                        for (j, &(i, p)) in bs.iter().enumerate() { if j > 0 && p < min_p { break; } out.push((m.head_ids()[i.min(hm.rows - 1)], None)); }
+                        for (j, &(i, p)) in bs.iter().enumerate() { if j > 0 && crate::spec::draft_stop() { break; } if !crate::spec::draft_gate(j, p, min_p) { break; } out.push((m.head_ids()[i.min(hm.rows - 1)], None)); }
                     }
                     HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 for j in 0..(if gmode && !gxm { k } else { 0 }) {
+            if j > 0 && crate::spec::draft_stop() { break; }
                     self.embd.row(tok as usize, &mut e);
                     let Some((lg, rr2, krow, vrow)) = m.step_gpu_g(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j, rid) else { break };
                     if j == 0 { m.kv_push(&mut kv, &krow, &vrow); }
                     let th = std::time::Instant::now(); let (i, p) = cb.best(&lg, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
                     HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if j > 0 && p < min_p { break; }
+                    if !crate::spec::draft_gate(j, p, min_p) { break; }
                     out.push((id, None)); rh = rr2; tok = id;
                 }
                 for j in 0..(if gmode { 0 } else { k }) {
+            if j > 0 && crate::spec::draft_stop() { break; }
                     self.embd.row(tok as usize, &mut e);
                     let Some(gs) = m.step_gpu(cb, &g, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j) else { break };
                     if j == 0 { m.kv_push(&mut kv, &gs.krow, &gs.vrow); }
                     let th = std::time::Instant::now(); let o = cb.empty(hm.rows); cb.gemv(hm, &gs.s, d, 0, &o, hm.rows, 0); let (i, p) = cb.best(&o, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
                     HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if j > 0 && p < min_p { break; }
+                    if !crate::spec::draft_gate(j, p, min_p) { break; }
                     out.push((id, None)); rh = gs.rr; tok = id;
                 }
                 gr.end = gr.end.min(kv.end()).max(if kv.end() == n { n } else { 0 }); gr.gid = kv.gid; gdone = true;
             }
         }
         for j in 0..(if gdone { 0 } else { k }) {
+            if j > 0 && crate::spec::draft_stop() { break; }
             self.embd.row(tok as usize, &mut e);
             let (s, r2) = if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.step(&mut kv, &r, &e, n - 1 + j)) } else { mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)) }; let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
@@ -1883,7 +1886,7 @@ impl Model {
             let (id, p) = if let Some((cb, hm)) = hg { let xb = cb.buf(&s); let o = cb.empty(hm.rows); if !(env_var("PYRE_MTP_HEAD_DP4A").map(|v| v == "1").unwrap_or(false) && cb.gemv_q8d(hm, &xb, &o)) { cb.gemv(hm, &xb, s.len(), 0, &o, hm.rows, 0); } let (i, p) = if env_var("PYRE_MTP_BEST_GPU").map(|v| v != "0").unwrap_or(true) { cb.best(&o, hm.rows) } else { super::mtp::best(&cb.read(&o)) }; (m.head_ids()[i.min(hm.rows - 1)], p) }
                 else if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
             HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            if j > 0 && p < min_p { break; }
+            if !crate::spec::draft_gate(j, p, min_p) { break; }
             out.push((id, None)); r = r2; tok = id;
         }
         kv.truncate(n, row); st.mtp_kv = kv;
