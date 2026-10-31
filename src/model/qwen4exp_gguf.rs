@@ -2970,3 +2970,26 @@ pub fn pool_bench() {
             eprintln!("pbench expert {gty:?}+Q2_0 {mb:.2} MB t={t}: 1-thread hot {h:.0} us ({:.1} GB/s), cold {c:.0} us ({:.1} GB/s); pool {n}x distinct {pp:.1} us/expert ({:.1} GB/s aggregate)", mb / h * 1e3, mb / c * 1e3, mb / pp * 1e3);
         } }
 }
+
+/// Prompt-prefix snapshot for the serve prefix cache (PYRE_QN_PCACHE): the complete host-side recurrent state after
+/// `tokens` (DeltaNet conv + ssm, attention K/V + QSA index keys, PLE rings, MTP residual window). Restoring it and
+/// prefilling the rest of a prompt in the same absolute chunk grid gives the same state as a full prefill.
+pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
+impl Model {
+    /// Snapshot of `st` (None when the GPU holds attention rows the host copy lacks, i.e. after decode steps).
+    pub fn snapshot(&self, st: &State) -> Option<Snap> {
+        let row = self.cfg.n_kv * self.cfg.hd;
+        for (ai, g) in st.kvg.iter().enumerate() { if let Some(g) = g { if g.len * row > st.k.get(ai).map_or(0, |k| k.len()) { return None; } } }
+        let (conv, ssm) = if st.gdn_gpu { let cb = self.cube.as_ref()?; (st.gdn.iter().map(|(a, _)| cb.read(a)).collect::<Vec<_>>(), st.gdn.iter().map(|(_, b)| cb.read(b)).collect::<Vec<_>>()) } else { (st.conv.clone(), st.ssm.clone()) };
+        let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
+        let mut s = Snap { tokens: st.tokens.clone(), conv, ssm, k: st.k.clone(), v: st.v.clone(), ik: st.ik.clone(), ib: st.ib.clone(), ple_hist: st.ple_hist.clone(), mtp_r: st.mtp_r.clone(), bytes: 0 };
+        s.bytes = sz(&s.conv) + sz(&s.ssm) + sz(&s.k) + sz(&s.v) + sz(&s.ik) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
+        Some(s)
+    }
+    /// A fresh State equal to the snapshot (GPU mirrors are rebuilt on demand; the MTP drafter K/V catches up from the residual window).
+    pub fn restore(&self, s: &Snap) -> State {
+        let mut st = self.new_state();
+        st.tokens = s.tokens.clone(); st.conv = s.conv.clone(); st.ssm = s.ssm.clone(); st.k = s.k.clone(); st.v = s.v.clone(); st.ik = s.ik.clone(); st.ib = s.ib.clone(); st.ple_hist = s.ple_hist.clone(); st.mtp_r = s.mtp_r.clone();
+        st
+    }
+}
