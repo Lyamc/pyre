@@ -119,6 +119,10 @@ struct XbgP(*const Model); unsafe impl Send for XbgP {} impl XbgP { fn get(&self
 fn pfkv() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_PFKV").unwrap_or(if xexact() { 1 } else { 0 })) }
 static KVZ: std::sync::Mutex<Option<(burn_cubecl::cubecl::server::Handle, usize)>> = std::sync::Mutex::new(None);
 fn kvfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_KVFAST").map(|v| v == 1).unwrap_or(xexact())) }
+/// PYRE_QN_PREFETCH (gate/up rows ahead, software prefetch; default 2; k21b/k21c: 0/2/6/12 and DPREFETCH=0 all inside the
+/// run-to-run bimodal pool bandwidth, 37-39 vs 46-48 GB/s, unrelated to the setting) and PYRE_QN_DPREFETCH (down rows ahead, default 4). No numeric effect.
+fn gu_pf() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_PREFETCH").unwrap_or(2)) }
+fn dn_pf() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_DPREFETCH").unwrap_or(4)) }
 static XNF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn xfillfree() -> Option<usize> { static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new(); *K.get_or_init(|| { let n = env_usize("PYRE_QN_XFILLFREE").unwrap_or(0); (n > 0).then_some(n) }) }
 fn xprofill() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_XPROFILL").map(|v| v == "1").unwrap_or(false)) }
@@ -1551,7 +1555,7 @@ impl Model {
             let mut hbuf = vec![0f32; toks.len() * (r1 - r0)];
             if qgu { let mut sc = qdot::Scratch::default();
                 let mut s2 = qdot::Scratch::default();
-                let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
+                let pf = gu_pf();
                 for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                     if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
                     if toks.len() > 2 { qdot::decode(gm.ty, gr, d, &mut sc); qdot::decode(um.ty, ur, d, &mut s2);
@@ -1641,7 +1645,7 @@ impl Model {
                 for j in 0..self.4 { let hx = unsafe { self.6.slice(self.7[wi] + j * ff, ff) }; if self.8 { super::qdot::quantize_d_into_x(hx, &mut v[j]); } else { super::qdot::quantize_d_into(hx, &mut v[j]); } } } } }
             let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff, exq);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
-                let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
+                let pf = gu_pf();
                 let multi = usek && toks.len() >= 2 && toks.len() <= 16 && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
                 if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = ([0f32; 16], [0f32; 16]);
                     for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
@@ -1671,7 +1675,7 @@ impl Model {
                 // sums its partials in its own expert order: the same additions as a one-token call
                 let nr = r1 - r0; let mut part = vec![0f32; slot_n * nr];
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, nr); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
-                    for r in 0..nr { let dr = dm.row_raw(r); if r + 4 < nr { prefetch(dm.row_raw(r + 4)); }
+                    for r in 0..nr { let dr = dm.row_raw(r); { let dp = dn_pf(); if dp > 0 && r + dp < nr { prefetch(dm.row_raw(r + dp)); } }
                         if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
                             for (j, &(_, w)) in toks.iter().enumerate() { part[(slot0[wi] + j) * nr + r] = w * ov[j]; } continue; }
                         for (j, &(_, w)) in toks.iter().enumerate() { part[(slot0[wi] + j) * nr + r] = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; } } }
@@ -1683,7 +1687,7 @@ impl Model {
                     for &(wi, j) in lst { let pp = &part[(slot0[wi] + j) * nr..(slot0[wi] + j + 1) * nr]; for r in 0..nr { yt[r] += pp[r]; } } } }); return; }
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
-                    for r in 0..r1 - r0 { let dr = dm.row_raw(r); if r + 4 < r1 - r0 { prefetch(dm.row_raw(r + 4)); }
+                    for r in 0..r1 - r0 { let dr = dm.row_raw(r); { let dp = dn_pf(); if dp > 0 && r + dp < r1 - r0 { prefetch(dm.row_raw(r + dp)); } }
                         if used && toks.len() >= 2 && toks.len() <= 8 && dmulti() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, &al, &mut ov);
                             for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } continue; }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
@@ -1727,7 +1731,7 @@ impl Model {
         let mut slot0 = vec![0usize; work.len()]; let mut slot_n = 0usize; for (wi, (_, toks)) in work.iter().enumerate() { slot0[wi] = slot_n; slot_n += toks.len(); }
         let mut part = vec![0f32; slot_n * d]; let pp = SyncPtr(part.as_mut_ptr());
         let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
-        let pf = env_usize("PYRE_QN_PREFETCH").unwrap_or(2);
+        let pf = gu_pf();
         let task = |wi: usize| { let (e, toks) = work[wi]; let nt = toks.len(); let mut hid = vec![0f32; nt * ff]; let mut sc = qdot::Scratch::default();
             for b in 0..nb { let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
                 let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
