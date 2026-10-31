@@ -218,7 +218,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
 }
 
 
-// ---- PYRE_SPEC_POLICY=1 (opt-in, greedy only): cost-aware MTP window, after Strata's DraftPolicy::keep_draft /
+// ---- PYRE_SPEC_POLICY=1 (default on under PYRE_QN_XEXACT=1, =0 off; opt-in elsewhere; greedy only): cost-aware MTP window, after Strata's DraftPolicy::keep_draft /
 // observe_probs (include/strata/spec/draft_policy.hpp, github.com/Niko1221/Strata, MIT; reimplemented, no code copied).
 // After draft j (drafter probability p_j): E_j = 1 + q_0 + .. + q_j, q_i = prod_{k<=i} a(p_k), a() = the measured
 // acceptance of drafts that came with that probability (8 buckets, decayed counts); the window is the width with the best
@@ -226,7 +226,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
 // stops once one or two more drafts could no longer beat the best (so a low-probability draft step is not even computed).
 // PYRE_SPEC_POLICY_K (default 3) caps the drafts (the XEXACT verify path also caps the window via PYRE_QN_XWMAX).
 // It only chooses which drafts are verified: greedy output is unchanged.
-pub fn policy_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_SPEC_POLICY").map(|v| v == "1").unwrap_or(false)) }
+pub fn policy_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_SPEC_POLICY").map(|v| v == "1").unwrap_or_else(|_| std::env::var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false))) }
 const PB: usize = 8;
 struct Pol { ok: [f64; PB], n: [f64; PB], dcost: [f64; 10], cost: [f64; 10], cap: usize, q: f64, e: f64, best_v: f64, best_rows: usize,
     probs: Vec<f32>, on: bool, stop: bool, hist: [usize; 10], vc: [f64; 10], vn: [f64; 10], last: [usize; 10], rounds: usize, nv: usize, nd: usize }
