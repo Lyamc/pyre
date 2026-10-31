@@ -112,6 +112,7 @@ static XTR: std::sync::OnceLock<Option<std::sync::Mutex<std::io::LineWriter<std:
 fn xtron() -> bool { XTR.get_or_init(|| env_var("PYRE_QN_XTRACE").ok().and_then(|p| std::fs::File::create(p).ok()).map(|f| std::sync::Mutex::new(std::io::LineWriter::new(f)))).is_some() }
 fn xtr(f: impl FnOnce() -> String) { if xtron() { if let Some(Some(m)) = XTR.get() { use std::io::Write; let _ = writeln!(m.lock().unwrap(), "{}", f()); } } }
 fn xtr_l(il: usize, ti: usize, on: &[(usize, f32)], off: &[(usize, f32)]) { xtr(|| { let j = |v: &[(usize, f32)]| v.iter().map(|x| x.0.to_string()).collect::<Vec<_>>().join(" "); format!("L {il} {ti} {} | {}", j(on), j(off)) }) }
+fn xfillfree() -> Option<usize> { static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new(); *K.get_or_init(|| { let n = env_usize("PYRE_QN_XFILLFREE").unwrap_or(0); (n > 0).then_some(n) }) }
 fn xprofill() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_XPROFILL").map(|v| v == "1").unwrap_or(false)) }
 fn save_xprofile(pth: &str, cnt: &[Vec<u32>]) {
     let (nl, ne) = (cnt.len(), cnt.first().map_or(0, |r| r.len()));
@@ -1002,6 +1003,39 @@ impl Model {
         let dec = env_f32("PYRE_QN_ADAPT_DECAY").unwrap_or(0.7);
         for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c = (*c as f32 * dec) as u32; } }
     }
+    /// PYRE_QN_XFILLFREE=<n> (p4, opt-in; 0 = off): between the scheduled refills, empty cache
+    /// slots take the best-ranked routed experts that are not resident, at most n per window, never evicting. A short
+    /// prompt (A: 5 tokens) left ~45% of the slots empty for the whole decode, because each scheduled refill adds at most
+    /// PYRE_QN_XSWAP (64) experts every 16 calls. Offline (tools/xsim.py, A trace, 5.0 GiB): hits 55.9 -> 80.5%. Placement
+    /// only (XEXACT output is placement-invariant). Measured (moe.md p4): A hits 55.5 -> 71.4% at 3.5 GiB but A tok/s DOWN
+    /// (T4 window 69.6 -> 77.9 ms): pool -9 ms, GPU readback wait +8 ms -> the exact GPU expert kernels (~25 us per
+    /// token-expert pair) become the critical path; more hits only pay in CPU-critical layers. Opt-in.
+    fn xfill_free(&self, cb: &super::qn_cube::Cube, xc: &mut XCache, mx: usize) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        if xc.free.is_empty() || !xc.sloc.is_empty() || adapt_on() { return; }
+        // once per new routing (the t calls of one window see the same counts)
+        if LAST.swap(xc.total, std::sync::atomic::Ordering::Relaxed) == xc.total { return; }
+        let slot = xc.slot; let room = ((xc.budget.saturating_sub(xc.used)) / slot.max(1)).min(xc.free.len()).min(mx);
+        if room == 0 { return; }
+        let mut cand: Vec<(u64, usize, usize)> = vec![];
+        for (il, l) in self.layers.iter().enumerate() {
+            if super::qn_cube::xtype(l.gate_e.ty).is_none() || super::qn_cube::xtype(l.up_e.ty).is_none() || super::qn_cube::xtype(l.down_e.ty).is_none() { continue; }
+            for e in 0..self.cfg.n_exp { if xc.cnt[il][e] == 0 || xc.map.contains_key(&(il, e)) { continue; } cand.push((xscore(xc, il, e), il, e)); }
+        }
+        cand.sort_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2)))); cand.truncate(room);
+        let mut jobs: Vec<(usize, usize, usize, (u32, u32, u32))> = vec![];
+        for &(_, il, e) in &cand { let l = &self.layers[il]; let Some(sl) = xc.free.pop() else { break };
+            xc.used += slot; jobs.push((il, e, sl, (super::qn_cube::xtype(l.gate_e.ty).unwrap(), super::qn_cube::xtype(l.up_e.ty).unwrap(), super::qn_cube::xtype(l.down_e.ty).unwrap()))); }
+        if jobs.is_empty() { return; }
+        use rayon::prelude::*;
+        let tr0 = std::time::Instant::now();
+        let pks: Vec<_> = jobs.par_iter().map(|&(il, e, _, tys)| self.xpacked(il, e, tys)).collect();
+        let tr1 = tr0.elapsed();
+        for (&(il, e, sl, _), pk) in jobs.iter().zip(pks.iter()) { let mut ent = xc.up(cb, sl, &pk.0, pk.1, pk.2); ent.arena = xc.loc(sl).0; ent.slot = sl; xc.map.insert((il, e), ent); }
+        let (a, b) = (tr1.as_secs_f64() * 1e3, (tr0.elapsed() - tr1).as_secs_f64() * 1e3);
+        xtr(|| format!("F {} {} {a:.2} {b:.2}", xc.calls, jobs.len()));
+        if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: fill-free {} experts (resident {}): repack {a:.2} ms, upload {b:.2} ms", jobs.len(), xc.map.len()); }
+    }
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
         xc.calls += 1;
         // PYRE_QN_XSTAT=1: cache hit rate and misses per layer per token so far (every 16 calls)
@@ -1012,7 +1046,7 @@ impl Model {
         let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16);
         // an empty cache fills right away (the call before prefill has no routing counts yet, so the first
         // real fill used to wait until call `every` and then add only XSWAP experts)
-        if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { return; }
+        if xc.calls != 1 && xc.calls % every != 0 && !xc.map.is_empty() { if let Some(mx) = xfillfree() { self.xfill_free(cb, xc, mx); } return; }
         xtr(|| format!("R {} {}", xc.calls, xc.map.len()));
         let ff = self.cfg.ff_exp; let d = self.cfg.d;
         let slot = xc.slot; let xcl = !xc.sloc.is_empty(); let (dd0, ff0) = (self.cfg.d, self.cfg.ff_exp);
