@@ -3850,6 +3850,8 @@ fn k_xgu_ex16(xq: &[u32], xd: &[f32], ar: &[u32], ar1: &[u32], meta: &[u32], oc:
     #[comptime] gn: u32, #[comptime] ty: u32) {
     let mut grid = Shared::<[u32]>::new_slice(comptime!(gn as usize));
     let mut fa = Shared::<[f32]>::new_slice(256usize);
+    // entry slots past the window's hit count (PYRE_QN_XGR launches t*k slots) leave at once
+    if CUBE_POS_Y >= oc[3] { terminate!(); }
     let mut i = UNIT_POS;
     while i < gn { grid[i as usize] = gsrc[i as usize]; i += CUBE_DIM; }
     sync_cube();
@@ -3901,6 +3903,7 @@ static XGU2_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 /// each lane accumulating its blocks in order (same per-lane fma order and final sum as k_xdown_ex8), no shared integer stage.
 #[cube(launch_unchecked)]
 fn k_xdown_ex16(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta: &[u32], oc: &[u32], y: &mut [f32], rows: u32, nb: u32, rbd: u32) {
+    if CUBE_POS_Y >= oc[3] { terminate!(); }
     let mut fa = Shared::<[f32]>::new_slice(256usize);
     let e = CUBE_POS_Y;
     let wy = UNIT_POS_Y;
@@ -4167,6 +4170,56 @@ fn k_xdown_ex8(hq: &[u32], hd: &[f32], hs: &[u32], ar: &[u32], ar1: &[u32], meta
         let wt = f32::reinterpret(meta[(e * 4 + 3) as usize]);
         y[(e * rows + row) as usize] = fma(wt, v, 0.0f32);
     }
+}
+/// PYRE_QN_XGR: routing on the GPU right after the router GEMV. One cube (unit = expert, <= 1024), tokens in turn:
+/// rank(e) = #{j: r_j > r_e} + #{j < e: r_j == r_e}; selected iff rank < k. That is the host top_k's set whenever the
+/// k-th and (k+1)-th logits differ (the host checks this per token and falls back otherwise). The selected experts that
+/// are resident (rt[e*4+3] != 0, rt = the host's xmeta words of the layer's cache table) become hit entries in ascending
+/// expert order (weight word 1.0; the routing weight is applied later by k_xgr_scale with the host's softmax), oc =
+/// cumulative hit counts per token (padded to 4), dbg = the selected ids in ascending order (PYRE_QN_XGR_CHK).
+#[cube(launch_unchecked)]
+fn k_xgr_topk(rd: &[f32], rt: &[u32], mh: &mut [u32], oc: &mut [u32], dbg: &mut [u32], rn: u32, d: u32, ne: u32, kk: u32, t: u32) {
+    let mut lg = Shared::<[f32]>::new_slice(1024usize);
+    let mut hf = Shared::<[u32]>::new_slice(1024usize);
+    let mut sf = Shared::<[u32]>::new_slice(1024usize);
+    let e = UNIT_POS;
+    let mut base = 0u32;
+    let mut ti = 0u32;
+    while ti < t {
+        if e < ne { lg[e as usize] = rd[(ti * rn + d + e) as usize]; }
+        sync_cube();
+        let mut sel = 0u32;
+        let mut hit = 0u32;
+        if e < ne {
+            let v = lg[e as usize];
+            let mut rank = 0u32;
+            for j in 0..ne { let u = lg[j as usize]; if u > v { rank += 1u32; } else if u == v && j < e { rank += 1u32; } }
+            if rank < kk { sel = 1u32; if rt[(e * 4 + 3) as usize] != 0u32 { hit = 1u32; } }
+            hf[e as usize] = hit;
+            sf[e as usize] = sel;
+        }
+        sync_cube();
+        let mut tot = 0u32;
+        if e < ne {
+            let mut hp = 0u32;
+            let mut sp = 0u32;
+            for j in 0..ne { if j < e { hp += hf[j as usize]; sp += sf[j as usize]; } tot += hf[j as usize]; }
+            if hit == 1u32 { let o = (base + hp) * 4; mh[o as usize] = rt[(e * 4) as usize]; mh[(o + 1) as usize] = rt[(e * 4 + 1) as usize]; mh[(o + 2) as usize] = rt[(e * 4 + 2) as usize]; mh[(o + 3) as usize] = 1065353216u32; }
+            if sel == 1u32 { dbg[(ti * kk + sp) as usize] = e; }
+        }
+        base += tot;
+        if e == 0u32 { oc[ti as usize] = base; }
+        sync_cube();
+        ti += 1u32;
+    }
+    if e == 0u32 { let mut j = t; while j < 4u32 { oc[j as usize] = base; j += 1u32; } }
+}
+/// PYRE_QN_XGR: the hit rows (written by k_xdown_ex16 with weight 1.0, i.e. fma(1, v, 0)) scaled by the host's routing
+/// weights with the same single fma as the weighted down kernel: y = fma(w, v, 0).
+#[cube(launch_unchecked)]
+fn k_xgr_scale(y: &mut [f32], w: &[u32], n: u32, d: u32) {
+    let i = ABSOLUTE_POS_X;
+    if i < n { let wt = f32::reinterpret(w[(i / d) as usize]); y[i as usize] = fma(wt, y[i as usize], 0.0f32); }
 }
 /// PYRE_QN_XEXACT: per token, its routed experts' weighted rows summed in routing order from 0 (as the CPU's
 /// per-token accumulation), each row from the GPU entry rows (gy) or the CPU rows (cy, code bit 31).
@@ -5135,6 +5188,17 @@ impl Cube {
             BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
             sz(gy), sz(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(gb.clone(), gn), BufferArg::from_raw_parts(dn.clone(), t * ds),
             d as u32, kk as u32, gs as u32, goff as u32, ds as u32, lr as u32, hc as u32) }
+    }
+    /// PYRE_QN_XGR: k_xgr_topk over the t router rows of `rd` (stride rn, logits at d..d+ne) against the layer table `rt`
+    pub fn xgr_topk(&self, rd: &Handle, rdn: usize, rt: &Handle, ne: usize, mh: &Handle, kk: usize, oc: &Handle, dbg: &Handle, rn: usize, d: usize, t: usize) {
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        let cd = (ne.div_ceil(32) * 32).min(1024) as u32;
+        unsafe { k_xgr_topk::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(cd), a(rd, rdn), a(rt, ne * 4), a(mh, t * kk * 4), a(oc, 4), a(dbg, t * kk), rn as u32, d as u32, ne as u32, kk as u32, t as u32) }
+    }
+    /// PYRE_QN_XGR: y[i] = fma(w[i / d], y[i], 0) for the first n entries' rows
+    pub fn xgr_scale(&self, y: &Handle, w: &Handle, n: usize, d: usize) {
+        let a = |hd: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd.clone(), n) };
+        unsafe { k_xgr_scale::launch_unchecked(&self.client, CubeCount::Static(((n * d) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), a(y, n * d), a(w, n), (n * d) as u32, d as u32) }
     }
     pub fn rsum_ex(&self, gy: &Handle, cy: &Handle, tab: &Handle, y: &Handle, d: usize, kk: usize, t: usize) {
         let a = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };

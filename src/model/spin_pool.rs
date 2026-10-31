@@ -33,6 +33,7 @@ struct Shared {
     etail: usize,
     /// bumped by prewake(): spinning workers restart their spin window, parked ones wake and spin
     kick: AtomicU64,
+    pin0: Option<usize>,
 }
 
 pub struct Pool { sh: Arc<Shared>, pub threads: usize }
@@ -44,11 +45,13 @@ impl Pool {
     /// Workers with index >= `n_fast` are slow (E-cores): they skip a job's last `etail` tasks.
     pub fn new_hybrid(threads: usize, spin: Duration, pin: &[usize], n_fast: usize, etail: usize) -> Self {
         let sh = Arc::new(Shared { gen: AtomicU64::new(0), ticket: AtomicU64::new(0), job: AtomicPtr::new(std::ptr::null_mut()), done: AtomicUsize::new(0), n: AtomicUsize::new(0),
-            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail, kick: AtomicU64::new(0) });
+            sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail, kick: AtomicU64::new(0),
+            pin0: if std::env::var("PYRE_QN_XPIN0").map(|v| v == "1").unwrap_or(false) { pin.first().copied() } else { None } });
         for i in 1..threads.max(1) {
             let sh = sh.clone(); let cpu = pin.get(i).copied();
-            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { WID.with(|w| w.set(i)); if let Some(c) = cpu { pin_to(c); } worker(&sh, i >= n_fast) }).expect("spawn pool worker");
+            std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { WID.with(|w| w.set(i)); if let Some(c) = cpu { pin_to(c); } thr_tune(); worker(&sh, i >= n_fast) }).expect("spawn pool worker");
         }
+        proc_tune(); thr_tune();
         Pool { sh, threads: threads.max(1) }
     }
 
@@ -66,12 +69,22 @@ impl Pool {
         if n == 0 { side(); return; }
         let sh = &*self.sh;
         let js = if jprof() { let t = now_ns(); JFC.store(u64::MAX, Relaxed); JLC.store(0, Relaxed); JLF.store(0, Relaxed); JB.store(0, Relaxed); t } else { 0 };
+        // PYRE_QN_XPIN0=1 (opt-in): the calling thread (pool index 0) is pinned to pin[0], the one core with no worker, instead
+        // of floating (it could share a core with a pinned worker and halve that core's speed for the whole job)
+        thread_local! { static P0: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        if let Some(c) = sh.pin0 { if !P0.with(|p| p.replace(true)) { pin_to(c); } }
         let job = Job { f, n };
         let g = sh.gen.load(Relaxed) + 1;
+        // CAS path (TFA off or etail): the ticket moves to generation g FIRST: a worker still in work() for the previous job
+        // may have read that job's exhausted ticket and then read the new (larger) n; its compare_exchange on the old ticket
+        // must fail, or it would run task i twice through a stale job pointer and over-count `done`. (TFA claims carry
+        // their own generation and n and need job/n published BEFORE the ticket, so they keep that order.)
+        let tf = tfa() && sh.etail == 0;
+        if !tf { sh.ticket.store(g << 32, SeqCst); }
         sh.done.store(0, Relaxed);
-        sh.n.store(n, Relaxed);
+        sh.n.store(n, Release);
         sh.job.store(&job as *const Job as *mut Job<'static>, Relaxed);
-        if tfa() && sh.etail == 0 { assert!(n + PB < 1 << 20); sh.ticket.store(((g & 0xfffff) << 44) | (((n + if pedq() { PB } else { 0 }) as u64) << 24), Release); } else { sh.ticket.store(g << 32, Relaxed); }
+        if tf { assert!(n + PB < 1 << 20); sh.ticket.store(((g & 0xfffff) << 44) | (((n + if pedq() { PB } else { 0 }) as u64) << 24), Release); }
         sh.gen.store(g, Release);
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
         let tj = Instant::now();
@@ -169,6 +182,33 @@ pub fn pin_to(cpu: usize) {
 }
 #[cfg(not(windows))]
 pub fn pin_to(_cpu: usize) {}
+
+/// PYRE_QN_XQOS=1 (opt-in): opt this process (and each pool thread / the caller) out of Windows power throttling
+/// (EcoQoS: a windowless background process may be scheduled for efficiency) via SetProcessInformation /
+/// SetThreadInformation on our own handles - a per-process hint, nothing system-wide is changed.
+/// PYRE_QN_XPRIO=N: SetThreadPriority(N) for the pool workers and the calling thread (1 above normal, 2 highest; 0 normal);
+/// default 1 under PYRE_QN_XEXACT=1 (fewer preempted-worker tails: e62 maxlay 1.8 vs 2.0-3.2 ms), else unchanged.
+fn xqos() -> bool { std::env::var("PYRE_QN_XQOS").map(|v| v == "1").unwrap_or(false) }
+fn xprio() -> Option<i32> { match std::env::var("PYRE_QN_XPRIO") { Ok(v) => v.parse().ok(), Err(_) => if std::env::var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false) { Some(1) } else { None } } }
+#[cfg(windows)]
+fn proc_tune() {
+    use windows_sys::Win32::System::Threading::*;
+    if xqos() { let st = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED, StateMask: 0 };
+        let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st as *const _ as *const core::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
+        eprintln!("expert pool: XQOS process power throttling off: {}", ok != 0); }
+    if let Some(p) = xprio() { eprintln!("expert pool: XPRIO thread priority {p}"); }
+}
+#[cfg(windows)]
+fn thr_tune() {
+    use windows_sys::Win32::System::Threading::*;
+    if xqos() { let st = THREAD_POWER_THROTTLING_STATE { Version: THREAD_POWER_THROTTLING_CURRENT_VERSION, ControlMask: 1, StateMask: 0 };
+        unsafe { SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &st as *const _ as *const core::ffi::c_void, std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32); } }
+    if let Some(p) = xprio() { unsafe { SetThreadPriority(GetCurrentThread(), p); } }
+}
+#[cfg(not(windows))]
+fn proc_tune() {}
+#[cfg(not(windows))]
+fn thr_tune() {}
 
 /// One logical CPU per physical core of the fastest efficiency class (P-cores on a hybrid Intel
 /// part), or empty when that cannot be read. Strata likewise runs one pool worker per physical core.
