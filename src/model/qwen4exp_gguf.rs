@@ -146,7 +146,7 @@ pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, 
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
+pub struct Model { vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xzs: std::sync::Mutex<Option<XZs>>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -233,12 +233,13 @@ fn xl_idx(il: usize, t: usize) -> Option<usize> { (il < 128 && t < 5).then_some(
 /// layer il's rd wait (behind layer il-1's gate): update il-1's balance
 fn xl_rdwait(il: usize, t: usize, ns: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    if il == 0 || !(xbal() || xlstat()) { return; }
+    if il == 0 || !(xbal() || xlstat() || xzs()) { return; }
     let (Some(ib), Some(ip)) = (xl_idx(il, t), xl_idx(il - 1, t)) else { return; };
     let mn = XL_MIN[ib].fetch_min(ns, Relaxed).min(ns); let n = XL_CNT[ib].fetch_add(1, Relaxed);
     if n < 4 { return; }
     let ex = ns - mn; let hi = env_usize("PYRE_QN_XBAL_HI_US").unwrap_or(40) as u64 * 1000; let lo = env_usize("PYRE_QN_XBAL_LO_US").unwrap_or(10) as u64 * 1000;
     let s = &XL_ST[il - 1]; s[2].fetch_add(ex, Relaxed); s[5].fetch_add(1, Relaxed); if ex > hi { s[3].fetch_add(1, Relaxed); }
+    if xzs() { xzs_ctl(ip, ex); }
     if !xbal() { return; }
     if ex > hi { XL_K[ip].fetch_add(1, Relaxed); XL_LOW[ip].store(0, Relaxed); }
     else if ex < lo { let lw = XL_LOW[ip].fetch_add(1, Relaxed) + 1; if lw >= env_usize("PYRE_QN_XBAL_N").unwrap_or(4) as u64 { XL_LOW[ip].store(0, Relaxed); let k = XL_K[ip].load(Relaxed); if k > 0 { XL_K[ip].store(k - 1, Relaxed); } } }
@@ -304,6 +305,64 @@ static XZ_RB: std::sync::Mutex<(usize, Vec<usize>, usize, u32)> = std::sync::Mut
 /// PYRE_QN_XGR_CHK=1 (debug): reads the GPU's selected ids, hit entries and counts back every layer and compares them
 /// with the host's (counts in the xhost line: xgr used/tie/tab/chk-mismatch).
 fn xgr() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| xexact() && env_var("PYRE_QN_XGR").map(|v| v == "1").unwrap_or(false)) }
+/// PYRE_QN_XZS=1 (XEXACT; opt-in): zero-copy PCIe share of missed experts (moe.md x1-x4). A page-locked, device-mapped
+/// host arena (cuMemHostAlloc DEVICEMAP, in-process; PYRE_QN_XZS_GB default 6, hard cap 8, shrunk so >= 24 GiB of RAM
+/// stays free; freed on exit) holds experts repacked in the GPU arena layout: the hottest ones not resident in VRAM,
+/// ranked by routing count in this run, then the profile (PYRE_QN_XZS_PROFILE=<file[;file]>, else PYRE_QN_XPROFILE);
+/// refreshed at every cache refill (<= PYRE_QN_XZS_SWAP, 48, replacements). Per (layer, T) a controller picks k of the
+/// layer's misses that are in the arena (most tokens first, then expert id) and runs them through the SAME exact kernels
+/// as the hits (xrun_exact, unchanged: they read the host arena over PCIe through a cubecl-pipe alias of a small
+/// placeholder buffer, pyre_alias_mapped) on a second CUDA stream, concurrently with the hit kernels and the CPU pool.
+/// Before the in-order sum the main stream joins it (device event, pyre_stream_join; bounded by the kernels themselves)
+/// and the rows are copied after the hit rows; the sum table points at them. Placement cannot change the output.
+/// Controller: the balance idea is Strata's PcieModel (github.com/Niko1221/Strata, MIT, expert_source.hpp PcieModel:
+/// fit pool and GPU cost, give the GPU the share that equalises both sides); reimplemented on pyre's own XLSTAT lateness
+/// signal instead of a cost fit: layer l's next rd wait above its per-(layer,T) minimum by > PYRE_QN_XZS_HI_US (40) ->
+/// the GPU side was late -> k-1; < PYRE_QN_XZS_LO_US (15) for PYRE_QN_XZS_N (2) windows while the pool still ran
+/// > PYRE_QN_XZS_POOL_US (150) -> k+1; 0 <= k <= PYRE_QN_XZS_MAX (6), start PYRE_QN_XZS_K0 (2).
+fn xzs() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| xexact() && env_var("PYRE_QN_XZS").map(|v| v == "1").unwrap_or(false)) && !XZS_ERR.load(std::sync::atomic::Ordering::Relaxed) }
+static XZS_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static XZS_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static XZS_FAIL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static XZS_ERRW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// after each window: a timed-out device wait (err word) or a failed async submit turns XZS off (that window's output is invalid)
+fn xzs_err_check() { let e = XZS_ERRW.load(std::sync::atomic::Ordering::Relaxed); if e == 0 { return; } let bad = unsafe { std::ptr::read_volatile(e as *const u32) } != 0 || XZS_FAIL.load(std::sync::atomic::Ordering::Relaxed) != 0; if bad && !XZS_ERR.swap(true, std::sync::atomic::Ordering::Relaxed) { eprintln!("PYRE_QN_XZS: device wait timed out or submit failed; XZS off for the rest of the run (that window's output is invalid)"); } }
+static XZS_K: [std::sync::atomic::AtomicU64; XLN] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; XLN];
+static XZS_LOW: [std::sync::atomic::AtomicU64; XLN] = [const { std::sync::atomic::AtomicU64::new(0) }; XLN];
+static XZS_POOL: [std::sync::atomic::AtomicU64; XLN] = [const { std::sync::atomic::AtomicU64::new(0) }; XLN];
+/// 0 layer calls, 1 shared experts, 2 shared rows, 3 misses in the arena (distinct), 4 miss rows, 5 sum of k, 6 swaps, 7 fills
+pub static XZS_ST: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+fn xzs_cfg(k: &str, d: u64) -> u64 { env_usize(k).map(|v| v as u64).unwrap_or(d) }
+/// PYRE_QN_XZS_ZC=1: the shared kernels read the pinned arena in place (zero-copy) instead of a DMA'd VRAM stage (x3: slower)
+fn xzs_zc() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XZS_ZC").map(|v| v == "1").unwrap_or(false)) }
+fn xzs_max() -> u64 { static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new(); *K.get_or_init(|| xzs_cfg("PYRE_QN_XZS_MAX", 6).min(16)) }
+/// layer il-1's controller step from layer il's rd wait excess (ns); see xzs()
+fn xzs_ctl(ip: usize, ex: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = XZS_K[ip].load(Relaxed); if k == u64::MAX { return; }
+    static C: std::sync::OnceLock<(u64, u64, u64, u64)> = std::sync::OnceLock::new();
+    let &(hi, lo, n, pm) = C.get_or_init(|| (xzs_cfg("PYRE_QN_XZS_HI_US", 40) * 1000, xzs_cfg("PYRE_QN_XZS_LO_US", 15) * 1000, xzs_cfg("PYRE_QN_XZS_N", 2).max(1), xzs_cfg("PYRE_QN_XZS_POOL_US", 150) * 1000));
+    if ex > hi { if k > 0 { XZS_K[ip].store(k - 1, Relaxed); } XZS_LOW[ip].store(0, Relaxed); }
+    else if ex < lo && XZS_POOL[ip].load(Relaxed) > pm { let w = XZS_LOW[ip].fetch_add(1, Relaxed) + 1; if w >= n { XZS_LOW[ip].store(0, Relaxed); if k < xzs_max() { XZS_K[ip].store(k + 1, Relaxed); } } }
+    else { XZS_LOW[ip].store(0, Relaxed); }
+}
+fn xzs_print(tag: &str) {
+    use std::sync::atomic::Ordering::Relaxed; let v: Vec<u64> = XZS_ST.iter().map(|a| a.load(Relaxed)).collect(); let n = v[0].max(1) as f64;
+    eprintln!("xzs{tag}: layer calls {} shared/layer {:.2} rows/layer {:.2} k/layer {:.2} arena-misses/layer {:.2} miss rows/layer {:.2} swaps {} fills {}", v[0], v[1] as f64 / n, v[2] as f64 / n, v[5] as f64 / n, v[3] as f64 / n, v[4] as f64 / n, v[6], v[7]);
+}
+/// raw routing counts of one or more expert profile files (PYRE_QN_XPROFILE_SAVE format), summed
+fn xzs_profile() -> Option<Vec<Vec<f64>>> {
+    let ps = env_var("PYRE_QN_XZS_PROFILE").or_else(|_| env_var("PYRE_QN_XPROFILE")).ok()?; let mut acc: Option<Vec<Vec<f64>>> = None;
+    for pth in ps.split(';').filter(|x| !x.is_empty()) { let Ok(b) = std::fs::read(pth) else { eprintln!("xzs: profile {pth} unreadable"); continue };
+        if b.len() < 8 { continue; } let u = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]); let (nl, ne) = (u(0) as usize, u(1) as usize); if b.len() != 8 + 4 * nl * ne { continue; }
+        let a = acc.get_or_insert_with(|| vec![vec![0.0; ne]; nl]); if a.len() != nl || a[0].len() != ne { continue; }
+        for l in 0..nl { for e in 0..ne { a[l][e] += u(2 + l * ne + e) as f64; } } }
+    acc
+}
+/// The XZS pinned arena: `nslot` slots of `slot` bytes at host address `host` (device-mapped); `ph` is the placeholder
+/// device buffer cubecl-pipe aliases to it; `map` = (layer, expert) -> entry (offsets in words, as the GPU arenas).
+pub struct XZs { host: usize, bytes: usize, slot: usize, s2: cubecl_environment::stream::StreamId, tabs: super::qn_cube::XTabs, flag: usize, err: usize, ring: usize, rslot: usize, nring: usize, iring: usize, islot: usize, pin: Vec<burn_cubecl::cubecl::server::Handle>, stage: burn_cubecl::cubecl::server::Handle, nstage: usize, zscr: super::qn_cube::XScr, ybuf: burn_cubecl::cubecl::server::Handle, seq: std::sync::atomic::AtomicU32, ph: burn_cubecl::cubecl::server::Handle, map: std::collections::HashMap<(usize, usize), super::qn_cube::XEnt>, owner: Vec<Option<(usize, usize)>>, prof: Option<Vec<Vec<f64>>>, filled: bool, free: Option<Box<dyn FnOnce() + Send>> }
+impl Drop for XZs { fn drop(&mut self) { if let Some(f) = self.free.take() { f(); xzs_print(" final"); eprintln!("xzs: pinned arena freed ({:.2} GiB)", self.bytes as f64 / (1u64 << 30) as f64); } } }
 fn xgr_chk() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XGR_CHK").map(|v| v == "1").unwrap_or(false)) }
 static XGR_N: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 struct XgrPend { il: usize, t: usize, y: H, mh: H, oc: H, dbg: H, rt: Vec<u32> }
@@ -447,7 +506,7 @@ impl Model {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
+        Ok(Model { vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xzs: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
     }
 
     pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
@@ -944,6 +1003,82 @@ impl Model {
         let dec = env_f32("PYRE_QN_ADAPT_DECAY").unwrap_or(0.7);
         for row in xc.cnt.iter_mut() { for c in row.iter_mut() { *c = (*c as f32 * dec) as u32; } }
     }
+    /// PYRE_QN_XZS: allocate the pinned arena (once), fill it, and refresh it at cache refills (see xzs()).
+    fn xzs_tick(&self, cb: &super::qn_cube::Cube, xc: &XCache) {
+        let mut g = self.xzs.lock().unwrap();
+        if g.is_none() { if XZS_INIT.swap(true, std::sync::atomic::Ordering::Relaxed) { return; } *g = self.xzs_init(cb, xc); if g.is_none() { XZS_ERR.store(true, std::sync::atomic::Ordering::Relaxed); return; } }
+        let z = g.as_mut().unwrap();
+        let every = env_usize("PYRE_QN_XREFILL").unwrap_or(16).max(1);
+        let full = !z.filled && (z.prof.is_some() || xc.total > 0);
+        if !full && !(z.filled && xc.calls % every == 0) { return; }
+        let t0 = std::time::Instant::now(); let nslot = z.owner.len();
+        let types = |l: &Layer| match (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { (Some(a), Some(b), Some(c2)) if a == b && a <= 1 && c2 == 3 => Some((a, b, c2)), _ => None };
+        let score = |il: usize, e: usize| -> u64 { if xc.map.contains_key(&(il, e)) { return 0; } let pr = z.prof.as_ref().and_then(|p| p.get(il)).and_then(|r| r.get(e)).copied().unwrap_or(0.0); ((xc.cnt[il][e] as u64) << 32) | (pr as u64).min(u32::MAX as u64) };
+        let mut cand: Vec<(u64, usize, usize)> = vec![];
+        for (il, l) in self.layers.iter().enumerate() { if types(l).is_none() { continue; } for e in 0..self.cfg.n_exp { let sc = score(il, e); if sc > 0 && !z.map.contains_key(&(il, e)) { cand.push((sc, il, e)); } } }
+        cand.sort_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+        // (slot, layer, expert): free slots first, then victims (lowest score first, VRAM-resident ones score 0) a candidate beats
+        let mut jobs: Vec<(usize, usize, usize)> = vec![];
+        let mut freev: Vec<usize> = (0..nslot).filter(|&s| z.owner[s].is_none()).rev().collect();
+        let mut vict: Vec<(u64, usize)> = (0..nslot).filter_map(|s| z.owner[s].map(|(il, e)| (score(il, e), s))).collect();
+        vict.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let maxj = if full { usize::MAX } else { env_usize("PYRE_QN_XZS_SWAP").unwrap_or(48) };
+        for &(sc, il, e) in &cand { if jobs.len() >= maxj { break; }
+            if let Some(s) = freev.pop() { jobs.push((s, il, e)); continue; }
+            match vict.last() { Some(&(vs, s)) if vs < sc && (sc >> 32) > 0 => { vict.pop(); if let Some(k) = z.owner[s].take() { z.map.remove(&k); } jobs.push((s, il, e)); }, _ => break } }
+        let (host, slot) = (z.host, z.slot);
+        use rayon::prelude::*;
+        for ch in jobs.chunks(256) {
+            let pks: Vec<_> = ch.par_iter().map(|&(_, il, e)| self.xpacked(il, e, types(&self.layers[il]).unwrap())).collect();
+            ch.par_iter().zip(pks.par_iter()).for_each(|(&(s, _, _), pk)| { let n = pk.0.len().min(slot);
+                // SAFETY: slot s lies inside the arena (s < nslot) and no kernel reads it: it is not in the map until below,
+                // and refills run between windows (every XZS kernel of the last window was joined into the main stream and read back)
+                unsafe { std::ptr::copy_nonoverlapping(pk.0.as_ptr(), (host + s * slot) as *mut u8, n); } });
+            for (&(s, il, e), pk) in ch.iter().zip(pks.iter()) { let b = ((s * slot) / 4) as u32;
+                z.map.insert((il, e), super::qn_cube::XEnt { off: [b, b + pk.1 as u32, b + pk.2 as u32], arena: 0, slot: s, bytes: slot }); z.owner[s] = Some((il, e)); }
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        if full { z.filled = true; XZS_ST[7].fetch_add(1, Relaxed); eprintln!("xzs: arena filled: {} experts ({} profile, call {}) in {:.0} ms", z.map.len(), if z.prof.is_some() { "with" } else { "no" }, xc.calls, t0.elapsed().as_secs_f64() * 1e3); }
+        else { XZS_ST[6].fetch_add(jobs.len() as u64, Relaxed); }
+    }
+    fn xzs_init(&self, cb: &super::qn_cube::Cube, xc: &XCache) -> Option<XZs> {
+        let slot = xc.slot.next_multiple_of(256); let gib = (1u64 << 30) as f64;
+        let want = (env_f32("PYRE_QN_XZS_GB").unwrap_or(6.0).clamp(0.0, 8.0) as f64 * gib) as usize;
+        let avail = avail_ram(); let room = avail.saturating_sub(24usize << 30);
+        let cap = ((8usize << 30) - slot).min(want).min(room); let nslot = cap / slot.max(1);
+        if nslot < 16 { eprintln!("xzs: off: budget {:.2} GiB, {:.1} GiB RAM free (keeps >= 24 GiB free)", want as f64 / gib, avail as f64 / gib); return None; }
+        let bytes = nslot * slot;
+        let host = match cb.client.pyre_host_pinned(bytes) { Ok(h) => h, Err(e) => { eprintln!("xzs: off: pinned alloc of {bytes} B failed: {e}"); return None; } };
+        let cl = cb.client.clone(); let free: Box<dyn FnOnce() + Send> = Box::new(move || { let _ = cubecl_environment::future::block_on(cl.sync()); if let Err(e) = unsafe { cl.pyre_host_free(host) } { eprintln!("xzs: free failed: {e}"); } });
+        // everything the shared kernels touch lives on their own stream (main id + 1): the placeholder, the tables, the
+        // inputs and outputs; the join is a mapped flag, so CubeCL never syncs the two streams itself (a cross-stream
+        // GC wait on another thread invalidates a VGRAPH capture running in global mode)
+        let s2 = cubecl_environment::stream::StreamId { value: cubecl_environment::stream::StreamId::current().value.wrapping_add(1) };
+        let (nring, rslot, islot) = (8usize, (64 * self.cfg.d * 4).next_multiple_of(4096), 256usize << 10);
+        let fr = match cb.client.pyre_host_pinned(4096 + nring * (rslot + islot)) { Ok(h) => h, Err(e) => { eprintln!("xzs: off: flag alloc failed: {e}"); free(); return None; } };
+        unsafe { std::ptr::write_bytes(fr as *mut u8, 0, 4096); }
+        let (ph, tabs) = s2.executes(|| (cb.client.empty(256), cb.xtabs()));
+        if let Err(e) = s2.executes(|| unsafe { cb.client.pyre_alias_mapped(&ph, host, bytes) }) { eprintln!("xzs: off: alias failed: {e}"); free(); return None; }
+        // per ring slot, an input placeholder aliased to its mapped slot (table | counts @1 KiB | rd rows @2 KiB): the shared
+        // kernels read them over PCIe, so the host writes them without a blocking upload
+        let iring = fr + 4096 + nring * rslot; let mut pin = vec![];
+        for j in 0..nring { let h = s2.executes(|| cb.client.empty(islot)); if let Err(e) = s2.executes(|| unsafe { cb.client.pyre_alias_mapped(&h, iring + j * islot, islot) }) { eprintln!("xzs: off: input alias failed: {e}"); free(); return None; } pin.push(h); }
+        // self-test: a kernel reading the placeholder must see the host bytes (first and last 64 words)
+        let nw = bytes / 4; let pat = |i: usize| (0x3f80_0000u32 ^ (i as u32).wrapping_mul(2654435761)) & 0x3fff_ffff;
+        for i in (0..64).chain(nw - 64..nw) { unsafe { *((host as *mut u32).add(i)) = pat(i); } }
+        let got = s2.executes(|| { let dst = cb.empty(128); cb.copy(&ph, nw, 0, &dst, 128, 0, 64); cb.copy(&ph, nw, nw - 64, &dst, 128, 64, 64); cb.read(&dst) });
+        let ok = (0..64).all(|i| got[i].to_bits() == pat(i)) && (0..64).all(|i| got[64 + i].to_bits() == pat(nw - 64 + i));
+        if !ok { eprintln!("xzs: off: alias self-test failed"); free(); return None; }
+        // DMA mode (default): per layer the shared experts are copied by the copy engine (cuMemcpyHtoDAsync from the pinned
+        // arena, on the second stream) into a small VRAM stage, then the exact kernels run on it there
+        let nstage = 16usize; let stage = s2.executes(|| cb.client.empty(nstage * slot));
+        // persistent second-stream scratch and output: no pool allocation on s2 per layer (a pool reuse across streams makes
+        // CubeCL order s2 behind the main stream, whose join waits on s2 -> the bounded wait times out)
+        let (zscr, ybuf) = s2.executes(|| (cb.xscratch_t(self.cfg.d, self.cfg.ff_exp, 64, 4), cb.empty(64 * self.cfg.d)));
+        XZS_ERRW.store(fr + 64, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("xzs: pinned arena {:.2} GiB ({nslot} slots of {slot} B), {:.1} GiB RAM free before, {:.1} after; stream {:?}", bytes as f64 / gib, avail as f64 / gib, avail_ram() as f64 / gib, s2);
+        Some(XZs { host, bytes, slot, s2, tabs, flag: fr, err: fr + 64, ring: fr + 4096, rslot, nring, iring, islot, pin, stage, nstage, zscr, ybuf, seq: std::sync::atomic::AtomicU32::new(0), ph, map: Default::default(), owner: vec![None; nslot], prof: xzs_profile(), filled: false, free: Some(free) })
+    }
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
         xc.calls += 1;
         // PYRE_QN_XSTAT=1: cache hit rate and misses per layer per token so far (every 16 calls)
@@ -1018,6 +1153,8 @@ impl Model {
                 let t1 = std::time::Instant::now(); for _ in 0..200 { cb.xrun_fast_to(&xc.tabs, &xc.arena, xc.ar_bytes, &ents, &xb, d, d, ff, tys, &xc.scr, false, &y0); } cb.read(&y0);
                 let us = t1.elapsed().as_secs_f64() * 1e6 / 200.0; eprintln!("cubebench xfast ne {ne}: {us:.1} us ({:.0} GB/s)", ne as f64 * ent.bytes as f64 / (us * 1e-6) / 1e9); } }
         } }
+        // PYRE_QN_XZS: after the VRAM fill, so the pinned arena takes the hottest experts that did not make it into VRAM
+        if xzs() { self.xzs_tick(cb, xc); }
         if n > 0 && env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: +{n} experts in {:.1} ms, {} resident ({:.2} GiB), hit rate so far {:.1}%", t0.elapsed().as_secs_f64() * 1e3, xc.map.len(), xc.used as f64 / (1u64 << 30) as f64, 100.0 * xc.hits as f64 / xc.total.max(1) as f64); }
     }
 
@@ -1859,6 +1996,7 @@ impl Model {
         }
         }
         if xgate() { xg_err_check(); }
+        if xexact() { xzs_err_check(); }
         let qh = std::time::Instant::now(); let hs = xs.unwrap();
         let mut lg: Vec<Vec<f32>> = vec![];
         let headb = env_var("PYRE_QN_HEADB").map(|v| v != "0").unwrap_or(true); let mut hb: Vec<f32> = vec![]; let mut nb = 0usize;
@@ -2132,6 +2270,7 @@ impl Model {
         let mut ygs: Vec<Option<burn_cubecl::cubecl::server::Handle>> = vec![None; t];
         let mut shs: Vec<burn_cubecl::cubecl::server::Handle> = Vec::with_capacity(t);
         let (hb_all, sh_all) = (cb.empty(t * sf), cb.empty(t * d)); let mut sh_b = false; let mut sh_g: Option<H> = None; let mut ex_y: Option<H> = None; let mut ex_tab: Option<Vec<u32>> = None;
+        let mut zs_pend: Option<((usize, u32, usize, usize), usize, usize)> = None;
         let xin: Vec<f32> = rvs.iter().flat_map(|r| r[..d].iter().copied()).collect();
         if let Some(xm) = &self.xc {
             let mut xcg = xm.lock().unwrap();
@@ -2217,6 +2356,22 @@ impl Model {
                     XL_ST[il][4].fetch_add(k as u64, Relaxed); }
                 if il == 0 { static NC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); let n = NC.fetch_add(1, Relaxed) + 1; if xlstat() && n % 32 == 0 { xl_print(); } }
             }
+            // PYRE_QN_XZS: up to k (controller, per (layer, T)) of this layer's misses that sit in the pinned host arena, most
+            // tokens first, run zero-copy on the GPU on a second stream; they leave the CPU lists (see xzs())
+            let zsg = if ex_ok && xzs() && xgp.is_none() && !st.pf && il < 128 { self.xzs.lock().ok().filter(|g| g.as_ref().is_some_and(|z| z.filled)) } else { None };
+            let mut zs_tok: Vec<Vec<(usize, f32)>> = vec![vec![]; t];
+            if let (Some(gz), Some(ix)) = (zsg.as_ref(), xl_idx(il, t)) { let z = gz.as_ref().unwrap(); use std::sync::atomic::Ordering::Relaxed;
+                let mut k = XZS_K[ix].load(Relaxed); if k == u64::MAX { k = xzs_cfg("PYRE_QN_XZS_K0", 2).min(xzs_max()); XZS_K[ix].store(k, Relaxed); }
+                let mut cm: Vec<(usize, usize)> = vec![]; let mut nm = 0u64;
+                for o in &offs { for &(e, _) in o { nm += 1; if z.map.contains_key(&(il, e)) { match cm.iter_mut().find(|x| x.0 == e) { Some(x) => x.1 += 1, None => cm.push((e, 1)) } } } }
+                cm.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0))); cm.truncate(k as usize);
+                XZS_ST[0].fetch_add(1, Relaxed); XZS_ST[3].fetch_add(cm.len() as u64, Relaxed); XZS_ST[4].fetch_add(nm, Relaxed); XZS_ST[5].fetch_add(k, Relaxed);
+                if !cm.is_empty() { let mut rows = 0u64;
+                    for ti in 0..t { let (mv, keep): (Vec<(usize, f32)>, Vec<(usize, f32)>) = offs[ti].drain(..).partition(|(e, _)| cm.iter().any(|x| x.0 == *e)); offs[ti] = keep; rows += mv.len() as u64; zs_tok[ti] = mv; }
+                    XZS_ST[1].fetch_add(cm.len() as u64, Relaxed); XZS_ST[2].fetch_add(rows, Relaxed); }
+                if il == 0 && xlstat() { static NC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); if (NC.fetch_add(1, Relaxed) + 1) % 32 == 0 { xzs_print(""); } }
+            }
+            let nzs: usize = zs_tok.iter().map(|v| v.len()).sum(); let acc_h: usize = ons.iter().map(|o| o.len()).sum();
             // union of the missed experts; each token keeps its own order for the accumulation
             let mut lists: Vec<(usize, Vec<(usize, f32)>)> = vec![]; let mut pos_of: std::collections::HashMap<usize, usize> = Default::default();
             let mut ord: Vec<Vec<(usize, usize)>> = vec![vec![]; t];
@@ -2230,6 +2385,7 @@ impl Model {
                 for ti in 0..t { let mut n = 0usize;
                     for &e in &sels[ti] {
                         let code = if let Some(p) = ons[ti].iter().position(|x| x.0 == e) { Some((eo + p) as u32) }
+                            else if let Some(p) = zs_tok[ti].iter().position(|x| x.0 == e) { Some((acc_h + zs_tok[..ti].iter().map(|v| v.len()).sum::<usize>() + p) as u32) }
                             else if let Some(&wi) = pos_of.get(&e) { lists[wi].1.iter().position(|x| x.0 == ti).map(|j| (1u32 << 31) | (slot0[wi] + j) as u32) } else { None };
                         if let Some(cd) = code { if n < kk { tab[ti * (kk + 1) + 1 + n] = cd; n += 1; } } }
                     tab[ti * (kk + 1)] = n as u32; eo += ons[ti].len(); }
@@ -2265,23 +2421,67 @@ impl Model {
                 }
                 let mut all: Vec<u32> = vec![]; let mut oc = [0u32; 4]; let mut acc = 0u32;
                 for (ti, o) in oc.iter_mut().enumerate() { if ti < t { let ents: Vec<(&super::qn_cube::XEnt, f32)> = ons[ti].iter().map(|(e, w)| (&xcr.map[&(il, *e)], *w)).collect(); all.extend(super::qn_cube::Cube::xmeta(&xcr.arena, &ents)); acc += ents.len() as u32; } *o = acc; }
-                if acc == 0 { return None; }
+                if acc == 0 { return if nzs > 0 { Some(cb.empty(nzs * d)) } else { None }; }
                 // XZT: routing table (gated layers), hit meta and counts in one zero-copy upload (one blocking server call per layer)
                 let (mh, och) = if xzt() { let tabw: &[u32] = if xslot.is_some() { ex_tab.as_deref().unwrap_or(&[]) } else { &[] };
                     let (o1, o2) = (tabw.len().div_ceil(4) * 4, tabw.len().div_ceil(4) * 4 + all.len().div_ceil(4) * 4);
                     let mut w = vec![0u32; o2 + 4]; w[..tabw.len()].copy_from_slice(tabw); w[o1..o1 + all.len()].copy_from_slice(&all); w[o2..o2 + 4].copy_from_slice(&oc);
                     let h = xt_up(cb, &w); if !tabw.is_empty() { zt_tb.set(Some(h.clone())); } (h.clone().offset_start((o1 * 4) as u64), h.offset_start((o2 * 4) as u64)) }
                     else { (cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&all)), cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&oc))) };
-                let yent = cb.empty(acc as usize * d);
+                let yent = cb.empty((acc as usize + nzs) * d);
                 let q = std::time::Instant::now(); cb.xrun_exact(&xcr.tabs, &xcr.arena, xcr.ar_bytes, t, acc as usize, &mh, &och, &rd, t * rn, d, c.ff_exp, tyg, &yent, None); SD[0].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); XW[12].fetch_add(q.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 Some(yent)
             };
+            // PYRE_QN_XZS: the shared misses on their own CUDA stream (main id + 1), launched before the hits. Inputs are uploaded
+            // there from the host's copy of rd (same bits), the rows go to a mapped pinned ring slot followed by a doorbell
+            let zs_y: std::cell::Cell<Option<(usize, u32, usize, usize)>> = std::cell::Cell::new(None); let zs_done = std::cell::Cell::new(false);
+            let zs_go = || { if nzs == 0 || zs_done.replace(true) { return; } let Some(z) = zsg.as_ref().and_then(|g| g.as_ref()) else { eprintln!("xzs bail Z"); return };
+                if nzs > 64 || t * rn > rall.len() { eprintln!("xzs bail A nzs {nzs} t*rn {} rall {}", t * rn, rall.len()); return; }
+                // PYRE_QN_XZS_ZC=1: the kernels read the pinned arena itself over PCIe (alias); default: the distinct shared experts
+                // are first DMA'd into the VRAM stage on the second stream (entry offsets rebased onto their stage slot)
+                let zcm = xzs_zc(); let mut dist: Vec<usize> = vec![]; for v in zs_tok.iter() { for &(e, _) in v { if !dist.contains(&e) { dist.push(e); } } }
+                if !zcm && dist.len() > z.nstage { eprintln!("xzs bail B"); return; }
+                let ars = if zcm { std::slice::from_ref(&z.ph) } else { std::slice::from_ref(&z.stage) };
+                let ent_of = |e: usize| -> super::qn_cube::XEnt { let x = &z.map[&(il, e)]; if zcm { return super::qn_cube::XEnt { off: x.off, arena: 0, slot: x.slot, bytes: x.bytes }; }
+                    let j = dist.iter().position(|&v| v == e).unwrap(); let b = ((j * z.slot) / 4) as u32; super::qn_cube::XEnt { off: [b, b + (x.off[1] - x.off[0]), b + (x.off[2] - x.off[0])], arena: 0, slot: j, bytes: z.slot } };
+                let mut mv: Vec<u32> = Vec::with_capacity(nzs * 4 + 4); let mut oc = [0u32; 4]; let mut a = 0u32;
+                for (ti, o) in oc.iter_mut().enumerate() { if ti < t { for &(e, w) in &zs_tok[ti] { mv.extend(super::qn_cube::Cube::xmeta(ars, &[(&ent_of(e), w)])); a += 1; } } *o = a; }
+                let ml = mv.len();
+                if ml * 4 + 16 > 1024 || 2048 + t * rn * 4 > z.islot { eprintln!("xzs bail C ml {ml} t*rn {}", t * rn); return; }
+                let tg = z.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1).max(1); let j = tg as usize % z.nring; let rs = z.ring + j * z.rslot; let hin = z.iring + j * z.islot;
+                // SAFETY: slot j of the mapped input ring (islot bytes; sizes checked above); its last reader (the shared kernels of the
+                // layer z.nring calls ago) finished before this layer's rd was read back (main stream waited on its doorbell)
+                unsafe { std::ptr::copy_nonoverlapping(mv.as_ptr(), hin as *mut u32, ml); std::ptr::copy_nonoverlapping(oc.as_ptr(), (hin + 1024) as *mut u32, 4); std::ptr::copy_nonoverlapping(rall.as_ptr(), (hin + 2048) as *mut f32, t * rn); }
+                let (mh, och, src) = (z.pin[j].clone(), z.pin[j].clone().offset_start(1024), z.pin[j].clone().offset_start(2048));
+                z.s2.executes(|| { let y = z.ybuf.clone();
+                    if !zcm { for (j, &e) in dist.iter().enumerate() { let sl = z.map[&(il, e)].slot; unsafe { cb.client.pyre_host_gate(None, z.host + sl * z.slot, z.slot, &z.stage.clone().offset_start((j * z.slot) as u64)); }
+                        if env_var("PYRE_QN_XZS_CHECK").is_ok() { static ONCE: std::sync::Once = std::sync::Once::new(); ONCE.call_once(|| {
+                            let v = cb.read(&z.stage); let sl = z.map[&(il, dist[0])].slot;
+                            let hw = unsafe { std::slice::from_raw_parts((z.host + sl * z.slot) as *const u32, 64) };
+                            let same = (0..64).all(|i| v[i].to_bits() == hw[i]);
+                            eprintln!("xzs check: layer {il} stage[0..64] == host slot {sl}: {same} (stage {:08x} host {:08x})", v[0].to_bits(), hw[0]); }); } } }
+                    cb.xrun_exact(&z.tabs, ars, if zcm { z.bytes } else { z.nstage * z.slot }, t, nzs, &mh, &och, &src, t * rn, d, c.ff_exp, tyg, &y, Some(&z.zscr));
+                    if env_var("PYRE_QN_XZS_CHECK").is_ok() { static NC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if NC.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { let v = cb.read(&y); let bad = v.iter().filter(|x| !x.is_finite()).count();
+                            let mx = v.iter().fold(0f32, |m, x| m.max(x.abs())); eprintln!("xzs check y: layer {il} t {t} nzs {nzs} dist {} non-finite {bad} max|y| {mx} oc {oc:?} meta {:?}", dist.len(), &mv[..mv.len().min(8)]);
+                            let mut k = 0usize; for ti in 0..t { for &(e, w) in &zs_tok[ti] { let mut yc = vec![0f32; d]; let wv = vec![(0usize, w)];
+                                self.routed_pool_ord(l, &rall[ti * rn..ti * rn + d], &[(e, &wv)], 1, &mut yc, &mut || {}, None);
+                                let yg = &v[k * d..(k + 1) * d]; let nd = (0..d).filter(|&i| yg[i].to_bits() != yc[i].to_bits()).count();
+                                let fb = (0..d).find(|&i| yg[i].to_bits() != yc[i].to_bits()); let lb = (0..d).rev().find(|&i| yg[i].to_bits() != yc[i].to_bits());
+                                eprintln!("xzs check e{k}: tok {ti} expert {e} w {w}: {nd}/{d} differ (first {fb:?} last {lb:?})"); k += 1; } } } }
+                    unsafe { cb.client.pyre_copy_to_mapped_async(&y, nzs * d * 4, rs, z.flag, tg, XZS_FAIL.as_ptr() as usize); }
+                    cb.client.flush_queue(); });
+                zs_y.set(Some((rs, tg, z.flag, z.err))); };
+            // join: a bounded device wait on the doorbell (pyre_wcfm, 100 ms cap) pulls the rows in after the hit rows
+            let zs_join = |ey: &Option<H>| { if nzs > 0 && (zs_y.get().is_none() || ey.is_none()) { eprintln!("xzs join miss il {il} launched {} ey {}", zs_y.get().is_some(), ey.is_some()); } if let (Some((rs, tg, fl, er)), Some(ey)) = (zs_y.take(), ey.as_ref()) { unsafe { cb.client.pyre_wait_copy_from_mapped_async(fl, tg, 100_000_000, er, rs, nzs * d * 4, &ey.clone().offset_start((acc_h * d * 4) as u64), XZS_FAIL.as_ptr() as usize); } } };
             // PYRE_QN_XEARLY=1 (opt-in): the GPU hits are enqueued before the CPU pool's activation setup, not in its side task
             let early = ex_ok && xearly() && !lists.is_empty();
+            if early { zs_go(); }
             if early { ex_y = hits(); }
             let mut gpu = || {
                 let hx0 = std::time::Instant::now(); XHX[0].fetch_add((hx0 - q_rt).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 if ex_ok {
+                    zs_go();
                     if !early { ex_y = hits(); }
                     XHX[1].fetch_add(hx0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t);
@@ -2300,6 +2500,7 @@ impl Model {
                           if zc { XZ_N[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); } else { unsafe { cb.client.pyre_wait_flag(fl, tg, tmo, er); cb.client.pyre_host_gate(None, ps, sn_all * d * 4, &ycpu); } } }
                         if let Some(a) = xchr { super::xchain::stamp(cb, a + 8); }
                         XG_OPEN.with(|g| g.set(true));
+                        zs_join(&ex_y);
                         if xfuse() { let _ = &ysum; cb.rsum_comb3_m(ex_y.as_ref().unwrap_or(&ycpu), &ycpu, &tb, c.top_k, xs, &sh_all, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
                         cb.rsum_ex(ex_y.as_ref().unwrap_or(&ycpu), &ycpu, &tb, &ysum, d, c.top_k, t);
                         let none: Vec<Option<H>> = vec![None; t];
@@ -2393,12 +2594,13 @@ impl Model {
                 if let Some(ps) = pdir { let yp = unsafe { std::slice::from_raw_parts_mut(ps as *mut f32, sn_all * d) }; self.routed_pool_ord(l, &xin, &work, t, yp, &mut gpu, Some(&ord)); }
                 else { self.routed_pool_ord(l, &xin, &work, t, &mut yr, &mut gpu, Some(&ord)); }
                 EXACT_PARTS.with(|c| c.set(false));
-                { let rns = tr.elapsed().as_nanos() as u64; if ex_ok && il < 128 && (xbal() || xlstat()) { XL_ST[il][1].fetch_add(rns, std::sync::atomic::Ordering::Relaxed); } if ex_ok { super::xchain::pool(rns); } ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
+                { let rns = tr.elapsed().as_nanos() as u64; if ex_ok && il < 128 && (xbal() || xlstat()) { XL_ST[il][1].fetch_add(rns, std::sync::atomic::Ordering::Relaxed); } if ex_ok && xzs() { if let Some(ix) = xl_idx(il, t) { XZS_POOL[ix].store(rns, std::sync::atomic::Ordering::Relaxed); } } if ex_ok { super::xchain::pool(rns); } ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             } else { gpu(); }
             if xg_tg.get() != 0 && !(ex_ok && xpdirect()) { if let Some(ps) = xslot { unsafe { std::ptr::copy_nonoverlapping(yr.as_ptr(), ps as *mut f32, sn_all * d); } } }
             XCK_TG.store(0, std::sync::atomic::Ordering::Relaxed);
             let piped = xg_tg.get() != 0; if piped { super::xchain::flag(); } drop(xg_guard);
             for k in &sins { xcg.map.remove(k); }
+            zs_pend = zs_y.take().map(|y| (y, nzs, acc_h));
             drop(xcg);
             if piped { HY[3].fetch_add((std::time::Instant::now() - q5).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); return; }
         } else {
@@ -2413,6 +2615,7 @@ impl Model {
         let yball = cb.buf(&yr);
         let sh_all = sh_g.unwrap_or(sh_all);
         if let Some(tab) = ex_tab.take() {
+            if let (Some(((rs, tg, fl, er), nzs, acc_h)), Some(ey)) = (zs_pend.take(), ex_y.as_ref()) { unsafe { cb.client.pyre_wait_copy_from_mapped_async(fl, tg, 100_000_000, er, rs, nzs * d * 4, &ey.clone().offset_start((acc_h * d * 4) as u64), XZS_FAIL.as_ptr() as usize); } }
             let tb = cb.hup(<u32 as burn_cubecl::cubecl::CubeElement>::as_bytes(&tab)); let ysum = cb.empty(t * d);
             cb.rsum_ex(ex_y.as_ref().unwrap_or(&yball), &yball, &tb, &ysum, d, c.top_k, t);
             let none: Vec<Option<H>> = vec![None; t];

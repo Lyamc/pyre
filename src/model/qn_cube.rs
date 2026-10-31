@@ -3968,7 +3968,7 @@ pub fn xsh() -> bool { std::env::var("PYRE_QN_XSH").map(|v| v != "0").unwrap_or(
 pub fn xshr() -> u32 { std::env::var("PYRE_QN_XSHR").ok().and_then(|v| v.parse().ok()).unwrap_or(8) }
 
 /// Reusable buffers of the one-arena expert path (one layer at a time on the stream).
-pub struct XScr { xq: Handle, xs: Handle, hq: Handle, hs: Handle, h: Handle, pub y: Handle, max_ne: usize }
+pub struct XScr { xq: Handle, xs: Handle, hq: Handle, hs: Handle, h: Handle, pub y: Handle, max_ne: usize, max_t: usize }
 
 pub struct XTabs { g2s: Handle, g2x: Handle, ks: Handle, g1: Handle, sm: Handle, q2l: Handle }
 /// One cached expert: raw GGUF bytes of its gate, up and down rows.
@@ -4437,8 +4437,10 @@ impl Cube {
         }
         true
     }
+    /// PYRE_QN_XZS: scratch for up to `max_t` tokens (xq/xs sized for max_t * d), so a second-stream xrun_exact allocates nothing
+    pub fn xscratch_t(&self, d: usize, ff: usize, max_ne: usize, max_t: usize) -> XScr { let mut s = self.xscratch(max_t * d, ff, max_ne); s.max_t = max_t; s }
     pub fn xscratch(&self, d: usize, ff: usize, max_ne: usize) -> XScr {
-        XScr { xq: self.client.empty(d), xs: self.client.empty(d / 8), hq: self.client.empty(max_ne * ff), hs: self.client.empty(max_ne * ff / 8), h: self.client.empty(4 * max_ne * ff), y: self.client.empty(4 * d), max_ne }
+        XScr { xq: self.client.empty(d), xs: self.client.empty(d / 8), hq: self.client.empty(max_ne * ff), hs: self.client.empty(max_ne * ff / 8), h: self.client.empty(4 * max_ne * ff), y: self.client.empty(4 * d), max_ne, max_t: 1 }
     }
     /// One layer's cached experts from one arena: x is read straight from `src` (its first d values),
     /// y = sum_e w_e D_e silu(G_e x)*(U_e x) is written to scr.y. Four launches, one small upload.
@@ -4545,7 +4547,7 @@ impl Cube {
         let (ar, ar1) = (&ars[0], ars.last().unwrap());
         let nsb = d / 256; let nb = ff / 64;
         // PYRE_QN_XEXACT decode: the persistent XScr buffers (sizes checked: xs d/32 >= nsb, hs holds hd and hs) instead of six pool allocations
-        let (xq, xd, h, hq, hd, hs) = match scr { Some(sc) if t == 1 && ne <= sc.max_ne => (sc.xq.clone(), sc.xs.clone(), sc.h.clone(), sc.hq.clone(), sc.hs.clone(), sc.hs.clone().offset_start((ne * nb * 4) as u64)),
+        let (xq, xd, h, hq, hd, hs) = match scr { Some(sc) if t <= sc.max_t && ne <= sc.max_ne => (sc.xq.clone(), sc.xs.clone(), sc.h.clone(), sc.hq.clone(), sc.hs.clone(), sc.hs.clone().offset_start((ne * nb * 4) as u64)),
             _ => (self.empty(t * d / 4), self.empty(t * nsb), self.empty(ne * ff), self.empty(ne * ff / 4), self.empty(ne * nb), self.empty(ne * nb)) };
         unsafe {
             k_q8k_m::launch_unchecked(&self.client, CubeCount::Static(1, t as u32, 1), CubeDim::new_1d(16), a(src, sn), a(&xq, t * d / 4), a(&xd, t * nsb), sn as u32 / t as u32, nsb as u32);
