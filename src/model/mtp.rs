@@ -260,6 +260,9 @@ impl Mtp {
     pub fn warm_gpu<'a>(&self, cb: &Cb, g: &(dyn Fn(&Q8Mat) -> Option<&'a CM> + Sync), head: &CM) { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
         let r = cb.buf(&vec![0.01f32; self.rdim()]); if self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1).is_none() { eprintln!("mtp: warm step returned None"); } if let Some(st) = self.step_gpu(cb, g, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1) { let o = cb.empty(head.rows); cb.gemv(head, &st.s, self.d, 0, &o, head.rows, 0); let _ = cb.best(&o, head.rows); }
         if std::env::var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true) { if let Some((lg, ..)) = self.step_gpu_g(cb, g, head, &g0.k, &g0.v, g0.cap, 0, &r, &vec![0.01f32; self.d], 1, g0.id) { let _ = cb.best(&lg, head.rows); } } }
+    /// PYRE_MTP_GX: build the pool / resident drafter and JIT the chained draft kernels at prewarm (one throwaway 2-draft run), not at the first draft
+    pub fn warm_gx<'a>(&self, cb: &Cb, g: &(dyn Fn(&Q8Mat) -> Option<&'a CM> + Sync), head: &CM, emb: &(dyn Fn(u32, &mut [f32]) + Sync)) -> bool { let mut ring = None; let row = self.row(); let mut kv = Kv { c0: 0, n: 1, k: vec![0.0; row], v: vec![0.0; row], gid: 0 }; self.kv_sync(cb, &mut ring, &mut kv); let g0 = ring.unwrap();
+        let r = cb.buf(&vec![0.01f32; self.rdim()]); let e = vec![0.01f32; self.d]; let a = self.draft_gx(cb, g, head, &g0.k, &g0.v, g0.cap, 0, &r, &e, 1, g0.id, 2, emb).is_some(); let b = self.draft_gx(cb, g, head, &g0.k, &g0.v, g0.cap, 0, &r, &e, 1, g0.id, 2, emb).is_some(); a && b }
     pub fn kv_reset(&self, kv: &mut Kv, c0: usize) { *kv = Kv { c0, ..Default::default() }; }
     /// one catch-up cell on the GPU: K/V of cell `pos` written to the ring and returned (k, v) for the CPU copy
     #[allow(clippy::too_many_arguments)]
@@ -443,9 +446,36 @@ pub fn find() -> Option<std::path::PathBuf> {
 /// Experts not resident are skipped for that draft (weights renormalised over the resident picks); misses are uploaded
 /// after the run (up to PYRE_MTP_GX_UP per run, default 16). Draft-only numerics: verify decides every token.
 pub fn gx_on() -> bool { static M: OnceLock<bool> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GX").map(|v| v != "0").unwrap_or(false)) }
+/// PYRE_MTP_GX=2: resident drafter (all routed experts in VRAM as PYRE_MTP_GXR_BITS-bit codes, no LRU, no misses, no uploads);
+/// after Strata (MIT, github.com/Niko1221/Strata): all 512 drafter experts resident, the draft round chained on the GPU.
+pub fn gxr_on() -> bool { static M: OnceLock<bool> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GX").map(|v| v == "2").unwrap_or(false)) }
+pub fn gxr_bits() -> usize { static M: OnceLock<usize> = OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_MTP_GXR_BITS").ok().and_then(|v| v.parse().ok()).filter(|b| *b == 2 || *b == 4).unwrap_or(2)) }
+/// VRAM the resident drafter takes for `ne` experts of d x ff (codes + scales; plus ~128 MB draft-vocab embedding and slack)
+pub fn gxr_bytes(d: usize, ff: usize, ne: usize) -> usize { ne * 3 * d * ff * (gxr_bits() * 64 + 32) / (8 * 64) + (160usize << 20) }
+/// one 64-weight group to `bits`-bit codes with an asymmetric (scale, min) pair, least-squares refined; returns (codes, f16 scale | f16 min << 16)
+fn qgrp(x: &[f32], bits: usize, codes: &mut [u8]) -> u32 {
+    let l = ((1usize << bits) - 1) as f32; let n = x.len() as f32;
+    let (mn, mx) = x.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let (mut d, mut m) = ((mx - mn) / l, mn);
+    for _ in 0..4 { if d <= 0.0 { break; } let iv = 1.0 / d;
+        let (mut sc, mut scc, mut sx, mut scx) = (0f32, 0f32, 0f32, 0f32);
+        for &v in x { let c = ((v - m) * iv).round().clamp(0.0, l); sc += c; scc += c * c; sx += v; scx += c * v; }
+        let det = n * scc - sc * sc; if det <= 0.0 { break; } let d2 = (n * scx - sc * sx) / det; if d2 <= 0.0 { break; } d = d2; m = (sx - d * sc) / n; }
+    let (dh, mh) = (half::f16::from_f32(d), half::f16::from_f32(m)); let (d, m) = (dh.to_f32(), mh.to_f32()); let iv = if d > 0.0 { 1.0 / d } else { 0.0 };
+    for (c, &v) in codes.iter_mut().zip(x) { *c = ((v - m) * iv).round().clamp(0.0, l) as u8; }
+    (dh.to_bits() as u32) | ((mh.to_bits() as u32) << 16)
+}
+/// a rows x cols bf16 matrix (St::row layout) to packed codes (as f32 bits) + per-64 scale words (as f32 bits)
+fn qmat(b: &[u8], rows: usize, cols: usize, bits: usize, w: &mut [f32], s: &mut [f32]) {
+    let per = 32 / bits; let (wr, sr) = (cols / per, cols / 64); let mut y = vec![0f32; cols]; let mut rc = vec![0u8; cols];
+    for r in 0..rows { St::row(b, r, cols, &mut y);
+        for g in 0..sr { s[r * sr + g] = f32::from_bits(qgrp(&y[g * 64..(g + 1) * 64], bits, &mut rc[g * 64..(g + 1) * 64])); }
+        // pack: 8-word chunks, word li of chunk c = columns c*8*per + q*8 + li, q < per (see mtp_gpu::k_xgvq)
+        for c in 0..cols / (8 * per) { for li in 0..8 { let mut wd = 0u32; for q in 0..per { wd |= (rc[c * 8 * per + q * 8 + li] as u32) << (q * bits); } w[r * wr + c * 8 + li] = f32::from_bits(wd); } } }
+}
 pub static GX_ST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 const GXK: usize = 16;
-pub struct GXP { n: usize, wsl: usize, ssl: usize, wsd: usize, ssd: usize, wgu: H, sgu: H, wdn: H, sdn: H, smap: H, sgw: H, ew: H, es: H, ewn: usize, esn: usize,
+pub struct GXP { bits: usize, n: usize, wsl: usize, ssl: usize, wsd: usize, ssd: usize, wgu: H, sgu: H, wdn: H, sdn: H, smap: H, sgw: H, ew: H, es: H, ewn: usize, esn: usize,
     slot_of: Vec<i32>, exp_of: Vec<i32>, last: Vec<u64>, clock: u64 }
 pub struct GG3 { fx: Vec<H>, b: Vec<H>, g: Option<burn_cubecl::cubecl::client::Graph>, o: Option<(H, H, H)>, key: (u64, usize, usize), ob: H }
 pub static GX_S: std::sync::Mutex<Option<(Option<GXP>, Option<GG3>)>> = std::sync::Mutex::new(None);
@@ -458,6 +488,7 @@ fn q8ws(q: &Q8Mat) -> (Vec<f32>, Vec<f32>) {
 impl Mtp {
     fn gx_new(&self, cb: &Cb, emb: &(dyn Fn(u32, &mut [f32]) + Sync)) -> Option<GXP> {
         let (d, ff, ne) = (self.d, self.ff, self.ne); if ne > 1024 || self.top_k > 64 || d % 32 != 0 || ff % 32 != 0 { eprintln!("mtp gx: unsupported shape, off"); return None; }
+        if gxr_on() { return self.gxr_new(cb, emb); }
         let mb: usize = std::env::var("PYRE_MTP_GX_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
         let per = 3 * d * ff * 9 / 8; let n = (mb << 20) / per; if n < self.top_k { eprintln!("mtp gx: budget too small"); return None; } let n = n.min(ne);
         let nh = self.head.rows; let eb = nh * d * 9 / 8;
@@ -468,9 +499,33 @@ impl Mtp {
             for (bi, b) in row.chunks_exact(32).enumerate() { let am = b.iter().fold(0f32, |a, v| a.max(v.abs())); let sc = am / 127.0; let iv = if sc > 0.0 { 1.0 / sc } else { 0.0 }; es[bi] = sc;
                 for (ci, c) in b.chunks_exact(4).enumerate() { let q: Vec<u8> = c.iter().map(|v| ((v * iv).round().clamp(-127.0, 127.0) as i8) as u8).collect(); ew[bi * 8 + ci] = f32::from_bits(u32::from_le_bytes([q[0], q[1], q[2], q[3]])); } } });
         let (wsl, ssl, wsd, ssd) = (2 * ff * d / 4, 2 * ff * d / 32, d * ff / 4, d * ff / 32);
-        let p = GXP { n, wsl, ssl, wsd, ssd, wgu: cb.empty(n * wsl), sgu: cb.empty(n * ssl), wdn: cb.empty(n * wsd), sdn: cb.empty(n * ssd), smap: cb.buf(&vec![-1f32; ne]), sgw: cb.buf(&self.sgate),
+        let p = GXP { bits: 0, n, wsl, ssl, wsd, ssd, wgu: cb.empty(n * wsl), sgu: cb.empty(n * ssl), wdn: cb.empty(n * wsd), sdn: cb.empty(n * ssd), smap: cb.buf(&vec![-1f32; ne]), sgw: cb.buf(&self.sgate),
             ewn: ew.len(), esn: es.len(), ew: cb.buf(&ew), es: cb.buf(&es), slot_of: vec![-1; ne], exp_of: vec![-1; n], last: vec![0; n], clock: 0 };
         eprintln!("mtp gx: {n} expert slots ({:.0} MB) + draft-vocab embedding ({:.0} MB) on gpu, {:.0} ms", (n * per) as f64 / 1e6, eb as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
+        Some(p)
+    }
+    fn gx_emb(&self, emb: &(dyn Fn(u32, &mut [f32]) + Sync)) -> (Vec<f32>, Vec<f32>) {
+        let (d, nh) = (self.d, self.head.rows); let (mut ew, mut es) = (vec![0f32; nh * d / 4], vec![0f32; nh * d / 32]);
+        ew.par_chunks_mut(d / 4).zip(es.par_chunks_mut(d / 32)).zip(self.ids.par_iter()).for_each(|((ew, es), &id)| { let mut row = vec![0f32; d]; emb(id, &mut row);
+            for (bi, b) in row.chunks_exact(32).enumerate() { let am = b.iter().fold(0f32, |a, v| a.max(v.abs())); let sc = am / 127.0; let iv = if sc > 0.0 { 1.0 / sc } else { 0.0 }; es[bi] = sc;
+                for (ci, c) in b.chunks_exact(4).enumerate() { let q: Vec<u8> = c.iter().map(|v| ((v * iv).round().clamp(-127.0, 127.0) as i8) as u8).collect(); ew[bi * 8 + ci] = f32::from_bits(u32::from_le_bytes([q[0], q[1], q[2], q[3]])); } } });
+        (ew, es)
+    }
+    /// PYRE_MTP_GX=2: every routed expert resident as gxr_bits()-bit codes (slot = expert id), quantized from the bf16 file at first use
+    fn gxr_new(&self, cb: &Cb, emb: &(dyn Fn(u32, &mut [f32]) + Sync)) -> Option<GXP> {
+        let (d, ff, ne, bits) = (self.d, self.ff, self.ne, gxr_bits()); if ne > 1024 || self.top_k > 64 || d % 128 != 0 || ff % 128 != 0 { eprintln!("mtp gxr: unsupported shape, off"); return None; }
+        let (wsl, ssl, wsd, ssd) = (2 * ff * d * bits / 32, 2 * ff * d / 64, d * ff * bits / 32, d * ff / 64);
+        let per = 4 * (wsl + ssl + wsd + ssd); let eb = self.head.rows * d * 9 / 8;
+        if !cb.take(ne * per + eb) { eprintln!("mtp gxr: no vram budget ({:.0} MB), off", (ne * per + eb) as f64 / 1e6); return None; }
+        let t0 = std::time::Instant::now();
+        let (_, gu) = self.st.raw("mlp.experts.gate_up_proj").ok()?; let (_, dn) = self.st.raw("mlp.experts.down_proj").ok()?;
+        let (mut wgu, mut sgu, mut wdn, mut sdn) = (vec![0f32; ne * wsl], vec![0f32; ne * ssl], vec![0f32; ne * wsd], vec![0f32; ne * ssd]);
+        wgu.par_chunks_mut(wsl).zip(sgu.par_chunks_mut(ssl)).enumerate().for_each(|(e, (w, s))| qmat(&gu[e * 2 * ff * d * 2..(e + 1) * 2 * ff * d * 2], 2 * ff, d, bits, w, s));
+        wdn.par_chunks_mut(wsd).zip(sdn.par_chunks_mut(ssd)).enumerate().for_each(|(e, (w, s))| qmat(&dn[e * d * ff * 2..(e + 1) * d * ff * 2], d, ff, bits, w, s));
+        let (ew, es) = self.gx_emb(emb); let smap: Vec<f32> = (0..ne).map(|e| e as f32).collect();
+        let p = GXP { bits, n: ne, wsl, ssl, wsd, ssd, wgu: cb.buf(&wgu), sgu: cb.buf(&sgu), wdn: cb.buf(&wdn), sdn: cb.buf(&sdn), smap: cb.buf(&smap), sgw: cb.buf(&self.sgate),
+            ewn: ew.len(), esn: es.len(), ew: cb.buf(&ew), es: cb.buf(&es), slot_of: (0..ne as i32).collect(), exp_of: (0..ne as i32).collect(), last: vec![0; ne], clock: 0 };
+        eprintln!("mtp gxr: all {ne} drafter experts resident, {bits}-bit ({:.0} MB) + draft-vocab embedding ({:.0} MB) on gpu, {:.0} ms", (ne * per) as f64 / 1e6, eb as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
         Some(p)
     }
     fn gx_upload(&self, cb: &Cb, p: &mut GXP, ids: &[usize]) {
@@ -490,11 +545,13 @@ impl Mtp {
     fn gpx<'a>(&self, cb: &Cb, g: &dyn Fn(&Q8Mat) -> Option<&'a CM>, head: &CM, fx: &[H], kc: &H, vc: &H, cap: usize, p: &GXP, al: &mut dyn FnMut(usize) -> H) -> Option<(H, H, H)> {
         use super::mtp_gpu as mg; let (d, ff, ne, kk, row) = (self.d, self.ff, self.ne, self.top_k, self.row()); let w = self.hc * d; let pn = ne + 2 * d + 2 * row;
         let (rr, inj2, pk) = self.gp1(cb, g, fx, kc, vc, cap, al)?;
-        let sel = al(3 * kk); mg::xsel(cb, &pk, pn, &p.smap, &sel, ne, kk);
+        let sel = al(3 * kk); if p.bits > 0 && std::env::var("PYRE_MTP_GXR_SEL").map(|v| v != "1").unwrap_or(true) { mg::xsel2(cb, &pk, pn, &p.smap, &sel, ne, kk); } else { mg::xsel(cb, &pk, pn, &p.smap, &sel, ne, kk); }
         let m2 = pk.clone().offset_start((ne * 4) as u64);
-        let h = al(kk * 2 * ff); mg::xgv(cb, &m2, d, &p.wgu, p.n * p.wsl, &p.sgu, p.n * p.ssl, &sel, kk, &h, 2 * ff, d, 0, p.wsl, p.ssl);
-        let a = al(kk * ff); mg::xact(cb, &h, &a, ff, kk);
-        let o = al(kk * d); mg::xgv(cb, &a, kk * ff, &p.wdn, p.n * p.wsd, &p.sdn, p.n * p.ssd, &sel, kk, &o, d, ff, ff, p.wsd, p.ssd);
+        let h = al(kk * 2 * ff); let a = al(kk * ff); let o = al(kk * d);
+        if p.bits > 0 { mg::xgvq(cb, &m2, d, &p.wgu, p.n * p.wsl, &p.sgu, p.n * p.ssl, &sel, kk, &h, 2 * ff, d, 0, p.wsl, p.ssl, p.bits); mg::xact(cb, &h, &a, ff, kk);
+            mg::xgvq(cb, &a, kk * ff, &p.wdn, p.n * p.wsd, &p.sdn, p.n * p.ssd, &sel, kk, &o, d, ff, ff, p.wsd, p.ssd, p.bits);
+        } else { mg::xgv(cb, &m2, d, &p.wgu, p.n * p.wsl, &p.sgu, p.n * p.ssl, &sel, kk, &h, 2 * ff, d, 0, p.wsl, p.ssl); mg::xact(cb, &h, &a, ff, kk);
+            mg::xgv(cb, &a, kk * ff, &p.wdn, p.n * p.wsd, &p.sdn, p.n * p.ssd, &sel, kk, &o, d, ff, ff, p.wsd, p.ssd); }
         mg::xsum(cb, &o, &sel, &pk, pn, &p.sgw, &fx[2], d, kk, ne);
         self.gp2(cb, g, head, fx, &rr, &inj2, al)?;
         let bo = al(2); cb.best_into(&fx[3], head.rows, &bo);
@@ -527,7 +584,7 @@ impl Mtp {
         let bs: Vec<(usize, f32)> = (0..k).map(|j| (hv[2 * j] as usize, hv[2 * j + 1])).collect();
         let ids: Vec<usize> = (0..k * kk).map(|i| hv[2 * GXK + i] as usize).collect();
         let kvo = 2 * GXK + GXK * kk; let (kr, vr) = (hv[kvo..kvo + row].to_vec(), hv[kvo + row..kvo + 2 * row].to_vec());
-        self.gx_upload(cb, p, &ids);
+        if p.bits == 0 { self.gx_upload(cb, p, &ids); }
         if std::env::var("PYRE_MTP_DEBUG").is_ok() { eprintln!("mtp gx: hits {} misses {} uploads {} ({:.1} ms)", GX_ST[0].load(std::sync::atomic::Ordering::Relaxed), GX_ST[1].load(std::sync::atomic::Ordering::Relaxed), GX_ST[2].load(std::sync::atomic::Ordering::Relaxed), GX_ST[3].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6); }
         Some((bs, kr, vr))
     }

@@ -206,3 +206,59 @@ pub fn xsum(cb: &Cube, o: &H, sel: &H, pk: &H, pn: usize, sgw: &H, y: &H, d: usi
 #[allow(clippy::too_many_arguments)]
 pub fn next(cb: &Cube, pb: &H, bo: &H, ew: &H, ewn: usize, es: &H, esn: usize, d: usize, cap: usize, row: usize, window: usize) { unsafe { k_next::launch_unchecked(&cb.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), ba!(pb, 4 + d), ba!(bo, 2), ba!(ew, ewn), ba!(es, esn), d as u32, cap as u32, row as u32, window as u32) } }
 pub fn cpw(cb: &Cube, src: &H, dst: &H, dn: usize, dof: usize, n: usize) { unsafe { k_cpw::launch_unchecked(&cb.client, g1(n), CubeDim::new_1d(256), ba!(src, n), ba!(dst, dn), dof as u32, n as u32) } }
+
+// PYRE_MTP_GX=2 (resident drafter): all routed drafter experts resident in VRAM as low-bit codes (PYRE_MTP_GXR_BITS, 2 default
+// or 4) with one (f16 scale, f16 min) pair per 64 weights. Idea after Strata (MIT, github.com/Niko1221/Strata, src/core/mtp.cpp:
+// all 512 drafter experts resident as Q2_0 and run inside the draft round graph, no CPU expert step); kernel is pyre's own.
+#[cube]
+fn h2f(h: u32) -> f32 { let e = (h >> 10u32) & 31u32; let mut r = 0.0f32; if e != 0u32 { r = f32::reinterpret(((h & 0x8000u32) << 16u32) | ((e + 112u32) << 23u32) | ((h & 0x3ffu32) << 13u32)); } r }
+/// gathered low-bit GEMV: like k_xgv, w = packed codes (32/bits per word, row-major), s = per-64 (scale | min << 16) f16 pairs
+#[cube(launch_unchecked)]
+fn k_xgvq(x: &[f32], w: &[u32], s: &[u32], sel: &[f32], out: &mut [f32], rows: u32, cols: u32, xst: u32, wsl: u32, ssl: u32, #[comptime] bits: u32) {
+    let j = CUBE_POS_Y; let row = CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y;
+    if row < rows {
+        let sl = sel[j as usize];
+        if sl >= 0.0f32 {
+            // codes interleaved in 8-word chunks (word li of chunk c holds columns c*8*per + q*8 + li, q < per) so the 8 lanes of a
+            // chunk read 8 consecutive x values per code; one (scale, min) per 64 columns = per 8 codes of a word
+            let slot = u32::cast_from(sl); let words = cols * bits / 32u32; let wb = slot * wsl + row * words; let sb = slot * ssl + row * (cols / 64u32); let xo = j * xst; let mask = (1u32 << bits) - 1u32;
+            let mut acc = 0.0f32; let mut wi = UNIT_POS_X;
+            while wi < words { let wd = w[(wb + wi) as usize]; let base = (wi / 8u32) * comptime!(8 * (32 / bits)) + wi % 8u32;
+                #[unroll] for h in 0..comptime!(32 / bits / 8) { let mut pc = 0.0f32; let mut px = 0.0f32;
+                    #[unroll] for r in 0..8u32 { let q = h * 8u32 + r; let xv = x[(xo + base + q * 8u32) as usize]; pc += f32::cast_from((wd >> (q * bits)) & mask) * xv; px += xv; }
+                    let sm = s[(sb + ((wi / 8u32) * comptime!(8 * (32 / bits)) + h * 64u32) / 64u32) as usize]; acc += h2f(sm & 0xffffu32) * pc + h2f(sm >> 16u32) * px; }
+                wi += 32u32; }
+            let tt = plane_sum(acc);
+            if UNIT_POS_X == 0u32 { out[(j * rows + row) as usize] = tt; }
+        } else { if UNIT_POS_X == 0u32 { out[(j * rows + row) as usize] = 0.0f32; } }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub fn xgvq(cb: &Cube, x: &H, xn: usize, w: &H, wn: usize, s: &H, sn: usize, sel: &H, k: usize, out: &H, rows: usize, cols: usize, xst: usize, wsl: usize, ssl: usize, bits: usize) {
+    unsafe { k_xgvq::launch_unchecked(&cb.client, CubeCount::Static((rows as u32).div_ceil(8), k as u32, 1), CubeDim::new_2d(32, 8), ba!(x, xn), ba!(w, wn), ba!(s, sn), ba!(sel, 3 * k), ba!(out, k * rows), rows as u32, cols as u32, xst as u32, wsl as u32, ssl as u32, bits as u32) }
+}
+
+/// one 32-lane plane: top-k of pk[0..ne] (ne <= 1024) with plane max/min reductions instead of 1024-thread tree passes; same output as k_xsel
+#[cube(launch_unchecked)]
+fn k_xsel2(pk: &[f32], smap: &[f32], sel: &mut [f32], ne: u32, k: u32) {
+    let lane = UNIT_POS_X; let mut v = Array::<f32>::new(32usize);
+    #[unroll] for i in 0..32u32 { let e = i * 32u32 + lane; if e < ne { v[i as usize] = pk[e as usize]; } else { v[i as usize] = f32::new(-3.0e38); } }
+    let mut t = 0u32;
+    while t < k {
+        let mut bv = f32::new(-3.0e38); let mut bi = 0u32;
+        #[unroll] for q in 0..32u32 { if v[q as usize] > bv { bv = v[q as usize]; bi = q; } }
+        let gm = plane_max(bv); let mut cand = 0xffffffffu32; if bv == gm { cand = bi * 32u32 + lane; }
+        let ge = u32::min(plane_min(cand), ne - 1u32);
+        if ge % 32u32 == lane { #[unroll] for q in 0..32u32 { if q == ge / 32u32 { v[q as usize] = f32::new(-3.0e38); } } }
+        if lane == 0u32 { sel[(2u32 * k + t) as usize] = f32::cast_from(ge); sel[(k + t) as usize] = gm; }
+        t += 1u32;
+    }
+    if lane == 0u32 {
+        let mx = sel[k as usize]; let mut s = 0.0f32; let mut q = 0u32;
+        while q < k { let e = u32::cast_from(sel[(2u32 * k + q) as usize]); if smap[e as usize] >= 0.0f32 { s += f32::exp(sel[(k + q) as usize] - mx); } q += 1u32; }
+        let mut q2 = 0u32;
+        while q2 < k { let e = u32::cast_from(sel[(2u32 * k + q2) as usize]); let sl = smap[e as usize]; let lv = sel[(k + q2) as usize]; sel[q2 as usize] = sl;
+            if sl >= 0.0f32 && s > 0.0f32 { sel[(k + q2) as usize] = f32::exp(lv - mx) / s; } else { sel[(k + q2) as usize] = 0.0f32; } q2 += 1u32; }
+    }
+}
+pub fn xsel2(cb: &Cube, pk: &H, pn: usize, smap: &H, sel: &H, ne: usize, k: usize) { unsafe { k_xsel2::launch_unchecked(&cb.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(32), ba!(pk, pn), ba!(smap, ne), ba!(sel, 3 * k), ne as u32, k as u32) } }

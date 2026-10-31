@@ -572,6 +572,9 @@ impl Model {
                 // routed-expert cache (default on, PYRE_QN_XCACHE_GB=<GiB>, 0 = off): up to that much of the VRAM left above the reserve
                 let left = g.budget_left().max(0) as usize;
                 let cap = env_var("PYRE_QN_XCACHE_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|v| (v * (1u64 << 30) as f64) as usize).unwrap_or(if xexact() { (xexact_cache_gb() * (1u64 << 30) as f64) as usize } else { 5usize << 29 }); // XEXACT: 3 GiB (e5: +hits, C +1.6 tok/s, ~3.3 GB VRAM still free); default on, 2.5 GiB: on the RTX 3060 (quiet GPU) 2 GiB gives ~17 vs ~14 tok/s cache off; bigger budgets push VRAM past the point where WDDM pages and get slower. 0 = off
+                // PYRE_MTP_GX=2 (resident drafter, ~0.9 GB): the default cache gives up what the drafter needs beyond PYRE_MTP_GXR_SLACK_MB (default 512) of the
+                // headroom, so the 1 GB floor holds (XEXACT output is the same for any cache size); an explicit PYRE_QN_XCACHE_GB wins
+                let cap = if super::mtp::gxr_on() && env_var("PYRE_QN_XCACHE_GB").is_err() && super::mtp::find().is_some() { let need = super::mtp::gxr_bytes(self.cfg.d, self.cfg.ff_exp, self.cfg.n_exp).saturating_sub(env_usize("PYRE_MTP_GXR_SLACK_MB").unwrap_or(512) << 20); eprintln!("gpu: resident drafter: expert cache cap -{:.2} GiB", need as f64 / (1u64 << 30) as f64); cap.saturating_sub(need) } else { cap };
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(if xexact() { 512 } else { 2048 }) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
@@ -1946,7 +1949,8 @@ impl Model {
         if !mtp_gpustep() || !self.mtp_gpu_on() { return; }
         let (Some(m), Some(cb)) = (self.mtp.as_ref(), self.cube.as_ref()) else { return };
         let hm = self.mtp_headc.get_or_init(|| { let h = m.head_q8(); if h.rows == 0 { return None; } cb.upload_q8(h.rows, h.cols, h.blocks()) });
-        match (self.mtp_dense.get(), hm) { (Some(map), Some(hm)) => { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3); }
+        match (self.mtp_dense.get(), hm) { (Some(map), Some(hm)) => { let t0 = std::time::Instant::now(); let g = |q: &super::qdot::Q8Mat| map.get(&(q as *const _ as usize)); m.warm_gpu(cb, &g, hm); eprintln!("mtp: gpu step warmed in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+                if super::mtp::gx_on() && env_var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true) { let t1 = std::time::Instant::now(); let ok = m.warm_gx(cb, &g, hm, &|t, o| self.embd.row(t as usize, o)); eprintln!("mtp gx: chained draft warmed ({ok}) in {:.0} ms", t1.elapsed().as_secs_f64() * 1e3); } }
             (a, b) => eprintln!("mtp: gpu step NOT warmed (dense {} head {})", a.is_some(), b.is_some()) }
     }
     pub fn prewarm_verify(&self) {
