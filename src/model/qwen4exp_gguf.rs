@@ -275,7 +275,7 @@ fn xexact_types(l: &Layer) -> bool { let t = (super::qn_cube::xtype(l.gate_e.ty)
 /// PYRE_QN_XSCR_EX=0: the exact decode kernels allocate their temporaries per call instead of using the persistent XScr
 fn xscr_ex() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XSCR_EX").map(|v| v != "0").unwrap_or(true)) }
 /// XEXACT default expert cache (GiB): native IQ4_XS dense + native LM head leave room for more experts
-pub fn xwmax() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_XWMAX").unwrap_or(3).clamp(1, 4)) }
+pub fn xwmax() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_XWMAX").unwrap_or(if crate::spec::policy_on() { 4 } else { 3 }).clamp(1, 4)) }
 fn xexact_cache_gb() -> f64 { 5.6 } // e22: 2 arenas of 2900 MiB hold 5.66 GiB; 4-7 token window buffers gone (XWMAX=3) freed ~0.6 GB
 fn xexact() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false)) }
 /// PYRE_QN_XGATE (XEXACT, default on; =0 off): bounded host gate in the exact verify path, ported from qwen-pipe's
