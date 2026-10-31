@@ -117,6 +117,8 @@ fn xbg() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::ne
 struct XbgP(*const Model); unsafe impl Send for XbgP {} impl XbgP { fn get(&self) -> &'static Model { unsafe { &*self.0 } } }
 /// PYRE_QN_PFKV: 1 = prefill-end KV/DeltaNet GPU mirror (default under XEXACT), 2 = same + wait for it (measurement), 0 = off
 fn pfkv() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_PFKV").unwrap_or(if xexact() { 1 } else { 0 })) }
+static KVZ: std::sync::Mutex<Option<(burn_cubecl::cubecl::server::Handle, usize)>> = std::sync::Mutex::new(None);
+fn kvfast() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_KVFAST").map(|v| v == 1).unwrap_or(xexact())) }
 static XNF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn xfillfree() -> Option<usize> { static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new(); *K.get_or_init(|| { let n = env_usize("PYRE_QN_XFILLFREE").unwrap_or(0); (n > 0).then_some(n) }) }
 fn xprofill() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_XPROFILL").map(|v| v == "1").unwrap_or(false)) }
@@ -1336,6 +1338,15 @@ impl Model {
         if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
         self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
         let cap = need.max(cl).next_power_of_two().max(1024);
+        // PYRE_QN_KVFAST (default 1 under XEXACT): upload only the cl rows in use (one upload per layer) and zero the rest
+        // with GPU copies from a cached zero buffer, instead of uploading cap (>=1024) padded rows; same buffer contents
+        if kvfast() { let ih = self.cfg.idx_hd; let (nk, ni) = (cap * row, cap * ih);
+            let zr = { let mut z = KVZ.lock().unwrap(); let zn = nk.max(ni); if z.as_ref().map_or(true, |(_, n)| *n < zn) { *z = Some((cb.buf(&vec![0f32; zn]), zn)); } z.clone().unwrap() };
+            let (uk, ui) = (st.k[ai].len(), st.ik[ai].len()); let mut up = Vec::with_capacity(2 * uk + ui); up.extend_from_slice(&st.k[ai]); up.extend_from_slice(&st.v[ai]); up.extend_from_slice(&st.ik[ai]);
+            let src = if up.is_empty() { None } else { Some((cb.buf(&up), up.len())) };
+            let mk = |n: usize, off: usize, used: usize| -> H { if n == 0 { return cb.buf(&[]); } let h = cb.empty(n); cb.copy(&zr.0, zr.1, 0, &h, n, 0, n); if used > 0 { if let Some((s, sn)) = &src { cb.copy(s, *sn, off, &h, n, 0, used); } } h };
+            let (k, v, ik) = (mk(nk, 0, uk), mk(nk, uk, uk), mk(ni, 2 * uk, ui));
+            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl }); return; }
         let mut kb = st.k[ai].clone(); kb.resize(cap * row, 0.0); let mut vb = st.v[ai].clone(); vb.resize(cap * row, 0.0);
         let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
         st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl });
@@ -1825,7 +1836,11 @@ impl Model {
         // so the first decode window does not do it inside its next-layer dense enqueue (window 1 side() was 40-50 ms vs 2-8)
         if ids.len() > 1 && pfkv() > 0 { if let Some(cb) = &self.cube { let t0 = std::time::Instant::now(); let need = st.tokens.len() + 8;
             for ai in 0..st.k.len() { self.kv_push(cb, ai, st, need); } let tk = t0.elapsed();
-            if xexact() && !st.gdn_gpu && self.cl.len() == self.layers.len() { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
+            if xexact() && !st.gdn_gpu && self.cl.len() == self.layers.len() {
+                // the host DeltaNet state is dead once it lives on the GPU (it is read back before any CPU step), so hand the
+                // vectors to the uploads instead of cloning them (VG_STATE buffers already allocated by prewarm)
+                let moved = vgraph_on() && { let g = VG_STATE.lock().unwrap(); if g.0.len() == st.conv.len() { for (i, (h1, h2)) in g.0.iter().enumerate() { cb.client.write(h1, burn_cubecl::cubecl::bytes::Bytes::from_elems(std::mem::take(&mut st.conv[i]))); cb.client.write(h2, burn_cubecl::cubecl::bytes::Bytes::from_elems(std::mem::take(&mut st.ssm[i]))); } st.gdn = g.0.clone(); true } else { false } };
+                if !moved { st.gdn = self.gdn_bufs(st); } st.gdn_gpu = true; }
             if pfkv() == 2 { let z = cb.empty(1); let _ = cb.read(&z); } if env_var("PYRE_QN_XWIN").is_ok() { eprintln!("pfkv: {:.1} ms (kv {:.1})", t0.elapsed().as_secs_f64() * 1e3, tk.as_secs_f64() * 1e3); } } }
         lg
     }
@@ -2086,7 +2101,7 @@ impl Model {
         // behind the open gate (VG_SKIP), so their verify graphs were only captured in the first real decode windows (B: 41 + 31
         // captures in windows 1-2, ~+80 ms + ~15 ms, moe.md b1). A second pass captures them here (same shared state/scratch
         // buffers -> same keys), so decode starts with replays. Graphs are the same kernels with the same arguments -> bit-identical.
-        let rep = env_usize("PYRE_QN_PREWARM_REP").unwrap_or(1).max(1); // opt-in: measured no tok/s gain (moe.md b1-b4: first-window rdwait +13 ms offsets the saved captures)
+        let rep = env_usize("PYRE_QN_PREWARM_REP").unwrap_or(if xexact() { 2 } else { 1 }).max(1); // h20: default 2 under XEXACT (window-1/2 captures move here; with PFKV/KVFAST no first-window wait) // opt-in: measured no tok/s gain (moe.md b1-b4: first-window rdwait +13 ms offsets the saved captures)
         for _ in 0..rep { for t in 1..=mw { let ids: Vec<u32> = (0..t as u32).map(|i| 3 + i).collect(); let _ = if t == 1 { self.forward_inner(&ids, &mut st) } else { self.forward_multi(&ids, &mut st).pop().unwrap_or_default() }; } }
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); if !g.map.is_empty() { eprintln!("prewarm: warning, expert cache already filled ({})", g.map.len()); } for c in g.cnt.iter_mut() { for v in c.iter_mut() { *v = 0; } } g.calls = 0; g.hits = 0; g.total = 0; xtr(|| "Z".to_string()); }
         eprintln!("prewarm: decode/verify kernels (T<={mw}) in {:.0} ms (vgraph captures {})", t0.elapsed().as_secs_f64() * 1e3, VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed));
