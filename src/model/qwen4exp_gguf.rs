@@ -1738,7 +1738,7 @@ thread_local! { static XW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell:
 fn xwin_begin() -> Option<std::time::Instant> { if !xwin() { return None; } let d = XW_DEPTH.with(|c| { let v = c.get(); c.set(v + 1); v }); if d == 0 { for a in XW.iter() { a.store(0, std::sync::atomic::Ordering::Relaxed); } Some(std::time::Instant::now()) } else { None } }
 fn xwin_end(w: Option<std::time::Instant>, t: usize) { if !xwin() { return; } XW_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     if let Some(w) = w { if t <= 8 { let g = |i: usize| XW[i].load(std::sync::atomic::Ordering::Relaxed); let ms = |v: u64| v as f64 / 1e6;
-        eprintln!("xwin T={t} wall {:.2} cpu_pairs {} cpu_exp {} lay {} pool {:.2} maxlay {:.3} gu {:.2} q {:.2} dn {:.2} gpu {} rdwait {:.2} refill {:.2} head {:.2} xenq {:.2} ple {:.2} route {:.2} post {:.2} rest {:.2} gated {} ungated {}", w.elapsed().as_secs_f64() * 1e3, g(0), g(8), g(2), ms(g(3)), ms(g(4)), ms(g(5)), ms(g(6)), ms(g(7)), g(1), ms(g(9)), ms(g(10)), ms(g(11)), ms(g(12)), ms(g(13)), ms(g(14)), ms(g(15)), w.elapsed().as_secs_f64() * 1e3 - ms(g(3)) - ms(g(9)) - ms(g(10)) - ms(g(11)), XG_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XG_N[1].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("xhost toside {:.2} tohits {:.2} side {:.2} topool {:.2} psetup {:.2} zc rd {} rows {} fb {} zt {} xgr {}/{}/{}/{} rt {}", ms(XHX[0].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[1].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[2].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[3].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[4].swap(0, std::sync::atomic::Ordering::Relaxed)), XZ_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XZ_N[1].swap(0, std::sync::atomic::Ordering::Relaxed), XZ_N[2].load(std::sync::atomic::Ordering::Relaxed), XZ_N[3].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[1].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[2].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[3].load(std::sync::atomic::Ordering::Relaxed), XGR_N[4].swap(0, std::sync::atomic::Ordering::Relaxed)); } } }
+        eprintln!("xwin T={t} wall {:.2} cpu_pairs {} cpu_exp {} lay {} pool {:.2} maxlay {:.3} gu {:.2} q {:.2} dn {:.2} gpu {} rdwait {:.2} refill {:.2} head {:.2} xenq {:.2} ple {:.2} route {:.2} post {:.2} rest {:.2} gated {} ungated {}", w.elapsed().as_secs_f64() * 1e3, g(0), g(8), g(2), ms(g(3)), ms(g(4)), ms(g(5)), ms(g(6)), ms(g(7)), g(1), ms(g(9)), ms(g(10)), ms(g(11)), ms(g(12)), ms(g(13)), ms(g(14)), ms(g(15)), w.elapsed().as_secs_f64() * 1e3 - ms(g(3)) - ms(g(9)) - ms(g(10)) - ms(g(11)), XG_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XG_N[1].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("xhost toside {:.2} tohits {:.2} side {:.2} topool {:.2} psetup {:.2} zc rd {} rows {} fb {} zt {} xgr {}/{}/{}/{} rt {}", ms(XHX[0].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[1].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[2].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[3].swap(0, std::sync::atomic::Ordering::Relaxed)), ms(XHX[4].swap(0, std::sync::atomic::Ordering::Relaxed)), XZ_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XZ_N[1].swap(0, std::sync::atomic::Ordering::Relaxed), XZ_N[2].load(std::sync::atomic::Ordering::Relaxed), XZ_N[3].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[0].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[1].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[2].swap(0, std::sync::atomic::Ordering::Relaxed), XGR_N[3].load(std::sync::atomic::Ordering::Relaxed), XGR_N[4].swap(0, std::sync::atomic::Ordering::Relaxed)); eprintln!("xwvg cap {} replay {} eager {}", VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed), VG_REPLAYS.load(std::sync::atomic::Ordering::Relaxed), VG_EAGER.load(std::sync::atomic::Ordering::Relaxed)); } } }
 impl Model {
     #[allow(dead_code)] fn _xwin_dummy(&self) {}
 
@@ -1757,7 +1757,9 @@ impl Model {
         }
         let xw = xwin_begin(); let lg = self.forward_inner(ids, st); xwin_end(xw, ids.len());
         // first fill of the expert cache from the prompt's routing counts (part of prefill time)
-        if let (Some(cb), Some(xm), true) = (&self.cube, &self.xc, ids.len() > 1) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
+        if let (Some(cb), Some(xm), true) = (&self.cube, &self.xc, ids.len() > 1) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g);
+            // PYRE_QN_XFILLSYNC=1 (measurement): wait here until the first fill's uploads have landed (moe.md b2)
+            if env_var("PYRE_QN_XFILLSYNC").map(|v| v == "1").unwrap_or(false) { let ts = std::time::Instant::now(); let z = cb.empty(1); let _ = cb.read(&z); eprintln!("xfillsync: {:.1} ms", ts.elapsed().as_secs_f64() * 1e3); } } }
         lg
     }
 
@@ -2013,9 +2015,14 @@ impl Model {
         let t0 = std::time::Instant::now(); let mut st = self.new_state();
         let _ = self.forward_inner(&[1, 2], &mut st);
         let mw = self.spec_max_window().min(env_usize("PYRE_QN_PREWARM_MAX").unwrap_or(if super::qn_cube::native_mode() == 2 { 7 } else { 3 })); // only the windows decode uses (Q8 T=8 buffers would cost ~2.5 GB VRAM)
-        for t in 1..=mw { let ids: Vec<u32> = (0..t as u32).map(|i| 3 + i).collect(); let _ = if t == 1 { self.forward_inner(&ids, &mut st) } else { self.forward_multi(&ids, &mut st).pop().unwrap_or_default() }; }
+        // PYRE_QN_PREWARM_REP=n: run the T=1..mw windows n times. Under XGATE the first pass runs most layers' dense part eagerly
+        // behind the open gate (VG_SKIP), so their verify graphs were only captured in the first real decode windows (B: 41 + 31
+        // captures in windows 1-2, ~+80 ms + ~15 ms, moe.md b1). A second pass captures them here (same shared state/scratch
+        // buffers -> same keys), so decode starts with replays. Graphs are the same kernels with the same arguments -> bit-identical.
+        let rep = env_usize("PYRE_QN_PREWARM_REP").unwrap_or(1).max(1); // opt-in: measured no tok/s gain (moe.md b1-b4: first-window rdwait +13 ms offsets the saved captures)
+        for _ in 0..rep { for t in 1..=mw { let ids: Vec<u32> = (0..t as u32).map(|i| 3 + i).collect(); let _ = if t == 1 { self.forward_inner(&ids, &mut st) } else { self.forward_multi(&ids, &mut st).pop().unwrap_or_default() }; } }
         if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); if !g.map.is_empty() { eprintln!("prewarm: warning, expert cache already filled ({})", g.map.len()); } for c in g.cnt.iter_mut() { for v in c.iter_mut() { *v = 0; } } g.calls = 0; g.hits = 0; g.total = 0; xtr(|| "Z".to_string()); }
-        eprintln!("prewarm: decode/verify kernels (T<={mw}) in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("prewarm: decode/verify kernels (T<={mw}) in {:.0} ms (vgraph captures {})", t0.elapsed().as_secs_f64() * 1e3, VG_CAPTURES.load(std::sync::atomic::Ordering::Relaxed));
     }
     pub fn multi_ok(&self) -> bool {
         self.cube.is_some() && env_var("PYRE_QN_GDN_GPU").map(|v| v != "0").unwrap_or(true)

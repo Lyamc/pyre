@@ -40,7 +40,7 @@ class Sim:
         s.cnt = collections.defaultdict(float); s.wcnt = collections.defaultdict(float); s.last = {}; s.res = set()
         s.hits = s.pairs = s.dmiss = s.dtot = s.swaps = s.swaps_late = 0; s.calls = 0; s.wi = 0
         s.evict_t = {}; s.reref = [0, 0]  # just-evicted experts needed again within 4 windows / evictions
-        s.lay = collections.defaultdict(lambda: [0, 0]); s.win_cost = []
+        s.lay = collections.defaultdict(lambda: [0, 0]); s.win_cost = []; s.lay_cost = []
     def score(s, key):
         p = s.pol; c = s.cnt[key]
         if p in ('base', 'lfu', 'lfud'): return c
@@ -84,20 +84,24 @@ class Sim:
         s.swaps += n
     def window(s, w):
         t = w['t']; keep = w['keep']; pairs = hits = dm = dt = 0
+        lay_cost = 0.0
         for il, lst in w['r'].items():
-            used = collections.Counter()
+            used = collections.Counter(); lh = lm = 0
             for ti, es in lst:
                 for e in es: used[e] += 1
             on = s.elig.get(il) 
             for e, nt in used.items():
                 key = (il, e); h = on and key in s.res
                 pairs += nt; dt += 1
-                if h: hits += nt
-                else: dm += 1
+                if h: hits += nt; lh += nt
+                else: dm += 1; lm += nt
                 s.lay[il][0] += nt * h; s.lay[il][1] += nt
                 if not h and key in s.evict_t and s.wi - s.evict_t[key] <= 4: s.reref[0] += 1; del s.evict_t[key]
+            # per-layer model (--gpu=us per GPU pair, default 8 after k_xgu_gx/k_xdown_gx): CPU misses and GPU hits of a layer run
+            # concurrently, the layer waits for the slower side; CPU fixed cost 7.2 ms/window spread over the layers
+            lay_cost += max(POOL_FIX / 45 + POOL_PAIR * lm, GPU_PAIR * lh)
         s.hits += hits; s.pairs += pairs; s.dmiss += dm; s.dtot += dt
-        s.win_cost.append((t, pairs - hits, dm))
+        s.win_cost.append((t, pairs - hits, dm)); s.lay_cost.append(lay_cost)
         # counts: accepted tokens only (base semantics: rejected drafts are rolled back)
         dec = s.kw.get('decay')
         if dec:
@@ -194,6 +198,8 @@ def reuse(tr):
     return dict(n=len(d), p25=q(.25), p50=q(.5), p75=q(.75), p90=q(.9), distinct=len(once), once=single)
 
 SWAP_MS = float(next((a.split('=')[1] for a in sys.argv if a.startswith('--swap=')), 0.105))  # p3: fast repack 64 experts = 6.7 ms (was 10.7 = 0.167/expert)   # measured: a 64-expert refill = 10.7 ms on the critical path (repack 2.3 ms/expert over rayon + write); pool ms = 7.2 + 0.0274 * miss pairs (fit, 203 windows)
+POOL_FIX, POOL_PAIR = 7.2, 0.0274
+GPU_PAIR = float(next((a.split('=')[1] for a in sys.argv if a.startswith('--gpu=')), 8.0)) / 1000.0   # ms per GPU (token, expert) pair (k3: 7-10 us)
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     caps = [int(a.split('=')[1]) for a in sys.argv[1:] if a.startswith('--cap=')]
@@ -239,7 +245,8 @@ def main():
                 s = Sim(tr, cap, pol, **kw).run()
                 ms = [m for t, m, d in s.win_cost]; dm = [d for t, m, d in s.win_cost]
                 est = (7.2 * len(ms) + 0.0274 * sum(ms) + SWAP_MS * s.swaps_late) / len(ms)
-                print(f"   {nm:42s} est {est:5.2f} ms/win (swaps late {s.swaps_late:4d}) hit {100 * s.hits / s.pairs:5.1f}%  miss pairs/win {sum(ms) / len(ms):6.1f}  distinct miss/win {sum(dm) / len(dm):6.1f}  swaps {s.swaps:5d}  evict->reuse<=4w {s.reref[0]}/{s.reref[1]}")
+                est2 = (sum(s.lay_cost) + SWAP_MS * s.swaps_late) / len(ms)
+                print(f"   {nm:42s} est {est:5.2f} lay-max {est2:5.2f} ms/win (swaps late {s.swaps_late:4d}) hit {100 * s.hits / s.pairs:5.1f}%  miss pairs/win {sum(ms) / len(ms):6.1f}  distinct miss/win {sum(dm) / len(dm):6.1f}  swaps {s.swaps:5d}  evict->reuse<=4w {s.reref[0]}/{s.reref[1]}")
             if '--layers' in sys.argv:
                 s = Sim(tr, cap, 'base').run(); print('   base per-layer hit%:', ' '.join(f"{il}:{100 * a / max(1, b):.0f}" for il, (a, b) in sorted(s.lay.items())))
 main()
