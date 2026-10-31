@@ -16,7 +16,35 @@ static EP: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn now_ns() -> u64 { EP.get_or_init(Instant::now).elapsed().as_nanos() as u64 }
 static JFC: AtomicU64 = AtomicU64::new(0); static JLC: AtomicU64 = AtomicU64::new(0); static JLF: AtomicU64 = AtomicU64::new(0); static JB: AtomicU64 = AtomicU64::new(0);
 static JA: [[AtomicU64; 8]; 2] = [const { [const { AtomicU64::new(0) }; 8] }; 2];
-#[inline] fn call(f: &(dyn Fn(usize) + Sync), i: usize) { if jprof() { let t = now_ns(); if WID.with(|w| w.get()) != 0 { JFC.fetch_min(t, Relaxed); } JLC.fetch_max(t, Relaxed); f(i); let e = now_ns(); JLF.fetch_max(e, Relaxed); JB.fetch_add(e - t, Relaxed); return; } if wbusy() { let t = Instant::now(); f(i); WB[WID.with(|w| w.get()).min(63)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); } else { f(i) } }
+/// PYRE_QN_XPSTAT=1 (measurement only): per routed-pool job (tagged by XP_TAG = misses/experts of the layer), per worker first claim,
+/// last finish, busy ns and task count; the distribution of job wall and where the slow jobs lose time (wake / P vs E / tail) is
+/// printed every 600 jobs ('xpstat'). Which worker runs a task is unchanged -> results identical.
+pub fn xpstat() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_XPSTAT").map(|v| v == "1").unwrap_or(false)) }
+pub static XP_TAG: AtomicUsize = AtomicUsize::new(0);
+static XS_FC: [AtomicU64; 64] = [const { AtomicU64::new(u64::MAX) }; 64]; static XS_LF: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static XS_MX: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64]; static XS_MI: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static XS_BZ: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64]; static XS_NT: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+#[derive(Clone, Copy, Default)] struct XRec { wall: u64, tag: u64, slp: u64, cfc: u64, pfc: u64, efc: u64, late: u64, last: u64, lid: usize, med: u64, cend: u64, mx: u64, mxw: usize, mxi: u64, n: u64, bz: [u64; 3], nt: [u64; 3] }
+static XRECS: Mutex<Vec<XRec>> = Mutex::new(Vec::new());
+fn xp_print(v: &mut Vec<XRec>, threads: usize) {
+    let mut w: Vec<u64> = v.iter().map(|r| r.wall).collect(); w.sort(); let q = |f: f64| w[((w.len() - 1) as f64 * f) as usize] as f64 / 1e3;
+    let thr = w[(w.len() - 1) * 9 / 10];
+    let agg = |sel: &dyn Fn(&XRec) -> bool| { let s: Vec<&XRec> = v.iter().filter(|r| sel(r)).collect(); let n = s.len().max(1) as f64; let m = |f: &dyn Fn(&XRec) -> f64| s.iter().map(|r| f(r)).sum::<f64>() / n;
+        let (mut lcc, mut lcp, mut lce) = (0, 0, 0); for r in &s { match r.lid { 0 => lcc += 1, x if x >= 1000 => lce += 1, _ => lcp += 1 } }
+        format!("n {} wall {:.0} misses {:.2} sleepers@pub {:.2} callerStart {:.0} maxClaimP {:.0} maxClaimE {:.0} late>50us {:.2} lastEnd {:.0} medEnd {:.0} tail {:.0} | last=C/P/E {}/{}/{} | busy% {:.0}",
+            s.len(), m(&|r| r.wall as f64 / 1e3), m(&|r| r.tag as f64), m(&|r| r.slp as f64), m(&|r| r.cfc as f64 / 1e3), m(&|r| r.pfc as f64 / 1e3), m(&|r| r.efc as f64 / 1e3), m(&|r| r.late as f64),
+            m(&|r| r.last as f64 / 1e3), m(&|r| r.med as f64 / 1e3), m(&|r| (r.last - r.med.min(r.last)) as f64 / 1e3), lcc, lcp, lce,
+            100.0 * s.iter().map(|r| r.bz.iter().sum::<u64>()).sum::<u64>() as f64 / (s.iter().map(|r| r.wall).sum::<u64>().max(1) as f64 * threads as f64)) };
+    let pt = |c: usize| { let b: u64 = v.iter().map(|r| r.bz[c]).sum(); let n: u64 = v.iter().map(|r| r.nt[c]).sum(); b as f64 / n.max(1) as f64 / 1e3 };
+    let mut per: Vec<(u64, u64)> = vec![(0, 0); 40]; for r in v.iter() { let k = (r.tag as usize).min(39); per[k].0 += r.wall; per[k].1 += 1; }
+    let pm: String = per.iter().enumerate().filter(|x| x.1 .1 >= 20).map(|(k, x)| format!(" {k}:{:.0}", x.0 as f64 / x.1 as f64 / 1e3)).collect();
+    eprintln!("xpstat jobs {} wall us p10 {:.0} p50 {:.0} p90 {:.0} p99 {:.0} max {:.0} | us/task C {:.1} P {:.1} E {:.1} (E/P {:.2})\n  all : {}\n  slow: {}\n  wall by misses:{pm}",
+        w.len(), q(0.1), q(0.5), q(0.9), q(0.99), q(1.0), pt(0), pt(1), pt(2), pt(2) / pt(1).max(1e-9), agg(&|_| true), agg(&|r| r.wall >= thr));
+    let mut ix: Vec<usize> = (0..v.len()).collect(); ix.sort_by_key(|&i| std::cmp::Reverse(v[i].wall));
+    eprintln!("  worst:{}", ix.iter().take(4).map(|&i| { let r = &v[i]; format!(" [wall {:.0} callerStart {:.0} maxClaimP {:.0} maxClaimE {:.0} last w{} at {:.0} med {:.0} callerEnd {:.0} misses {} longestTask {:.0} w{} task {}/{}]", r.wall as f64 / 1e3, r.cfc as f64 / 1e3, r.pfc as f64 / 1e3, r.efc as f64 / 1e3, r.lid, r.last as f64 / 1e3, r.med as f64 / 1e3, r.cend as f64 / 1e3, r.tag, r.mx as f64 / 1e3, r.mxw, r.mxi, r.n) }).collect::<String>());
+    v.clear();
+}
+#[inline] fn call(f: &(dyn Fn(usize) + Sync), i: usize) { if xpstat() { let w = WID.with(|w| w.get()).min(63); let t = now_ns(); XS_FC[w].fetch_min(t, Relaxed); f(i); let e = now_ns(); XS_LF[w].fetch_max(e, Relaxed); XS_BZ[w].fetch_add(e - t, Relaxed); XS_NT[w].fetch_add(1, Relaxed); if e - t > XS_MX[w].load(Relaxed) { XS_MX[w].store(e - t, Relaxed); XS_MI[w].store(i as u64, Relaxed); } return; } if jprof() { let t = now_ns(); if WID.with(|w| w.get()) != 0 { JFC.fetch_min(t, Relaxed); } JLC.fetch_max(t, Relaxed); f(i); let e = now_ns(); JLF.fetch_max(e, Relaxed); JB.fetch_add(e - t, Relaxed); return; } if wbusy() { let t = Instant::now(); f(i); WB[WID.with(|w| w.get()).min(63)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed); } else { f(i) } }
 struct Job<'a> { f: &'a (dyn Fn(usize) + Sync), n: usize }
 
 struct Shared {
@@ -34,6 +62,7 @@ struct Shared {
     /// bumped by prewake(): spinning workers restart their spin window, parked ones wake and spin
     kick: AtomicU64,
     pin0: Option<usize>,
+    nfast: usize,
 }
 
 pub struct Pool { sh: Arc<Shared>, pub threads: usize }
@@ -46,7 +75,7 @@ impl Pool {
     pub fn new_hybrid(threads: usize, spin: Duration, pin: &[usize], n_fast: usize, etail: usize) -> Self {
         let sh = Arc::new(Shared { gen: AtomicU64::new(0), ticket: AtomicU64::new(0), job: AtomicPtr::new(std::ptr::null_mut()), done: AtomicUsize::new(0), n: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0), lock: Mutex::new(()), cv: Condvar::new(), spin, etail, kick: AtomicU64::new(0),
-            pin0: if std::env::var("PYRE_QN_XPIN0").map(|v| v == "1").unwrap_or(false) { pin.first().copied() } else { None } });
+            pin0: if std::env::var("PYRE_QN_XPIN0").map(|v| v == "1").unwrap_or(xexact_env()) { pin.first().copied() } else { None }, nfast: n_fast });
         for i in 1..threads.max(1) {
             let sh = sh.clone(); let cpu = pin.get(i).copied();
             std::thread::Builder::new().name(format!("pyre-xp{i}")).spawn(move || { WID.with(|w| w.set(i)); if let Some(c) = cpu { pin_to(c); } thr_tune(); worker(&sh, i >= n_fast) }).expect("spawn pool worker");
@@ -74,6 +103,8 @@ impl Pool {
         thread_local! { static P0: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
         if let Some(c) = sh.pin0 { if !P0.with(|p| p.replace(true)) { pin_to(c); } }
         let job = Job { f, n };
+        let xtag = if xpstat() { XP_TAG.load(Relaxed) } else { 0 };
+        let (xjs, xslp) = if xtag > 0 { for w in 0..self.threads.min(64) { XS_FC[w].store(u64::MAX, Relaxed); XS_LF[w].store(0, Relaxed); XS_BZ[w].store(0, Relaxed); XS_NT[w].store(0, Relaxed); XS_MX[w].store(0, Relaxed); } (now_ns(), sh.sleepers.load(Relaxed) as u64) } else { (0, 0) };
         let g = sh.gen.load(Relaxed) + 1;
         // CAS path (TFA off or etail): the ticket moves to generation g FIRST: a worker still in work() for the previous job
         // may have read that job's exhausted ticket and then read the new (larger) n; its compare_exchange on the old ticket
@@ -89,8 +120,18 @@ impl Pool {
         if sh.sleepers.load(Acquire) > 0 { let _l = sh.lock.lock().unwrap(); sh.cv.notify_all(); }
         let tj = Instant::now();
         side(); let ts = if jprof() { now_ns() } else { 0 };
-        work(sh, g, &job, false); let tc = if jprof() { now_ns() } else { 0 };
+        if !cnw() { work(sh, g, &job, false); } let tc = if jprof() { now_ns() } else { 0 };
         while sh.done.load(Acquire) < n { std::hint::spin_loop(); }
+        if xtag > 0 { let te = now_ns(); let nt = self.threads.min(64); let mut r = XRec { wall: te - xjs, tag: xtag as u64, slp: xslp, ..Default::default() };
+            let mut ends: Vec<u64> = vec![];
+            r.n = n as u64; for w in 0..nt { let m = XS_MX[w].load(Relaxed); if m > r.mx { r.mx = m; r.mxw = w; r.mxi = XS_MI[w].load(Relaxed); } }
+            r.cend = XS_LF[0].load(Relaxed).saturating_sub(xjs);
+            for w in 0..nt { let fc = XS_FC[w].load(Relaxed); let lf = XS_LF[w].load(Relaxed); let c = if w == 0 { 0 } else if w < sh.nfast { 1 } else { 2 };
+                r.bz[c] += XS_BZ[w].load(Relaxed); r.nt[c] += XS_NT[w].load(Relaxed);
+                if fc != u64::MAX { let d = fc.saturating_sub(xjs); if w == 0 { r.cfc = d } else if c == 1 { r.pfc = r.pfc.max(d) } else { r.efc = r.efc.max(d) } if w > 0 && d > 50_000 { r.late += 1; }
+                    let le = lf.saturating_sub(xjs); ends.push(le); if le > r.last { r.last = le; r.lid = if c == 2 { 1000 + w } else { w }; } } }
+            ends.sort(); r.med = ends.get(ends.len() / 2).copied().unwrap_or(0);
+            let mut v = XRECS.lock().unwrap(); v.push(r); if v.len() >= 600 { xp_print(&mut v, self.threads); } }
         if jprof() { let te = now_ns(); let a = &JA[has_side as usize]; let fc = JFC.load(Relaxed); let fc = if fc == u64::MAX { te } else { fc };
             let v = [fc.saturating_sub(js), ts - js, tc - js, JLC.load(Relaxed).saturating_sub(js), JLF.load(Relaxed).saturating_sub(js), te - js, 1, JB.load(Relaxed)];
             for k in 0..8 { a[k].fetch_add(v[k], Relaxed); }
@@ -101,6 +142,9 @@ impl Pool {
     }
 }
 
+/// PYRE_QN_XCNW=1 (opt-in): the calling thread claims no tasks (only its side closure, then waits), so a preempted
+/// caller can not hold a gate/up task the down barrier waits on. Which thread runs a task does not change its result.
+fn cnw() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_XCNW").map(|v| v == "1").unwrap_or(false)) }
 const PB: usize = 256;
 fn pedq() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PEDQ").map(|v| v == "1").unwrap_or(false)) }
 fn tfa() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_TFA").map(|v| v != "0").unwrap_or(true)) }
@@ -147,7 +191,7 @@ fn work(sh: &Shared, g: u64, job: &Job, slow: bool) {
 
 fn worker(sh: &Shared, slow: bool) {
     let mut seen = 0u64; let mut kseen = sh.kick.load(Relaxed);
-    let mut idle = Instant::now();
+    let mut idle = Instant::now(); let mut ny = 0usize;
     loop {
         let g = sh.gen.load(Acquire);
         if g != seen {
@@ -159,13 +203,40 @@ fn worker(sh: &Shared, slow: bool) {
             continue;
         }
         let kk = sh.kick.load(Acquire); if kk != kseen { kseen = kk; idle = Instant::now(); continue; }
-        if idle.elapsed() < sh.spin { for _ in 0..64 { std::hint::spin_loop(); } continue; }
+        if idle.elapsed() < sh.spin { if umwait_on() { umwait_line(&sh.gen as *const AtomicU64 as *const u8, || sh.gen.load(Acquire) == seen && sh.kick.load(Acquire) == kseen); } else { for _ in 0..64 { std::hint::spin_loop(); } } ny += 1; if spiny() > 0 && ny % spiny() == 0 { yield_now(); } continue; }
         sh.sleepers.fetch_add(1, AcqRel);
         let mut l = sh.lock.lock().unwrap();
         while sh.gen.load(Acquire) == seen && sh.kick.load(Acquire) == kseen { l = sh.cv.wait_timeout(l, Duration::from_millis(50)).unwrap().0; }
         drop(l);
         sh.sleepers.fetch_sub(1, AcqRel);
     }
+}
+
+/// p1-p8 (2026-10-31, XPSTAT): under PYRE_QN_XEXACT=1 the pool defaults to XPIN0=1 (caller on the one P-core without a worker),
+/// SPIN_US=800 (workers keep spinning through the ~0.5 ms GPU dense half between layers instead of parking: 22-23 of 23 were
+/// parked at every publish, ~55 us condvar wake) and UMWAIT=1 (that spin in C0.1). Each =0 / other value restores the old one.
+pub fn xexact_env() -> bool { std::env::var("PYRE_QN_XEXACT").map(|v| v == "1").unwrap_or(false) }
+/// PYRE_QN_SPINY=k (opt-in measurement/fix): an idle spinning worker calls SwitchToThread every k spin rounds (~0.8 us
+/// each), so a ready thread of this process or the OS takes an idle spinner's core instead of preempting a worker that is
+/// inside a task (a preempted gate/up task stalls every worker at the down barrier for a 15-31 ms quantum).
+fn spiny() -> usize { static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_SPINY").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+#[cfg(windows)] fn yield_now() { unsafe { windows_sys::Win32::System::Threading::SwitchToThread(); } }
+#[cfg(not(windows))] fn yield_now() { std::thread::yield_now(); }
+/// PYRE_QN_UMWAIT=1 (opt-in, x86 WAITPKG only): a spinning worker waits with UMONITOR/UMWAIT (light C0.1 state, ~7 us TSC
+/// deadline) on the cache line of the job generation instead of a pause loop; it wakes on the publish's write. Less power
+/// than 23 pause loops (more turbo headroom for the P-cores). After Strata's STRATA_POOL_UMWAIT (MIT). No CPU support: pause loop.
+fn umwait_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| {
+    let want = std::env::var("PYRE_QN_UMWAIT").map(|v| v == "1").unwrap_or(xexact_env()); if !want { return false; }
+    #[cfg(target_arch = "x86_64")] { let ok = unsafe { (core::arch::x86_64::__cpuid_count(7, 0).ecx >> 5) & 1 == 1 }; eprintln!("expert pool: UMWAIT {}", if ok { "on" } else { "requested, no WAITPKG -> pause loop" }); ok }
+    #[cfg(not(target_arch = "x86_64"))] { false } }) }
+#[inline] fn umwait_line(addr: *const u8, still: impl Fn() -> bool) {
+    #[cfg(target_arch = "x86_64")] unsafe {
+        std::arch::asm!("umonitor {0}", in(reg) addr, options(nostack, preserves_flags));
+        if !still() { return; }
+        let dl = core::arch::x86_64::_rdtsc() + 20_000;
+        std::arch::asm!("umwait {0:e}", in(reg) 1u32, in("edx") (dl >> 32) as u32, in("eax") dl as u32, options(nostack));
+    }
+    #[cfg(not(target_arch = "x86_64"))] { let _ = (addr, still); std::hint::spin_loop(); }
 }
 
 /// A raw pointer that tasks writing disjoint ranges may share.

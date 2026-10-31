@@ -1573,9 +1573,11 @@ impl Model {
         let chain = guq && env_var("PYRE_QN_CHAIN").map(|v| v != "0").unwrap_or(true);
         let (z1, z2);
         if chain { let ngu = gtn; let gd = std::sync::atomic::AtomicUsize::new(0); let hqe: Vec<Vec<qdot::Q8Act>> = vec![];
+            if super::spin_pool::xpstat() { super::spin_pool::XP_TAG.store(work.len(), std::sync::atomic::Ordering::Relaxed); }
             pool.run_side(ngu + nd, &|k| { if k < ngu { gu(k); gd.fetch_add(1, std::sync::atomic::Ordering::Release); } else {
                 while gd.load(std::sync::atomic::Ordering::Acquire) < ngu { std::hint::spin_loop(); }
                 let hd: &[Vec<qdot::Q8D>] = unsafe { std::slice::from_raw_parts(qp.0 as *const Vec<qdot::Q8D>, work.len()) }; down(k - ngu, hd, &hqe); } }, &mut sidef);
+            if super::spin_pool::xpstat() { super::spin_pool::XP_TAG.store(0, std::sync::atomic::Ordering::Relaxed); }
             z1 = std::time::Instant::now(); z2 = z1; TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         } else {
         pool.run_side(gtn, &gu, &mut sidef);
@@ -2751,7 +2753,7 @@ fn qn_pool() -> &'static super::spin_pool::Pool {
         { // PYRE_QN_ETAIL: a job's last N tasks go to P-core workers only (E-cores ~2.3x slower would finish last)
             let nf = if auto_pin { super::spin_pool::n_fast() + lsib as usize } else { usize::MAX }; let et = env_usize("PYRE_QN_ETAIL").unwrap_or(0);
             eprintln!("expert pool: {} fast workers, E-core tail reserve {et}", nf.min(n));
-            super::spin_pool::Pool::new_hybrid(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(100) as u64), &pin, nf, et) }
+            super::spin_pool::Pool::new_hybrid(n, std::time::Duration::from_micros(env_usize("PYRE_QN_SPIN_US").unwrap_or(if super::spin_pool::xexact_env() { 800 } else { 100 }) as u64), &pin, nf, et) }
     })
 }
 
