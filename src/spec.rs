@@ -170,6 +170,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
             let t0 = std::time::Instant::now();
             logits = target.step(pending);
             let dt = t0.elapsed().as_secs_f64(); tm_s += dt; ns_ += 1; if policy_on() { pol_vcost(1, dt); } ts = if ts == 0.0 { dt } else { 0.8 * ts + 0.2 * dt };
+            if trace_on() { let am = crate::sampler::argmax(&logits); eprintln!("spectrace: at {produced} step {} -> argmax {am} logit {:.3}", history.last().copied().unwrap_or(0), logits[am as usize]); }
             pending = sampler.sample(&mut logits, history);
             continue;
         }
@@ -204,6 +205,7 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         for i in 0..drafts.len().min(8) { if i <= acc { pos_r[i] += 1; } if i < acc { pos_a[i] += 1; } }
         out.rounds += 1; out.drafted += drafts.len(); out.accepted += acc;
         ROUNDS.fetch_add(1, Relaxed); DRAFTED.fetch_add(drafts.len() as u64, Relaxed); ACCEPTED.fetch_add(acc as u64, Relaxed);
+        if trace_on() { let top = |l: &[f32]| { let mut v: Vec<(u32, f32)> = l.iter().enumerate().map(|(i, &x)| (i as u32, x)).collect(); v.sort_by(|a, b| b.1.total_cmp(&a.1)); v.truncate(3); v }; eprintln!("spectrace: at {produced} window {toks:?} acc {acc} next {nx} tops {:?}", ls.iter().map(|l| top(l)).collect::<Vec<_>>()); }
         if std::env::var("PYRE_SPEC_DEBUG").is_ok() { eprintln!("spec: at {produced} drafted {} accepted {acc} {:?}", drafts.len(), drafts.iter().map(|d| d.0).collect::<Vec<_>>()); }
         let mut stop = false;
         for (dt, _) in &drafts[..acc] { history.push(*dt); produced += 1; if !emit(*dt) || produced >= max_new { stop = true; break; } }
@@ -299,3 +301,6 @@ mod tests {
         assert_eq!(ngram_draft(&[1, 2, 3], 2, 2, 4), Vec::<u32>::new());
     }
 }
+
+/// PYRE_SPEC_TRACE=1 (diagnostic, off by default): per-round window, accepted count and top-3 logits of every verify position.
+pub fn trace_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_SPEC_TRACE").map(|v| v == "1").unwrap_or(false)) }

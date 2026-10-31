@@ -227,18 +227,22 @@ pub fn qn_attach_gpu(m: &mut model::qwen4exp_gguf::Model, backend: &str) -> Resu
 fn load_qn(dir: &std::path::Path, id: &str, backend_name: &str, n_predict: usize) -> Result<server::Llm> {
     let f = qn_find::find_gguf(dir).context("no .gguf found")?;
     qn_threads();
-    let t = std::time::Instant::now();
-    let mut m = model::qwen4exp_gguf::Model::load(&f)?;
-    let label = qn_attach_gpu(&mut m, backend_name)?;
-    m.load_mtp()?; m.prewarm_verify();
-    let tp = std::time::Instant::now(); let gb = m.prefault_experts(); if gb > 0.0 { tracing::info!("qwen4exp: {gb:.1} GiB of routed experts made resident in {:.1}s", tp.elapsed().as_secs_f64()); }
-    tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
-        f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
-    let (tok, template, eos) = qn_text_parts(&f, &m)?;
-    tracing::info!("eos ids {eos:?}");
-    let n_ctx = m.max_ctx();
-    let engine = engine_qn::spawn(Arc::new(m), tok.clone(), eos);
-    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: f.display().to_string(), n_ctx,
+    let backend_name = backend_name.to_string();
+    // load, GPU attach, MTP + verify-graph prewarm all on the worker thread that will decode (see engine_qn::spawn_init)
+    let (engine, (tok, template, n_ctx, label, path)) = engine_qn::spawn_init(move || {
+        let t = std::time::Instant::now();
+        let mut m = model::qwen4exp_gguf::Model::load(&f)?;
+        let label = qn_attach_gpu(&mut m, &backend_name)?;
+        m.load_mtp()?; m.prewarm_verify();
+        let tp = std::time::Instant::now(); let gb = m.prefault_experts(); if gb > 0.0 { tracing::info!("qwen4exp: {gb:.1} GiB of routed experts made resident in {:.1}s", tp.elapsed().as_secs_f64()); }
+        tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
+            f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
+        let (tok, template, eos) = qn_text_parts(&f, &m)?;
+        tracing::info!("eos ids {eos:?}");
+        let n_ctx = m.max_ctx();
+        Ok((m, tok.clone(), eos, (tok, template, n_ctx, label, f.display().to_string())))
+    })?;
+    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: path, n_ctx,
         backend: label, dtype: "gguf".into(), default_max_tokens: n_predict })
 }
 
