@@ -1833,6 +1833,7 @@ impl Model {
         let min_p: f32 = crate::spec::draft_min_p().unwrap_or_else(|| env_var("PYRE_MTP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.9));
         let mut e = vec![0f32; d];
         for j in 0..k {
+            if j > 0 && crate::spec::draft_stop() { break; }
             self.embd.row(tok as usize, &mut e);
             let (s, r2) = if let Some(h) = &gh { super::mtp::with_mm_hook(h, || m.step(&mut kv, &r, &e, n - 1 + j)) } else { mtp_cpu(|| m.step(&mut kv, &r, &e, n - 1 + j)) }; let th = std::time::Instant::now();
             // the draft head: the main head on the GPU when it is there (full vocabulary), else the CPU subset
@@ -1841,7 +1842,7 @@ impl Model {
             let (id, p) = if let Some((cb, hm)) = hg { let xb = cb.buf(&s); let o = cb.empty(hm.rows); cb.gemv(hm, &xb, s.len(), 0, &o, hm.rows, 0); let (i, p) = super::mtp::best(&cb.read(&o)); (m.head_ids()[i], p) }
                 else if self.headc.is_some() && env_var("PYRE_MTP_HEAD_CPU").is_err() { let (i, p) = super::mtp::best(&self.head_logits(&s)); (i as u32, p) } else { m.head_cpu(&s) };
             HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            if j > 0 && p < min_p { break; }
+            if !crate::spec::draft_gate(j, p, min_p) { break; }
             out.push((id, None)); r = r2; tok = id;
         }
         kv.truncate(n, row); st.mtp_kv = kv;
