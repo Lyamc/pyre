@@ -1918,7 +1918,7 @@ impl Model {
         // XGATE: the next layer's dense half is queued behind this layer's gate when it needs no host data (no PLE, mixer on the GPU)
         let (an, ln) = (*ai, *li); let nl = il + 1; let t = xs.len(); let mut nx: Option<(H, H, H)> = None;
         if xgate() && !st.pf && nl < self.layers.len() && self.dense_gpu_only(nl, st, start, t) && !VG_SKIP.lock().unwrap().contains(&(nl, t)) {
-            let mut f = |s: &mut State| { let (ly, cn) = (&self.layers[nl], self.cl[nl].as_ref().unwrap()); nx = Some(match if vgraph_on() { self.lcm_dense_g(nl, ly, cn, xs, s, ln) } else { None } { Some(x) => x, None => self.lcm_dense(nl, ly, cn, xs, s, an, ln, start, 0, t) }); };
+            let mut f = |s: &mut State| { let (ly, cn) = (&self.layers[nl], self.cl[nl].as_ref().unwrap()); super::xchain::dbeg(self.cube.as_ref().unwrap(), matches!(ly.mix, Mixer::Attn { .. }) as u32, t); nx = Some(match if vgraph_on() { self.lcm_dense_g(nl, ly, cn, xs, s, ln) } else { None } { Some(x) => x, None => self.lcm_dense(nl, ly, cn, xs, s, an, ln, start, 0, t) }); super::xchain::dend(); };
             self.lcm_moe_p(il, l, cl, xs, st, dd, rall, 0, Some(&mut f));
         } else { self.lcm_moe(il, l, cl, xs, st, dd, rall, 0); }
         *pre = nx;
@@ -1982,11 +1982,11 @@ impl Model {
         let at = |h: &H, off: usize| -> H { h.clone().offset_start((off * 4) as u64) };
         let seg = |b: &VGraph| {
             cb.rms_t(xs, &cl.hca.norm, &b.xn, hc, d, c.eps);
-            cb.gemv_m(&cl.hca.di, &b.xn, t * w, 0, w, &b.da, t * dar, 0, dar, t);
-            if !(gatem() && cb.gate_m(&b.xn, &b.da, &cl.hca.up, &b.mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.da, ti * dar), &cl.hca.up, &at(&b.mixed, ti * d), d, 0, hc, d); } }
-            cb.gemv_m(&cl.min, &b.mixed, t * d, 0, d, &b.proj, t * pr, 0, pr, t);
+            super::xchain::dmark(cb, "rms_a"); cb.gemv_m(&cl.hca.di, &b.xn, t * w, 0, w, &b.da, t * dar, 0, dar, t);
+            super::xchain::dmark(cb, "di_a"); if !(gatem() && cb.gate_m(&b.xn, &b.da, &cl.hca.up, &b.mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.da, ti * dar), &cl.hca.up, &at(&b.mixed, ti * d), d, 0, hc, d); } }
+            super::xchain::dmark(cb, "gate_a"); cb.gemv_m(&cl.min, &b.mixed, t * d, 0, d, &b.proj, t * pr, 0, pr, t);
             let (mut cks, mut ckm) = (vec![], 0u32);
-            if xfuse() && convm() && cn == ch * (c.conv_k - 1) {
+            super::xchain::dmark(cb, "min"); if xfuse() && convm() && cn == ch * (c.conv_k - 1) {
                 // PYRE_QN_XFUSE: the window's convs + conv-state checkpoints in one k_conv_m (as the eager path)
                 let mut ckc: Vec<Option<H>> = vec![];
                 for ti in 0..t { if ti + 1 < t { let (a, bb) = &cka[ti]; ckc.push(Some(a.clone())); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { ckc.push(None); cks.push(None); } }
@@ -1994,17 +1994,17 @@ impl Model {
             } else {
             for ti in 0..t { let pj = at(&b.proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&b.co, ti * ch), ch, c.conv_k);
                 if ti + 1 < t { let (a, bb) = &cka[ti]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(bb.clone())); } else { cks.push(None); } } }
-            cb.delta_m(&b.co, ch, &b.proj, pr, gw, &ss, &b.core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
-            cb.gemv_m(&cl.mout, &b.core, t * core_n, 0, core_n, &b.o, t * d, 0, d, t);
-            if xfuse() && combm() && t <= 4 { cb.comb_m(xs, &b.o, &b.da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&b.o, ti * d), None, None, &at(&b.da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &b.xn, hc, d, c.eps);
-            cb.gemv_m(&cl.hcf.di, &b.xn, t * w, 0, w, &b.df, t * dfr, 0, dfr, t);
-            if !(gatem() && cb.gate_m(&b.xn, &b.df, &cl.hcf.up, &b.rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.df, ti * dfr), &cl.hcf.up, &at(&b.rd, ti * rn), rn, 0, hc, d); } }
-            cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t);
+            super::xchain::dmark(cb, "conv"); cb.delta_m(&b.co, ch, &b.proj, pr, gw, &ss, &b.core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
+            super::xchain::dmark(cb, "delta"); cb.gemv_m(&cl.mout, &b.core, t * core_n, 0, core_n, &b.o, t * d, 0, d, t);
+            super::xchain::dmark(cb, "mout"); if xfuse() && combm() && t <= 4 { cb.comb_m(xs, &b.o, &b.da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&b.o, ti * d), None, None, &at(&b.da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &b.xn, hc, d, c.eps);
+            super::xchain::dmark(cb, "rms_f"); cb.gemv_m(&cl.hcf.di, &b.xn, t * w, 0, w, &b.df, t * dfr, 0, dfr, t);
+            super::xchain::dmark(cb, "di_f"); if !(gatem() && cb.gate_m(&b.xn, &b.df, &cl.hcf.up, &b.rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&b.xn, ti * w), &at(&b.df, ti * dfr), &cl.hcf.up, &at(&b.rd, ti * rn), rn, 0, hc, d); } }
+            super::xchain::dmark(cb, "gate_f"); cb.gemv_m(&cl.fin, &b.rd, t * rn, 0, rn, &b.rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
         };
-        if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if b.g.is_some() && b.key == key { unsafe { b.g.as_ref().unwrap().replay() }.expect("graph replay"); VG_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); super::xchain::dmark(cb, "graph"); }
         else if xg_open() { VG_SKIP.lock().unwrap().insert((il, t)); seg(b); }
         else {
-            b.g = None; b.keep.clear();
+            b.g = None; b.keep.clear(); let _ = super::xchain::dpause();
             let vf = |s: &str| if env_var("PYRE_QN_VGDBG").is_ok() { let _ = cb.client.flush(); std::thread::sleep(std::time::Duration::from_millis(30)); if let Some(v) = crate::limits::vram() { eprintln!("vgdbg il {il} t {t} {s}: free {} MiB", v.free >> 20); } };
             vf("pre");
             if cb.client.graph_prepare().is_ok() { vf("prepared"); cb.client.memory_persistent_allocation((), |_| seg(b)); vf("eager");
@@ -2040,11 +2040,11 @@ impl Model {
             else { (cb.empty(t * w), cb.empty(t * dar), cb.empty(t * d), cb.empty(t * pr), cb.empty(t * core_n), cb.empty(t * d), cb.empty(t * dfr), cb.empty(t * rn)) };
         let pre = || {
         cb.rms_t(xs, &cl.hca.norm, &xn, hc, d, c.eps);
-        cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
-        if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
-        cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
+        super::xchain::dmark(cb, "rms_a"); cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
+        super::xchain::dmark(cb, "di_a"); if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
+        super::xchain::dmark(cb, "gate_a"); cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
         };
-        if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); }
+        if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); } super::xchain::dmark(cb, "min"); 
         // the mixer, token by token (recurrent / causal state)
         // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
         // and their state checkpoints stay per token, in the same order)
@@ -2063,7 +2063,7 @@ impl Model {
             for ti in 0..t { let pj = at(&proj, ti * pr); cb.conv(&pj, pr, &gw.conv, &cs, &at(&co_all, ti * ch), ch, c.conv_k);
                 if off + ti + 1 < ttot && !st.pf { let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); if ti < 4 { ckm |= 1 << ti; } cks.push(Some(b.clone())); } else { cks.push(None); } }
             }
-            cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
+            super::xchain::dmark(cb, "conv"); cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             dm_done = true;
         } }
         for ti in 0..t {
@@ -2092,13 +2092,13 @@ impl Model {
                 let cbuf = cb.buf(&cv); cb.copy(&cbuf, core_n, 0, &core, t * core_n, ti * core_n, core_n);
             }
         }
-        let post = || {
+        super::xchain::dmark(cb, "mixer"); let post = || {
         cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
-        if combm() && t <= 4 { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
-        cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
-        if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
-        cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t);
+        super::xchain::dmark(cb, "mout"); if combm() && t <= 4 { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
+        super::xchain::dmark(cb, "rms_f"); cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
+        super::xchain::dmark(cb, "di_f"); if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
+        super::xchain::dmark(cb, "gate_f"); cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
         };
         if ag { vg_run(cb, (2, il, t), &gk, &post); } else { post(); }
         HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
