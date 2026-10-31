@@ -6,6 +6,6 @@ pub mod qwen4exp;
 pub mod gguf_q;
 pub mod iq_tables;
 pub mod qwen4exp_gguf;
-pub mod qn_gpu; pub mod qn_cube; pub mod spin_pool;
+pub mod qn_gpu; pub mod qn_cube; pub mod spin_pool; pub mod xchain;
 pub mod qdot;
 pub mod mtp;

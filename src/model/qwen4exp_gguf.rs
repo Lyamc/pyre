@@ -315,6 +315,7 @@ fn xz_read(cb: &super::qn_cube::Cube, h: &H, hk: &mut dyn FnMut()) -> Option<Vec
     }
     g.3 = g.3.wrapping_add(1).max(1); let seq = g.3; let slot = g.1[(seq as usize) % 4]; let fl = g.0 + 128;
     drop(g);
+    let xcal = super::xchain::cal(cb);
     if let Err(e) = unsafe { cb.client.pyre_copy_to_mapped(h, len, slot, fl, seq) } { eprintln!("PYRE_QN_XZC: pyre_copy_to_mapped failed ({e}); readback zero-copy off"); XZ_ERR.store(true, std::sync::atomic::Ordering::Relaxed); return None; }
     cb.client.flush_queue();
     hk(); cb.client.flush_queue();
@@ -328,6 +329,7 @@ fn xz_read(cb: &super::qn_cube::Cube, h: &H, hk: &mut dyn FnMut()) -> Option<Vec
         eprintln!("PYRE_QN_XZC: doorbell not seen after {:?}; blocking read fallback, readback zero-copy off", t0.elapsed());
         XZ_ERR.store(true, std::sync::atomic::Ordering::Relaxed); XZ_N[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed); return None;
     }
+    super::xchain::door(xcal);
     let mut v = vec![0f32; len / 4]; unsafe { std::ptr::copy_nonoverlapping(slot as *const f32, v.as_mut_ptr(), len / 4); }
     XZ_N[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(v)
@@ -1458,7 +1460,14 @@ impl Model {
         let z1 = std::time::Instant::now(); TL[0].fetch_add(t_first.load(std::sync::atomic::Ordering::Relaxed).min(1 << 40), std::sync::atomic::Ordering::Relaxed); TL[1].fetch_add(t_last.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed); TL[2].fetch_add((z1 - zp).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let used = l.down_e.ty == super::gguf_q::QType::Q2_0 && ff % 64 == 0 && env_var("PYRE_QN_Q8D").map(|v| v != "0").unwrap_or(true);
         let hq: Vec<Vec<qdot::Q8Act>> = if used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| qdot::quantize(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff])).collect()).collect() };
-        let hdq: Vec<Vec<qdot::Q8D>> = if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); if exq { qdot::quantize_d_into_x(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); } else { qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); } a }).collect()).collect() };
+        // PYRE_QN_XPQ (default on under XEXACT, =0 off; =1 also without): the per-(expert, token) Q8D quantize of the hidden rows runs across the pool (one task per
+        // row, the same quantize_d_into(_x) on the same input -> identical bytes) instead of serially on the caller
+        let hdq: Vec<Vec<qdot::Q8D>> = if used && xpq() && work.iter().map(|w| w.1.len()).sum::<usize>() >= 2 {
+            let mut v: Vec<Vec<qdot::Q8D>> = work.iter().map(|(_, toks)| (0..toks.len()).map(|_| qdot::Q8D::default()).collect()).collect();
+            let ptr: Vec<(usize, usize)> = v.iter_mut().enumerate().flat_map(|(wi, r)| { let ho = hoff[wi]; r.iter_mut().enumerate().map(move |(j, a)| (ho + j * ff, a as *mut qdot::Q8D as usize)) }).collect();
+            let hs = &hid;
+            pool.run(ptr.len(), &|k| { let (o, p) = ptr[k]; let a = unsafe { &mut *(p as *mut qdot::Q8D) }; if exq { qdot::quantize_d_into_x(&hs[o..o + ff], a); } else { qdot::quantize_d_into(&hs[o..o + ff], a); } });
+            v } else if !used { vec![] } else { work.iter().enumerate().map(|(wi, (_, toks))| (0..toks.len()).map(|j| { let mut a = qdot::Q8D::default(); if exq { qdot::quantize_d_into_x(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); } else { qdot::quantize_d_into(&hid[hoff[wi] + j * ff..hoff[wi] + (j + 1) * ff], &mut a); } a }).collect()).collect() };
         let dblk = env_usize("PYRE_QN_SDBLK").unwrap_or(64); let yp = SyncPtr(y.as_mut_ptr()); let z2 = std::time::Instant::now();
         let mut slot0 = vec![0usize; work.len()]; let mut slot_n = 0usize; for (wi, (_, toks)) in work.iter().enumerate() { slot0[wi] = slot_n; slot_n += toks.len(); } let (slot0, slot_n) = (&slot0, slot_n);
         pool.run(d.div_ceil(dblk), &|b| {
@@ -1470,7 +1479,10 @@ impl Model {
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, nr);
                     for r in 0..nr { let dr = dm.row_raw(r); if r + 4 < nr { prefetch(dm.row_raw(r + 4)); }
                         for (j, &(_, w)) in toks.iter().enumerate() { part[(slot0[wi] + j) * nr + r] = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; } } }
-                if parts_out { for sl in 0..slot_n { let yt = unsafe { yp.slice(sl * d + r0, nr) }; yt.copy_from_slice(&part[sl * nr..(sl + 1) * nr]); } return; }
+                if parts_out { for sl in 0..slot_n { let yt = unsafe { yp.slice(sl * d + r0, nr) }; yt.copy_from_slice(&part[sl * nr..(sl + 1) * nr]); }
+                    // XCK: this column chunk of every CPU row is in the pinned slot -> the device may pull it now
+                    let tg = XCK_TG.load(std::sync::atomic::Ordering::Acquire); if tg != 0 && dblk == xck_blk() { if let Some(&cp) = XCK_PG.get() { unsafe { (*((cp + 64 * b) as *const std::sync::atomic::AtomicU32)).store(tg, std::sync::atomic::Ordering::Release); } } }
+                    return; }
                 for (ti, lst) in ord.iter().enumerate() { let yt = unsafe { yp.slice(ti * d + r0, nr) };
                     for &(wi, j) in lst { let pp = &part[(slot0[wi] + j) * nr..(slot0[wi] + j + 1) * nr]; for r in 0..nr { yt[r] += pp[r]; } } } }); return; }
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
@@ -1510,6 +1522,21 @@ impl Model {
         });
     }
 }
+/// PYRE_QN_XCK (default on under XEXACT, =0 off; gated layers with XPDIRECT/XZT): the CPU rows are pulled per column chunk (the pool's
+/// down-phase task = PYRE_QN_SDBLK floats of every row) by cubecl-pipe pyre_wait_copy_chunks: each chunk's device block waits
+/// (bounded) on its own mapped flag, stored by the pool task that finished it, or on the layer's gate flag (always stored when
+/// the pool is done, also on unwind), so most rows cross PCIe while the pool still runs. Same bytes -> bit-identical.
+fn xck() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCK").map(|v| v != "0").unwrap_or(xexact())) }
+fn xck_blk() -> usize { static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *K.get_or_init(|| env_usize("PYRE_QN_SDBLK").unwrap_or(64)) }
+static XCK_TG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static XCK_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XCK_PG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn xck_page(cb: &super::qn_cube::Cube) -> Option<usize> {
+    if let Some(&p) = XCK_PG.get() { return Some(p); }
+    match cb.client.pyre_host_pinned(1 << 16) { Ok(p) => { unsafe { std::ptr::write_bytes(p as *mut u8, 0, 1 << 16); } let p64 = p.div_ceil(64) * 64; let _ = XCK_PG.set(p64); Some(p64) }
+        Err(e) => { eprintln!("PYRE_QN_XCK: pinned alloc failed ({e}); per-chunk rows off"); None } }
+}
+fn xpq() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XPQ").map(|v| v != "0").unwrap_or(xexact())) }
 fn xwin() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XWIN").map(|v| v == "1").unwrap_or(false)) }
 /// XWIN host side of a gated layer (ns/window): 0 routing start -> GPU side task start, 1 side start -> hits enqueued, 2 side total
 thread_local! { static XHX_T: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) }; }
@@ -2258,15 +2285,22 @@ impl Model {
                         // XGATE: tables up first, then the bounded wait, the CPU rows, the sum + combine and the next layer's dense
                         let tb = match zt_tb.take() { Some(h) => h, None => xt_up(cb, tab) }; let ycpu = cb.empty(sn_all * d); let ysum = cb.empty(t * d);
                         let tg = XG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1).max(1); xg_tg.set(tg);
+                        let xchr = super::xchain::rec(cb, sn_all * d * 4); if let Some(a) = xchr { super::xchain::stamp(cb, a); }
                         { let tmo = env_usize("PYRE_QN_XGATE_SPIN_US").unwrap_or(100_000) as u64 * 1000;
-                          let zc = xzc() & 1 != 0 && !XZ_ERR.load(std::sync::atomic::Ordering::Relaxed) && if xzt() && xzt_check() && (sn_all * d * 4) % 16 == 0 && ps % 16 == 0 { unsafe { cb.client.pyre_wait_copy_from_mapped_async(fl, tg, tmo, er, ps, sn_all * d * 4, &ycpu, XZT_FAIL.as_ptr() as usize); } Ok(()) } else { unsafe { cb.client.pyre_wait_copy_from_mapped(fl, tg, tmo, er, ps, sn_all * d * 4, &ycpu) } }.map_err(|e| { eprintln!("PYRE_QN_XZC: pyre_wait_copy_from_mapped failed ({e}); rows zero-copy off"); XZ_ERR.store(true, std::sync::atomic::Ordering::Relaxed); }).is_ok();
+                          let ckp = if xck() && xpdirect() && xzt() && xzt_check() && (sn_all * d * 4) % 16 == 0 && ps % 16 == 0 && (xck_blk() * 4) % 16 == 0 && xzc() & 1 != 0 && !XZ_ERR.load(std::sync::atomic::Ordering::Relaxed) { xck_page(cb) } else { None };
+                          let zc = if let Some(cp) = ckp { unsafe { cb.client.pyre_wait_copy_chunks_async(fl, cp, tg, tmo, er, ps, sn_all, d * 4, xck_blk() * 4, &ycpu, XZT_FAIL.as_ptr() as usize); }
+                              XCK_TG.store(tg, std::sync::atomic::Ordering::Release); XCK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed); true } else {
+                          xzc() & 1 != 0 && !XZ_ERR.load(std::sync::atomic::Ordering::Relaxed) && if xzt() && xzt_check() && (sn_all * d * 4) % 16 == 0 && ps % 16 == 0 { unsafe { cb.client.pyre_wait_copy_from_mapped_async(fl, tg, tmo, er, ps, sn_all * d * 4, &ycpu, XZT_FAIL.as_ptr() as usize); } Ok(()) } else { unsafe { cb.client.pyre_wait_copy_from_mapped(fl, tg, tmo, er, ps, sn_all * d * 4, &ycpu) } }.map_err(|e| { eprintln!("PYRE_QN_XZC: pyre_wait_copy_from_mapped failed ({e}); rows zero-copy off"); XZ_ERR.store(true, std::sync::atomic::Ordering::Relaxed); }).is_ok() };
                           if zc { XZ_N[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); } else { unsafe { cb.client.pyre_wait_flag(fl, tg, tmo, er); cb.client.pyre_host_gate(None, ps, sn_all * d * 4, &ycpu); } } }
+                        if let Some(a) = xchr { super::xchain::stamp(cb, a + 8); }
                         XG_OPEN.with(|g| g.set(true));
                         if xfuse() { let _ = &ysum; cb.rsum_comb3_m(ex_y.as_ref().unwrap_or(&ycpu), &ycpu, &tb, c.top_k, xs, &sh_all, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
                         cb.rsum_ex(ex_y.as_ref().unwrap_or(&ycpu), &ycpu, &tb, &ysum, d, c.top_k, t);
                         let none: Vec<Option<H>> = vec![None; t];
                         cb.comb3_m(xs, &none, &sh_all, &ysum, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); }
+                        if let Some(a) = xchr { super::xchain::stamp(cb, a + 16); }
                         if let Some(nx) = next.as_mut() { nx(&mut *stp); }
+                        if let Some(a) = xchr { super::xchain::stamp(cb, a + 24); }
                         cb.client.flush_queue();
                         XHX[2].fetch_add(hx0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         return;
@@ -2353,10 +2387,11 @@ impl Model {
                 if let Some(ps) = pdir { let yp = unsafe { std::slice::from_raw_parts_mut(ps as *mut f32, sn_all * d) }; self.routed_pool_ord(l, &xin, &work, t, yp, &mut gpu, Some(&ord)); }
                 else { self.routed_pool_ord(l, &xin, &work, t, &mut yr, &mut gpu, Some(&ord)); }
                 EXACT_PARTS.with(|c| c.set(false));
-                { let rns = tr.elapsed().as_nanos() as u64; if ex_ok && il < 128 && (xbal() || xlstat()) { XL_ST[il][1].fetch_add(rns, std::sync::atomic::Ordering::Relaxed); } ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
+                { let rns = tr.elapsed().as_nanos() as u64; if ex_ok && il < 128 && (xbal() || xlstat()) { XL_ST[il][1].fetch_add(rns, std::sync::atomic::Ordering::Relaxed); } if ex_ok { super::xchain::pool(rns); } ROUTED_NS.fetch_add(rns, std::sync::atomic::Ordering::Relaxed); crate::metrics::add_cpu_expert_ns(rns); }
             } else { gpu(); }
             if xg_tg.get() != 0 && !(ex_ok && xpdirect()) { if let Some(ps) = xslot { unsafe { std::ptr::copy_nonoverlapping(yr.as_ptr(), ps as *mut f32, sn_all * d); } } }
-            let piped = xg_tg.get() != 0; drop(xg_guard);
+            XCK_TG.store(0, std::sync::atomic::Ordering::Relaxed);
+            let piped = xg_tg.get() != 0; if piped { super::xchain::flag(); } drop(xg_guard);
             for k in &sins { xcg.map.remove(k); }
             drop(xcg);
             if piped { HY[3].fetch_add((std::time::Instant::now() - q5).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); return; }
