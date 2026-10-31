@@ -229,11 +229,11 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
 pub fn policy_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_SPEC_POLICY").map(|v| v == "1").unwrap_or(false)) }
 const PB: usize = 8;
 struct Pol { ok: [f64; PB], n: [f64; PB], dcost: [f64; 10], cost: [f64; 10], cap: usize, q: f64, e: f64, best_v: f64, best_rows: usize,
-    probs: Vec<f32>, on: bool, stop: bool, hist: [usize; 10], vc: [f64; 10], vn: [f64; 10] }
+    probs: Vec<f32>, on: bool, stop: bool, hist: [usize; 10], vc: [f64; 10], vn: [f64; 10], last: [usize; 10], rounds: usize, nv: usize, nd: usize }
 thread_local! { static POL: std::cell::RefCell<Pol> = std::cell::RefCell::new(Pol::new()); }
 impl Pol {
     fn new() -> Self { let (mut ok, mut n) = ([0.0; PB], [0.0; PB]); for b in 0..PB { n[b] = 2.0; ok[b] = 2.0 * (b as f64 + 0.5) / PB as f64; }
-        Pol { ok, n, dcost: [0.0; 10], cost: [0.0; 10], cap: 1, q: 1.0, e: 1.0, best_v: 0.0, best_rows: 1, probs: vec![], on: false, stop: false, hist: [0; 10], vc: [0.0; 10], vn: [0.0; 10] } }
+        Pol { ok, n, dcost: [0.0; 10], cost: [0.0; 10], cap: 1, q: 1.0, e: 1.0, best_v: 0.0, best_rows: 1, probs: vec![], on: false, stop: false, hist: [0; 10], vc: [0.0; 10], vn: [0.0; 10], last: [0; 10], rounds: 0, nv: 0, nd: 0 } }
     fn bucket(p: f32) -> usize { ((p.clamp(0.0, 1.0) * PB as f32) as usize).min(PB - 1) }
     fn rate(&self, p: f32) -> f64 { let b = Self::bucket(p); self.ok[b] / self.n[b].max(1e-9) }
     /// drafter time for d drafts: measured, else the nearest measured count scaled by a step of ~4% of a plain step
@@ -243,14 +243,19 @@ impl Pol {
     /// verify cost per width: the robust measured value, else extrapolated from the measured widths (a width step of
     /// the nearest measured pair, else 25% of the narrowest measured window per row)
     fn extrap(&self) -> [f64; 10] { let mut c = [0.0; 10]; let m: Vec<usize> = (1..10).filter(|&t| self.vn[t] > 0.0).collect(); if m.is_empty() { return c; }
-        let step = m.windows(2).map(|w| (self.vc[w[1]] - self.vc[w[0]]) / (w[1] - w[0]) as f64).filter(|&x| x > 0.0).last().unwrap_or(0.25 * self.vc[m[0]]);
-        for t in 1..10 { c[t] = if self.vn[t] > 0.0 { self.vc[t] } else { let i = *m.iter().min_by_key(|&&i| (i as isize - t as isize).abs()).unwrap(); (self.vc[i] + step * (t as f64 - i as f64)).max(0.5 * self.vc[m[0]]) }; } c }
+        let step = m.windows(2).map(|w| (self.vc[w[1]] - self.vc[w[0]]) / (w[1] - w[0]) as f64).filter(|&x| x > 0.0).last().unwrap_or(0.2 * self.vc[m[0]]);
+        for t in 1..10 { c[t] = if self.vn[t] > 0.0 { self.vc[t] } else { let i = *m.iter().min_by_key(|&&i| (i as isize - t as isize).abs()).unwrap(); (self.vc[i] + step * (t as f64 - i as f64)).max(0.5 * self.vc[m[0]]) }; }
+        // a narrower window never costs more than a wider one (a stale first-use sample must not price a width out)
+        for t in (1..9).rev() { if c[t + 1] > 0.0 { c[t] = c[t].min(c[t + 1]); } } for t in 2..10 { c[t] = c[t].max(c[t - 1]); } c }
     fn c(&self, rows: usize) -> f64 { self.cost[rows.min(9)] + self.dc(rows - 1) }
 }
 fn pol_clear() { POL.with(|c| { let mut s = c.borrow_mut(); s.probs.clear(); s.stop = false; }) }
 fn pol_begin(cap: usize, ts: f64, tv: &[f64; 10]) {
     POL.with(|c| { let mut s = c.borrow_mut(); s.cap = cap.clamp(1, 9); s.probs.clear(); s.stop = false; s.q = 1.0; s.e = 1.0;
-        let _ = (ts, tv); let cost = s.extrap(); s.cost = cost;
+        let _ = (ts, tv); s.rounds += 1;
+        // a width not measured for 24 rounds is forgotten and priced from the fresher ones again (Strata re-probes stale sizes too)
+        for t in 2..10 { if s.vn[t] > 0.0 && s.rounds - s.last[t] > 24 { s.vn[t] = 0.0; } }
+        let cost = s.extrap(); s.cost = cost;
         s.on = s.cost[1] > 0.0 && (2..10).any(|t| s.vn[t] > 0.0);
         s.best_rows = 1; s.best_v = if s.on { 1.0 / s.cost[1] } else { 0.0 }; })
 }
@@ -258,9 +263,9 @@ fn pol_begin(cap: usize, ts: f64, tv: &[f64; 10]) {
 // that captures a graph, a stalled round) counts as a tenth of a sample, so one capture cannot price a width out of use
 fn robust(v: &mut f64, n: &mut f64, exp: f64, x: f64) { let w = if exp > 0.0 && x > 1.6 * exp { 0.1 } else { 1.0 };
     if *n == 0.0 && w == 1.0 { *v = x; } else { let base = if *n == 0.0 { exp } else { *v }; let a = 0.3 * w; *v = (1.0 - a) * base + a * x; } *n += w; }
-fn pol_draft_time(secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let d = s.probs.len().min(9); if d == 0 { return; } let exp = if s.dcost[d] > 0.0 || s.cost[1] > 0.0 { s.dc(d) } else { 0.0 };
+fn pol_draft_time(secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let d = s.probs.len().min(9); if d == 0 { return; } s.nd += 1; if s.nd <= 2 { return; } let exp = if s.dcost[d] > 0.0 || s.cost[1] > 0.0 { s.dc(d) } else { 0.0 };
     let (mut v, mut n) = (s.dcost[d], if s.dcost[d] > 0.0 { 1.0 } else { 0.0 }); robust(&mut v, &mut n, exp, secs); s.dcost[d] = v; }) }
-fn pol_vcost(t: usize, secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let t = t.min(9); let exp = s.extrap()[t]; let (mut v, mut n) = (s.vc[t], s.vn[t]); robust(&mut v, &mut n, exp, secs); s.vc[t] = v; s.vn[t] = n; }) }
+fn pol_vcost(t: usize, secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let t = t.min(9); s.nv += 1; if s.nv <= 2 { return; } s.last[t] = s.rounds; let exp = s.extrap()[t]; let (mut v, mut n) = (s.vc[t], s.vn[t]); robust(&mut v, &mut n, exp, secs); s.vc[t] = v; s.vn[t] = n; }) }
 fn pol_rows() -> Option<usize> { POL.with(|c| { let mut s = c.borrow_mut(); if s.probs.is_empty() { return None; } let r = s.best_rows.min(s.probs.len() + 1); s.hist[r.min(9)] += 1; Some(r) }) }
 fn pol_observe(verified: usize, acc: usize) { POL.with(|c| { let mut s = c.borrow_mut();
     for i in 0..verified.min(s.probs.len()) { if i > acc { break; } let b = Pol::bucket(s.probs[i]); s.n[b] = 0.97 * s.n[b] + 1.0; s.ok[b] = 0.97 * s.ok[b] + if i < acc { 1.0 } else { 0.0 }; } }) }
