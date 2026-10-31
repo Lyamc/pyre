@@ -335,7 +335,7 @@ pub static XZS_ST: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomi
 fn xzs_cfg(k: &str, d: u64) -> u64 { env_usize(k).map(|v| v as u64).unwrap_or(d) }
 /// PYRE_QN_XZS_ZC=1: the shared kernels read the pinned arena in place (zero-copy) instead of a DMA'd VRAM stage (x3: slower)
 fn xzs_zc() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XZS_ZC").map(|v| v == "1").unwrap_or(false)) }
-fn xzs_max() -> u64 { static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new(); *K.get_or_init(|| xzs_cfg("PYRE_QN_XZS_MAX", 6).min(16)) }
+fn xzs_max() -> u64 { static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new(); *K.get_or_init(|| xzs_cfg("PYRE_QN_XZS_MAX", 2).min(2)) /* k >= 4 hit a 100 ms join timeout (XZ10f, moe.md x5): capped at the validated 2 */ }
 /// layer il-1's controller step from layer il's rd wait excess (ns); see xzs()
 fn xzs_ctl(ip: usize, ex: u64) {
     use std::sync::atomic::Ordering::Relaxed;
