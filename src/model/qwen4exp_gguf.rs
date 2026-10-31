@@ -1820,7 +1820,7 @@ impl Model {
     pub fn forward(&self, ids: &[u32], st: &mut State) -> Vec<f32> {
         // PYRE_QN_PF_MULTI=K (opt-in): prompt chunks go through the decode verify path K tokens at a time (dense
         // on the GPU, decode numerics); the expert cache fills after the first piece instead of after the prompt
-        let k = env_usize("PYRE_QN_PF_MULTI").unwrap_or(0);
+        let k = self.pf_multi();
         if k > 1 && ids.len() > 1 && self.multi_ok() {
             let mut last = vec![];
             for c in ids.chunks(k) {
@@ -2974,11 +2974,14 @@ pub fn pool_bench() {
 /// Prompt-prefix snapshot for the serve prefix cache (PYRE_QN_PCACHE): the complete host-side recurrent state after
 /// `tokens` (DeltaNet conv + ssm, attention K/V + QSA index keys, PLE rings, MTP residual window). Restoring it and
 /// prefilling the rest of a prompt in the same absolute chunk grid gives the same state as a full prefill.
+/// Serve's default for PYRE_QN_PF_MULTI (engine_qn sets it from PYRE_QN_SERVE_PF; the CLI keeps 0 = exact f32 prefill).
+pub static PF_MULTI_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
 impl Model {
     /// Snapshot of `st` (None when the GPU holds attention rows the host copy lacks, i.e. after decode steps).
-    pub fn snapshot(&self, st: &State) -> Option<Snap> {
+    pub fn snapshot(&self, st: &mut State) -> Option<Snap> {
         let row = self.cfg.n_kv * self.cfg.hd;
+        for ai in 0..st.k.len() { self.kv_pull(ai, st); }
         for (ai, g) in st.kvg.iter().enumerate() { if let Some(g) = g { if g.len * row > st.k.get(ai).map_or(0, |k| k.len()) { return None; } } }
         let (conv, ssm) = if st.gdn_gpu { let cb = self.cube.as_ref()?; (st.gdn.iter().map(|(a, _)| cb.read(a)).collect::<Vec<_>>(), st.gdn.iter().map(|(_, b)| cb.read(b)).collect::<Vec<_>>()) } else { (st.conv.clone(), st.ssm.clone()) };
         let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
@@ -2986,6 +2989,9 @@ impl Model {
         s.bytes = sz(&s.conv) + sz(&s.ssm) + sz(&s.k) + sz(&s.v) + sz(&s.ik) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
         Some(s)
     }
+    /// Prompt window of the verify-path prefill (PYRE_QN_PF_MULTI, else the serve default PF_MULTI_DEFAULT; 0 = f32 CPU prefill).
+    /// That prefill gives every token decode numerics, so its state does not depend on how the prompt is split.
+    pub fn pf_multi(&self) -> usize { let k = env_usize("PYRE_QN_PF_MULTI").unwrap_or(PF_MULTI_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)); if k > 1 && self.multi_ok() { k } else { 0 } }
     /// A fresh State equal to the snapshot (GPU mirrors are rebuilt on demand; the MTP drafter K/V catches up from the residual window).
     pub fn restore(&self, s: &Snap) -> State {
         let mut st = self.new_state();
