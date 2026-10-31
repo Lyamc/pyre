@@ -4186,6 +4186,32 @@ fn k_rsum_ex(gy: &[f32], cy: &[f32], tab: &[u32], y: &mut [f32], d: u32, kk: u32
         y[(ti * d + r) as usize] = acc;
     }
 }
+/// PYRE_QN_XFUSE: k_rsum_ex + k_comb3_m (gate on, b = the routed sum, no c) in one launch: each element recomputes its
+/// token's routed sum (same rows, same order from 0) and applies k_comb3_m's arithmetic, so the result is bit-identical.
+#[cube(launch_unchecked)]
+fn k_rsc_m(x0: &mut [f32], x1: &mut [f32], x2: &mut [f32], x3: &mut [f32], gy: &[f32], cy: &[f32], tab: &[u32], a: &[f32], gb: &[f32], dn: &[f32],
+    d: u32, kk: u32, gs: u32, goff: u32, ds: u32, lr: u32, #[comptime] hc: u32) {
+    let k = CUBE_POS_X * CUBE_DIM_X + UNIT_POS_X;
+    let ti = CUBE_POS_Y;
+    if k < d * hc {
+        let st = k / d;
+        let i = k % d;
+        let b0 = ti * (kk + 1);
+        let n = tab[b0 as usize];
+        let mut acc = 0.0f32;
+        for j in 0..n {
+            let cd = tab[(b0 + 1 + j) as usize];
+            let ix = cd & 2147483647u32;
+            if (cd >> 31) == 1u32 { acc = acc + cy[(ix * d + i) as usize]; } else { acc = acc + gy[(ix * d + i) as usize]; }
+        }
+        let mut o = a[(ti * d + i) as usize];
+        o = o / (1.0f32 + f32::exp(-gb[(ti * gs + goff) as usize]));
+        o += acc;
+        let inj = dn[(ti * ds + lr + st) as usize] / f32::cast_from(hc);
+        let v = o * 2.0f32 / (1.0f32 + f32::exp(-inj));
+        if ti == 0u32 { x0[k as usize] += v; } else if ti == 1u32 { x1[k as usize] += v; } else if ti == 2u32 { x2[k as usize] += v; } else { x3[k as usize] += v; }
+    }
+}
 /// PYRE_QN_MOEGRAPH: k_xgu_st / k_xdown_qt with the cumulative entry counts o1..o4 read from `oc` (device) instead of
 /// launch scalars and a grid sized for the window's maximum entries; entries e >= o4 are padding and skipped, so one
 /// captured launch serves every routing. Same per-entry/per-row arithmetic as the originals.
@@ -5100,6 +5126,16 @@ impl Cube {
     /// per-token counts. Only IQ2_S/IQ2_XXS gate+up with Q2_0 down.
     #[allow(clippy::too_many_arguments)]
     /// PYRE_QN_XEX8=0: the one-row-per-cube exact kernels (reference for the 8-row ones)
+    /// PYRE_QN_XFUSE: rsum_ex(gy, cy, tab) then comb3_m(xs, no c, a, sum, gb, ..) as one k_rsc_m launch (bit-identical)
+    #[allow(clippy::too_many_arguments)]
+    pub fn rsum_comb3_m(&self, gy: &Handle, cy: &Handle, tab: &Handle, kk: usize, xs: &[Handle], a: &Handle, gb: &Handle, gn: usize, gs: usize, goff: usize, dn: &Handle, ds: usize, lr: usize, hc: usize, d: usize) {
+        let t = xs.len(); let x = |i: usize| xs[i.min(t - 1)].clone();
+        let sz = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };
+        unsafe { k_rsc_m::launch_unchecked(&self.client, CubeCount::Static(((hc * d) as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(x(0), hc * d), BufferArg::from_raw_parts(x(1), hc * d), BufferArg::from_raw_parts(x(2), hc * d), BufferArg::from_raw_parts(x(3), hc * d),
+            sz(gy), sz(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(a.clone(), t * d), BufferArg::from_raw_parts(gb.clone(), gn), BufferArg::from_raw_parts(dn.clone(), t * ds),
+            d as u32, kk as u32, gs as u32, goff as u32, ds as u32, lr as u32, hc as u32) }
+    }
     pub fn rsum_ex(&self, gy: &Handle, cy: &Handle, tab: &Handle, y: &Handle, d: usize, kk: usize, t: usize) {
         let a = |hd: &Handle| unsafe { BufferArg::from_raw_parts(hd.clone(), (hd.size_in_used() / 4) as usize) };
         unsafe { k_rsum_ex::launch_unchecked(&self.client, CubeCount::Static((d as u32).div_ceil(256), t as u32, 1), CubeDim::new_1d(256), a(gy), a(cy), BufferArg::from_raw_parts(tab.clone(), t * (kk + 1)), BufferArg::from_raw_parts(y.clone(), t * d), d as u32, kk as u32) }
