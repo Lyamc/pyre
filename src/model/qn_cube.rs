@@ -33,6 +33,12 @@ pub fn readnb() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceL
 pub fn natr_prmt() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_PRMT").map(|v| v == "1").unwrap_or(false)) }
 /// PYRE_QN_NATR_U: blocks whose loads k_gemv_iq4d_r2 issues together (default 2; 1 = the old k_gemv_iq4d_r; 2 or 4). Bit-identical.
 pub fn natr_u() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_U").ok().and_then(|v| v.parse().ok()).map(|v: u32| if v >= 4 { 4 } else if v >= 2 { 2 } else { 1 }).unwrap_or(2)) }
+/// PYRE_QN_NATR3=rows (1, 2, 4 or 8; default 4; 0 = k_gemv_iq4d_r2): k_gemv_iq4d_r3 (software-pipelined loads after Strata's il_pf kernel). Bit-identical to r2.
+pub fn natr3() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR3").ok().and_then(|v| v.parse().ok()).map(|v: u32| if v >= 8 { 8 } else if v >= 4 { 4 } else if v >= 2 { 2 } else { v }).unwrap_or(4)) }
+/// PYRE_QN_NATR3_PL=0: k_gemv_iq4d_r3 decodes levels with the shared table instead of byte permutes (same integers; default permutes, s2: 119 -> 114 us)
+pub fn natr3_pl() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR3_PL").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_DELTA2 (default on, =0 k_delta_m): k_delta_m2 (one state pass per token, identical results; s3: 64.5 -> 56.3 us T=3)
+pub fn delta2() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_DELTA2").map(|v| v != "0").unwrap_or(true)) }
 /// PYRE_QN_NATR_Y: warps per cube for k_gemv_iq4d_r (default 4; b307 sweep -> 4 best)
 pub fn natr_y() -> u32 { static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR_Y").ok().and_then(|v| v.parse().ok()).unwrap_or(4)) }
 pub fn natr() -> bool { static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *M.get_or_init(|| std::env::var("PYRE_QN_NATR").map(|v| v != "0").unwrap_or(true)) }
@@ -1198,6 +1204,126 @@ fn k_gemv_iq4d_r2(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32]
     }
 }
 
+/// k_gemv_iq4d_r2 software-pipelined after Strata's native_mmvq_il_pf_kernel (MIT, src/kernels/cuda/native_mmvq.cu:1998-2240,
+/// "P1" hoisted group loads + DB ping-pong): the next block's loads (all `rr` rows' header + quant words, the x words) are issued
+/// with no branch (address clamped to the last block / last row, like Strata's tail clamp) before the current block's math, so a
+/// warp always has one block per row in flight while it computes the previous one. `rr` rows a warp (1, 2, 4). Per (row, column)
+/// the lane mapping (lane = sub-block*4 + word), the products, the ascending-block accumulation and the plane_sum are
+/// k_gemv_iq4d_r2's: bit-identical output. PYRE_QN_NATR3=rr (default 4).
+#[cube(launch_unchecked)]
+fn k_gemv_iq4d_r3(xq: &[u32], xs: &[f32], w: &[u32], t2: &[u32], out: &mut [f32], rows: u32, cols: u32, ooff: u32, ost: u32, nt: u32, #[comptime] rr: u32, #[comptime] pl: bool) {
+    let row0 = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) * rr;
+    let mut tb = Shared::<[u32]>::new_slice(256usize);
+    let mut ti = UNIT_POS_Y * 32 + UNIT_POS_X;
+    while ti < 256u32 { tb[ti as usize] = t2[ti as usize]; ti += CUBE_DIM_X * CUBE_DIM_Y; }
+    sync_cube();
+    if row0 < rows {
+        let nb = cols / 256;
+        let rw = nb * 35;
+        let ib = UNIT_POS_X / 4;
+        let k = UNIT_POS_X % 4;
+        let cq = cols / 4;
+        let cs = cols / 32;
+        let mut acc = Array::<f32>::new(comptime!((rr * 4) as usize));
+        #[unroll]
+        for i in 0..rr * 4 { acc[i as usize] = 0.0f32; }
+        let mut rb = Array::<u32>::new(comptime!(rr as usize));
+        #[unroll]
+        for r in 0..rr { let mut rx = row0 + r; if rx >= rows { rx = rows - 1; } rb[r as usize] = rx * rw; }
+        let mut xl = Array::<i32>::new(4usize);
+        let mut xh = Array::<i32>::new(4usize);
+        let mut xv = Array::<f32>::new(4usize);
+        let mut wd = Array::<f32>::new(comptime!(rr as usize));
+        let mut wh = Array::<u32>::new(comptime!(rr as usize));
+        let mut wl = Array::<u32>::new(comptime!(rr as usize));
+        let mut wq = Array::<u32>::new(comptime!(rr as usize));
+        let mut nl = Array::<i32>::new(4usize);
+        let mut nh = Array::<i32>::new(4usize);
+        let mut nv = Array::<f32>::new(4usize);
+        let mut nd = Array::<f32>::new(comptime!(rr as usize));
+        let mut nhh = Array::<u32>::new(comptime!(rr as usize));
+        let mut nll = Array::<u32>::new(comptime!(rr as usize));
+        let mut nq = Array::<u32>::new(comptime!(rr as usize));
+        // block 0 (columns >= nt read column 0's words: always in bounds, never used)
+        #[unroll]
+        for c in 0..4u32 {
+            let mut cc = 0u32; if c < nt { cc = c; }
+            xl[c as usize] = i32::cast_from(xq[(cc * cq + ib * 8 + k) as usize]);
+            xh[c as usize] = i32::cast_from(xq[(cc * cq + ib * 8 + k + 4) as usize]);
+            xv[c as usize] = xs[(cc * cs + ib) as usize];
+        }
+        #[unroll]
+        for r in 0..rr {
+            let b0 = rb[r as usize];
+            wd[r as usize] = f32::reinterpret(w[b0 as usize]);
+            wh[r as usize] = w[(b0 + 1) as usize];
+            wl[r as usize] = w[(b0 + 2) as usize];
+            wq[r as usize] = w[(b0 + 3 + UNIT_POS_X) as usize];
+        }
+        let mut blk = 0u32;
+        while blk < nb {
+            let mut bn = blk + 1; if bn >= nb { bn = nb - 1; }
+            let xw = bn * 64 + ib * 8 + k;
+            let xi = bn * 8 + ib;
+            #[unroll]
+            for c in 0..4u32 {
+                let mut cc = 0u32; if c < nt { cc = c; }
+                nl[c as usize] = i32::cast_from(xq[(cc * cq + xw) as usize]);
+                nh[c as usize] = i32::cast_from(xq[(cc * cq + xw + 4) as usize]);
+                nv[c as usize] = xs[(cc * cs + xi) as usize];
+            }
+            #[unroll]
+            for r in 0..rr {
+                let b0 = rb[r as usize] + bn * 35;
+                nd[r as usize] = f32::reinterpret(w[b0 as usize]);
+                nhh[r as usize] = w[(b0 + 1) as usize];
+                nll[r as usize] = w[(b0 + 2) as usize];
+                nq[r as usize] = w[(b0 + 3 + UNIT_POS_X) as usize];
+            }
+            #[unroll]
+            for r in 0..rr {
+                let q = wq[r as usize];
+                let ls = i32::cast_from(((wl[r as usize] >> (4 * ib)) & 15u32) | (((wh[r as usize] >> (2 * ib)) & 3u32) << 4)) - 32i32;
+                let mut lo = 0i32;
+                let mut hi = 0i32;
+                if comptime!(pl) {
+                    let (lu, hu) = iq4_lookup(q);
+                    lo = i32::cast_from(lu);
+                    hi = i32::cast_from(hu);
+                } else {
+                    let u0 = tb[(q & 255u32) as usize];
+                    let u1 = tb[((q >> 8) & 255u32) as usize];
+                    let u2 = tb[((q >> 16) & 255u32) as usize];
+                    let u3 = tb[(q >> 24) as usize];
+                    lo = i32::cast_from((u0 & 255u32) | ((u1 & 255u32) << 8) | ((u2 & 255u32) << 16) | ((u3 & 255u32) << 24));
+                    hi = i32::cast_from(((u0 >> 8) & 255u32) | (u1 & 65280u32) | (((u2 >> 8) & 255u32) << 16) | (((u3 >> 8) & 255u32) << 24));
+                }
+                let dl = wd[r as usize] * f32::cast_from(ls);
+                #[unroll]
+                for c in 0..4u32 {
+                    if c < nt {
+                        let p = dp4a(hi, xh[c as usize], dp4a(lo, xl[c as usize], 0i32));
+                        acc[(r * 4 + c) as usize] += dl * xv[c as usize] * f32::cast_from(p);
+                    }
+                }
+            }
+            #[unroll]
+            for c in 0..4u32 { xl[c as usize] = nl[c as usize]; xh[c as usize] = nh[c as usize]; xv[c as usize] = nv[c as usize]; }
+            #[unroll]
+            for r in 0..rr { wd[r as usize] = nd[r as usize]; wh[r as usize] = nhh[r as usize]; wl[r as usize] = nll[r as usize]; wq[r as usize] = nq[r as usize]; }
+            blk += 1u32;
+        }
+        #[unroll]
+        for r in 0..rr {
+            #[unroll]
+            for c in 0..4u32 {
+                let t = plane_sum(acc[(r * 4 + c) as usize]);
+                if UNIT_POS_X == 0 && c < nt && row0 + r < rows { out[(ooff + c * ost + row0 + r) as usize] = t; }
+            }
+        }
+    }
+}
+
 /// PTX prmt.b32 (CUDA __byte_perm): byte n of the result = byte sel[n] of {b:a}. The selector nibbles are masked
 /// to 3 bits, as __byte_perm does (prmt's bit 3 would sign-replicate).
 #[cube]
@@ -1973,6 +2099,89 @@ fn k_delta_m(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &
     }
 }
 
+/// k_delta_m with one pass over the state per token instead of two: the next token's memory read-out
+/// mem(t+1) = sum_i S_i(t+1) k_i(t+1) is accumulated in the same loop that writes S(t+1) (= the update of token t), and
+/// all tokens' normalised q/k and gates are computed before the loop (inputs only). Per element the products, the
+/// ascending-i sums and every float op are k_delta_m's (same values, same order): identical results. Fewer passes over
+/// the (spilled) 128-entry state column and two independent chains per pass. Idea of fusing the GDN step after Strata's
+/// gdn_step_norm_kernel (MIT, src/kernels/cuda/fused_gdn.cu); Strata's warp-per-column layout itself reorders the sums,
+/// so it is not used. PYRE_QN_DELTA2=0 reverts.
+#[cube(launch_unchecked)]
+fn k_delta_m2(co: &[f32], proj: &[f32], a: &[f32], dt: &[f32], norm: &[f32], s: &mut [f32], out: &mut [f32], c0: &mut [f32], c1: &mut [f32], c2: &mut [f32], c3: &mut [f32],
+    nk: u32, ch: u32, pn: u32, ostr: u32, ckm: u32, zoff: u32, boff: u32, aoff: u32, eps: f32, #[comptime] dk: u32, #[comptime] nt: u32) {
+    let h = CUBE_POS_X;
+    let j = UNIT_POS_X;
+    let kh = h % nk;
+    let mut qs = Shared::<[f32]>::new_slice(comptime!((dk * nt) as usize));
+    let mut ks = Shared::<[f32]>::new_slice(comptime!((dk * nt) as usize));
+    let mut red = Shared::<[f32]>::new_slice(comptime!((dk / 32) as usize));
+    let base = h * dk * dk;
+    let mut st = Array::<f32>::new(comptime!(dk as usize));
+    #[unroll]
+    for i in 0..dk {
+        st[i as usize] = s[(base + i * dk + j) as usize];
+    }
+    let mut gg = Array::<f32>::new(comptime!(nt as usize));
+    let mut bb = Array::<f32>::new(comptime!(nt as usize));
+    #[unroll]
+    for t in 0..nt {
+        let cbs = t * ch;
+        let pb = t * pn;
+        let qj = co[(cbs + kh * dk + j) as usize];
+        let kj = co[(cbs + nk * dk + kh * dk + j) as usize];
+        let sq = cube_sum(qj * qj, &mut red, comptime!(dk / 32));
+        let sk = cube_sum(kj * kj, &mut red, comptime!(dk / 32));
+        qs[(t * dk + j) as usize] = qj / f32::sqrt(sq + 1e-6f32) / f32::sqrt(f32::cast_from(dk));
+        ks[(t * dk + j) as usize] = kj / f32::sqrt(sk + 1e-6f32);
+        let x = proj[(pb + aoff + h) as usize] + dt[h as usize];
+        let mut sp = x;
+        if x <= 20.0f32 {
+            sp = f32::ln(1.0f32 + f32::exp(x));
+        }
+        gg[t as usize] = f32::exp(sp * a[h as usize]);
+        bb[t as usize] = 1.0f32 / (1.0f32 + f32::exp(-proj[(pb + boff + h) as usize]));
+    }
+    sync_cube();
+    let mut mem = 0.0f32;
+    #[unroll]
+    for i in 0..dk {
+        mem += st[i as usize] * ks[i as usize];
+    }
+    #[unroll]
+    for t in 0..nt {
+        let cbs = t * ch;
+        let pb = t * pn;
+        let g = gg[t as usize];
+        let vj = co[(cbs + 2 * nk * dk + h * dk + j) as usize];
+        mem *= g;
+        let delta = (vj - mem) * bb[t as usize];
+        let ck = ((ckm >> t) & 1u32) == 1u32;
+        let mut o = 0.0f32;
+        let mut mn = 0.0f32;
+        #[unroll]
+        for i in 0..dk {
+            let v = st[i as usize] * g + ks[(t * dk + i) as usize] * delta;
+            st[i as usize] = v;
+            o += v * qs[(t * dk + i) as usize];
+            if t + 1 < nt {
+                mn += v * ks[((t + 1) * dk + i) as usize];
+            }
+            if ck {
+                let idx = (base + i * dk + j) as usize;
+                if t == 0u32 { c0[idx] = v; } else if t == 1u32 { c1[idx] = v; } else if t == 2u32 { c2[idx] = v; } else { c3[idx] = v; }
+            }
+        }
+        mem = mn;
+        let so = cube_sum(o * o, &mut red, comptime!(dk / 32));
+        let r = 1.0f32 / f32::sqrt(so / f32::cast_from(dk) + eps);
+        let z = proj[(pb + zoff + h * dk + j) as usize];
+        out[(t * ostr + h * dk + j) as usize] = o * r * norm[j as usize] / (1.0f32 + f32::exp(-z));
+    }
+    #[unroll]
+    for i in 0..dk {
+        s[(base + i * dk + j) as usize] = st[i as usize];
+    }
+}
 // ---- routed experts cached on the GPU in their native GGUF formats (Strata's expert cache idea) ----
 // type codes: 0 = IQ2_S, 1 = IQ2_XXS, 2 = IQ1_M, 3 = Q2_0
 
@@ -4179,7 +4388,10 @@ impl Cube {
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32, natx_fma()) } } } else if nats_on() || natx() { for (r0, n, w) in &m.nat { unsafe { k_gemv_iq4s_m::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(ROWS_PER_CUBE), 1, 1), CubeDim::new_2d(32, ROWS_PER_CUBE),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32) } } } else {
-            for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { if natr_u() > 1 { unsafe { k_gemv_iq4d_r2::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
+            for (r0, n, w) in &m.nat { if natr() && NATS_OV.load(std::sync::atomic::Ordering::Relaxed) != 1 && *n >= natr_min() { if natr3() > 0 { let rr = natr3(); unsafe { k_gemv_iq4d_r3::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * rr), 1, 1), CubeDim::new_2d(32, natr_y()),
+                BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
+                BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32, rr, natr3_pl() || natr_prmt()) } continue; }
+                if natr_u() > 1 { unsafe { k_gemv_iq4d_r2::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
                 BufferArg::from_raw_parts(xq.clone(), nt * m.cols / 4), BufferArg::from_raw_parts(xs.clone(), nt * nb), BufferArg::from_raw_parts(w.clone(), n * m.cols / 256 * 35), BufferArg::from_raw_parts(m.kv.clone().unwrap(), 256),
                 BufferArg::from_raw_parts(out.clone(), on), *n as u32, m.cols as u32, (ooff + r0) as u32, ost as u32, nt as u32, natr_u(), natr_prmt()) } continue; }
                 unsafe { k_gemv_iq4d_r::launch_unchecked(&self.client, CubeCount::Static((*n as u32).div_ceil(natr_y() * 4), 1, 1), CubeDim::new_2d(32, natr_y()),
@@ -4332,11 +4544,19 @@ impl Cube {
         let sn = nv * dk * dk; let dummy = self.empty(1);
         let ck = |i: usize| match cks.get(i) { Some(Some(h)) if (ckm >> i) & 1 == 1 => (h.clone(), sn), _ => (dummy.clone(), 1) };
         let (k0, k1, k2, k3) = (ck(0), ck(1), ck(2), ck(3));
+        if delta2() {
+        unsafe { k_delta_m2::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
+            BufferArg::from_raw_parts(co.clone(), nt * ch), BufferArg::from_raw_parts(proj.clone(), nt * pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
+            BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), sn), BufferArg::from_raw_parts(out.clone(), nt * ostr),
+            BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1), BufferArg::from_raw_parts(k3.0, k3.1),
+            nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
+        } else {
         unsafe { k_delta_m::launch_unchecked(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(dk as u32),
             BufferArg::from_raw_parts(co.clone(), nt * ch), BufferArg::from_raw_parts(proj.clone(), nt * pn), BufferArg::from_raw_parts(w.a.clone(), nv), BufferArg::from_raw_parts(w.dt.clone(), nv),
             BufferArg::from_raw_parts(w.norm.clone(), dk), BufferArg::from_raw_parts(s.clone(), sn), BufferArg::from_raw_parts(out.clone(), nt * ostr),
             BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1), BufferArg::from_raw_parts(k3.0, k3.1),
             nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
+        }
     }
     /// Decode attention for one token (see k_attn_prep / k_attn); `p` = the fused q|k|v projection.
     #[allow(clippy::too_many_arguments)]
