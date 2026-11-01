@@ -719,7 +719,7 @@ impl Model {
             cb.delta(&co, ch, &proj, cl.min.rows, gw, ss, &ob, nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
             cb.gemv(&cl.mout, &ob, nv * dk, 0, &o, d, 0);
             q2 = std::time::Instant::now(); q3 = q2;
-        } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (start + 1 <= self.dense_n() || qsa_gpu())) {
+        } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (start + 1 <= self.dense_n() || qsa_gpu()) && self.kv_ok(st, *ai, start + 1)) {
             let (nh, hd) = (c.n_head, c.hd); let pos = start; let sp = &cl.min.splits;
             self.kv_push(cb, *ai, st, pos + 1);
             let g = st.kvg[*ai].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
@@ -1420,6 +1420,20 @@ impl Model {
         if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get(ai)) { let cl = st.k[ai].len() / row;
             if g.len > cl { let (kk, vv) = (cb.read(&g.k), cb.read(&g.v)); st.k[ai].extend_from_slice(&kk[cl * row..g.len * row]); st.v[ai].extend_from_slice(&vv[cl * row..g.len * row]);
                 let ih = self.cfg.idx_hd; if self.has_idx() { let ii = cb.read(&g.ik); st.ik[ai].extend_from_slice(&ii[cl * ih..g.len * ih]); } } }
+    }
+    /// int45f: can this attention layer keep (or grow) its KV on the GPU for `need` positions without going under the
+    /// VRAM floor? If not, the KV is pulled to the host and dropped, and attention runs on the CPU (attn_core) for this
+    /// conversation instead of aborting the server (36k-context pi session: 166 MiB KV growth with nothing left to shrink).
+    fn kv_ok(&self, st: &mut State, ai: usize, need: usize) -> bool {
+        if matches!(st.kvg.get(ai), Some(Some(g)) if g.cap >= need) { return true; }
+        let fl = crate::limits::vram_floor_mb() as u64; if fl == 0 { return true; }
+        let row = (self.cfg.n_kv * self.cfg.hd * 2 + self.cfg.idx_hd) as u64 * 4; let nn = need as u64; let bytes = (nn + (nn / 8).max(1024)) * row;
+        let old = st.kvg.get(ai).and_then(|g| g.as_ref()).map_or(0, |g| g.cap as u64 * row);
+        let free = crate::limits::vram().map_or(u64::MAX, |v| v.free);
+        if free >= bytes.saturating_sub(old) + ((fl + 256) << 20) { return true; }
+        if st.kvg.get(ai).map_or(false, |g| g.is_some()) { self.kv_pull(ai, st); st.kvg[ai] = None;
+            crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host", "layer": ai, "need": need, "free_mib": free >> 20})); }
+        false
     }
     /// Make the GPU KV hold every host position, with room for `need`.
     fn kv_push(&self, cb: &super::qn_cube::Cube, ai: usize, st: &mut State, need: usize) {
@@ -2574,7 +2588,7 @@ impl Model {
             dm_done = true;
         } }
         // BPG: the chunk's attention in two launches (k_attn_prep_b + k_attn3_b) instead of two per token
-        if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, !dm_done && t > 8 && bpg() && attn_gpu(c) && start + t <= self.dense_n() && env_var("PYRE_QN_BPG_ATTN").map(|v| v != "0").unwrap_or(true)) {
+        if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, !dm_done && t > 8 && bpg() && attn_gpu(c) && start + t <= self.dense_n() && self.kv_ok(st, ai0, start + t) && env_var("PYRE_QN_BPG_ATTN").map(|v| v != "0").unwrap_or(true)) {
             let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
             self.kv_push(cb, ai0, st, start + t);
             let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, start, "gpu kv out of step");
@@ -2597,7 +2611,7 @@ impl Model {
                 cb.delta(&co, ch, &pj, pr, gw, &ss, &at(&core, ti * core_n), nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
                 if off + ti + 1 < ttot && !st.pf { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
                     let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
-            } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (pos + 1 <= self.dense_n() || qsa_gpu())) {
+            } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (pos + 1 <= self.dense_n() || qsa_gpu()) && self.kv_ok(st, ai0, pos + 1)) {
                 let sp = &cl.min.splits;
                 self.kv_push(cb, ai0, st, pos + 1);
                 let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
