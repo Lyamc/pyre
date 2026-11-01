@@ -112,7 +112,8 @@ pub struct LoadReq<'a> { pub kind: Kind, pub r: &'a str, pub alias: Option<Strin
 pub fn load(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
     let gpu = !matches!(q.backend.as_deref().unwrap_or(&d.backend), "cpu" | "flex" | "ndarray");
     let m = load_inner(storage, d, q)?;
-    if gpu && crate::limits::headroom() == Some(0) {
+    // int45c: a shrink the adaptive expert cache already decided (applied at the first step) counts as free
+    if gpu && crate::limits::headroom() == Some(0) && !crate::limits::vram().is_some_and(|v| v.free + crate::limits::xc_pending_bytes() >= crate::limits::reserve()) {
         let v = crate::limits::vram();
         drop(m);
         anyhow::bail!("loading this model left only {} MiB of VRAM free, below the {} MiB reserve for other apps; it was unloaded (lower --vram-reserve / PYRE_VRAM_RESERVE, or unload another model)",

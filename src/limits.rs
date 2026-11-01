@@ -238,6 +238,8 @@ fn emergency_shrink(free: u64) -> bool {
     crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "emergency_shrink_expert_cache", "free_mib": free >> 20, "floor_mib": fl >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20}));
     true
 }
+/// Bytes the expert cache will release at the next step (decided shrink not yet applied).
+pub fn xc_pending_bytes() -> u64 { XC_CUR.load(Ordering::Relaxed).saturating_sub(XC_TGT.load(Ordering::Relaxed)) }
 pub fn vram_adapt_on() -> bool { std::env::var("PYRE_VRAM_ADAPT").map(|v| v != "0").unwrap_or(true) }
 fn adaptive_vram() -> bool { vram_adapt_on() }
 /// a step within this window counts as pyre being busy (prefill chunks run ~3 s apart)
