@@ -55,6 +55,13 @@ fn recent_hit() -> Option<f64> { let h = W_H.load(Relaxed) + W_PH.load(Relaxed);
 pub fn log_warning() { LOG_WARN.fetch_add(1, Relaxed); }
 pub fn xcache_slots(resident: usize, slots: usize, slot_bytes: usize) { XC_RES.store(resident as u64, Relaxed); XC_SLOTS.store(slots as u64, Relaxed); XC_SLOT_B.store(slot_bytes as u64, Relaxed); }
 pub fn warning() { WARNINGS.fetch_add(1, Relaxed); }
+static ROUTER_NAN: AtomicU64 = AtomicU64::new(0);
+/// Router logits contained NaN (handled: NaN -> -inf). Logged at most once per 10 s.
+pub fn router_nan(layer: usize, n: usize) {
+    let c = ROUTER_NAN.fetch_add(1, Relaxed); warning();
+    static LAST: AtomicU64 = AtomicU64::new(0); let t = uptime_s() as u64 + 1; let l = LAST.load(Relaxed);
+    if c == 0 || t >= l + 10 { LAST.store(t, Relaxed); crate::logbuf::event("router_nan", "WARN", serde_json::json!({"layer": if layer == usize::MAX { None } else { Some(layer) }, "nan_logits": n, "total_events": c + 1})); }
+}
 
 fn epoch() -> &'static Instant { static E: OnceLock<Instant> = OnceLock::new(); E.get_or_init(Instant::now) }
 fn now_s() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
@@ -192,6 +199,7 @@ pub fn snapshot() -> Value {
         "speculative": {"rounds": rounds, "drafted": drafted, "accepted": accepted, "acceptance": if drafted > 0 { Some(accepted as f64 / drafted as f64) } else { None }},
         "context": crate::spec::status()["context"],
         "gpu": {"vram_total_bytes": opt(&G_TOTAL), "vram_free_bytes": opt(&G_FREE), "vram_used_bytes": opt(&G_USED), "process_vram_bytes": opt(&G_PROC), "util_pct": opt(&G_UTIL), "samples": G_SAMPLES.load(Relaxed)},
+        "governor": crate::limits::governor_status(), "router_nan_events": ROUTER_NAN.load(Relaxed),
     })
 }
 
@@ -249,6 +257,21 @@ pub fn prometheus() -> String {
     g(&mut o, "pyre_gpu_vram_used_bytes", "gauge", "Device VRAM used (all processes).", f(&d["vram_used_bytes"]));
     g(&mut o, "pyre_process_vram_bytes", "gauge", "VRAM used by this process (when the driver reports it).", f(&d["process_vram_bytes"]));
     g(&mut o, "pyre_gpu_utilization_percent", "gauge", "GPU utilization.", f(&d["util_pct"]));
+    let gv = &v["governor"];
+    g(&mut o, "pyre_gpu_duty_base_percent", "gauge", "Configured GPU duty limit (PYRE_GPU_DUTY; 0 = pacing off).", f(&gv["duty_base_pct"]));
+    g(&mut o, "pyre_gpu_duty_target_percent", "gauge", "Current auto-tuned GPU duty target.", f(&gv["duty_target_pct"]));
+    g(&mut o, "pyre_gpu_pace_ratio", "gauge", "Sleep inserted per unit of step time.", f(&gv["pace_ratio"]));
+    g(&mut o, "pyre_gpu_paced_seconds_total", "counter", "Idle time inserted by GPU pacing.", f(&gv["paced_s"]));
+    g(&mut o, "pyre_gpu_duty_backoffs_total", "counter", "Times the duty target was lowered (heat, power, saturation, other apps).", f(&gv["duty_backoffs"]));
+    g(&mut o, "pyre_gpu_util_ema_percent", "gauge", "Smoothed GPU utilization seen by the governor.", f(&gv["util_ema_pct"]));
+    g(&mut o, "pyre_gpu_temperature_celsius", "gauge", "GPU temperature.", f(&gv["temp_c"]));
+    g(&mut o, "pyre_gpu_power_fraction", "gauge", "GPU power draw / enforced limit.", f(&gv["power_frac"]));
+    g(&mut o, "pyre_gpu_other_app_busy", "gauge", "1 while another app keeps the GPU busy.", if gv["other_app_busy"].as_bool() == Some(true) { Some(1.0) } else { Some(0.0) });
+    g(&mut o, "pyre_expert_cache_configured_bytes", "gauge", "Configured expert cache size.", f(&gv["xcache_cfg_bytes"]));
+    g(&mut o, "pyre_expert_cache_target_bytes", "gauge", "Adaptive expert cache target (shrinks under VRAM pressure).", f(&gv["xcache_target_bytes"]));
+    g(&mut o, "pyre_expert_cache_shrinks_total", "counter", "Expert cache shrinks under VRAM pressure.", f(&gv["xcache_shrinks"]));
+    g(&mut o, "pyre_expert_cache_grows_total", "counter", "Expert cache grow-backs.", f(&gv["xcache_grows"]));
+    g(&mut o, "pyre_router_nan_total", "counter", "Router logit vectors that contained NaN (handled).", f(&v["router_nan_events"]));
     o
 }
 fn esc(s: &str) -> String { s.replace('\\', "\\\\").replace('"', "\\\"") }

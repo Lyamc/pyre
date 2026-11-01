@@ -610,7 +610,8 @@ impl Model {
                     // had 3, so XEXACT silently fell back to the non-exact per-arena path (slower, and C diverged at token 76)
                     if xexact() && nslot > 2 * maxper { eprintln!("gpu: XEXACT expert cache capped at {} slots (2 arenas of {} MiB; the exact kernels take at most 2)", 2 * maxper, (maxper * slot) >> 20); nslot = 2 * maxper; }
                     let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
-                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k), sloc: vec![], bg: None }));
+                    self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if crate::limits::vram_adapt_on() { cb.client.memory_dedicated_allocation((), |_| cb.xarena(ar_bytes)) } else if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k), sloc: vec![], bg: None }));
+                    if !xclass() { crate::limits::xc_register(budget as u64); }
                     xtr(|| format!("C {nslot} {slot} {} {} {}", self.layers.len(), self.cfg.n_exp, self.cfg.top_k)); for (il, l) in self.layers.iter().enumerate() { let t3 = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)); let el = matches!(t3, (Some(_), Some(_), Some(_))) && (!xexact() || xexact_types(l)); let b = if let (Some(a), Some(b2), Some(c2)) = t3 { let w = super::qn_cube::xwords((a, b2, c2), self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) } else { 0 }; xtr(|| format!("S {il} {b} {}", el as u8)); }
                     if xclass() { let xm = self.xc.as_ref().unwrap(); let mut x = xm.lock().unwrap();
                         // classes: expert bytes (256-aligned) -> layer count; each layer gets q slots of its class, largest first
@@ -1426,8 +1427,12 @@ impl Model {
         if st.kvg.len() <= ai { st.kvg.resize_with(ai + 1, || None); }
         let cl = st.k[ai].len() / row;
         if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
+        let dbg = env_var("PYRE_QN_KVDBG").is_ok(); if dbg { eprintln!("kvdbg push ai {ai} need {need} host_k {cl} host_ik {} gpu {:?}", st.ik.get(ai).map_or(0, |v| v.len() / self.cfg.idx_hd.max(1)), st.kvg[ai].as_ref().map(|g| (g.len, g.cap, g.nbp))); }
         self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
-        let cap = need.max(cl).next_power_of_two().max(1024);
+        if dbg { let nn = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count(); eprintln!("kvdbg pulled ai {ai} host_k {cl} host_ik {} nonfinite k {} v {} ik {}", st.ik[ai].len() / self.cfg.idx_hd.max(1), nn(&st.k[ai]), nn(&st.v[ai]), nn(&st.ik[ai])); }
+        // int45: need + 1/8 headroom (>= 1024 rows), 1024-row multiples, instead of the next power of two (32769 -> 65536
+        // doubled every attention layer at decode start: the +0.9 GiB spike before the 32k driver event). PYRE_QN_KVPOW2=1 = old
+        let nn = need.max(cl); let cap = if env_var("PYRE_QN_KVPOW2").map(|v| v == "1").unwrap_or(false) { nn.next_power_of_two().max(1024) } else { { let gr = env_usize("PYRE_QN_KVGRAN").unwrap_or(1024).max(64); (nn + (nn / 8).max(1024)).next_multiple_of(gr) } };
         // PYRE_QN_KVFAST (default 1 under XEXACT): upload only the cl rows in use (one upload per layer) and zero the rest
         // with GPU copies from a cached zero buffer, instead of uploading cap (>=1024) padded rows; same buffer contents
         if kvfast() { let ih = self.cfg.idx_hd; let (nk, ni) = (cap * row, cap * ih);
@@ -1616,11 +1621,8 @@ impl Model {
         let mut by_exp: Vec<Vec<(usize, f32)>> = vec![vec![]; c.n_exp];
         for ti in 0..t {
             let r = &lg[ti * c.n_exp..(ti + 1) * c.n_exp];
-            let mut idx: Vec<usize> = (0..c.n_exp).collect();
-            idx.select_nth_unstable_by(c.top_k, |a, b| r[*b].partial_cmp(&r[*a]).unwrap());
-            let top = &idx[..c.top_k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
-            let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
-            for (&e, w) in top.iter().zip(ws) { by_exp[e].push((ti, w / sum)); }
+            let tk = top_k(r, c.top_k); let top: Vec<usize> = tk.iter().map(|x| x.0).collect(); let top = &top[..];
+            for (e, w) in tk { by_exp[e].push((ti, w)); }
             if let Some(xm) = &self.xc { if let Some(il) = self.layers.iter().position(|x| std::ptr::eq(x, l)) { let mut g = xm.lock().unwrap(); for &e in top { g.cnt[il][e] += xinc(); } xtr(|| format!("P {il} {}", top.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" "))); } }
         }
         let work: Vec<(usize, &Vec<(usize, f32)>)> = by_exp.iter().enumerate().filter(|(_, v)| !v.is_empty()).collect();
@@ -1878,7 +1880,7 @@ impl Model {
             let pw = std::mem::replace(&mut c.1[il], act.to_vec());
             if !pw.is_empty() { XP[6].fetch_add(act.len() as u64, Relaxed); XP[7].fetch_add(miss.len() as u64, Relaxed); XP[8].fetch_add(pw.iter().filter(|e| act.contains(e)).count() as u64, Relaxed); XP[9].fetch_add(pw.iter().filter(|e| miss.contains(e)).count() as u64, Relaxed); }
             if il + 1 < nl { let r = &self.layers[il + 1].router; let mut lg = vec![0f32; r.rows]; r.matmul(x, 1, &mut lg);
-                let mut idx: Vec<usize> = (0..lg.len()).collect(); idx.sort_by(|a, b| lg[*b].partial_cmp(&lg[*a]).unwrap()); idx.truncate(2 * k); c.0[il + 1] = idx; }
+                let mut idx: Vec<usize> = (0..lg.len()).collect(); idx.sort_by(|a, b| lg[*b].total_cmp(&lg[*a])); idx.truncate(2 * k); c.0[il + 1] = idx; }
             if il == 0 { c.2 += 1; if c.2 % 32 == 0 { let g = |i: usize| XP[i].load(Relaxed) as f64; let p = |a: f64, b: f64| 100.0 * a / b.max(1.0);
                 eprintln!("xpred tok {}: next-layer router top10 covers {:.1}% of experts / {:.1}% of misses, top20 {:.1}% / {:.1}% | prev-token same layer {:.1}% / {:.1}% | misses/layer {:.2}",
                     c.2, p(g(2), g(0)), p(g(4), g(1)), p(g(3), g(0)), p(g(5), g(1)), p(g(8), g(6)), p(g(9), g(7)), g(1) / (g(0) / k as f64).max(1.0)); } }
@@ -1913,7 +1915,31 @@ impl Model {
     #[allow(dead_code)] fn _xwin_dummy(&self) {}
 
     /// Feed `ids` (appended to `st.tokens`) and return the logits of the last one.
+    /// int45 step boundary (prefill chunk / decode step / verify window): GPU duty pacing, graceful stop (drain, exit 87),
+    /// and the adaptive expert-cache size from limits (shrink under VRAM pressure, grow back later).
+    fn step_hook(&self) {
+        crate::limits::gpu_pace();
+        let Some(cb) = &self.cube else { return };
+        if crate::limits::stop_requested() { let t = cb.empty(1); let _ = cb.read(&t); crate::limits::stop_now(); }
+        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 { let mut x = xm.lock().unwrap(); if tgt != x.budget && x.sloc.is_empty() { self.xc_resize(cb, &mut x, tgt); } } }
+    }
+    fn xc_resize(&self, cb: &super::qn_cube::Cube, x: &mut XCache, tgt: usize) {
+        let t0 = std::time::Instant::now(); let old = x.budget;
+        { let t = cb.empty(1); let _ = cb.read(&t); } // drain: no kernel may still read the old arenas
+        if let Some(bg) = &x.bg { if let Ok(mut g) = bg.lock() { *g = None; } }
+        x.map.clear(); x.arena.clear(); x.stream.clear(); x.used = 0;
+        let _ = cb.client.memory_cleanup();
+        let slot = x.slot; let maxper = (env_usize("PYRE_QN_ARENA_MB").unwrap_or(if xexact() { 2900 } else { 2560 }) << 20) / slot;
+        let mut nslot = (tgt / slot).max(64); if xexact() && nslot > 2 * maxper { nslot = 2 * maxper; }
+        let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot;
+        x.arena = (0..narena).map(|_| cb.client.memory_dedicated_allocation((), |_| cb.xarena(ar_bytes))).collect();
+        x.ar_bytes = ar_bytes; x.per = per; x.free = (0..narena * per).rev().collect(); x.budget = tgt;
+        crate::limits::xc_applied(tgt as u64); crate::metrics::xcache_slots(0, narena * per, slot);
+        let fr = crate::limits::vram().map(|v| v.free >> 20).unwrap_or(0);
+        crate::logbuf::event("xcache_resize", if tgt < old { "WARN" } else { "INFO" }, serde_json::json!({"from_mib": old >> 20, "to_mib": tgt >> 20, "slots": narena * per, "ms": t0.elapsed().as_millis() as u64, "free_mib_after": fr}));
+    }
     pub fn forward(&self, ids: &[u32], st: &mut State) -> Vec<f32> {
+        self.step_hook();
         // PYRE_QN_PF_MULTI=K (opt-in): prompt chunks go through the decode verify path K tokens at a time (dense
         // on the GPU, decode numerics); the expert cache fills after the first piece instead of after the prompt
         let k = self.pf_multi();
@@ -2025,10 +2051,11 @@ impl Model {
     /// Strata's STRATA_ROUTE_PRIOR / arXiv 2412.00099). Changes outputs, so it is opt-in.
     fn route_sel(&self, il: usize, r: &[f32], xc: Option<&XCache>) -> Vec<(usize, f32)> {
         let k = self.cfg.top_k; let lam = crate::spec::route_prior();
+        if let Some(c) = nan_clean(r, il) { let mut idx: Vec<usize> = (0..c.len()).collect(); idx.select_nth_unstable_by(k, |x, y| c[*y].total_cmp(&c[*x])); return soft_top(&c, &idx[..k]); }
         let Some(xc) = xc.filter(|_| lam > 0.0) else { return top_k(r, k) };
         let b: Vec<f32> = (0..r.len()).map(|e| r[e] + if xc.map.contains_key(&(il, e)) { lam } else { 0.0 }).collect();
         let mut idx: Vec<usize> = (0..r.len()).collect();
-        idx.select_nth_unstable_by(k, |x, y| b[*y].partial_cmp(&b[*x]).unwrap());
+        idx.select_nth_unstable_by(k, |x, y| b[*y].partial_cmp(&b[*x]).unwrap_or(std::cmp::Ordering::Equal));
         let top = &idx[..k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
         let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
         top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()
@@ -2223,6 +2250,7 @@ impl Model {
     pub fn forward_multi(&self, ids: &[u32], st: &mut State) -> Vec<Vec<f32>> { let xw = xwin_begin(); let r = self.forward_multi_x(ids, st, false); xwin_end(xw, ids.len()); r }
     /// `last_only`: logits for the last token only (prompt chunks).
     fn forward_multi_x(&self, ids: &[u32], st: &mut State, last_only: bool) -> Vec<Vec<f32>> {
+        self.step_hook();
         let t = ids.len();
         if t == 1 || !self.multi_ok() {
             // no verify path: plain sequential decode (no rollback checkpoints; callers check multi_ok)
@@ -2413,7 +2441,12 @@ impl Model {
     fn dense_gpu_only(&self, nl: usize, st: &State, start: usize, t: usize) -> bool {
         let (l, cl, c) = (&self.layers[nl], self.cl[nl].as_ref().unwrap(), &self.cfg);
         if l.ple.is_some() { return false; }
-        match l.mix { Mixer::Lin { .. } => cl.gdn.is_some() && st.gdn_gpu, Mixer::Attn { .. } => cl.an.is_some() && attn_gpu(c) && (start + t <= self.dense_n() || qsa_gpu()) }
+        match l.mix { Mixer::Lin { .. } => cl.gdn.is_some() && st.gdn_gpu, Mixer::Attn { .. } => cl.an.is_some() && attn_gpu(c) && (start + t <= self.dense_n() || qsa_gpu()) && {
+            // int45: never pre-enqueue an attention layer whose GPU KV must grow: kv_push then reads the KV back and
+            // re-uploads it while the stream sits behind the host gate, and the next layer's index key came out NaN
+            // (int33 "router NaN" at a 4096-token prompt: the KV was exactly full at decode start)
+            let ai = self.layers[..nl].iter().filter(|x| matches!(x.mix, Mixer::Attn { .. })).count();
+            matches!(st.kvg.get(ai), Some(Some(g)) if g.cap >= start + t) } }
     }
     /// `lcm_dense` of a DeltaNet layer for a whole verify window (t = 2..4, the k_delta_m path) as a replayed graph.
     /// Same kernels, same order, same arguments as lcm_dense; only the buffers are the graph's own. None = not eligible.
@@ -2966,9 +2999,22 @@ static ROUTED_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 #[inline] fn prefetch(b: &[u8]) {
     #[cfg(target_arch = "x86_64")] unsafe { use std::arch::x86_64::*; let mut o = 0; while o < b.len() { _mm_prefetch::<_MM_HINT_T0>(b.as_ptr().add(o) as *const i8); o += 64; } }
 }
+/// int45: router logits with NaN never panic: NaN -> -inf (counted in metrics, logged rate-limited); all-NaN -> uniform.
+fn nan_clean(r: &[f32], il: usize) -> Option<Vec<f32>> {
+    if !r.iter().any(|v| v.is_nan()) { return None; }
+    crate::metrics::router_nan(il, r.iter().filter(|v| v.is_nan()).count());
+    Some(r.iter().map(|v| if v.is_nan() { f32::NEG_INFINITY } else { *v }).collect())
+}
+fn soft_top(r: &[f32], top: &[usize]) -> Vec<(usize, f32)> {
+    let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
+    if !mx.is_finite() { let w = 1.0 / top.len().max(1) as f32; return top.iter().map(|&e| (e, w)).collect(); }
+    let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
+    top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()
+}
 fn top_k(r: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if let Some(c) = nan_clean(r, usize::MAX) { let mut idx: Vec<usize> = (0..c.len()).collect(); idx.select_nth_unstable_by(k, |a, b| c[*b].total_cmp(&c[*a])); return soft_top(&c, &idx[..k]); }
     let mut idx: Vec<usize> = (0..r.len()).collect();
-    idx.select_nth_unstable_by(k, |a, b| r[*b].partial_cmp(&r[*a]).unwrap());
+    idx.select_nth_unstable_by(k, |a, b| r[*b].partial_cmp(&r[*a]).unwrap_or(std::cmp::Ordering::Equal));
     let top = &idx[..k]; let mx = top.iter().map(|&e| r[e]).fold(f32::NEG_INFINITY, f32::max);
     let ws: Vec<f32> = top.iter().map(|&e| (r[e] - mx).exp()).collect(); let sum: f32 = ws.iter().sum();
     top.iter().zip(ws).map(|(&e, w)| (e, w / sum)).collect()

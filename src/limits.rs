@@ -146,7 +146,171 @@ pub fn vram_watch() {
     static W: std::sync::Once = std::sync::Once::new();
     W.call_once(|| { let fl = vram_floor_mb(); if fl == 0 || vram().is_none() { return; }
         let _ = std::thread::Builder::new().name("vram-floor".into()).spawn(move || loop {
-            if let Some(v) = vram() { if v.free < (fl << 20) { vram_breach(v.free, 0, "watcher"); } }
+            // int45: a watcher breach first asks for a graceful stop (drain at the next step boundary, exit 87); only if
+            // still below the floor 3 s later does it exit hard
+            if let Some(v) = vram() { if v.free < (fl << 20) {
+                eprintln!("pyre: VRAM floor breach (watcher): free {} MiB < floor {} MiB; requesting graceful stop", v.free >> 20, fl);
+                request_stop(); std::thread::sleep(std::time::Duration::from_secs(3));
+                if let Some(v2) = vram() { if v2.free < (fl << 20) { vram_breach(v2.free, 0, "watcher"); } } } }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }); });
+}
+// ======================= adaptive GPU governor (int45) =======================
+// One background thread (250 ms) watches NVML utilisation, temperature, power and device free VRAM and drives
+//  * compute pacing: PYRE_GPU_DUTY (default 85 %, `off`/0/100 = disabled). The model thread calls gpu_pace() once per
+//    step / prefill chunk and sleeps `busy * r`; r rises while the smoothed utilisation is above the current duty
+//    target and decays when below, so light work (decode at ~60-75 %) is never slowed. The target itself auto-tunes:
+//    -5 points (every 5 s, floor PYRE_GPU_DUTY_MIN, default 50) while the GPU is hot (>= 80 C), near its power limit
+//    (>= 95 %) or saturated (>= 97 % for 20 s); down to base-15 while another app uses the GPU (util > 30 % while
+//    pyre is idle); +1 point every 5 s back toward the base after 30 s calm.
+//  * adaptive VRAM: when device free VRAM drops below floor + 512 MiB (other apps allocating), the expert-cache
+//    target shrinks so free returns to floor + 768 MiB (256 MiB steps); after 30 s with free > floor + 832 MiB it grows
+//    back by up to 512 MiB at a time (never below floor + 768 free), up to the configured size. The model applies the target at its next step (xc_target).
+//  * graceful stop: a stop request (file <temp>/pyre/stop.<pid>, or request_stop()) is seen at the next step; the
+//    model drains the GPU and exits 87. If no step comes within PYRE_STOP_GRACE_S (default 10) the thread exits.
+use std::sync::atomic::AtomicBool;
+static DUTY_BASE: AtomicU64 = AtomicU64::new(0); // 0 = pacing off
+static DUTY_CUR: AtomicU64 = AtomicU64::new(0);
+static PACE_R_PPM: AtomicU64 = AtomicU64::new(0);
+static PACE_US: AtomicU64 = AtomicU64::new(0);
+static DUTY_DOWN: AtomicU64 = AtomicU64::new(0);
+static G_UTIL_EMA: AtomicU64 = AtomicU64::new(0); // x100
+static G_TEMP: AtomicU64 = AtomicU64::new(0);
+static G_PWR: AtomicU64 = AtomicU64::new(0); // permille of the power limit
+static OTHERS_BUSY: AtomicBool = AtomicBool::new(false);
+static LAST_STEP_MS: AtomicU64 = AtomicU64::new(0);
+static XC_CFG: AtomicU64 = AtomicU64::new(0);   // configured expert-cache bytes (0 = no adaptive cache)
+static XC_TGT: AtomicU64 = AtomicU64::new(0);   // current target bytes
+static XC_CUR: AtomicU64 = AtomicU64::new(0);   // bytes the model has applied
+static XC_SHRINKS: AtomicU64 = AtomicU64::new(0);
+static XC_GROWS: AtomicU64 = AtomicU64::new(0);
+static STOP: AtomicBool = AtomicBool::new(false);
+static STOP_AT_MS: AtomicU64 = AtomicU64::new(0);
+fn now_ms() -> u64 { static T0: OnceLock<Instant> = OnceLock::new(); T0.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1 }
+
+fn duty_cfg() -> u64 {
+    static D: OnceLock<u64> = OnceLock::new();
+    *D.get_or_init(|| match std::env::var("PYRE_GPU_DUTY").ok().as_deref().map(str::trim) {
+        Some("off") | Some("0") | Some("100") => 0,
+        Some(v) => v.parse::<u64>().map(|x| x.clamp(30, 99)).unwrap_or(85),
+        None => 85 })
+}
+fn duty_min() -> u64 { std::env::var("PYRE_GPU_DUTY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(50u64).clamp(20, 95) }
+pub fn duty_target() -> u64 { DUTY_CUR.load(Ordering::Relaxed) }
+
+/// Pace the GPU: call once per model step (decode step, verify window, prefill chunk) on the model thread.
+pub fn gpu_pace() {
+    governor_start();
+    thread_local! { static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
+    let now = Instant::now(); LAST_STEP_MS.store(now_ms(), Ordering::Relaxed);
+    let r = PACE_R_PPM.load(Ordering::Relaxed);
+    let busy = LAST.with(|c| c.get()).map(|t| now - t).unwrap_or_default();
+    let mut end = now;
+    if r > 0 && busy < Duration::from_secs(10) && DUTY_BASE.load(Ordering::Relaxed) > 0 {
+        let s = busy.mul_f64(r as f64 / 1e6).min(Duration::from_secs(2));
+        if s >= Duration::from_micros(300) { std::thread::sleep(s); PACE_US.fetch_add(s.as_micros() as u64, Ordering::Relaxed); end = Instant::now(); }
+    }
+    LAST.with(|c| c.set(Some(end)));
+}
+
+/// The model registers its configured expert-cache size (bytes) once it exists.
+pub fn xc_register(bytes: u64) { XC_CFG.store(bytes, Ordering::Relaxed); XC_TGT.store(bytes, Ordering::Relaxed); XC_CUR.store(bytes, Ordering::Relaxed); }
+/// Target expert-cache bytes (the model resizes when this differs from what it applied; then calls xc_applied).
+pub fn xc_target() -> u64 { XC_TGT.load(Ordering::Relaxed) }
+pub fn xc_applied(bytes: u64) { XC_CUR.store(bytes, Ordering::Relaxed); }
+/// PYRE_VRAM_ADAPT (default 1, 0 = off): adaptive expert cache (dedicated, returnable arenas).
+pub fn vram_adapt_on() -> bool { std::env::var("PYRE_VRAM_ADAPT").map(|v| v != "0").unwrap_or(true) }
+fn adaptive_vram() -> bool { vram_adapt_on() }
+/// a step within this window counts as pyre being busy (prefill chunks run ~3 s apart)
+const ACTIVE_MS: u64 = 6000;
+pub fn is_active() -> bool { now_ms().saturating_sub(LAST_STEP_MS.load(Ordering::Relaxed)) < ACTIVE_MS }
+
+/// Ask pyre to stop at its next step (drain GPU work, exit 87).
+pub fn request_stop() { if !STOP.swap(true, Ordering::Relaxed) { STOP_AT_MS.store(now_ms(), Ordering::Relaxed); eprintln!("pyre: stop requested; draining at the next step"); } }
+pub fn stop_requested() -> bool { STOP.load(Ordering::Relaxed) }
+pub fn stop_file() -> std::path::PathBuf { std::env::temp_dir().join("pyre").join(format!("stop.{}", std::process::id())) }
+/// Called by the model at a step boundary after its GPU work is drained.
+pub fn stop_now() -> ! { let _ = std::fs::remove_file(stop_file()); eprintln!("pyre: stopped gracefully (GPU drained)"); crate::logbuf::event("stop", "WARN", serde_json::json!({"graceful": true})); std::process::exit(87) }
+
+pub fn governor_start() {
+    static S: std::sync::Once = std::sync::Once::new();
+    S.call_once(|| {
+        let base = duty_cfg(); DUTY_BASE.store(base, Ordering::Relaxed); DUTY_CUR.store(base, Ordering::Relaxed);
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("pyre"));
+        let _ = std::thread::Builder::new().name("pyre-governor".into()).spawn(move || {
+            let dev = nvml().and_then(|n| n.device_by_index(0).ok());
+            let (mut ema, mut sat_since, mut calm_since, mut last_adj, mut last_grow, mut others_until) = (0.0f64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut r = 0.0f64; let mut high_since = 0u64; let mut low_n = 0u32;
+            let grace = std::env::var("PYRE_STOP_GRACE_S").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10) * 1000;
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let t = now_ms();
+                // graceful stop
+                if !STOP.load(Ordering::Relaxed) && stop_file().exists() { request_stop(); }
+                if STOP.load(Ordering::Relaxed) && t.saturating_sub(STOP_AT_MS.load(Ordering::Relaxed)) > grace {
+                    eprintln!("pyre: stop grace ({} s) elapsed without a step boundary; exiting", grace / 1000); let _ = std::fs::remove_file(stop_file()); std::process::exit(88);
+                }
+                let Some(d) = dev.as_ref() else { continue };
+                let util = d.utilization_rates().map(|u| u.gpu as f64).unwrap_or(0.0);
+                let temp = d.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu).unwrap_or(0) as u64;
+                let pwr = match (d.power_usage(), d.enforced_power_limit()) { (Ok(p), Ok(l)) if l > 0 => p as u64 * 1000 / l as u64, _ => 0 };
+                ema = 0.7 * ema + 0.3 * util; G_UTIL_EMA.store((ema * 100.0) as u64, Ordering::Relaxed); G_TEMP.store(temp, Ordering::Relaxed); G_PWR.store(pwr, Ordering::Relaxed);
+                let seen = LAST_STEP_MS.load(Ordering::Relaxed) > 0; let active = seen && t.saturating_sub(LAST_STEP_MS.load(Ordering::Relaxed)) < ACTIVE_MS;
+                if seen && !active && util > 30.0 { others_until = t + 30_000; }
+                OTHERS_BUSY.store(t < others_until, Ordering::Relaxed);
+                // ---- duty target auto-tune
+                if base > 0 {
+                    let cur = DUTY_CUR.load(Ordering::Relaxed); let dmin = duty_min().min(base);
+                    if active && ema >= 97.0 { if sat_since == 0 { sat_since = t; } } else { sat_since = 0; }
+                    let hot = temp >= 80 || pwr >= 950 || (sat_since > 0 && t - sat_since > 20_000);
+                    let mut nt = cur;
+                    if hot { calm_since = 0; if t - last_adj > 5000 && cur > dmin { nt = cur.saturating_sub(5).max(dmin); } }
+                    else if t < others_until && cur > base.saturating_sub(15).max(dmin) { nt = base.saturating_sub(15).max(dmin); calm_since = 0; }
+                    else if temp < 75 && pwr < 850 && t >= others_until && (!active || ema < cur as f64 - 5.0) { if calm_since == 0 { calm_since = t; } if t - calm_since > 30_000 && t - last_adj > 5000 && cur < base { nt = cur + 1; } }
+                    else { calm_since = 0; }
+                    if nt != cur { DUTY_CUR.store(nt, Ordering::Relaxed); last_adj = t;
+                        if nt < cur { DUTY_DOWN.fetch_add(1, Ordering::Relaxed); crate::metrics::warning();
+                            crate::logbuf::event("gpu_duty", "WARN", serde_json::json!({"from": cur, "to": nt, "util_ema": (ema * 10.0).round() / 10.0, "temp_c": temp, "power_permille": pwr, "other_app": t < others_until})); }
+                        else { crate::logbuf::event("gpu_duty", "INFO", serde_json::json!({"from": cur, "to": nt})); } }
+                    // ---- pacing controller (only while pyre is stepping)
+                    let tgt = DUTY_CUR.load(Ordering::Relaxed) as f64;
+                    if active { let e = ema - tgt; r = if e > 0.0 { r + 0.01 * e } else { r + 0.004 * e }; r = r.clamp(0.0, 1.5); } else { r = (r - 0.02).max(0.0); }
+                    PACE_R_PPM.store((r * 1e6) as u64, Ordering::Relaxed);
+                }
+                // ---- adaptive VRAM (expert cache)
+                let cfg = XC_CFG.load(Ordering::Relaxed);
+                if cfg > 0 && adaptive_vram() {
+                    if let Ok(m) = d.memory_info() {
+                        let fl = vram_floor_mb().max(512) << 20; let (free, tgt) = (m.free, XC_TGT.load(Ordering::Relaxed));
+                        let applied = XC_CUR.load(Ordering::Relaxed) == tgt;
+                        if free < fl + (512 << 20) { low_n += 1; } else { low_n = 0; }
+                        if free < fl + (512 << 20) && low_n >= 3 && seen && applied && tgt > 0 { low_n = 0;
+                            let deficit = (fl + (768 << 20)).saturating_sub(free).next_multiple_of(256 << 20);
+                            let nt = tgt.saturating_sub(deficit);
+                            XC_TGT.store(nt, Ordering::Relaxed); XC_SHRINKS.fetch_add(1, Ordering::Relaxed); crate::metrics::warning(); high_since = 0; last_grow = t;
+                            crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "shrink_expert_cache", "free_mib": free >> 20, "floor_mib": fl >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20}));
+                        } else if free > fl + (832 << 20) && applied && tgt < cfg {
+                            if high_since == 0 { high_since = t; }
+                            if t - high_since > 30_000 && t - last_grow > 30_000 {
+                                let room = free - (fl + (768 << 20)); let step = room.min(512 << 20).min(cfg - tgt) & !((64u64 << 20) - 1);
+                                if step > 0 { let nt = tgt + step; XC_TGT.store(nt, Ordering::Relaxed); XC_GROWS.fetch_add(1, Ordering::Relaxed); last_grow = t; high_since = t;
+                                    crate::logbuf::event("vram_pressure", "INFO", serde_json::json!({"action": "grow_expert_cache", "free_mib": free >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20})); }
+                            }
+                        } else if free <= fl + (832 << 20) { high_since = 0; }
+                    }
+                }
+            }
+        });
+    });
+}
+
+pub fn governor_status() -> serde_json::Value {
+    serde_json::json!({
+        "duty_base_pct": DUTY_BASE.load(Ordering::Relaxed), "duty_target_pct": DUTY_CUR.load(Ordering::Relaxed),
+        "pace_ratio": PACE_R_PPM.load(Ordering::Relaxed) as f64 / 1e6, "paced_s": PACE_US.load(Ordering::Relaxed) as f64 / 1e6,
+        "duty_backoffs": DUTY_DOWN.load(Ordering::Relaxed), "util_ema_pct": G_UTIL_EMA.load(Ordering::Relaxed) as f64 / 100.0,
+        "temp_c": G_TEMP.load(Ordering::Relaxed), "power_frac": G_PWR.load(Ordering::Relaxed) as f64 / 1000.0, "other_app_busy": OTHERS_BUSY.load(Ordering::Relaxed),
+        "xcache_cfg_bytes": XC_CFG.load(Ordering::Relaxed), "xcache_target_bytes": XC_TGT.load(Ordering::Relaxed), "xcache_applied_bytes": XC_CUR.load(Ordering::Relaxed),
+        "xcache_shrinks": XC_SHRINKS.load(Ordering::Relaxed), "xcache_grows": XC_GROWS.load(Ordering::Relaxed), "stop_requested": STOP.load(Ordering::Relaxed),
+    })
 }

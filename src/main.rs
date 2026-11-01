@@ -321,7 +321,7 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         let addr = format!("{}:{}", args.host, args.port);
         let local = if args.host == "0.0.0.0" || args.host == "::" { "127.0.0.1".to_string() } else { args.host.clone() };
         apps::set_server(format!("http://{local}:{}", args.port));
-        crate::metrics::set_instance(args.port); crate::metrics::start_sampler();
+        crate::metrics::set_instance(args.port); crate::metrics::start_sampler(); crate::limits::governor_start();
         if let Some(mb) = args.metrics_bind.clone().filter(|s| !s.is_empty()) {
             let ml = tokio::net::TcpListener::bind(&mb).await?;
             tracing::info!("metrics on http://{mb}/metrics (token {})", if std::env::var("PYRE_METRICS_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) { "required" } else { "not set" });
