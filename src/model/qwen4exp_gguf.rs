@@ -1949,6 +1949,9 @@ impl Model {
                 last = if c.len() == 1 { self.forward_inner(c, st) } else { st.pf = true; let v = self.forward_multi_x(c, st, true).pop().unwrap(); st.pf = false; v };
                 if let (Some(cb), Some(xm)) = (&self.cube, &self.xc) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
             }
+            // int45d: hand the prefill-window (t = 256) scratch pages back to the driver before decode; without verify graphs the
+            // first decode windows otherwise allocated fresh pages on top of them (+1.8 GiB at decode start, free 802 MiB)
+            if ids.len() > 8 { if let Some(cb) = &self.cube { let z = cb.empty(1); let _ = cb.read(&z); let _ = cb.client.memory_cleanup(); } }
             if bpg() && ids.len() > 8 { let n = HOTN.swap(0, std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("bpg hot: {n} experts streamed in {:.0} ms", HOTT.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6); } }
             return last;
         }
@@ -2341,6 +2344,7 @@ impl Model {
             if xs.is_none() { xs = Some(if vgraph_on() { self.vxs_fill(cb, &xh) } else { xh.iter().map(|v| cb.buf(v)).collect() }); }
             // int45b: prefill chunks run ~3 s of back-to-back GPU work; pace per layer so the duty target holds within a chunk
             if st.pf { crate::limits::gpu_pace(); }
+            if !st.pf && start >= 1000 && env_var("PYRE_QN_MEMDBG").is_ok() { static MC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if MC.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 { let _ = self.cube.as_ref().unwrap().client.flush(); let z = self.cube.as_ref().unwrap().empty(1); let _ = self.cube.as_ref().unwrap().read(&z); if let Some(v) = crate::limits::vram() { eprintln!("memdbg il {il} t {} start {start} free {} MiB", xs.as_ref().map_or(0, |x| x.len()), v.free >> 20); } } }
             self.layer_cube_multi_p(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start, &mut pre);
         }
         }

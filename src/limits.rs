@@ -268,6 +268,8 @@ pub fn governor_start() {
                 let t = now_ms();
                 // graceful stop
                 if !STOP.load(Ordering::Relaxed) && stop_file().exists() { request_stop(); }
+                // int45d: idle (no step for ACTIVE_MS) = nothing in flight on the GPU: stop now instead of waiting out the grace
+                if STOP.load(Ordering::Relaxed) && !is_active() { stop_now(); }
                 if STOP.load(Ordering::Relaxed) && t.saturating_sub(STOP_AT_MS.load(Ordering::Relaxed)) > grace {
                     eprintln!("pyre: stop grace ({} s) elapsed without a step boundary; exiting", grace / 1000); let _ = std::fs::remove_file(stop_file()); std::process::exit(88);
                 }
