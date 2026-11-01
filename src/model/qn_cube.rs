@@ -5744,6 +5744,7 @@ impl Cube {
         if xs.len() > 4 && t8() && w8() { let t = xs.len(); let w = hc * d; let g = |i: usize| unsafe { BufferArg::from_raw_parts(xs[i.min(t - 1)].clone(), w) };
             unsafe { k_rms8::launch_unchecked(&self.client, CubeCount::Static(hc as u32, t as u32, 1), CubeDim::new_1d(256), g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7),
                 BufferArg::from_raw_parts(norm.clone(), w), BufferArg::from_raw_parts(xn.clone(), t * w), d as u32, w as u32, eps) } return; }
+        if xs.len() > 8 && super::qwen4exp_gguf::bpg() { let w = hc * d; for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.rms_t(&xs[c0..c1], norm, &xn.clone().offset_start((c0 * w * 4) as u64), hc, d, eps); } return; }
         if xs.len() > 4 && t8() { let w = hc * d; for c0 in (0..xs.len()).step_by(4) { let c1 = (c0 + 4).min(xs.len()); self.rms_t(&xs[c0..c1], norm, &xn.clone().offset_start((c0 * w * 4) as u64), hc, d, eps); } return; }
         let t = xs.len(); let w = hc * d;
         if t >= 2 && t <= 4 && std::env::var("PYRE_QN_RMS4").map(|v| v != "0").unwrap_or(true) {
@@ -5761,6 +5762,7 @@ impl Cube {
     }
     /// k_gate over t tokens at strides xs / ds / os (elements); false when t is not 2..=4 (caller loops k_gate)
     pub fn gate_m(&self, xn: &Handle, dn: &Handle, up: &CMat, out: &Handle, on: usize, ooff: usize, hc: usize, d: usize, t: usize, xs: usize, ds: usize, os: usize) -> bool {
+        if t > 8 && super::qwen4exp_gguf::bpg() { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); if n == 1 { self.gate(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d); } else { self.gate_m(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d, n, xs, ds, os); } } return true; }
         if t > 4 && t <= 8 && t8() && !gate8() { for c0 in (0..t).step_by(4) { let n = (t - c0).min(4); if n == 1 { self.gate(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d); } else { self.gate_m(&xn.clone().offset_start((c0 * xs * 4) as u64), &dn.clone().offset_start((c0 * ds * 4) as u64), up, out, on, ooff + c0 * os, hc, d, n, xs, ds, os); } } return true; }
         if !((2..=4).contains(&t) || t <= 8 && t8() && gate8()) { return false; }
         let lr = up.cols;

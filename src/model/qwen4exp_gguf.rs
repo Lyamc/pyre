@@ -2454,7 +2454,7 @@ impl Model {
         // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
         // and their state checkpoints stay per token, in the same order)
         let mut dm_done = false;
-        if let (Mixer::Lin { .. }, Some(gw), true) = (&l.mix, &cl.gdn, st.gdn_gpu) { if t >= 2 && (t <= 4 || t <= 8 && super::qn_cube::t8()) && c.lin_dk == c.lin_dv && env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) {
+        if let (Mixer::Lin { .. }, Some(gw), true) = (&l.mix, &cl.gdn, st.gdn_gpu) { if t >= 2 && (t <= 4 || t <= 8 && super::qn_cube::t8() || bpg()) && c.lin_dk == c.lin_dv && env_var("PYRE_QN_DELTAM").map(|v| v != "0").unwrap_or(true) {
             let (nk, nv, dk) = (c.lin_nk, c.lin_nv, c.lin_dk); let ch = cl.min.splits[1]; let sp = &cl.min.splits;
             let (cs, ss) = st.gdn[li0].clone(); let co_all = cb.empty(t * ch);
             let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv);
@@ -2500,7 +2500,7 @@ impl Model {
         super::xchain::dmark(cb, "mixer"); let post = || {
         gmm(cb, &cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
-        super::xchain::dmark(cb, "mout"); if combm() && (t <= 4 || super::qn_cube::t8()) { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
+        super::xchain::dmark(cb, "mout"); if combm() && (t <= 4 || super::qn_cube::t8() || bpg()) { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
         super::xchain::dmark(cb, "rms_f"); gmm(cb, &cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         super::xchain::dmark(cb, "di_f"); if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
         super::xchain::dmark(cb, "gate_f"); gmm(cb, &cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
