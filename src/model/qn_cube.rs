@@ -145,6 +145,89 @@ fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows:
         }
     }
 }
+/// k_gemm_pf on tensor cores: tile 64 rows x 64 tokens per cube (4 warps, each 32 tokens x 32 rows = 2x2 16x16x16 f16
+/// fragments with f32 accumulators). Each 32-column step dequantizes the tile's weights (Q8_0 / native IQ4_XS) and the
+/// tokens' activations to f16 in shared memory; same output/split-K interface as k_gemm_pf. Tensor-core prompt GEMM as in
+/// Strata's prefill (MIT, github.com/Niko1221/Strata); pyre's own kernel.
+#[cube(launch_unchecked)]
+fn k_gemm_tc(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, #[comptime] nat: bool) {
+    let mut ws = Shared::<[half::f16]>::new_aligned_slice(2048usize, 32usize);
+    let mut xs = Shared::<[half::f16]>::new_aligned_slice(2048usize, 32usize);
+    let mut os = Shared::<[f32]>::new_aligned_slice(4096usize, 32usize);
+    let mut tab = Shared::<[f32]>::new_slice(16usize);
+    let tid = UNIT_POS;
+    if nat { if tid < 16u32 { tab[tid as usize] = kv[tid as usize]; } }
+    let r0 = CUBE_POS_X * 64u32; let t0 = CUBE_POS_Y * 64u32;
+    let wp = tid / 32u32; let wr = (wp % 2u32) as usize; let wt = (wp / 2u32) as usize;
+    let c00 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    let c01 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    let c10 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    let c11 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0);
+    let mut a0 = unsafe { cmma::Matrix::<half::f16>::uninitialized(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor) };
+    let mut a1 = unsafe { cmma::Matrix::<half::f16>::uninitialized(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor) };
+    let mut b0 = unsafe { cmma::Matrix::<half::f16>::uninitialized(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor) };
+    let mut b1 = unsafe { cmma::Matrix::<half::f16>::uninitialized(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor) };
+    let lr = tid / 2u32; let lh = tid % 2u32;
+    let mut grow = r0 + lr; if grow >= rows { grow = rows - 1u32; }
+    let mut tk = t0 + lr; if tk >= nt { tk = nt - 1u32; }
+    let kb = CUBE_POS_Z * kch; let mut ke = kb + kch; if ke > cols { ke = cols; }
+    let mut k0 = kb;
+    while k0 < ke {
+        sync_cube();
+        if nat {
+            let blk = k0 / 256u32; let ib = (k0 / 32u32) % 8u32;
+            let b = grow * (cols / 256u32) * 35u32 + blk * 35u32;
+            let d = f32::reinterpret(w[b as usize]); let sh = w[(b + 1u32) as usize]; let sl = w[(b + 2u32) as usize];
+            let ls = ((sl >> (4u32 * ib)) & 15u32) | (((sh >> (2u32 * ib)) & 3u32) << 4u32);
+            let dl = d * (f32::cast_from(ls) - 32.0f32);
+            #[unroll]
+            for wq in 0..4u32 {
+                let q = w[(b + 3u32 + 4u32 * ib + wq) as usize];
+                #[unroll]
+                for j in 0..4u32 {
+                    ws[(lr * 32u32 + 16u32 * lh + 4u32 * wq + j) as usize] = half::f16::cast_from(dl * tab[((q >> (8u32 * j + 4u32 * lh)) & 15u32) as usize]);
+                }
+            }
+        } else {
+            let sc = s[(grow * (cols / 32u32) + k0 / 32u32) as usize];
+            let wb = grow * (cols / 4u32) + k0 / 4u32 + 4u32 * lh;
+            #[unroll]
+            for h in 0..4u32 {
+                let wd = w[(wb + h) as usize];
+                #[unroll]
+                for j in 0..4u32 { ws[(lr * 32u32 + 16u32 * lh + 4u32 * h + j) as usize] = half::f16::cast_from(sc * dec(wd, j)); }
+            }
+        }
+        let xb = tk * cols + k0 + 16u32 * lh;
+        #[unroll]
+        for j in 0..16u32 { xs[(lr * 32u32 + 16u32 * lh + j) as usize] = half::f16::cast_from(x[(xb + j) as usize]); }
+        sync_cube();
+        #[unroll]
+        for kk in 0..2usize {
+            let xa = wt * 1024usize + kk * 16usize; let wa = wr * 1024usize + kk * 16usize;
+            cmma::load(&mut a0, &xs[xa..xa + 496usize], 32u32);
+            cmma::load(&mut a1, &xs[xa + 512usize..xa + 1008usize], 32u32);
+            cmma::load(&mut b0, &ws[wa..wa + 496usize], 32u32);
+            cmma::load(&mut b1, &ws[wa + 512usize..wa + 1008usize], 32u32);
+            cmma::execute(&a0, &b0, &c00, &c00);
+            cmma::execute(&a0, &b1, &c01, &c01);
+            cmma::execute(&a1, &b0, &c10, &c10);
+            cmma::execute(&a1, &b1, &c11, &c11);
+        }
+        k0 += 32u32;
+    }
+    let ob = wt * 2048usize + wr * 32usize;
+    cmma::store(&mut os.slice_mut(ob, ob + 1008usize), &c00, 64u32, cmma::MatrixLayout::RowMajor);
+    cmma::store(&mut os.slice_mut(ob + 16usize, ob + 1024usize), &c01, 64u32, cmma::MatrixLayout::RowMajor);
+    cmma::store(&mut os.slice_mut(ob + 1024usize, ob + 2032usize), &c10, 64u32, cmma::MatrixLayout::RowMajor);
+    cmma::store(&mut os.slice_mut(ob + 1040usize, ob + 2048usize), &c11, 64u32, cmma::MatrixLayout::RowMajor);
+    sync_cube();
+    let pb = CUBE_POS_Z * pst;
+    let mut i = tid;
+    while i < 4096u32 { let c = t0 + i / 64u32; let r = r0 + i % 64u32;
+        if r < rows && c < nt { out[(pb + c * ost + ooff + r) as usize] = os[i as usize]; }
+        i += 128u32; }
+}
 /// split-K reduction of k_gemm_pf: out[i] = sum_z part[z * n + i] (z in order)
 #[cube(launch_unchecked)]
 fn k_gemm_sum(part: &[f32], out: &mut [f32], rows: u32, n: u32, ks: u32, ooff: u32, ost: u32) {
@@ -5631,20 +5714,25 @@ impl Cube {
     pub fn gemm_pf(&self, m: &CMat, x: &Handle, xn: usize, t: usize, out: &Handle, on: usize) {
         let cols = m.cols; let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect(); let kvb = self.buf(&kv);
         let mut c0 = 0usize; let _ = (xn, on);
+        // PYRE_QN_BPF_TC (default on; 0 = f32 k_gemm_pf): tensor-core f16 tiles
+        let tc = std::env::var("PYRE_QN_BPF_TC").map(|v| v != "0").unwrap_or(true);
         if std::env::var("PYRE_QN_BPF_BENCH").is_ok() && t >= 128 { eprintln!("gemm_pf {}x{} t={t} nat {:?} qseg {:?}", m.rows, cols, m.nat.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>(), m.qseg.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>()); }
         while c0 < t { let nt = (t - c0).min(256);
             let xo = x.clone().offset_start((c0 * cols * 4) as u64); let xl = nt * cols; let oo = out.clone().offset_start((c0 * m.rows * 4) as u64); let ol = nt * m.rows;
             // split-K (per segment) so that small-row matrices (HC down: 324 rows, 64-row Q8 segments) still fill the SMs;
             // K ranges in whole 256 blocks; no split below 2048 columns. A split segment writes ks partial planes of its own
             // (ks x nt x n floats, small) that k_gemm_sum adds in plane order into out.
-            let ksplit = |n: usize| -> (usize, usize) { if cols < 2048 { return (1, cols); } let cubes = n.div_ceil(128) * nt.div_ceil(64); let ks0 = (112usize.div_ceil(cubes)).clamp(1, 8).min(cols / 256).max(1);
+            let ksplit = |n: usize| -> (usize, usize) { if cols < 2048 { return (1, cols); } let cubes = n.div_ceil(if tc { 64 } else { 128 }) * nt.div_ceil(64); let ks0 = (112usize.div_ceil(cubes)).clamp(1, 8).min(cols / 256).max(1);
                 let kch = (cols / 256).div_ceil(ks0) * 256; (cols.div_ceil(kch), kch) };
             let launch = |w: Handle, wl: usize, sh: Handle, sl: usize, r0: usize, n: usize, nat: bool| { let (ks, kch) = ksplit(n);
                 let part = if ks > 1 { Some(self.empty(ks * nt * n)) } else { None };
                 let (dst, dl, ooff, ost, pst) = match &part { Some(p) => (p.clone(), ks * nt * n, 0usize, n, nt * n), None => (oo.clone(), ol, r0, m.rows, 0) };
+                if tc { unsafe { k_gemm_tc::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(64), (nt as u32).div_ceil(64), ks as u32), CubeDim::new_1d(128),
+                BufferArg::from_raw_parts(xo.clone(), xl), BufferArg::from_raw_parts(w, wl), BufferArg::from_raw_parts(sh, sl), BufferArg::from_raw_parts(kvb.clone(), 16),
+                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) } } else {
                 unsafe { k_gemm_pf::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(128), (nt as u32).div_ceil(64), ks as u32), CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(xo.clone(), xl), BufferArg::from_raw_parts(w, wl), BufferArg::from_raw_parts(sh, sl), BufferArg::from_raw_parts(kvb.clone(), 16),
-                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) }
+                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) } }
                 if let Some(p) = &part { unsafe { k_gemm_sum::launch_unchecked(&self.client, CubeCount::Static(((nt * n) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(p.clone(), ks * nt * n), BufferArg::from_raw_parts(oo.clone(), ol), n as u32, (nt * n) as u32, ks as u32, r0 as u32, m.rows as u32) } } };
             if m.nat.is_empty() && m.qseg.is_empty() { launch(m.w.clone(), m.rows * cols / 4, m.s.clone(), m.rows * cols / 32, 0, m.rows, false); }
             for (r0, n, w) in &m.nat { launch(w.clone(), n * cols / 256 * 35, kvb.clone(), 16, *r0, *n, true); }
