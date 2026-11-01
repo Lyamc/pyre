@@ -142,7 +142,10 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         let left = max_new - produced; // tokens we may still emit
         // PYRE_SPEC_HI=acc (opt-in, e.g. 0.95): while the recent acceptance is at least acc, drafts may run to
         // PYRE_SPEC_HI_K (4) with the later-draft confidence gate at PYRE_SPEC_HI_P (0.6); otherwise the normal k and gate
-        let pol = policy_on() && greedy; pol_clear();
+        // the policy also runs for sampled requests (its own statistics): the MTP drafts are the drafter's argmax (a point-mass q),
+        // and the window only depends on the drafter's confidences, never on a target sample, so min(1, p/q) acceptance with the
+        // residual resample stays distribution-correct. PYRE_SPEC_POLICY_SAMPLED=0 restores the greedy-only policy.
+        let pol = policy_on() && (greedy || env("PYRE_SPEC_POLICY_SAMPLED", 1) == 1); PMODE.with(|m| m.set(!greedy as usize)); pol_clear();
         let hi = !pol && hi_acc() > 0.0 && p_acc >= hi_acc() as f64;
         let k = if pol { env("PYRE_SPEC_POLICY_K", 3).max(1) } else if hi { env("PYRE_SPEC_HI_K", if native2() { 6 } else { 4 }).max(k) } else { k };
         DRAFT_MIN_P.store(if hi { std::env::var("PYRE_SPEC_HI_P").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.6).to_bits() } else { u32::MAX }, Relaxed);
@@ -237,7 +240,8 @@ pub fn policy_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::On
 const PB: usize = 8;
 struct Pol { ok: [f64; PB], n: [f64; PB], dcost: [f64; 10], cost: [f64; 10], cap: usize, q: f64, e: f64, best_v: f64, best_rows: usize,
     probs: Vec<f32>, on: bool, stop: bool, hist: [usize; 10], vc: [f64; 10], vn: [f64; 10], last: [usize; 10], rounds: usize, nv: usize, nd: usize }
-thread_local! { static POL: std::cell::RefCell<Pol> = std::cell::RefCell::new(Pol::new()); }
+thread_local! { static POL: std::cell::RefCell<Vec<Pol>> = std::cell::RefCell::new(vec![Pol::new(), Pol::new()]); static PMODE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn pm() -> usize { PMODE.with(|m| m.get()) }
 impl Pol {
     fn new() -> Self { let (mut ok, mut n) = ([0.0; PB], [0.0; PB]); for b in 0..PB { n[b] = 2.0; ok[b] = 2.0 * (b as f64 + 0.5) / PB as f64; }
         Pol { ok, n, dcost: [0.0; 10], cost: [0.0; 10], cap: 1, q: 1.0, e: 1.0, best_v: 0.0, best_rows: 1, probs: vec![], on: false, stop: false, hist: [0; 10], vc: [0.0; 10], vn: [0.0; 10], last: [0; 10], rounds: 0, nv: 0, nd: 0 } }
@@ -256,9 +260,9 @@ impl Pol {
         for t in (1..9).rev() { if c[t + 1] > 0.0 { c[t] = c[t].min(c[t + 1]); } } for t in 2..10 { c[t] = c[t].max(c[t - 1]); } c }
     fn c(&self, rows: usize) -> f64 { self.cost[rows.min(9)] + self.dc(rows - 1) }
 }
-fn pol_clear() { POL.with(|c| { let mut s = c.borrow_mut(); s.probs.clear(); s.stop = false; }) }
+fn pol_clear() { POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; s.probs.clear(); s.stop = false; }) }
 fn pol_begin(cap: usize, ts: f64, tv: &[f64; 10]) {
-    POL.with(|c| { let mut s = c.borrow_mut(); s.cap = cap.clamp(1, 9); s.probs.clear(); s.stop = false; s.q = 1.0; s.e = 1.0;
+    POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; s.cap = cap.clamp(1, 9); s.probs.clear(); s.stop = false; s.q = 1.0; s.e = 1.0;
         let _ = (ts, tv); s.rounds += 1;
         // a width not measured for 24 rounds is forgotten and priced from the fresher ones again (Strata re-probes stale sizes too)
         for t in 2..10 { if s.vn[t] > 0.0 && s.rounds - s.last[t] > 24 { s.vn[t] = 0.0; } }
@@ -270,19 +274,19 @@ fn pol_begin(cap: usize, ts: f64, tv: &[f64; 10]) {
 // that captures a graph, a stalled round) counts as a tenth of a sample, so one capture cannot price a width out of use
 fn robust(v: &mut f64, n: &mut f64, exp: f64, x: f64) { let w = if exp > 0.0 && x > 1.6 * exp { 0.1 } else { 1.0 };
     if *n == 0.0 && w == 1.0 { *v = x; } else { let base = if *n == 0.0 { exp } else { *v }; let a = 0.3 * w; *v = (1.0 - a) * base + a * x; } *n += w; }
-fn pol_draft_time(secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let d = s.probs.len().min(9); if d == 0 { return; } s.nd += 1; if s.nd <= 2 { return; } let exp = if s.dcost[d] > 0.0 || s.cost[1] > 0.0 { s.dc(d) } else { 0.0 };
+fn pol_draft_time(secs: f64) { POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; let d = s.probs.len().min(9); if d == 0 { return; } s.nd += 1; if s.nd <= 2 { return; } let exp = if s.dcost[d] > 0.0 || s.cost[1] > 0.0 { s.dc(d) } else { 0.0 };
     let (mut v, mut n) = (s.dcost[d], if s.dcost[d] > 0.0 { 1.0 } else { 0.0 }); robust(&mut v, &mut n, exp, secs); s.dcost[d] = v; }) }
-fn pol_vcost(t: usize, secs: f64) { POL.with(|c| { let mut s = c.borrow_mut(); let t = t.min(9); s.nv += 1; if s.nv <= 2 { return; } s.last[t] = s.rounds; let exp = s.extrap()[t]; let (mut v, mut n) = (s.vc[t], s.vn[t]); robust(&mut v, &mut n, exp, secs); s.vc[t] = v; s.vn[t] = n; }) }
-fn pol_rows() -> Option<usize> { POL.with(|c| { let mut s = c.borrow_mut(); if s.probs.is_empty() { return None; } let r = s.best_rows.min(s.probs.len() + 1); s.hist[r.min(9)] += 1; Some(r) }) }
-fn pol_observe(verified: usize, acc: usize) { POL.with(|c| { let mut s = c.borrow_mut();
+fn pol_vcost(t: usize, secs: f64) { POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; let t = t.min(9); s.nv += 1; if s.nv <= 2 { return; } s.last[t] = s.rounds; let exp = s.extrap()[t]; let (mut v, mut n) = (s.vc[t], s.vn[t]); robust(&mut v, &mut n, exp, secs); s.vc[t] = v; s.vn[t] = n; }) }
+fn pol_rows() -> Option<usize> { POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; if s.probs.is_empty() { return None; } let r = s.best_rows.min(s.probs.len() + 1); s.hist[r.min(9)] += 1; Some(r) }) }
+fn pol_observe(verified: usize, acc: usize) { POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()];
     for i in 0..verified.min(s.probs.len()) { if i > acc { break; } let b = Pol::bucket(s.probs[i]); s.n[b] = 0.97 * s.n[b] + 1.0; s.ok[b] = 0.97 * s.ok[b] + if i < acc { 1.0 } else { 0.0 }; } }) }
-fn pol_text() -> String { if !policy_on() { return "off".into(); } POL.with(|c| { let s = c.borrow();
+fn pol_text() -> String { if !policy_on() { return "off".into(); } POL.with(|c| { let g = c.borrow(); let s = &g[pm()];
     format!("rows {:?} rate/bucket {:?} cost ms {:?} draft ms {:?}", &s.hist[1..6], (0..PB).map(|b| (s.ok[b] / s.n[b].max(1e-9) * 100.0).round() / 100.0).collect::<Vec<_>>(), (1..6).map(|t| (s.cost[t] * 1e4).round() / 10.0).collect::<Vec<_>>(), (1..5).map(|d| (s.dcost[d] * 1e4).round() / 10.0).collect::<Vec<_>>()) }) }
 /// Drafter hook, called after draft `j` came with probability `p`: whether to keep it (false = drop it and stop).
 /// Without PYRE_SPEC_POLICY this is the old gate (a later draft needs p >= min_p).
 pub fn draft_gate(j: usize, p: f32, min_p: f32) -> bool {
     if !policy_on() { return !(j > 0 && p < min_p); }
-    POL.with(|c| { let mut s = c.borrow_mut(); s.probs.push(p); let rows = j + 2;
+    POL.with(|c| { let mut g = c.borrow_mut(); let s = &mut g[pm()]; s.probs.push(p); let rows = j + 2;
         if !s.on { s.best_rows = rows; s.stop = rows >= s.cap || p < 0.9; return true; }
         let a = s.rate(p); s.q *= a; s.e += s.q; let v = s.e / s.c(rows);
         if v > s.best_v { s.best_v = v; s.best_rows = rows; }
@@ -292,7 +296,7 @@ pub fn draft_gate(j: usize, p: f32, min_p: f32) -> bool {
         s.stop = !more; true })
 }
 /// Drafter hook before computing draft `j` > 0: the policy decided to stop after the previous draft.
-pub fn draft_stop() -> bool { policy_on() && POL.with(|c| c.borrow().stop) }
+pub fn draft_stop() -> bool { policy_on() && POL.with(|c| c.borrow()[pm()].stop) }
 
 fn env(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
 
