@@ -34,7 +34,9 @@ struct Ple { key: QMat, value: QMat, nk: Vec<f32>, nq: Vec<f32>, nc: Vec<f32>, c
 struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, gate_e: QMat, up_e: QMat, down_e: QMat, sh_gate_inp: Vec<f32>, sh_gate: QMat, sh_up: QMat, sh_down: QMat }
 
 /// GPU copy of one attention layer's KV cache: `len` positions valid, room for `cap`.
-pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize }
+pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize,
+    /// QSA pooled block keys on the GPU (cap/ratio blocks) and how many leading blocks are pooled and still valid
+    pb: Option<burn_cubecl::cubecl::server::Handle>, nbp: usize }
 /// Pre-packed host copies of missed experts in the GPU arena layout (Strata's host expert arena, expert_source.cpp:
 /// experts kept in the device layout in RAM so a PCIe upload is a plain copy). Filled on first use up to
 /// PYRE_QN_XARENA_GB, and never while less than PYRE_QN_RAM_RESERVE_GB (default 16) of RAM would stay free.
@@ -445,6 +447,8 @@ fn mg_bufs(cb: &super::qn_cube::Cube, t: usize, max_ne: usize, d: usize, sf: usi
 // PYRE_QN_XBATCH=0: the window's GPU expert hits token by token
 fn xbatch() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XBATCH").map(|v| v != "0").unwrap_or(true)) }
 fn kick() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_KICK").map(|v| v != "0").unwrap_or(true)) }
+/// PYRE_QN_QSA_GPU (default on, =0 off): decode past the QSA dense range keeps attention on the GPU (attn_tok / attn_qsa)
+fn qsa_gpu() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_QSA_GPU").map(|v| v != "0").unwrap_or(true)) }
 fn attn_gpu(c: &Cfg) -> bool { c.hd % 32 == 0 && c.n_rot <= c.hd && c.n_head % c.n_kv == 0 && env_var("PYRE_QN_ATTN_GPU").map(|v| v != "0").unwrap_or(true) }
 #[inline] fn sigm(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 #[inline] fn silu(x: f32) -> f32 { x * sigm(x) }
@@ -714,13 +718,12 @@ impl Model {
             cb.delta(&co, ch, &proj, cl.min.rows, gw, ss, &ob, nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
             cb.gemv(&cl.mout, &ob, nv * dk, 0, &o, d, 0);
             q2 = std::time::Instant::now(); q3 = q2;
-        } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && start + 1 <= self.dense_n()) {
-            let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let pos = start; let sp = &cl.min.splits;
+        } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (start + 1 <= self.dense_n() || qsa_gpu())) {
+            let (nh, hd) = (c.n_head, c.hd); let pos = start; let sp = &cl.min.splits;
             self.kv_push(cb, *ai, st, pos + 1);
             let g = st.kvg[*ai].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
-            let csb = self.rope_h(cb, pos, half); let att = cb.empty(nh * hd);
-            cb.attn(&proj, cl.min.rows, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &att, nh, nkv, hd, half, pos, c.eps);
-            if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; cb.copy(&proj, cl.min.rows, sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
+            let att = cb.empty(nh * hd);
+            self.attn_tok(cb, idx, g, &proj, cl.min.rows, sp, qnh, knh, &proj, cl.min.rows, 0, pos, &att);
             g.len = pos + 1; *ai += 1;
             cb.gemv(&cl.mout, &att, nh * hd, 0, &o, d, 0);
             q2 = std::time::Instant::now(); q3 = q2;
@@ -950,6 +953,29 @@ impl Model {
         let mut g = C.lock().unwrap(); let m = g.get_or_insert_with(Default::default);
         if m.len() > 8192 { m.clear(); }
         m.entry((pos, half)).or_insert_with(mk).clone()
+    }
+    /// One token's full attention on the GPU (KV already pushed, g.len == pos): dense `attn` while every QSA block fits,
+    /// past that (PYRE_QN_QSA_GPU, default on) the QSA sparse attention on the GPU (attn_qsa) instead of attn_core on the
+    /// host. The token's raw index key is copied from `src` (offset `so`) first. Changes float order vs attn_core only.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_tok(&self, cb: &super::qn_cube::Cube, idx: &Option<(QMat, QMat, Vec<f32>, Vec<f32>)>, g: &mut KvG, pj: &H, pr: usize, sp: &[usize], qnh: &H, knh: &H, src: &H, srcn: usize, so: usize, pos: usize, out: &H) {
+        let c = &self.cfg; let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2);
+        let csb = self.rope_h(cb, pos, half);
+        let ihd = c.idx_hd; let has = idx.is_some() && sp.len() > 5;
+        if has { cb.copy(src, srcn, so + sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
+        let sparse = has && pos + 1 > self.dense_n() && env_var("PYRE_QN_DENSE").is_err();
+        if !sparse { cb.attn(pj, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, out, nh, nkv, hd, half, pos, c.eps); return; }
+        let Some((_, _, iqn, ikn)) = idx else { unreachable!() };
+        let ir = c.idx_ratio; let nbc = g.cap / ir;
+        if g.pb.is_none() { g.pb = Some(cb.empty(nbc * ihd)); g.nbp = 0; }
+        let pb = g.pb.clone().unwrap();
+        static NW: std::sync::Mutex<Option<std::collections::HashMap<usize, H>>> = std::sync::Mutex::new(None);
+        let nw = |v: &Vec<f32>| -> H { let mut m = NW.lock().unwrap(); m.get_or_insert_with(Default::default).entry(v.as_ptr() as usize).or_insert_with(|| cb.buf(v)).clone() };
+        let (iqh, ikh) = (nw(iqn), nw(ikn));
+        g.nbp = g.nbp.min(pos / ir); let nb = (pos + 1) / ir;
+        for b in g.nbp..nb { let cs = self.rope_h(cb, b * ir, half); cb.qsa_pool(&g.ik, g.cap * ihd, &ikh, &cs, &pb, nbc * ihd, b, ir, ihd, half, c.eps); }
+        g.nbp = nb;
+        cb.attn_qsa(pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir);
     }
     fn xpk_prefill(&self, skip: usize, cbp: Option<&super::qn_cube::Cube>) {
         if env_var("PYRE_QN_XARENA_GB").map(|v| v.parse::<f64>().unwrap_or(0.0) <= 0.0).unwrap_or(true) { return; }
@@ -1410,10 +1436,10 @@ impl Model {
             let src = if up.is_empty() { None } else { Some((cb.buf(&up), up.len())) };
             let mk = |n: usize, off: usize, used: usize| -> H { if n == 0 { return cb.buf(&[]); } let h = cb.empty(n); cb.copy(&zr.0, zr.1, 0, &h, n, 0, n); if used > 0 { if let Some((s, sn)) = &src { cb.copy(s, *sn, off, &h, n, 0, used); } } h };
             let (k, v, ik) = (mk(nk, 0, uk), mk(nk, uk, uk), mk(ni, 2 * uk, ui));
-            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl }); return; }
+            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl, pb: None, nbp: 0 }); return; }
         let mut kb = st.k[ai].clone(); kb.resize(cap * row, 0.0); let mut vb = st.v[ai].clone(); vb.resize(cap * row, 0.0);
         let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
-        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl });
+        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0 });
     }
 
     /// Visible tokens up to which every QSA block is selected (attention stays dense and exact).
@@ -2383,7 +2409,7 @@ impl Model {
     fn dense_gpu_only(&self, nl: usize, st: &State, start: usize, t: usize) -> bool {
         let (l, cl, c) = (&self.layers[nl], self.cl[nl].as_ref().unwrap(), &self.cfg);
         if l.ple.is_some() { return false; }
-        match l.mix { Mixer::Lin { .. } => cl.gdn.is_some() && st.gdn_gpu, Mixer::Attn { .. } => cl.an.is_some() && attn_gpu(c) && start + t <= self.dense_n() }
+        match l.mix { Mixer::Lin { .. } => cl.gdn.is_some() && st.gdn_gpu, Mixer::Attn { .. } => cl.an.is_some() && attn_gpu(c) && (start + t <= self.dense_n() || qsa_gpu()) }
     }
     /// `lcm_dense` of a DeltaNet layer for a whole verify window (t = 2..4, the k_delta_m path) as a replayed graph.
     /// Same kernels, same order, same arguments as lcm_dense; only the buffers are the graph's own. None = not eligible.
@@ -2528,13 +2554,11 @@ impl Model {
                 cb.delta(&co, ch, &pj, pr, gw, &ss, &at(&core, ti * core_n), nk, nv, dk, sp[1], sp[2], sp[3], c.eps);
                 if off + ti + 1 < ttot && !st.pf { let cn = (c.conv_k - 1) * (2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv); let sn = nv * dk * c.lin_dv;
                     let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
-            } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && pos + 1 <= self.dense_n()) {
-                let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
+            } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (pos + 1 <= self.dense_n() || qsa_gpu())) {
+                let sp = &cl.min.splits;
                 self.kv_push(cb, ai0, st, pos + 1);
                 let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
-                let csb = self.rope_h(cb, pos, half);
-                cb.attn(&pj, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &at(&core, ti * core_n), nh, nkv, hd, half, pos, c.eps);
-                if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; cb.copy(&proj, t * pr, ti * pr + sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
+                self.attn_tok(cb, idx, g, &pj, pr, sp, qnh, knh, &proj, t * pr, ti * pr, pos, &at(&core, ti * core_n));
                 g.len = pos + 1;
             } else {
                 let pv = cb.read(&proj); let pv = &pv[ti * pr..(ti + 1) * pr];

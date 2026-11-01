@@ -273,6 +273,68 @@ fn think_delta(r: String, c: String) -> Option<Value> {
     }
 }
 
+/// OpenAI tool calls: the model writes `<tool_call>...</tool_call>` blocks in its content, either Qwen3-coder XML
+/// (`<function=NAME><parameter=KEY>VALUE</parameter></function>`) or Hermes JSON (`{"name": .., "arguments": {..}}`).
+/// Content before the first block streams as text; from `<tool_call>` on it is held back and returned as `tool_calls`
+/// with finish_reason "tool_calls" (llama.cpp's behaviour). Parameter values are typed by the request's tool schemas.
+/// PYRE_TOOL_PARSE=0 leaves the raw text in `content`.
+struct Tools { on: bool, held: bool, buf: String, schema: Option<Value> }
+impl Tools {
+    fn new(tools: Option<&Value>) -> Self {
+        let on = tools.map(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false)).unwrap_or(false) && std::env::var("PYRE_TOOL_PARSE").map(|v| v != "0").unwrap_or(true);
+        Tools { on, held: false, buf: String::new(), schema: tools.cloned() }
+    }
+    /// Feed content; returns the content that may be sent now.
+    fn push(&mut self, c: &str) -> String {
+        if !self.on { return c.to_string(); }
+        self.buf.push_str(c);
+        if self.held { return String::new(); }
+        if let Some(k) = self.buf.find("<tool_call>") { self.held = true; let out: String = self.buf.drain(..k).collect(); return out; }
+        let n = self.buf.len() - Think::partial(&self.buf, "<tool_call>");
+        self.buf.drain(..n).collect()
+    }
+    /// End of output: (remaining content, tool calls).
+    fn finish(&mut self) -> (String, Vec<Value>) {
+        let rest = std::mem::take(&mut self.buf);
+        if !self.held { return (rest, vec![]); }
+        let mut calls = vec![]; let mut text = String::new(); let mut s = rest.as_str();
+        while let Some(a) = s.find("<tool_call>") {
+            text.push_str(&s[..a]); let body = &s[a + 11..];
+            let (inner, after) = match body.find("</tool_call>") { Some(e) => (&body[..e], &body[e + 12..]), None => (body, "") };
+            match self.parse(inner) { Some(c) => calls.push(c), None => { text.push_str("<tool_call>"); text.push_str(inner); } }
+            s = after;
+        }
+        text.push_str(s);
+        (text.trim().to_string(), calls)
+    }
+    fn ptype(&self, f: &str, k: &str) -> Option<String> {
+        self.schema.as_ref()?.as_array()?.iter().find(|t| t["function"]["name"] == f)
+            .and_then(|t| t["function"]["parameters"]["properties"][k]["type"].as_str().map(|x| x.to_string()))
+    }
+    fn parse(&self, inner: &str) -> Option<Value> {
+        let t = inner.trim();
+        let (name, args) = if t.starts_with('{') {
+            let v: Value = serde_json::from_str(t).ok()?;
+            let a = match &v["arguments"] { Value::String(x) => serde_json::from_str(x).unwrap_or(json!({})), Value::Null => json!({}), x => x.clone() };
+            (v["name"].as_str()?.to_string(), a)
+        } else {
+            let a = t.find("<function=")? + 10; let e = a + t[a..].find('>')?;
+            let name = t[a..e].trim().to_string(); let mut rest = &t[e + 1..]; let mut m = serde_json::Map::new();
+            while let Some(p) = rest.find("<parameter=") {
+                let q = p + 11; let Some(g) = rest[q..].find('>') else { break }; let key = rest[q..q + g].trim().to_string();
+                let vs = &rest[q + g + 1..]; let ve = vs.find("</parameter>").unwrap_or(vs.len());
+                let mut val = &vs[..ve]; if let Some(x) = val.strip_prefix('\n') { val = x; } if let Some(x) = val.strip_suffix('\n') { val = x; }
+                let ty = self.ptype(&name, &key);
+                let jv = if ty.as_deref() == Some("string") { Value::String(val.to_string()) } else { serde_json::from_str(val.trim()).unwrap_or(Value::String(val.to_string())) };
+                m.insert(key, jv); rest = &vs[(ve + 12).min(vs.len())..];
+            }
+            (name, Value::Object(m))
+        };
+        if name.is_empty() { return None; }
+        Some(json!({"id": rid("call"), "type": "function", "function": {"name": name, "arguments": args.to_string()}}))
+    }
+}
+
 // ---------- OpenAI chat ----------
 #[derive(Deserialize)]
 struct ChatReq {
@@ -292,6 +354,9 @@ fn norm_messages(m: &[Value]) -> Vec<Value> {
             msg["content"] = Value::String(t);
         }
         if msg.get("content").map(|c| c.is_null()).unwrap_or(true) { msg["content"] = Value::String(String::new()); }
+        // templates iterate tool_call.arguments as a mapping; OpenAI clients send it as a JSON string
+        if let Some(Value::Array(tc)) = msg.get_mut("tool_calls") { for c in tc.iter_mut() {
+            if let Some(Value::String(a)) = c.pointer("/function/arguments").cloned() { if let Ok(v) = serde_json::from_str::<Value>(&a) { c["function"]["arguments"] = v; } } } }
         msg
     }).collect()
 }
@@ -306,12 +371,16 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let id = rid("chatcmpl");
     let created = now();
     let mut think = Think::new(&prompt);
+    let mut tools = Tools::new(req.tools.as_ref());
     let rx = start(&st, ids, &req.g);
     if !req.g.stream {
         return match collect(rx).await {
             Ok((text, fin, t, _)) => {
                 let (mut r, mut c) = think.push(&text); let (r2, c2) = think.finish(); r.push_str(&r2); c.push_str(&c2);
-                let mut msg = json!({"role": "assistant", "content": c});
+                let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
+                let fin = if calls.is_empty() { fin } else { "tool_calls" };
+                let mut msg = json!({"role": "assistant", "content": if calls.is_empty() || !c.trim().is_empty() { json!(c) } else { Value::Null }});
+                if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 if !r.is_empty() { msg["reasoning_content"] = json!(r); }
                 Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": fin, "logprobs": null}],
@@ -325,11 +394,12 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let first = stream::once({ let c = chunk.clone(); async move { c(json!({"role": "assistant", "content": ""}), Value::Null) } });
     let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
         let v: Vec<Value> = match e {
-            Event::Token(s) => { let (r, c) = think.push(&s); think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
+            Event::Token(s) => { let (r, c) = think.push(&s); let c = tools.push(&c); think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
             Event::Done { finish_reason, timings, .. } => {
-                let (r, c) = think.finish();
+                let (r, c) = think.finish(); let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
                 let mut v: Vec<Value> = think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect();
-                let mut f = chunk(json!({}), json!(finish_reason));
+                if !calls.is_empty() { v.push(chunk(json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), Value::Null)); }
+                let mut f = chunk(json!({}), json!(if calls.is_empty() { finish_reason } else { "tool_calls" }));
                 f["timings"] = json!(timings);
                 v.push(f);
                 if inc { let mut u = chunk(json!({}), Value::Null); u["choices"] = json!([]); u["usage"] = usage(&timings); v.push(u); }
