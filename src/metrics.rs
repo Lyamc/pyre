@@ -50,7 +50,7 @@ fn now_s() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_se
 
 /// Instance label for aggregating several nodes: PYRE_INSTANCE, else `<hostname>:<port>`.
 static INSTANCE: OnceLock<String> = OnceLock::new();
-pub fn set_instance(port: u16) {
+pub fn set_instance(port: u16) { let _ = epoch();
     let _ = INSTANCE.set(std::env::var("PYRE_INSTANCE").unwrap_or_else(|_| format!("{}:{port}", hostname())));
     let _ = epoch();
 }
