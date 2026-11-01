@@ -5404,43 +5404,50 @@ fn k_attn3m(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mu
     let mut qr = Array::<f32>::new(nd as usize);
     #[unroll]
     for d in 0..nd { qr[d as usize] = q[(h * hd + d * 32u32 + lane) as usize]; }
+    // block-structured: warps take whole index blocks (tail blocks >= nbs are always active); only the selected blocks'
+    // positions are scored, exponentiated and summed into P.V, so the cost follows the QSA budget, not the context
+    let nbt = (n + ir - 1u32) / ir;
     let mut mx = scale * -3.0e30f32;
-    let mut pp = wy;
-    while pp + nw < n {
-        let kb = (pp * nkv + kvh) * hd; let kb2 = ((pp + nw) * nkv + kvh) * hd;
-        let mut dd = 0.0f32; let mut d2 = 0.0f32;
-        #[unroll]
-        for d in 0..nd { dd += qr[d as usize] * kc[(kb + d * 32u32 + lane) as usize]; d2 += qr[d as usize] * kc[(kb2 + d * 32u32 + lane) as usize]; }
-        let mut v = plane_sum(dd) * scale; let mut v2 = plane_sum(d2) * scale;
-        let b1 = pp / ir; let b2 = (pp + nw) / ir;
-        if b1 < nbs { if sel[b1 as usize] == 0.0f32 { v = -3.0e30f32; } }
-        if b2 < nbs { if sel[b2 as usize] == 0.0f32 { v2 = -3.0e30f32; } }
-        if lane == 0u32 { sc[(h * cap + pp) as usize] = v; sc[(h * cap + pp + nw) as usize] = v2; }
-        mx = f32::max(mx, v); mx = f32::max(mx, v2);
-        pp += 2u32 * nw;
-    }
-    if pp < n {
-        let kb = (pp * nkv + kvh) * hd;
-        let mut dd = 0.0f32;
-        #[unroll]
-        for d in 0..nd { dd += qr[d as usize] * kc[(kb + d * 32u32 + lane) as usize]; }
-        let mut v = plane_sum(dd) * scale;
-        let b1 = pp / ir;
-        if b1 < nbs { if sel[b1 as usize] == 0.0f32 { v = -3.0e30f32; } }
-        if lane == 0u32 { sc[(h * cap + pp) as usize] = v; }
-        mx = f32::max(mx, v);
+    let mut b = wy;
+    while b < nbt {
+        let mut on = 1.0f32;
+        if b < nbs { on = sel[b as usize]; }
+        if on != 0.0f32 {
+            let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+            let mut pp = b * ir;
+            while pp < pe {
+                let kb = (pp * nkv + kvh) * hd;
+                let mut dd = 0.0f32;
+                #[unroll]
+                for d in 0..nd { dd += qr[d as usize] * kc[(kb + d * 32u32 + lane) as usize]; }
+                let v = plane_sum(dd) * scale;
+                if lane == 0u32 { sc[(h * cap + pp) as usize] = v; }
+                mx = f32::max(mx, v);
+                pp += 1u32;
+            }
+        }
+        b += nw;
     }
     if lane == 0u32 { red[wy as usize] = mx; }
     sync_cube();
     let mut m = red[0];
     for w in 1..nw { m = f32::max(m, red[w as usize]); }
     let mut sum = 0.0f32;
-    pp = tid;
-    while pp < n {
-        let e = f32::exp(sc[(h * cap + pp) as usize] - m);
-        sc[(h * cap + pp) as usize] = e;
-        sum += e;
-        pp += nw * 32u32;
+    b = wy;
+    while b < nbt {
+        let mut on = 1.0f32;
+        if b < nbs { on = sel[b as usize]; }
+        if on != 0.0f32 {
+            let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+            let mut pp = b * ir + lane;
+            while pp < pe {
+                let e = f32::exp(sc[(h * cap + pp) as usize] - m);
+                sc[(h * cap + pp) as usize] = e;
+                sum += e;
+                pp += 32u32;
+            }
+        }
+        b += nw;
     }
     let ws = plane_sum(sum);
     if lane == 0u32 { red[(16u32 + wy) as usize] = ws; }
@@ -5451,12 +5458,21 @@ fn k_attn3m(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mu
     let mut acc = Array::<f32>::new(nd as usize);
     #[unroll]
     for d in 0..nd { acc[d as usize] = 0.0f32; }
-    let mut t = wy;
-    while t < n {
-        let e = sc[(h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
-        #[unroll]
-        for d in 0..nd { acc[d as usize] += e * vc[(vb + d * 32u32 + lane) as usize]; }
-        t += nw;
+    b = wy;
+    while b < nbt {
+        let mut on = 1.0f32;
+        if b < nbs { on = sel[b as usize]; }
+        if on != 0.0f32 {
+            let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+            let mut t = b * ir;
+            while t < pe {
+                let e = sc[(h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
+                #[unroll]
+                for d in 0..nd { acc[d as usize] += e * vc[(vb + d * 32u32 + lane) as usize]; }
+                t += 1u32;
+            }
+        }
+        b += nw;
     }
     #[unroll]
     for d in 0..nd { part[(wy * hd + d * 32u32 + lane) as usize] = acc[d as usize]; }

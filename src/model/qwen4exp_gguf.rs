@@ -2233,7 +2233,11 @@ impl Model {
         st.tokens.extend_from_slice(ids);
         st.spec_sel = vec![vec![]; t];
         xtr(|| format!("B {t}"));
-        { let qr = std::time::Instant::now(); if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap(); for _ in 0..t { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } } XW[10].fetch_add(qr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+        { let qr = std::time::Instant::now(); if let Some(xm) = &self.xc { let mut g = xm.lock().unwrap();
+            // PYRE_QN_PF_REFILL1 (default on under XEXACT, =0 off): a prompt chunk refills the expert cache once, not once per token
+            // (t = 256 refills, each repacking up to XSWAP experts on the critical path); XEXACT outputs do not depend on the cache
+            let reps = if st.pf && xexact() && env_var("PYRE_QN_PF_REFILL1").map(|v| v != "0").unwrap_or(true) { 1 } else { t };
+            for _ in 0..reps { if !g.map.is_empty() || g.calls > 0 { self.xrefill(cb, &mut g); } } } XW[10].fetch_add(qr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
         if !st.gdn_gpu { st.gdn = self.gdn_bufs(st); st.gdn_gpu = true; }
         // checkpoint buffers for t-1 positions
         let ch = 2 * c.lin_nk * c.lin_dk + c.lin_nv * c.lin_dv; let (cn, sn) = ((c.conv_k - 1) * ch, c.lin_nv * c.lin_dk * c.lin_dv);
