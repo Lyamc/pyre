@@ -31,7 +31,10 @@ pub fn spawn_init<R: Send + 'static>(init: impl FnOnce() -> anyhow::Result<(Mode
         #[cfg(windows)] if std::env::var("PYRE_LOW_PRIORITY").is_err() { use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, NORMAL_PRIORITY_CLASS}; unsafe { SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS); } tracing::info!("qwen-next: process priority NORMAL (PYRE_LOW_PRIORITY unset)"); }
         let spf = std::env::var("PYRE_QN_SERVE_PF").unwrap_or_default();
         if spf == "batch" { crate::model::qwen4exp_gguf::BPF_DEFAULT.store(true, Ordering::Relaxed); }
-        let pfk = if spf == "batch" { 0 } else { spf.parse().ok().unwrap_or(8usize) };
+        // PYRE_QN_SERVE_PF=bpg (default): GPU batched prefill (qwen4exp_gguf::bpg) in 128-token chunks; a number = verify windows of that size
+        let spf = if spf.is_empty() { "bpg".to_string() } else { spf };
+        if spf == "bpg" { crate::model::qwen4exp_gguf::BPG_DEFAULT.store(true, Ordering::Relaxed); }
+        let pfk = if spf == "batch" { 0 } else if spf == "bpg" { std::env::var("PYRE_QN_BPG_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize) } else { spf.parse().ok().unwrap_or(8usize) };
         crate::model::qwen4exp_gguf::PF_MULTI_DEFAULT.store(pfk, Ordering::Relaxed);
         let (model, tok, eos) = match init() { Ok((m, t, e, r)) => { let _ = rtx.send(Ok(r)); (m, t, e) }, Err(e) => { let _ = rtx.send(Err(e)); return; } };
         worker(&model, &tok, &eos, rx, b, q);
