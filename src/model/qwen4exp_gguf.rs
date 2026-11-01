@@ -1100,7 +1100,37 @@ impl Model {
         ADAPT_SWAPS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         xtr(|| format!("G {} {} {:.2}", xc.calls, n, t0.elapsed().as_secs_f64() * 1e3));
         if env_var("PYRE_QN_XDEBUG").is_ok() { eprintln!("xcache: bg apply {n} experts at call {} ({:.2} ms)", xc.calls, t0.elapsed().as_secs_f64() * 1e3); }
-    }    fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
+    }    /// PYRE_QN_BPG_HOT=K (opt-in, default 0 = off; pi 18.2 s off vs 19.1 s K=8 / 23.6 s K=4: the serial pack+upload and the evictions cost more than the CPU work saved): experts of layer il picked by >= K of the chunk's tokens
+    /// that are not in the GPU expert cache are packed and uploaded into it now (evicting the lowest-scored experts of
+    /// other layers), so the chunk runs them on the GPU instead of the CPU pool. Changes only where an expert runs.
+    fn xhot(&self, cb: &super::qn_cube::Cube, xc: &mut XCache, il: usize, l: &Layer, sels: &[Vec<usize>]) -> usize {
+        let k = env_usize("PYRE_QN_BPG_HOT").unwrap_or(0); if k == 0 { return 0; }
+        let Some(tys) = (|| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?)))() else { return 0 };
+        if xexact() && !xexact_types(l) { return 0; }
+        let mut cnt = vec![0usize; self.cfg.n_exp]; for s in sels { for &e in s { cnt[e] += 1; } }
+        let mut hot: Vec<(usize, usize)> = (0..cnt.len()).filter(|&e| cnt[e] >= k && !xc.map.contains_key(&(il, e))).map(|e| (cnt[e], e)).collect();
+        if hot.is_empty() { return 0; }
+        hot.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1))); hot.truncate(env_usize("PYRE_QN_BPG_HOT_MAX").unwrap_or(64));
+        let xcl = !xc.sloc.is_empty();
+        let need = if xcl { let w = super::qn_cube::xwords(tys, self.cfg.d, self.cfg.ff_exp); (4 * (w.0 + w.1 + w.2)).next_multiple_of(256) } else { xc.slot };
+        // victims: other layers' residents, lowest score first (ties by key, deterministic)
+        let mut ev: Vec<(u64, usize, usize)> = xc.map.keys().filter(|&&(a, _)| a != il).map(|&(a, b)| (xscore(xc, a, b), a, b)).collect();
+        ev.sort_by(|x, y| y.0.cmp(&x.0).then((y.1, y.2).cmp(&(x.1, x.2))));
+        let mut jobs: Vec<(usize, usize)> = vec![];
+        for &(_, e) in &hot {
+            let fits = |xc: &XCache| if xcl { xc.free.iter().any(|&s| xc.cap(s) >= need) } else { !xc.free.is_empty() && xc.used + need <= xc.budget };
+            while !fits(xc) { match ev.pop() { Some((_, a, b)) => { if let Some(v) = xc.map.remove(&(a, b)) { xc.used -= if xcl { v.bytes } else { xc.slot }; xc.free.push(v.slot); } }, None => break } }
+            if !fits(xc) { break; }
+            let i = if xcl { xc.free.iter().rposition(|&s| xc.cap(s) == need).or_else(|| xc.free.iter().rposition(|&s| xc.cap(s) >= need)).unwrap() } else { xc.free.len() - 1 };
+            let sl = xc.free.remove(i); xc.used += if xcl { xc.cap(sl) } else { xc.slot }; jobs.push((e, sl));
+        }
+        use rayon::prelude::*;
+        let pks: Vec<_> = jobs.par_iter().map(|&(e, _)| self.xpacked(il, e, tys)).collect();
+        for (&(e, sl), pk) in jobs.iter().zip(pks.iter()) { let mut ent = xc.up(cb, sl, &pk.0, pk.1, pk.2); ent.arena = xc.loc(sl).0; ent.slot = sl; xc.map.insert((il, e), ent); }
+        HOTN.fetch_add(jobs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        jobs.len()
+    }
+    fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
         xc.calls += 1;
         // PYRE_QN_XSTAT=1: cache hit rate and misses per layer per token so far (every 16 calls)
         if xc.calls % 16 == 0 && env_var("PYRE_QN_XSTAT").is_ok() { let nl = xc.cnt.len().max(1); let tok = (xc.total as f64 / (nl as f64 * self.cfg.top_k as f64)).max(1.0);
@@ -1867,6 +1897,7 @@ impl Model {
                 last = if c.len() == 1 { self.forward_inner(c, st) } else { st.pf = true; let v = self.forward_multi_x(c, st, true).pop().unwrap(); st.pf = false; v };
                 if let (Some(cb), Some(xm)) = (&self.cube, &self.xc) { let mut g = xm.lock().unwrap(); if g.calls == 0 { self.xrefill(cb, &mut g); } }
             }
+            if bpg() && ids.len() > 8 { let n = HOTN.swap(0, std::sync::atomic::Ordering::Relaxed); if n > 0 { eprintln!("bpg hot: {n} experts streamed in {:.0} ms", HOTT.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6); } }
             return last;
         }
         let xw = xwin_begin(); let lg = self.forward_inner(ids, st); xwin_end(xw, ids.len());
@@ -2552,6 +2583,7 @@ impl Model {
         if let Some(xm) = &self.xc {
             let mut xcg = xm.lock().unwrap();
             let (mut ons, mut offs) = (Vec::with_capacity(t), Vec::with_capacity(t)); let mut sels: Vec<Vec<usize>> = Vec::with_capacity(t);
+            if t > 8 && bpg() && st.pf { let ps: Vec<Vec<usize>> = rvs.iter().map(|rv| self.route_sel(il, &rv[d..d + ne], Some(&xcg)).into_iter().map(|x| x.0).collect::<Vec<usize>>()).collect(); let tq = std::time::Instant::now(); let n = self.xhot(cb, &mut xcg, il, l, &ps); if n > 0 { HOTT.fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); } }
             for (ti, rv) in rvs.iter().enumerate() {
                 let sel = self.route_sel(il, &rv[d..d + ne], Some(&xcg)); sels.push(sel.iter().map(|x| x.0).collect());
                 for &(e, _) in &sel { xcg.cnt[il][e] += xinc(); if let Some(v) = st.spec_sel.get_mut(off + ti) { v.push((il, e)); } }
@@ -3033,6 +3065,8 @@ pub fn pool_bench() {
 /// PYRE_QN_BPG=1 (opt-in): GPU batched prefill. Prompt chunks of PYRE_QN_PF_MULTI tokens (> 8) run through the verify
 /// layer path (dense part resident on the GPU), and its big GEMMs go to k_gemm_pf / k_gemm_tc instead of per-token GEMVs.
 pub fn bpg() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPG").map(|v| v == "1").unwrap_or(false) || BPG_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)) }
+pub static HOTT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HOTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BPG_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[allow(clippy::too_many_arguments)]
 fn gmm(cb: &super::qn_cube::Cube, m: &super::qn_cube::CMat, x: &burn_cubecl::cubecl::server::Handle, xn: usize, xoff: usize, xst: usize, out: &burn_cubecl::cubecl::server::Handle, on: usize, ooff: usize, ost: usize, t: usize) {
