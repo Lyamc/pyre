@@ -139,7 +139,12 @@ fn vram_breach(free: u64, need: u64, why: &str) -> ! {
 /// Check before allocating `bytes` on the GPU (only allocations >= 8 MiB pay for an NVML query).
 pub fn vram_check(bytes: u64) {
     let fl = vram_floor_mb(); if fl == 0 || bytes < (8 << 20) { return; }
-    if let Some(v) = vram() { if v.free < bytes + (fl << 20) { vram_breach(v.free, bytes, "allocation"); } }
+    if let Some(v) = vram() { if v.free < bytes + (fl << 20) {
+        // int45b: with an adaptive expert cache, first shrink it (applied at the next step) and allow the allocation
+        // while free stays above max(1024 MiB, floor / 2); the hard abort is the last resort
+        let hard = (fl / 2).max(1024) << 20;
+        if v.free >= bytes + hard && emergency_shrink(v.free) { return; }
+        vram_breach(v.free, bytes, "allocation"); } }
 }
 /// Start the 25 ms floor watcher once (call when the GPU is first used).
 pub fn vram_watch() {
@@ -149,8 +154,11 @@ pub fn vram_watch() {
             // int45: a watcher breach first asks for a graceful stop (drain at the next step boundary, exit 87); only if
             // still below the floor 3 s later does it exit hard
             if let Some(v) = vram() { if v.free < (fl << 20) {
+                if emergency_shrink(v.free) { eprintln!("pyre: VRAM below floor (watcher): free {} MiB < floor {} MiB; shrinking the expert cache", v.free >> 20, fl);
+                    std::thread::sleep(std::time::Duration::from_secs(3)); }
+                if vram().map_or(false, |v1| v1.free < (fl << 20)) {
                 eprintln!("pyre: VRAM floor breach (watcher): free {} MiB < floor {} MiB; requesting graceful stop", v.free >> 20, fl);
-                request_stop(); std::thread::sleep(std::time::Duration::from_secs(3));
+                request_stop(); std::thread::sleep(std::time::Duration::from_secs(3)); }
                 if let Some(v2) = vram() { if v2.free < (fl << 20) { vram_breach(v2.free, 0, "watcher"); } } } }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }); });
@@ -219,6 +227,17 @@ pub fn xc_register(bytes: u64) { XC_CFG.store(bytes, Ordering::Relaxed); XC_TGT.
 pub fn xc_target() -> u64 { XC_TGT.load(Ordering::Relaxed) }
 pub fn xc_applied(bytes: u64) { XC_CUR.store(bytes, Ordering::Relaxed); }
 /// PYRE_VRAM_ADAPT (default 1, 0 = off): adaptive expert cache (dedicated, returnable arenas).
+/// Below the floor: cut the expert-cache target so free returns to floor + 768 MiB (applied at the next step). false = nothing to shrink.
+fn emergency_shrink(free: u64) -> bool {
+    let (cfg, tgt) = (XC_CFG.load(Ordering::Relaxed), XC_TGT.load(Ordering::Relaxed));
+    if cfg == 0 || !adaptive_vram() || tgt <= (128 << 20) { return false; }
+    let fl = vram_floor_mb().max(512) << 20; let deficit = (fl + (768 << 20)).saturating_sub(free).next_multiple_of(256 << 20);
+    let nt = tgt.saturating_sub(deficit).max(128 << 20); if nt >= tgt { return false; }
+    if XC_TGT.compare_exchange(tgt, nt, Ordering::Relaxed, Ordering::Relaxed).is_err() { return true; }
+    XC_SHRINKS.fetch_add(1, Ordering::Relaxed); crate::metrics::warning();
+    crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "emergency_shrink_expert_cache", "free_mib": free >> 20, "floor_mib": fl >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20}));
+    true
+}
 pub fn vram_adapt_on() -> bool { std::env::var("PYRE_VRAM_ADAPT").map(|v| v != "0").unwrap_or(true) }
 fn adaptive_vram() -> bool { vram_adapt_on() }
 /// a step within this window counts as pyre being busy (prefill chunks run ~3 s apart)

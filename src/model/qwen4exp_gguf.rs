@@ -2339,6 +2339,8 @@ impl Model {
             }
             let cl = self.cl[il].as_ref().unwrap();
             if xs.is_none() { xs = Some(if vgraph_on() { self.vxs_fill(cb, &xh) } else { xh.iter().map(|v| cb.buf(v)).collect() }); }
+            // int45b: prefill chunks run ~3 s of back-to-back GPU work; pace per layer so the duty target holds within a chunk
+            if st.pf { crate::limits::gpu_pace(); }
             self.layer_cube_multi_p(il, l, cl, xs.as_ref().unwrap(), st, &mut ai, &mut li, start, &mut pre);
         }
         }
