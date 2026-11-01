@@ -142,7 +142,7 @@ pub fn vram_check(bytes: u64) {
     if let Some(v) = vram() { if v.free < bytes + (fl << 20) {
         // int45b: with an adaptive expert cache, first shrink it (applied at the next step) and allow the allocation
         // while free stays above max(1024 MiB, floor / 2); the hard abort is the last resort
-        let hard = (fl / 2).max(1024) << 20;
+        let hard = (fl / 2).max(768).min(fl) << 20; // int45e: 768 MiB hard minimum at floor 1024 (free 1127, 126 MiB KV growth aborted the server at 22k context)
         if v.free >= bytes + hard && emergency_shrink(v.free) { return; }
         vram_breach(v.free, bytes, "allocation"); } }
 }
