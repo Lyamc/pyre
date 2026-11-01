@@ -104,6 +104,9 @@ pub struct ServeArgs {
     /// Require `Authorization: Bearer <key>`
     #[arg(long = "api-key", env = "PYRE_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
+    /// Serve /metrics, /api/metrics and /api/logs on this extra address too (e.g. 0.0.0.0:9099); they are always on the main port
+    #[arg(long = "metrics-bind", env = "PYRE_METRICS_BIND")]
+    pub metrics_bind: Option<String>,
     /// Model name reported by /v1/models (defaults to -m)
     #[arg(short = 'a', long)]
     pub alias: Option<String>,
@@ -318,6 +321,14 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         let addr = format!("{}:{}", args.host, args.port);
         let local = if args.host == "0.0.0.0" || args.host == "::" { "127.0.0.1".to_string() } else { args.host.clone() };
         apps::set_server(format!("http://{local}:{}", args.port));
+        crate::metrics::set_instance(args.port); crate::metrics::start_sampler();
+        if let Some(mb) = args.metrics_bind.clone().filter(|s| !s.is_empty()) {
+            let ml = tokio::net::TcpListener::bind(&mb).await?;
+            tracing::info!("metrics on http://{mb}/metrics (token {})", if std::env::var("PYRE_METRICS_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) { "required" } else { "not set" });
+            let mr = api::metrics_routes(axum::Router::new()).with_state(app.clone());
+            tokio::spawn(async move { if let Err(e) = axum::serve(ml, mr).await { tracing::error!("metrics listener: {e}"); } });
+        }
+        if let Some(p) = crate::logbuf::file_path() { tracing::info!("structured log: {p}"); }
         let l = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("pyre listening on http://{addr} (web UI at /)");
         for u in lan_urls(&args.host, args.port) { tracing::info!("  reachable at {u}"); }

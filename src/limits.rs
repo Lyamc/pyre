@@ -32,6 +32,8 @@ pub fn vram() -> Option<Vram> {
     let m = d.memory_info().ok()?;
     Some(Vram { total: m.total, free: m.free, used: m.used })
 }
+/// VRAM used by this process (None when the driver does not report it, e.g. some WDDM setups).
+pub fn proc_vram() -> Option<u64> { let me = std::process::id(); nvml()?.device_by_index(0).ok()?.running_compute_processes().ok()?.into_iter().find(|p| p.pid == me).and_then(|p| match p.used_gpu_memory { nvml_wrapper::enums::device::UsedGpuMemory::Used(b) => Some(b), _ => None }) }
 pub fn gpu_util_now() -> Option<u32> { nvml()?.device_by_index(0).ok()?.utilization_rates().ok().map(|u| u.gpu) }
 
 /// Parse `1G`, `512M`, `1.5GiB`, `0`, or plain bytes.

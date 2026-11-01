@@ -180,8 +180,8 @@ fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> {
         while let Some(e) = rx_in.recv().await {
             match &e {
                 Event::Token(_) => crate::metrics::token(mid),
-                Event::Done { timings, .. } => { crate::metrics::finish(mid, "ok", Some(timings)); done = true; }
-                Event::Error(_) => { crate::metrics::finish(mid, "error", None); done = true; }
+                Event::Done { timings, finish_reason, .. } => { crate::metrics::finish_ex(mid, "ok", Some(timings), Some(finish_reason), None); done = true; }
+                Event::Error(e) => { crate::metrics::finish_ex(mid, "error", None, None, Some(e)); done = true; }
                 _ => {}
             }
             if tx_out.send(e).is_err() { break; }
@@ -338,6 +338,8 @@ impl Tools {
 /// PYRE_REQ_LOG=<file> (diagnostic, off by default): append each chat request's messages and the final response as JSON lines.
 fn reqlog(v: Value) -> bool {
     let Ok(f) = std::env::var("PYRE_REQ_LOG") else { return false };
+    // PYRE_REQ_LOG=1: into the structured log (kind "reqbody"); any other value: that file, as before
+    if f == "1" { crate::logbuf::event("reqbody", "DEBUG", json!({"body": v})); return true; }
     use std::io::Write;
     if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) { let _ = writeln!(fh, "{}", v); }
     true

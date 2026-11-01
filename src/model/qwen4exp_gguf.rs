@@ -1157,7 +1157,7 @@ impl Model {
         jobs.len()
     }
     fn xrefill(&self, cb: &super::qn_cube::Cube, xc: &mut XCache) {
-        xc.calls += 1;
+        xc.calls += 1; crate::metrics::xcache_slots(xc.map.len(), xc.map.len() + xc.free.len(), xc.slot);
         // PYRE_QN_XSTAT=1: cache hit rate and misses per layer per token so far (every 16 calls)
         if xc.calls % 16 == 0 && env_var("PYRE_QN_XSTAT").is_ok() { let nl = xc.cnt.len().max(1); let tok = (xc.total as f64 / (nl as f64 * self.cfg.top_k as f64)).max(1.0);
             eprintln!("xstat: call {} hit {:.1}% misses/layer/token {:.2} resident {} slots {} slot {:.3} MB", xc.calls, 100.0 * xc.hits as f64 / xc.total.max(1) as f64, (xc.total - xc.hits) as f64 / (tok * nl as f64), xc.map.len(), xc.map.len() + xc.free.len(), xc.slot as f64 / 1e6); }
@@ -1809,7 +1809,7 @@ impl Model {
         z2 = std::time::Instant::now();
         pool.run(nd, &|b| down(b, &hdq, &hq));
         }
-        use std::sync::atomic::Ordering::Relaxed; XW2[0].fetch_add(z0.elapsed().as_nanos() as u64, Relaxed); HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
+        use std::sync::atomic::Ordering::Relaxed; let zns = z0.elapsed().as_nanos() as u64; crate::metrics::add_cpu_expert_ns(zns); XW2[0].fetch_add(zns, Relaxed); HY[4].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); HY[5].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); HY[6].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed);
         if xwin() { let np: usize = work.iter().map(|w| w.1.len()).sum(); let tot = z0.elapsed().as_nanos() as u64;
             XW[0].fetch_add(np as u64, Relaxed); XW[2].fetch_add(1, Relaxed); XW[3].fetch_add(tot, Relaxed); XW[4].fetch_max(tot, Relaxed);
             XW[5].fetch_add((z1 - z0).as_nanos() as u64, Relaxed); XW[6].fetch_add((z2 - z1).as_nanos() as u64, Relaxed); XW[7].fetch_add(z2.elapsed().as_nanos() as u64, Relaxed); XW[8].fetch_add(work.len() as u64, Relaxed); }

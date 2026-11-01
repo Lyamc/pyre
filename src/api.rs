@@ -27,6 +27,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/status", get(status))
         .route("/api/metrics", get(metrics))
         .route("/api/logs", get(logs))
+        .route("/metrics", get(prom))
         .route("/v1/images/generations", post(images))
         .route("/sdapi/v1/txt2img", post(txt2img))
         .route("/v1/images/edits", post(images))
@@ -197,7 +198,29 @@ fn lan_ip() -> Option<String> {
 
 /// Live dashboard metrics: requests (active/recent, prefill/decode tok/s, context), VRAM vs
 /// reserve, GPU util, RAM, CPU, expert compute split and cache hit rate. See `crate::metrics`.
-async fn metrics(State(app): S) -> Json<Value> {
+/// Routes served on a separate `--metrics-bind` listener (read-only observability).
+pub fn metrics_routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
+    r.route("/metrics", get(prom)).route("/api/metrics", get(metrics)).route("/api/logs", get(logs))
+}
+
+/// PYRE_METRICS_TOKEN (optional, never logged): when set, /metrics, /api/metrics and /api/logs need `Authorization: Bearer <token>`.
+fn metrics_ok(h: &axum::http::HeaderMap) -> bool {
+    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(t) = T.get_or_init(|| std::env::var("PYRE_METRICS_TOKEN").ok().filter(|s| !s.is_empty())) else { return true };
+    h.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim() == t).unwrap_or(false)
+}
+
+/// Prometheus text exposition of the metrics registry.
+async fn prom(h: axum::http::HeaderMap) -> Response {
+    if !metrics_ok(&h) { return err(StatusCode::UNAUTHORIZED, "metrics token required"); }
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], crate::metrics::prometheus()).into_response()
+}
+
+async fn metrics(State(app): S, h: axum::http::HeaderMap) -> Response {
+    if !metrics_ok(&h) { return err(StatusCode::UNAUTHORIZED, "metrics token required"); }
+    metrics_json(app).await.into_response()
+}
+async fn metrics_json(app: Arc<App>) -> Json<Value> {
     let (cpu, used, total, rss, limits) = tokio::task::spawn_blocking(|| {
         let mut g = SYS.lock().unwrap();
         let sys = g.get_or_insert_with(sysinfo::System::new);
@@ -219,7 +242,14 @@ async fn metrics(State(app): S) -> Json<Value> {
     Json(v)
 }
 
-async fn logs() -> Json<Value> { Json(json!({"lines": crate::logbuf::tail(200)})) }
+#[derive(Deserialize)]
+struct LogQ { since: Option<u64>, n: Option<usize> }
+/// `GET /api/logs` (last 200 lines) or `?since=<seq>&n=<max>` for remote tailing (returns `next` = last seq).
+async fn logs(h: axum::http::HeaderMap, q: axum::extract::Query<LogQ>) -> Response {
+    if !metrics_ok(&h) { return err(StatusCode::UNAUTHORIZED, "metrics token required"); }
+    match q.since { Some(s) => { let (v, last) = crate::logbuf::since(s, q.n.unwrap_or(500).min(2000)); Json(json!({"entries": v, "next": last, "file": crate::logbuf::file_path()})).into_response() }
+        None => Json(json!({"lines": crate::logbuf::tail(q.n.unwrap_or(200).min(2000)), "next": crate::logbuf::since(u64::MAX, 0).1, "file": crate::logbuf::file_path()})).into_response() }
+}
 
 fn image_model(app: &App, name: Option<&str>) -> Result<Arc<crate::image::ImageModel>, Response> {
     let m = app.find(Kind::Image, name)?;
