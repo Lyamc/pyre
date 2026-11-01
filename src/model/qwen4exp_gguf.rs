@@ -2067,7 +2067,7 @@ impl Model {
     /// the softmax of the unbiased logits over the picked experts (residency-biased routing, idea from
     /// Strata's STRATA_ROUTE_PRIOR / arXiv 2412.00099). Changes outputs, so it is opt-in.
     fn route_sel(&self, il: usize, r: &[f32], xc: Option<&XCache>) -> Vec<(usize, f32)> {
-        let k = self.cfg.top_k; let lam = crate::spec::route_prior();
+        let k = self.cfg.top_k; let lam = crate::spec::route_prior_now();
         if let Some(c) = nan_clean(r, il) { let mut idx: Vec<usize> = (0..c.len()).collect(); idx.select_nth_unstable_by(k, |x, y| c[*y].total_cmp(&c[*x])); return soft_top(&c, &idx[..k]); }
         let Some(xc) = xc.filter(|_| lam > 0.0) else { return top_k(r, k) };
         let b: Vec<f32> = (0..r.len()).map(|e| r[e] + if xc.map.contains_key(&(il, e)) { lam } else { 0.0 }).collect();
@@ -2992,7 +2992,7 @@ impl Model {
 fn tail_skip(off: &mut Vec<(usize, f32)>, on: &[(usize, f32)]) {
     static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let r = *R.get_or_init(|| env_usize("PYRE_QN_TAIL_SKIP").unwrap_or(if crate::spec::fast() { 7 } else { 0 }));
-    if r == 0 || off.is_empty() { return; }
+    if r == 0 || off.is_empty() || crate::spec::route_hold() { return; }
     let mut ws: Vec<f32> = on.iter().chain(off.iter()).map(|x| x.1).collect();
     if r >= ws.len() { return; }
     ws.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));

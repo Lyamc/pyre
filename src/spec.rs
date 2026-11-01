@@ -54,6 +54,23 @@ static FAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 pub fn fast() -> bool { match FAST.load(Relaxed) { 0 => false, 1 => true, _ => std::env::var("PYRE_QN_FAST").map(|v| v != "0").unwrap_or(true) } }
 pub fn set_fast(on: bool) { FAST.store(on as u8, Relaxed); }
 pub fn set_route_prior(p: f32) { ROUTE_PRIOR.store(p.max(0.0).to_bits(), Relaxed); }
+/// FAST loop guard (int46): while set, the lossy routing shortcuts (route prior + tail skip) are suspended and routing
+/// is exact. Set per request by the engine when the output turns periodic (repetition loop) or the context passes
+/// PYRE_ROUTE_PRIOR_CTX; cleared at the start of each request. PYRE_ROUTE_GUARD=0 disables the guard.
+pub static ROUTE_HOLD: AtomicBool = AtomicBool::new(false);
+pub static ROUTE_HOLDS: AtomicU64 = AtomicU64::new(0);
+pub fn route_hold() -> bool { ROUTE_HOLD.load(Relaxed) }
+/// Route prior in effect right now (0 while the loop guard holds exact routing).
+pub fn route_prior_now() -> f32 { if route_hold() { 0.0 } else { route_prior() } }
+pub fn route_guard() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| std::env::var("PYRE_ROUTE_GUARD").map(|v| v != "0").unwrap_or(true)) }
+/// Context length past which the guard holds exact routing (0 = no context limit).
+pub fn route_prior_ctx() -> usize { static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *C.get_or_init(|| std::env::var("PYRE_ROUTE_PRIOR_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }
+/// True when the tail of `out` is periodic: some period p <= 64 repeats over the last max(64, 4p) tokens.
+pub fn looping(out: &[u32]) -> bool {
+    for p in 1..=64usize { let l = (4 * p).max(64); if out.len() < l { break; }
+        let t = &out[out.len() - l..]; if (p..l).all(|i| t[i] == t[i - p]) { return true; } }
+    false
+}
 
 // ---- statistics for /api/status ----
 pub static ROUNDS: AtomicU64 = AtomicU64::new(0);
@@ -75,7 +92,7 @@ pub fn status() -> serde_json::Value {
             "drafter": *DRAFTER.lock().unwrap(), "rounds": ROUNDS.load(Relaxed), "drafted": d, "accepted": a,
             "acceptance": if d > 0 { a as f64 / d as f64 } else { 0.0 }, "tokens": EMITTED.load(Relaxed),
             "last": {"draft_len": LAST_DRAFT.load(Relaxed), "acceptance": f32::from_bits(LAST_ACC.load(Relaxed)), "tok_per_s": f32::from_bits(LAST_TPS.load(Relaxed))}},
-        "route_prior": {"enabled": route_prior() > 0.0, "strength": route_prior()},
+        "route_prior": {"enabled": route_prior() > 0.0, "strength": route_prior(), "guard": route_guard(), "hold": route_hold(), "holds": ROUTE_HOLDS.load(Relaxed), "max_ctx": route_prior_ctx()},
         "fast": fast(),
         "context": {"used": CTX_USED.load(Relaxed), "max": CTX_MAX.load(Relaxed)},
     })
@@ -313,3 +330,16 @@ mod tests {
 
 /// PYRE_SPEC_TRACE=1 (diagnostic, off by default): per-round window, accepted count and top-3 logits of every verify position.
 pub fn trace_on() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_SPEC_TRACE").map(|v| v == "1").unwrap_or(false)) }
+
+#[cfg(test)]
+mod loop_guard_tests {
+    use super::looping;
+    #[test]
+    fn period_detector() {
+        let mut v: Vec<u32> = (0..200).collect(); assert!(!looping(&v));
+        for _ in 0..13 { v.extend([7, 8, 9, 10, 11]); } assert!(looping(&v)); // period 5 over 65 tokens
+        let mut w: Vec<u32> = (0..100).collect(); for _ in 0..3 { w.extend(1000..1050); } assert!(!looping(&w)); // period 50 needs 200
+        for _ in 0..1 { w.extend(1000..1050); } assert!(looping(&w));
+        assert!(!looping(&[1; 63])); assert!(looping(&[1; 64]));
+    }
+}
