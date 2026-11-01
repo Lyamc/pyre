@@ -25,6 +25,10 @@ pub fn spawn_init<R: Send + 'static>(init: impl FnOnce() -> anyhow::Result<(Mode
         // PYRE_QN_SERVE_PF (default 8; 0 = the exact f32 CPU prefill of the CLI/refs): serve's prompt runs through the
         // decode verify path this many tokens per window (GPU dense + GPU expert cache + CPU pool), ~4x the f32 prefill
         // PYRE_QN_SERVE_PF=batch: batched prompt chunks instead (qwen4exp_gguf::bpf, PYRE_QN_BPF)
+        // serve lowers the process to BELOW_NORMAL (limits::init, PYRE_LOW_PRIORITY default on). The qwen-next spin pool +
+        // GPU feeder lose ~40% of prefill and decode to that (pi_testA cold 48 s -> 31 s at normal), so qwen-next restores
+        // NORMAL unless PYRE_LOW_PRIORITY is set explicitly.
+        #[cfg(windows)] if std::env::var("PYRE_LOW_PRIORITY").is_err() { use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, NORMAL_PRIORITY_CLASS}; unsafe { SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS); } tracing::info!("qwen-next: process priority NORMAL (PYRE_LOW_PRIORITY unset)"); }
         let spf = std::env::var("PYRE_QN_SERVE_PF").unwrap_or_default();
         if spf == "batch" { crate::model::qwen4exp_gguf::BPF_DEFAULT.store(true, Ordering::Relaxed); }
         let pfk = if spf == "batch" { 0 } else { spf.parse().ok().unwrap_or(8usize) };
