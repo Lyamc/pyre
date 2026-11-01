@@ -2445,9 +2445,9 @@ impl Model {
             else { (cb.empty(t * w), cb.empty(t * dar), cb.empty(t * d), cb.empty(t * pr), cb.empty(t * core_n), cb.empty(t * d), cb.empty(t * dfr), cb.empty(t * rn)) };
         let pre = || {
         cb.rms_t(xs, &cl.hca.norm, &xn, hc, d, c.eps);
-        super::xchain::dmark(cb, "rms_a"); cb.gemv_m(&cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
+        super::xchain::dmark(cb, "rms_a"); gmm(cb, &cl.hca.di, &xn, t * w, 0, w, &da, t * dar, 0, dar, t);
         super::xchain::dmark(cb, "di_a"); if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
-        super::xchain::dmark(cb, "gate_a"); cb.gemv_m(&cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
+        super::xchain::dmark(cb, "gate_a"); gmm(cb, &cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
         };
         if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); } super::xchain::dmark(cb, "min"); 
         // the mixer, token by token (recurrent / causal state)
@@ -2498,12 +2498,12 @@ impl Model {
             }
         }
         super::xchain::dmark(cb, "mixer"); let post = || {
-        cb.gemv_m(&cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
+        gmm(cb, &cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
         super::xchain::dmark(cb, "mout"); if combm() && (t <= 4 || super::qn_cube::t8()) { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
-        super::xchain::dmark(cb, "rms_f"); cb.gemv_m(&cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
+        super::xchain::dmark(cb, "rms_f"); gmm(cb, &cl.hcf.di, &xn, t * w, 0, w, &df, t * dfr, 0, dfr, t);
         super::xchain::dmark(cb, "di_f"); if !(gatem() && cb.gate_m(&xn, &df, &cl.hcf.up, &rd, t * rn, 0, hc, d, t, w, dfr, rn)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&df, ti * dfr), &cl.hcf.up, &at(&rd, ti * rn), rn, 0, hc, d); } }
-        super::xchain::dmark(cb, "gate_f"); cb.gemv_m(&cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
+        super::xchain::dmark(cb, "gate_f"); gmm(cb, &cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
         };
         if ag { vg_run(cb, (2, il, t), &gk, &post); } else { post(); }
         HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -3014,6 +3014,14 @@ pub fn pool_bench() {
 /// Prompt-prefix snapshot for the serve prefix cache (PYRE_QN_PCACHE): the complete host-side recurrent state after
 /// `tokens` (DeltaNet conv + ssm, attention K/V + QSA index keys, PLE rings, MTP residual window). Restoring it and
 /// prefilling the rest of a prompt in the same absolute chunk grid gives the same state as a full prefill.
+/// PYRE_QN_BPG=1 (opt-in): GPU batched prefill. Prompt chunks of PYRE_QN_PF_MULTI tokens (> 8) run through the verify
+/// layer path (dense part resident on the GPU), and its big GEMMs go to k_gemm_pf / k_gemm_tc instead of per-token GEMVs.
+pub fn bpg() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPG").map(|v| v == "1").unwrap_or(false) || BPG_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)) }
+pub static BPG_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[allow(clippy::too_many_arguments)]
+fn gmm(cb: &super::qn_cube::Cube, m: &super::qn_cube::CMat, x: &burn_cubecl::cubecl::server::Handle, xn: usize, xoff: usize, xst: usize, out: &burn_cubecl::cubecl::server::Handle, on: usize, ooff: usize, ost: usize, t: usize) {
+    if t >= 16 && bpg() && xoff == 0 && xst == m.cols && ooff == 0 && ost == m.rows && m.cols % 256 == 0 { cb.gemm_pf(m, x, xn, t, out, on) } else { cb.gemv_m(m, x, xn, xoff, xst, out, on, ooff, ost, t) }
+}
 /// Serve's default for PYRE_QN_PF_MULTI (engine_qn sets it from PYRE_QN_SERVE_PF; the CLI keeps 0 = exact f32 prefill).
 pub static PF_MULTI_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Serve's default for PYRE_QN_BPF (engine_qn sets it from PYRE_QN_SERVE_PF=batch; the CLI keeps it off).
