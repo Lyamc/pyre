@@ -49,8 +49,20 @@ $pidFile = Join-Path $data 'pyre-server.pid'
 $exe = Join-Path $here 'pyre.exe'
 
 if ($Stop) {
+  # Graceful stop (pyre builds newer than cf84f1d, int45+): pyre polls <its %TEMP%>\pyre\stop.<pid>; at the next step boundary
+  # it drains the GPU and exits 87 (88 if no step comes within PYRE_STOP_GRACE_S, default 10 s). Older builds ignore the file,
+  # and a server started under another account (e.g. the SYSTEM task) has a different %TEMP%, so we fall back to killing the pid.
   $p = Get-Content $pidFile -ea 0
-  if ($p) { $proc = Get-Process -Id ([int]$p) -ea 0; if ($proc -and $proc.Path -eq $exe) { Stop-Process -Id $proc.Id } }
+  if ($p) {
+    $proc = Get-Process -Id ([int]$p) -ea 0
+    if ($proc -and $proc.Path -eq $exe) {
+      $sf = Join-Path ([IO.Path]::GetTempPath()) "pyre\stop.$($proc.Id)"
+      New-Item -ItemType Directory -Force (Split-Path $sf) | Out-Null; Set-Content $sf 'stop'
+      $grace = 10; if ($cfg['env'] -and $cfg['env'].PYRE_STOP_GRACE_S) { $grace = [int]$cfg['env'].PYRE_STOP_GRACE_S }
+      if (-not $proc.WaitForExit(($grace + 5) * 1000)) { Stop-Process -Id $proc.Id -Force -ea 0 }
+      Remove-Item $sf -ea 0
+    }
+  }
   Remove-Item $pidFile -ea 0; return
 }
 if ($FirstRun -or (-not $NoFirstRun -and -not $DryRun -and -not (V 'model'))) {

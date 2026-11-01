@@ -21,6 +21,14 @@ for a 12.6 build, so a 12.6 build needs the 12.x pair (`nvrtc64_120_0.dll` + `nv
 `release\build\cudarc-*\output` next to `-PyreExe` and refuses a mismatched `-CudaMajor`. To ship CUDA 13, put 13.3's nvcc first on PATH (or set
 `CUDARC_CUDA_VERSION=13030`) for the build, then pass `-CudaMajor 13`.
 
+**Confirmed at runtime** (read-only module check by Coder on the running `C:\Temp\qnx\int\pyre_int45c.exe`): it loads `C:\cuda\bin\nvrtc64_120_0.dll` +
+`nvrtc-builtins64_126.dll`, and MSVCP140/VCRUNTIME140/_1 from System32. That matches the 12.x pair and the app-local runtime the MSI ships.
+
+## Newer-build options and graceful stop (int45+, newer than cf84f1d)
+The `[env]` section of the template has commented `PYRE_GPU_DUTY`, `PYRE_GPU_DUTY_MIN`, `PYRE_VRAM_ADAPT` and `PYRE_STOP_GRACE_S` (semantics are taken from `src/limits.rs`).
+"Stop pyre server" first creates `%TEMP%\pyre\stop.<pid>` (pyre drains the GPU at the next step and exits 87). It waits up to the grace period + 5 s and then kills the pid.
+Builds older than int45 ignore the stop file, so they are killed.
+
 ## What gets installed
 `C:\Program Files\pyre` (added to PATH) gets:
 - `pyre.exe` and `pyre-gui.exe` (the GUI is built `+crt-static`).

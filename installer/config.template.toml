@@ -35,3 +35,12 @@ extra_args = ''        # appended verbatim to `pyre serve`
 # ---- [env]: any extra environment variables passed to pyre, e.g. PYRE_QN_QUANT = 'IQ2_XS' ----
 [env]
 PYRE_QN_QUANT = 'IQ2_XS'
+# --- Need a pyre build newer than cf84f1d (int45+); older builds ignore them ---
+# PYRE_GPU_DUTY = '85'       # adaptive GPU duty cap in % (default 85; 'off'/0/100 = disabled; clamped 30-99). Paces each step so smoothed
+#                            # util stays under the target; target auto-drops 5 pts/5 s when hot (>=80 C), near power limit or saturated,
+#                            # to base-15 while another app uses the GPU, and recovers +1 pt/5 s after 30 s calm.
+# PYRE_GPU_DUTY_MIN = '50'   # floor for the auto-tuned duty target (default 50, clamped 20-95)
+# PYRE_VRAM_ADAPT = '1'      # adaptive expert cache (default 1, 0 = off): when free VRAM < floor+512 MiB, shrink the expert cache so free
+#                            # returns to floor+768 MiB (256 MiB steps); regrow (<=512 MiB at a time) after 30 s with free > floor+832 MiB.
+#                            # Under the floor the watcher shrinks first, then requests a graceful stop, then hard-exits.
+# PYRE_STOP_GRACE_S = '10'   # graceful stop: max seconds to wait for a step boundary before exiting (Stop shortcut also waits this +5 s)
