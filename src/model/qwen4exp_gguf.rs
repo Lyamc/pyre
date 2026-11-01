@@ -2280,8 +2280,7 @@ impl Model {
                 let dd = dq[g].take().unwrap();
                 let q4 = std::time::Instant::now();
                 let fut = cb.read_start(&dd.0);
-                let wdf = wdefer() && bwave && !xgate(); /* XGATE on: deferring changed the output (the gated combine path), so off there */ let nxt = stages.get(i + 1).copied().filter(|&(nl, ng)| !(ng == 0 && self.layers[nl].ple.is_some()) && dq[ng].is_none());
-                if let Some((nl, ng)) = nxt.filter(|_| !wdf) { {
+                if let Some(&(nl, ng)) = stages.get(i + 1) { if !(ng == 0 && self.layers[nl].ple.is_some()) && dq[ng].is_none() {
                     let (n0, n1) = grp[ng]; let q4d = std::time::Instant::now();
                     dq[ng] = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xs.as_ref().unwrap()[n0..n1], st, ctr[nl].0, ctr[nl].1, start + n0, n0, t));
                     let q4f = std::time::Instant::now(); WV[3].fetch_add((q4f - q4d).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2298,15 +2297,7 @@ impl Model {
                     let mut f = |s: &mut State| { *slot = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xsr[o0..o1], s, ctrn.0, ctrn.1, start + o0, o0, t)); };
                     self.lcm_moe_p(il, l, cl, &xsr[o0..o1], st, dd, rall, o0, Some(&mut f));
                 } else {
-                if let Some((nl, ng)) = nxt.filter(|_| wdf) {
-                    // PYRE_QN_WDEFER (BPG chunks): the next stage's dense part is queued from inside this stage's MoE side task (right
-                    // after the GPU experts and the shared expert), while the CPU pool runs, not on the main thread before the MoE
-                    let (n0, n1) = grp[ng]; let xsr = xs.as_ref().unwrap(); let ctrn = ctr[nl]; let mut slot: Option<(H, H, H)> = None;
-                    { let mut f = |s: &mut State| { let q4d = std::time::Instant::now(); slot = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xsr[n0..n1], s, ctrn.0, ctrn.1, start + n0, n0, t)); WV[3].fetch_add(q4d.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); if wflush() { let _ = cb.client.flush(); } else if kickq() { cb.client.flush_queue(); } };
-                      self.lcm_moe_p(il, l, cl, &xsr[o0..o1], st, dd, rall, o0, Some(&mut f)); }
-                    if slot.is_none() { WDEF_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); slot = Some(self.lcm_dense(nl, &self.layers[nl], self.cl[nl].as_ref().unwrap(), &xsr[n0..n1], st, ctrn.0, ctrn.1, start + n0, n0, t)); }
-                    dq[ng] = slot;
-                } else { self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0); }
+                self.lcm_moe(il, l, cl, &xs.as_ref().unwrap()[o0..o1], st, dd, rall, o0);
                 }
             }
         } else {
@@ -2778,7 +2769,7 @@ impl Model {
                     XHX[1].fetch_add(hx0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t);
                     cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
-                    for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true; if wdefer() && !xgate() { if let Some(nx) = next.take() { nx(&mut *stp); } }
+                    for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
                     if let (Some(ps), Some(&(fl, er)), Some(tab)) = (xslot, XG_FLAG.get(), ex_tab.as_ref()) {
                         // XGATE: tables up first, then the bounded wait, the CPU rows, the sum + combine and the next layer's dense
                         let tb = match zt_tb.take() { Some(h) => h, None => xt_up(cb, tab) }; let ycpu = cb.empty(sn_all * d); let ysum = cb.empty(t * d);
@@ -2797,7 +2788,7 @@ impl Model {
                         let none: Vec<Option<H>> = vec![None; t];
                         cb.comb3_m(xs, &none, &sh_all, &ysum, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); }
                         if let Some(a) = xchr { super::xchain::stamp(cb, a + 16); }
-                        if let Some(nx) = next.take() { nx(&mut *stp); }
+                        if let Some(nx) = next.as_mut() { nx(&mut *stp); }
                         if let Some(a) = xchr { super::xchain::stamp(cb, a + 24); }
                         cb.client.flush_queue();
                         XHX[2].fetch_add(hx0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2869,7 +2860,7 @@ impl Model {
                 }
                 if combm() { cb.silu_mul_m(&rd, t * rn, rn, d + ne, d + ne + sf, &hb_all, sf, t); }
                 cb.gemv_m(&cl.sdown, &hb_all, t * sf, 0, sf, &sh_all, t * d, 0, d, t);
-                for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true; if wdefer() && !xgate() { if let Some(nx) = next.take() { nx(&mut *stp); } }
+                for ti in 0..t { shs.push(at(&sh_all, ti * d)); } sh_b = true;
                 if let Some(ps) = pslot {
                     // PIPE: gate + CPU-row copy + combine + next layer's dense, queued before the CPU rows exist
                     let yball = cb.empty(t * d); let g2 = pgate.clone();
@@ -2878,7 +2869,7 @@ impl Model {
                     } else { unsafe { cb.client.pyre_host_gate(Some(Box::new(move || g2.wait())), ps, t * d * 4, &yball); } } GATE_OPEN.with(|g| g.set(true));
                     if combm() && t <= 4 { cb.comb3_m(xs, &ygs, &sh_all, &yball, &rd, t * rn, rn, d + ne + 2 * sf, &df, dfr, lrf, hc, d); } else {
                     for ti in 0..t { let yb = at(&yball, ti * d); cb.comb3(&xs[ti], &shs[ti], Some(&yb), ygs[ti].as_ref(), Some((&rds[ti], rn, d + ne + 2 * sf)), &dfs[ti], lrf, hc, d); } }
-                    if let Some(nx) = next.take() { nx(&mut *stp); }
+                    if let Some(nx) = next.as_mut() { nx(&mut *stp); }
                     cb.client.flush_queue();
                 }
                 // no blocking flush (drop-queue event wait) behind an open host gate: it would stall until the gate timed out
@@ -3142,7 +3133,3 @@ impl Model {
         st
     }
 }
-
-/// PYRE_QN_WDEFER (default on): BPG wave stages queue the next stage's dense part from inside the MoE side task, see forward_multi_x
-fn wdefer() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| env_var("PYRE_QN_WDEFER").map(|v| v != "0").unwrap_or(true)) }
-pub static WDEF_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
