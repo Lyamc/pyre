@@ -3036,7 +3036,7 @@ pub fn bpg() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock
 pub static BPG_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[allow(clippy::too_many_arguments)]
 fn gmm(cb: &super::qn_cube::Cube, m: &super::qn_cube::CMat, x: &burn_cubecl::cubecl::server::Handle, xn: usize, xoff: usize, xst: usize, out: &burn_cubecl::cubecl::server::Handle, on: usize, ooff: usize, ost: usize, t: usize) {
-    if t >= 16 && bpg() && xoff == 0 && xst == m.cols && ooff == 0 && ost == m.rows && m.cols % 256 == 0 { cb.gemm_pf(m, x, xn, t, out, on) } else { cb.gemv_m(m, x, xn, xoff, xst, out, on, ooff, ost, t) }
+    if t >= 16 && bpg() && xoff == 0 && xst >= m.cols && ost >= ooff + m.rows && m.cols % 256 == 0 { cb.gemm_pfx(m, x, xn, xst, t, out, on, ooff, ost, /* ooff > 0: the router (fin into rd) stays f32 */ ooff > 0) } else { cb.gemv_m(m, x, xn, xoff, xst, out, on, ooff, ost, t) }
 }
 /// Serve's default for PYRE_QN_PF_MULTI (engine_qn sets it from PYRE_QN_SERVE_PF; the CLI keeps 0 = exact f32 prefill).
 pub static PF_MULTI_DEFAULT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

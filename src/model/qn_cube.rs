@@ -68,7 +68,7 @@ fn dot4(word: u32, x: &[f32], base: u32) -> f32 {
 /// reads each dense weight once per 64 tokens instead of once per 1-4 (gemv_m). Technique (weights read once per prompt
 /// chunk, shared-memory tiles) as in Strata's prefill (MIT, github.com/Niko1221/Strata); this kernel is pyre's own.
 #[cube(launch_unchecked)]
-fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, #[comptime] nat: bool) {
+fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, xst: u32, #[comptime] nat: bool) {
     // tile 128 rows x 64 tokens, 256 units = 16 (rows, 8 each) x 16 (tokens, 4 each); split-K over CUBE_POS_Z (kch columns
     // each, partial z written at out + z * pst). Shared: [k][row] 129 per k, [k][token] 65 per k (padding vs bank conflicts)
     let mut ws = Shared::<[f32]>::new_slice(4128usize);
@@ -116,7 +116,7 @@ fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows:
                 for j in 0..4u32 { ws[((16u32 * lh + 4u32 * h + j) * 129u32 + lr) as usize] = sc * dec(wd, j); }
             }
         }
-        let xb = tk * cols + k0 + 8u32 * lq;
+        let xb = tk * xst + k0 + 8u32 * lq;
         #[unroll]
         for j in 0..8u32 { xs[((8u32 * lq + j) * 65u32 + xr) as usize] = x[(xb + j) as usize]; }
         sync_cube();
@@ -150,7 +150,7 @@ fn k_gemm_pf(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows:
 /// tokens' activations to f16 in shared memory; same output/split-K interface as k_gemm_pf. Tensor-core prompt GEMM as in
 /// Strata's prefill (MIT, github.com/Niko1221/Strata); pyre's own kernel.
 #[cube(launch_unchecked)]
-fn k_gemm_tc(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, #[comptime] nat: bool) {
+fn k_gemm_tc(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows: u32, cols: u32, nt: u32, kch: u32, ooff: u32, ost: u32, pst: u32, xst: u32, #[comptime] nat: bool) {
     let mut ws = Shared::<[half::f16]>::new_aligned_slice(2048usize, 32usize);
     let mut xs = Shared::<[half::f16]>::new_aligned_slice(2048usize, 32usize);
     let mut os = Shared::<[f32]>::new_aligned_slice(4096usize, 32usize);
@@ -198,7 +198,7 @@ fn k_gemm_tc(x: &[f32], w: &[u32], s: &[f32], kv: &[f32], out: &mut [f32], rows:
                 for j in 0..4u32 { ws[(lr * 32u32 + 16u32 * lh + 4u32 * h + j) as usize] = half::f16::cast_from(sc * dec(wd, j)); }
             }
         }
-        let xb = tk * cols + k0 + 16u32 * lh;
+        let xb = tk * xst + k0 + 16u32 * lh;
         #[unroll]
         for j in 0..16u32 { xs[(lr * 32u32 + 16u32 * lh + j) as usize] = half::f16::cast_from(x[(xb + j) as usize]); }
         sync_cube();
@@ -5842,14 +5842,17 @@ impl Cube {
     }
     /// Batched-prefill GEMM (k_gemm_pf) of `t` tokens: x [t][cols] -> out [t][rows], every native / Q8 segment of m,
     /// in launches of at most 128 tokens (each a few ms at most).
-    pub fn gemm_pf(&self, m: &CMat, x: &Handle, xn: usize, t: usize, out: &Handle, on: usize) {
+    pub fn gemm_pf(&self, m: &CMat, x: &Handle, xn: usize, t: usize, out: &Handle, on: usize) { self.gemm_pfx(m, x, xn, m.cols, t, out, on, 0, m.rows, false) }
+    /// gemm_pf with token strides: x row j at j*xst, out row j at j*ost + obase
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_pfx(&self, m: &CMat, x: &Handle, xn: usize, xst: usize, t: usize, out: &Handle, on: usize, obase: usize, ostr: usize, f32only: bool) {
         let cols = m.cols; let kv: Vec<f32> = super::iq_tables::KVALUES_IQ4NL.iter().map(|&v| v as f32).collect(); let kvb = self.buf(&kv);
         let mut c0 = 0usize; let _ = (xn, on);
         // PYRE_QN_BPF_TC (default on; 0 = f32 k_gemm_pf): tensor-core f16 tiles
-        let tc = std::env::var("PYRE_QN_BPF_TC").map(|v| v != "0").unwrap_or(true);
+        let tc = !f32only && std::env::var("PYRE_QN_BPF_TC").map(|v| v != "0").unwrap_or(true);
         if std::env::var("PYRE_QN_BPF_BENCH").is_ok() && t >= 128 { eprintln!("gemm_pf {}x{} t={t} nat {:?} qseg {:?}", m.rows, cols, m.nat.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>(), m.qseg.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>()); }
         while c0 < t { let nt = (t - c0).min(256);
-            let xo = x.clone().offset_start((c0 * cols * 4) as u64); let xl = nt * cols; let oo = out.clone().offset_start((c0 * m.rows * 4) as u64); let ol = nt * m.rows;
+            let xo = x.clone().offset_start((c0 * xst * 4) as u64); let xl = (nt - 1) * xst + cols; let oo = out.clone().offset_start((c0 * ostr * 4) as u64); let ol = (nt - 1) * ostr + obase + m.rows;
             // split-K (per segment) so that small-row matrices (HC down: 324 rows, 64-row Q8 segments) still fill the SMs;
             // K ranges in whole 256 blocks; no split below 2048 columns. A split segment writes ks partial planes of its own
             // (ks x nt x n floats, small) that k_gemm_sum adds in plane order into out.
@@ -5857,14 +5860,14 @@ impl Cube {
                 let kch = (cols / 256).div_ceil(ks0) * 256; (cols.div_ceil(kch), kch) };
             let launch = |w: Handle, wl: usize, sh: Handle, sl: usize, r0: usize, n: usize, nat: bool| { let (ks, kch) = ksplit(n);
                 let part = if ks > 1 { Some(self.empty(ks * nt * n)) } else { None };
-                let (dst, dl, ooff, ost, pst) = match &part { Some(p) => (p.clone(), ks * nt * n, 0usize, n, nt * n), None => (oo.clone(), ol, r0, m.rows, 0) };
+                let (dst, dl, ooff, ost, pst) = match &part { Some(p) => (p.clone(), ks * nt * n, 0usize, n, nt * n), None => (oo.clone(), ol, obase + r0, ostr, 0) };
                 if tc { unsafe { k_gemm_tc::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(64), (nt as u32).div_ceil(64), ks as u32), CubeDim::new_1d(128),
                 BufferArg::from_raw_parts(xo.clone(), xl), BufferArg::from_raw_parts(w, wl), BufferArg::from_raw_parts(sh, sl), BufferArg::from_raw_parts(kvb.clone(), 16),
-                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) } } else {
+                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, xst as u32, nat) } } else {
                 unsafe { k_gemm_pf::launch_unchecked(&self.client, CubeCount::Static((n as u32).div_ceil(128), (nt as u32).div_ceil(64), ks as u32), CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(xo.clone(), xl), BufferArg::from_raw_parts(w, wl), BufferArg::from_raw_parts(sh, sl), BufferArg::from_raw_parts(kvb.clone(), 16),
-                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, nat) } }
-                if let Some(p) = &part { unsafe { k_gemm_sum::launch_unchecked(&self.client, CubeCount::Static(((nt * n) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(p.clone(), ks * nt * n), BufferArg::from_raw_parts(oo.clone(), ol), n as u32, (nt * n) as u32, ks as u32, r0 as u32, m.rows as u32) } } };
+                BufferArg::from_raw_parts(dst, dl), n as u32, cols as u32, nt as u32, kch as u32, ooff as u32, ost as u32, pst as u32, xst as u32, nat) } }
+                if let Some(p) = &part { unsafe { k_gemm_sum::launch_unchecked(&self.client, CubeCount::Static(((nt * n) as u32).div_ceil(256), 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(p.clone(), ks * nt * n), BufferArg::from_raw_parts(oo.clone(), ol), n as u32, (nt * n) as u32, ks as u32, (obase + r0) as u32, ostr as u32) } } };
             if m.nat.is_empty() && m.qseg.is_empty() { launch(m.w.clone(), m.rows * cols / 4, m.s.clone(), m.rows * cols / 32, 0, m.rows, false); }
             for (r0, n, w) in &m.nat { launch(w.clone(), n * cols / 256 * 35, kvb.clone(), 16, *r0, *n, true); }
             for (r0, n, qb) in &m.qseg { let (wo, so) = ((qb * cols) as u64, (qb * cols / 32 * 4) as u64); launch(m.w.clone().offset_start(wo), n * cols / 4, m.s.clone().offset_start(so), n * cols / 32, *r0, *n, false); }
