@@ -335,6 +335,14 @@ impl Tools {
     }
 }
 
+/// PYRE_REQ_LOG=<file> (diagnostic, off by default): append each chat request's messages and the final response as JSON lines.
+fn reqlog(v: Value) -> bool {
+    let Ok(f) = std::env::var("PYRE_REQ_LOG") else { return false };
+    use std::io::Write;
+    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) { let _ = writeln!(fh, "{}", v); }
+    true
+}
+
 // ---------- OpenAI chat ----------
 #[derive(Deserialize)]
 struct ChatReq {
@@ -372,6 +380,7 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let created = now();
     let mut think = Think::new(&prompt);
     let mut tools = Tools::new(req.tools.as_ref());
+    let rlog = reqlog(json!({"req": &id, "stream": req.g.stream, "messages": &req.messages, "ntools": req.tools.as_ref().and_then(|t| t.as_array()).map(|a| a.len())}));
     let rx = start(&st, ids, &req.g);
     if !req.g.stream {
         return match collect(rx).await {
@@ -381,6 +390,7 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
                 let fin = if calls.is_empty() { fin } else { "tool_calls" };
                 let mut msg = json!({"role": "assistant", "content": if calls.is_empty() || !c.trim().is_empty() { json!(c) } else { Value::Null }});
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
+                if rlog { reqlog(json!({"resp": &id, "finish": fin, "message": &msg})); }
                 if !r.is_empty() { msg["reasoning_content"] = json!(r); }
                 Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": fin, "logprobs": null}],
@@ -392,12 +402,14 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let chunk = move |delta: Value, fin: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": fin, "logprobs": null}]});
     let first = stream::once({ let c = chunk.clone(); async move { c(json!({"role": "assistant", "content": ""}), Value::Null) } });
+    let (mut acc_r, mut acc_c) = (String::new(), String::new());
     let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
         let v: Vec<Value> = match e {
-            Event::Token(s) => { let (r, c) = think.push(&s); let c = tools.push(&c); think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
+            Event::Token(s) => { let (r, c) = think.push(&s); let c = tools.push(&c); if rlog { acc_r.push_str(&r); acc_c.push_str(&c); } think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
             Event::Done { finish_reason, timings, .. } => {
                 let (r, c) = think.finish(); let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
-                let mut v: Vec<Value> = think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect();
+                let mut v: Vec<Value> = think_delta(r.clone(), c.clone()).map(|d| chunk(d, Value::Null)).into_iter().collect();
+                if rlog { reqlog(json!({"resp": "stream", "finish": finish_reason, "reasoning": format!("{acc_r}{r}"), "content": format!("{acc_c}{c}"), "tool_calls": &calls})); }
                 if !calls.is_empty() { v.push(chunk(json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), Value::Null)); }
                 let mut f = chunk(json!({}), json!(if calls.is_empty() { finish_reason } else { "tool_calls" }));
                 f["timings"] = json!(timings);
