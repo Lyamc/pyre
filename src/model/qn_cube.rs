@@ -5389,6 +5389,137 @@ fn k_attn3(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mut
         j += nw * 32u32;
     }
 }
+/// Batched prefill copies of k_attn_prep / k_attn3: token tq = CUBE_POS_Y at position pos0 + tq (per-token offsets pst/qst/cst/ost/sst); per token the same arithmetic as the one-token kernels.
+#[cube(launch_unchecked)]
+fn k_attn_prep_b(p: &[f32], qn: &[f32], kn: &[f32], cs: &[f32], q: &mut [f32], kc: &mut [f32], vc: &mut [f32], ko: u32, vo: u32, nh: u32, nkv: u32, hd: u32, half: u32, pos0: u32, eps: f32, pst: u32, qst: u32, cst: u32) {
+    let h = CUBE_POS_X;
+    let tq = CUBE_POS_Y;
+    let pos = pos0 + tq;
+    let lane = UNIT_POS_X;
+    let mut base = h * 2 * hd;
+    let mut dst = h * hd;
+    if h >= nh {
+        base = ko + (h - nh) * hd;
+        dst = (pos * nkv + h - nh) * hd;
+    }
+    let mut ss = 0.0f32;
+    let mut i = lane;
+    while i < hd {
+        let v = p[(tq * pst + base + i) as usize];
+        ss += v * v;
+        i += 32u32;
+    }
+    let s = 1.0f32 / f32::sqrt(plane_sum(ss) / f32::cast_from(hd) + eps);
+    i = lane;
+    while i < hd {
+        let mut wi = 0.0f32;
+        let mut wj = 0.0f32;
+        let mut j = i;
+        if i < half {
+            j = i + half;
+        } else if i < 2 * half {
+            j = i - half;
+        }
+        if h < nh {
+            wi = qn[i as usize];
+            wj = qn[j as usize];
+        } else {
+            wi = kn[i as usize];
+            wj = kn[j as usize];
+        }
+        let ni = p[(tq * pst + base + i) as usize] * (s * wi);
+        let nj = p[(tq * pst + base + j) as usize] * (s * wj);
+        let mut o = ni;
+        if i < half {
+            o = ni * cs[(tq * cst + i) as usize] - nj * cs[(tq * cst + half + i) as usize];
+        } else if i < 2 * half {
+            o = ni * cs[(tq * cst + j) as usize] + nj * cs[(tq * cst + half + j) as usize];
+        }
+        if h < nh {
+            q[(tq * qst + dst + i) as usize] = o;
+        } else {
+            kc[(dst + i) as usize] = o;
+            vc[(dst + i) as usize] = p[(tq * pst + vo + (h - nh) * hd + i) as usize];
+        }
+        i += 32u32;
+    }
+}
+#[cube(launch_unchecked)]
+fn k_attn3_b(q: &[f32], kc: &[f32], vc: &[f32], p: &[f32], sc: &mut [f32], o: &mut [f32], nh: u32, nkv: u32, hd: u32, n0: u32, cap: u32, scale: f32, #[comptime] nd: u32, pst: u32, qst: u32, ost: u32, sst: u32) {
+    let h = CUBE_POS_X;
+    let tq = CUBE_POS_Y;
+    let n = n0 + tq;
+    let lane = UNIT_POS_X;
+    let wy = UNIT_POS_Y;
+    let nw = CUBE_DIM_Y;
+    let tid = wy * 32u32 + lane;
+    let kvh = h / (nh / nkv);
+    let mut red = Shared::<[f32]>::new_slice(32usize);
+    let mut part = Shared::<[f32]>::new_slice(4096usize);
+    let mut qr = Array::<f32>::new(nd as usize);
+    #[unroll]
+    for d in 0..nd { qr[d as usize] = q[(tq * qst + h * hd + d * 32u32 + lane) as usize]; }
+    let mut mx = scale * -3.0e30f32;
+    let mut pp = wy;
+    while pp + nw < n {
+        let kb = (pp * nkv + kvh) * hd; let kb2 = ((pp + nw) * nkv + kvh) * hd;
+        let mut dd = 0.0f32; let mut d2 = 0.0f32;
+        #[unroll]
+        for d in 0..nd { dd += qr[d as usize] * kc[(kb + d * 32u32 + lane) as usize]; d2 += qr[d as usize] * kc[(kb2 + d * 32u32 + lane) as usize]; }
+        let v = plane_sum(dd) * scale; let v2 = plane_sum(d2) * scale;
+        if lane == 0u32 { sc[(tq * sst + h * cap + pp) as usize] = v; sc[(tq * sst + h * cap + pp + nw) as usize] = v2; }
+        mx = f32::max(mx, v); mx = f32::max(mx, v2);
+        pp += 2u32 * nw;
+    }
+    if pp < n {
+        let kb = (pp * nkv + kvh) * hd;
+        let mut dd = 0.0f32;
+        #[unroll]
+        for d in 0..nd { dd += qr[d as usize] * kc[(kb + d * 32u32 + lane) as usize]; }
+        let v = plane_sum(dd) * scale;
+        if lane == 0u32 { sc[(tq * sst + h * cap + pp) as usize] = v; }
+        mx = f32::max(mx, v);
+    }
+    if lane == 0u32 { red[wy as usize] = mx; }
+    sync_cube();
+    let mut m = red[0];
+    for w in 1..nw { m = f32::max(m, red[w as usize]); }
+    let mut sum = 0.0f32;
+    pp = tid;
+    while pp < n {
+        let e = f32::exp(sc[(tq * sst + h * cap + pp) as usize] - m);
+        sc[(tq * sst + h * cap + pp) as usize] = e;
+        sum += e;
+        pp += nw * 32u32;
+    }
+    let ws = plane_sum(sum);
+    if lane == 0u32 { red[(16u32 + wy) as usize] = ws; }
+    sync_cube();
+    let mut tot = 0.0f32;
+    for w in 0..nw { tot += red[(16u32 + w) as usize]; }
+    let inv = 1.0f32 / tot;
+    let mut acc = Array::<f32>::new(nd as usize);
+    #[unroll]
+    for d in 0..nd { acc[d as usize] = 0.0f32; }
+    let mut t = wy;
+    while t < n {
+        let e = sc[(tq * sst + h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
+        #[unroll]
+        for d in 0..nd { acc[d as usize] += e * vc[(vb + d * 32u32 + lane) as usize]; }
+        t += nw;
+    }
+    #[unroll]
+    for d in 0..nd { part[(wy * hd + d * 32u32 + lane) as usize] = acc[d as usize]; }
+    sync_cube();
+    let mut j = tid;
+    while j < hd {
+        let mut a = 0.0f32;
+        for w in 0..nw { a += part[(w * hd + j) as usize]; }
+        let g = p[(tq * pst + h * 2 * hd + hd + j) as usize];
+        o[(tq * ost + h * hd + j) as usize] = a * inv * (1.0f32 / (1.0f32 + f32::exp(-g)));
+        j += nw * 32u32;
+    }
+}
 fn attn3() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_ATTN3").map(|v| v != "0").unwrap_or(true)) }
 fn attn2() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| std::env::var("PYRE_QN_ATTN2").map(|v| v != "0").unwrap_or(native2())) }
 /// Grid tables for the expert kernels.
@@ -5875,6 +6006,21 @@ impl Cube {
             BufferArg::from_raw_parts(k0.0, k0.1), BufferArg::from_raw_parts(k1.0, k1.1), BufferArg::from_raw_parts(k2.0, k2.1), BufferArg::from_raw_parts(k3.0, k3.1),
             nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
         }
+    }
+    /// k_attn_prep_b + k_attn3_b for t tokens at positions pos0.. (K/V of all t written first; token j attends 0..=pos0+j).
+    /// cs = t rope tables (2*half each); p = t projections (stride pst); out stride ost. false = not eligible (caller loops attn()).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_b(&self, p: &Handle, pn: usize, pst: usize, ko: usize, vo: usize, qn: &Handle, kn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, out: &Handle, ost: usize, nh: usize, nkv: usize, hd: usize, half: usize, pos0: usize, t: usize, eps: f32) -> bool {
+        if !(attn2() && attn3() && hd <= 512 && hd % 32 == 0) || pos0 + t > cap { return false; }
+        let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
+        let q = self.empty(t * nh * hd); let sc = self.empty(t * nh * cap);
+        unsafe {
+            k_attn_prep_b::launch_unchecked(&self.client, CubeCount::Static((nh + nkv) as u32, t as u32, 1), CubeDim::new_1d(32),
+                a(p, pn), a(qn, hd), a(kn, hd), a(cs, t * 2 * half), a(&q, t * nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), ko as u32, vo as u32, nh as u32, nkv as u32, hd as u32, half as u32, pos0 as u32, eps, pst as u32, (nh * hd) as u32, (2 * half) as u32);
+            k_attn3_b::launch_unchecked(&self.client, CubeCount::Static(nh as u32, t as u32, 1), CubeDim::new_2d(32, 8),
+                a(&q, t * nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), a(p, pn), a(&sc, t * nh * cap), a(out, t * ost), nh as u32, nkv as u32, hd as u32, (pos0 + 1) as u32, cap as u32, (hd as f32).sqrt().recip(), (hd / 32) as u32, pst as u32, (nh * hd) as u32, ost as u32, (nh * cap) as u32);
+        }
+        true
     }
     /// Decode attention for one token (see k_attn_prep / k_attn); `p` = the fused q|k|v projection.
     #[allow(clippy::too_many_arguments)]

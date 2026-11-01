@@ -1686,7 +1686,7 @@ impl Model {
             let _q = Q(guq, &left, wi, qp, toks.len(), ff, &hp, &hoff, exq);
             SC.with(|c| { let (sc, s2) = &mut *c.borrow_mut();
                 let pf = gu_pf();
-                let multi = usek && toks.len() >= 2 && (toks.len() <= 16 || bpf()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
+                let multi = usek && toks.len() >= 2 && (toks.len() <= 16 || bpf() || bpg()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
                 if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = (vec![0f32; toks.len()], vec![0f32; toks.len()]);
                     for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                         if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
@@ -1728,7 +1728,7 @@ impl Model {
             SC.with(|c| { let (sc, _) = &mut *c.borrow_mut();
                 for (wi, &(e, toks)) in work.iter().enumerate() { let dm = l.down_e.slice_rows(e * d + r0, r1 - r0); let al: Vec<&qdot::Q8D> = if used { hdq[wi].iter().collect() } else { vec![] };
                     for r in 0..r1 - r0 { let dr = dm.row_raw(r); { let dp = dn_pf(); if dp > 0 && r + dp < r1 - r0 { prefetch(dm.row_raw(r + dp)); } }
-                        if used && toks.len() >= 2 && (toks.len() <= 8 || bpf()) && dmulti() { for (ac, tc) in al.chunks(8).zip(toks.chunks(8)) { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
+                        if used && toks.len() >= 2 && (toks.len() <= 8 || bpf() || bpg()) && dmulti() { for (ac, tc) in al.chunks(8).zip(toks.chunks(8)) { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
                             for (j, &(ti, w)) in tc.iter().enumerate() { let v = w * ov[j]; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } continue; }
                         for (j, &(ti, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[wi][j]) } else { qdot::row_dot(dm.ty, dr, &hq[wi][j], sc) }; unsafe { yp.slice(ti * d + r0 + r, 1)[0] += v; } } } } });
         };
@@ -1775,7 +1775,7 @@ impl Model {
         let task = |wi: usize| { let (e, toks) = work[wi]; let nt = toks.len(); let mut hid = vec![0f32; nt * ff]; let mut sc = qdot::Scratch::default();
             for b in 0..nb { let (r0, r1) = (b * blk, ((b + 1) * blk).min(ff));
                 let gm = l.gate_e.slice_rows(e * ff + r0, r1 - r0); let um = l.up_e.slice_rows(e * ff + r0, r1 - r0);
-                let multi = usek && nt >= 2 && (nt <= 16 || bpf()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
+                let multi = usek && nt >= 2 && (nt <= 16 || bpf() || bpg()) && gm.ty == um.ty && matches!(gm.ty, super::gguf_q::QType::IQ2S | super::gguf_q::QType::IQ2XXS);
                 if multi { let al: Vec<&qdot::Q8K> = toks.iter().map(|&(ti, _)| &actk[ti]).collect(); let (mut gv, mut uv) = (vec![0f32; toks.len()], vec![0f32; toks.len()]);
                     for r in 0..r1 - r0 { let (gr, ur) = (gm.row_raw(r), um.row_raw(r));
                         if pf > 0 && r + pf < r1 - r0 { prefetch(gm.row_raw(r + pf)); prefetch(um.row_raw(r + pf)); }
@@ -1791,7 +1791,7 @@ impl Model {
             let hdq: Vec<qdot::Q8D> = if !used { vec![] } else { (0..nt).map(|j| { let mut a = qdot::Q8D::default(); qdot::quantize_d_into(&hid[j * ff..(j + 1) * ff], &mut a); a }).collect() };
             let dm = l.down_e.slice_rows(e * d, d); let al: Vec<&qdot::Q8D> = hdq.iter().collect();
             for r in 0..d { let dr = dm.row_raw(r); if r + 4 < d { prefetch(dm.row_raw(r + 4)); }
-                if used && nt >= 2 && (nt <= 8 || bpf()) && dmulti() { for (c, ac) in al.chunks(8).enumerate() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
+                if used && nt >= 2 && (nt <= 8 || bpf() || bpg()) && dmulti() { for (c, ac) in al.chunks(8).enumerate() { let mut ov = [0f32; 8]; qdot::q2_0_dot_d_multi(dr, ac, &mut ov[..ac.len()]);
                     for (j, &(_, w)) in toks[c * 8..c * 8 + ac.len()].iter().enumerate() { unsafe { pp.slice((slot0[wi] + c * 8 + j) * d + r, 1)[0] = w * ov[j]; } } } continue; }
                 for (j, &(_, w)) in toks.iter().enumerate() { let v = w * if used { qdot::q2_0_dot_d(dr, &hdq[j]) } else { qdot::row_dot(dm.ty, dr, &hq[j], &mut sc) }; unsafe { pp.slice((slot0[wi] + j) * d + r, 1)[0] = v; } } } };
         let ser = env_usize("PYRE_QN_FUSE_SERIAL").unwrap_or(0);
@@ -2451,7 +2451,7 @@ impl Model {
         super::xchain::dmark(cb, "di_a"); if !(gatem() && cb.gate_m(&xn, &da, &cl.hca.up, &mixed, t * d, 0, hc, d, t, w, dar, d)) { for ti in 0..t { cb.gate(&at(&xn, ti * w), &at(&da, ti * dar), &cl.hca.up, &at(&mixed, ti * d), d, 0, hc, d); } }
         super::xchain::dmark(cb, "gate_a"); gmm(cb, &cl.min, &mixed, t * d, 0, d, &proj, t * pr, 0, pr, t);
         };
-        if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); } super::xchain::dmark(cb, "min"); 
+        if ag { vg_run(cb, (1, il, t), &gk, &pre); } else { pre(); } super::xchain::dmark(cb, "min"); let q_pre = q0.elapsed(); 
         // the mixer, token by token (recurrent / causal state)
         // PYRE_QN_DELTAM (default on): the DeltaNet recurrence of all t tokens in one k_delta_m launch (the convs
         // and their state checkpoints stay per token, in the same order)
@@ -2473,6 +2473,19 @@ impl Model {
             super::xchain::dmark(cb, "conv"); cb.delta_m(&co_all, ch, &proj, pr, gw, &ss, &core, core_n, &cks, ckm, nk, nv, dk, sp[1], sp[2], sp[3], c.eps, t);
             dm_done = true;
         } }
+        // BPG: the chunk's attention in two launches (k_attn_prep_b + k_attn3_b) instead of two per token
+        if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, !dm_done && t > 8 && bpg() && attn_gpu(c) && start + t <= self.dense_n() && env_var("PYRE_QN_BPG_ATTN").map(|v| v != "0").unwrap_or(true)) {
+            let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2); let sp = &cl.min.splits;
+            self.kv_push(cb, ai0, st, start + t);
+            let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, start, "gpu kv out of step");
+            let mut csv: Vec<f32> = Vec::with_capacity(t * 2 * half);
+            for ti in 0..t { let pos = start + ti; csv.extend((0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos())); csv.extend((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())); }
+            let csb = cb.buf(&csv);
+            if cb.attn_b(&proj, t * pr, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &core, core_n, nh, nkv, hd, half, start, t, c.eps) {
+                if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; for ti in 0..t { cb.copy(&proj, t * pr, ti * pr + sp[4], &g.ik, g.cap * ihd, (start + ti) * ihd, ihd); } }
+                g.len = start + t; dm_done = true;
+            }
+        }
         for ti in 0..t {
             let pos = start + ti; let pj = at(&proj, ti * pr);
             if dm_done { let _ = (pos, pj); }
@@ -2499,7 +2512,7 @@ impl Model {
                 let cbuf = cb.buf(&cv); cb.copy(&cbuf, core_n, 0, &core, t * core_n, ti * core_n, core_n);
             }
         }
-        super::xchain::dmark(cb, "mixer"); let post = || {
+        super::xchain::dmark(cb, "mixer"); let q_mix = q0.elapsed(); let post = || {
         gmm(cb, &cl.mout, &core, t * core_n, 0, core_n, &o, t * d, 0, d, t);
         // FFN hyper-connection read + router / shared expert projection, batched
         super::xchain::dmark(cb, "mout"); if combm() && (t <= 4 || super::qn_cube::t8() || bpg()) { cb.comb_m(xs, &o, &da, dar, lra, hc, d); } else { for ti in 0..t { cb.comb(&xs[ti], &at(&o, ti * d), None, None, &at(&da, ti * dar), lra, hc, d); } } super::xchain::dmark(cb, "comb"); cb.rms_t(xs, &cl.hcf.norm, &xn, hc, d, c.eps);
@@ -2508,6 +2521,7 @@ impl Model {
         super::xchain::dmark(cb, "gate_f"); gmm(cb, &cl.fin, &rd, t * rn, 0, rn, &rd, t * rn, d, rn, t); super::xchain::dmark(cb, "fin"); 
         };
         if ag { vg_run(cb, (2, il, t), &gk, &post); } else { post(); }
+        if t > 8 && env_var("PYRE_QN_BPG_TIME").is_ok() { eprintln!("bpgt il {il} t {t} {} pre {:.2} mix {:.2} post {:.2} ms", if matches!(l.mix, Mixer::Attn { .. }) { "attn" } else { "lin" }, q_pre.as_secs_f64() * 1e3, (q_mix - q_pre).as_secs_f64() * 1e3, (q0.elapsed() - q_mix).as_secs_f64() * 1e3); }
         HY[0].fetch_add(q0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         (rd, df, da)
     }
