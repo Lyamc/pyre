@@ -18,7 +18,7 @@ stt_model = ''         # --stt-model   (e.g. openai/whisper-tiny.en)
 tts_model = ''         # --tts-model
 host = '127.0.0.1'     # --host  (bind). '0.0.0.0' = LAN; you must add a firewall rule yourself.
 port = 8099            # --port  (pyre's own default is 8080)
-backend = 'cuda'       # -b : cuda | wgpu | vulkan | cpu | ndarray
+backend = ''           # -b : cuda | wgpu | vulkan | cpu | ndarray. Empty = let pyre choose.
 ctx_size = 4096        # -c
 n_predict = 512        # -n
 fast = true            # --fast (env PYRE_QN_FAST); false = exact outputs

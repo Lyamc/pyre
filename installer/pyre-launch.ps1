@@ -59,7 +59,8 @@ if ($FirstRun -or (-not $NoFirstRun -and -not $DryRun -and -not (V 'model'))) {
   if ($FirstRun -and -not $Gui -and -not $Web) { return }
 }
 
-$a = @('serve', '--host', $hostIp, '--port', "$port", '-b', (V 'backend' 'cuda'), '-c', (V 'ctx_size' '4096'), '-n', (V 'n_predict' '512'))
+$a = @('serve', '--host', $hostIp, '--port', "$port", '-c', (V 'ctx_size' '4096'), '-n', (V 'n_predict' '512'))
+if (V 'backend') { $a += @('-b', (V 'backend')) }
 if (V 'model') { $a += @('-m', (V 'model')) }
 foreach ($m in @(@('image_model', '--image-model'), @('stt_model', '--stt-model'), @('tts_model', '--tts-model'), @('vram_reserve', '--vram-reserve'))) { if (V $m[0]) { $a += @($m[1], (V $m[0])) } }
 if ((V 'gpu_util_max' '0') -ne '0') { $a += @('--gpu-util-max', (V 'gpu_util_max')) }

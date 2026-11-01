@@ -1,31 +1,57 @@
 # pyre Windows installer (MSI, WiX v5)
 
 ```powershell
-# exes must already be built (via C:\Temp\qnx\build.ps1 for pyre; gui\ is built separately)
-.\installer\build-installer.ps1 -PyreExe target\x86_64-pc-windows-msvc\release\pyre.exe `
-                                -GuiExe  gui\target\x86_64-pc-windows-msvc\release\pyre-gui.exe
-# -> installer\out\pyre-<ver>-x64.msi   (stage\ and out\ are git-ignored)
+# Exes must already be built via C:\Temp\qnx\build.ps1: once in the repo root (pyre) and once in gui\ (pyre-gui, own workspace).
+.\installer\build-installer.ps1 -CudaMajor 12 -SourceCommit cf84f1d `
+   -PyreExe target\x86_64-pc-windows-msvc\release\pyre.exe `
+   -GuiExe  gui\target\x86_64-pc-windows-msvc\release\pyre-gui.exe
+# -> installer\out\pyre-<ver>-x64.msi   (stage\ and out\ are git-ignored; stage\MANIFEST.txt records sources and hashes)
 ```
 
-**What gets installed** to `C:\Program Files\pyre` (added to PATH): `pyre.exe`, `pyre-gui.exe`, the NVRTC DLLs (`nvrtc64_*.dll`, `nvrtc-builtins64_*.dll`,
-redistributable under the CUDA EULA; cubecl compiles kernels at runtime), `pyre-launch.ps1`, `pyre-firstrun.ps1`, `pyre-service.ps1`, `config.template.toml`.
-You also get Start-menu entries for Dashboard, Web Chat, Start/Stop server, Model Setup, Edit config, and Uninstall. You can also pick the optional "Start server at logon" feature (off by default).
+## CUDA is optional
+pyre picks its backend (cuda / wgpu / vulkan / cpu), so nothing blocks the install. The MSI and `pyre-firstrun.ps1` only show a notice, with a link to
+https://www.nvidia.com/Download/index.aspx, when an NVIDIA GPU (PCI vendor 10DE) is present and `nvcuda.dll` is missing or older than the driver needed for the
+bundled NVRTC. That is driver 560.76 for CUDA 12.6 and 580.88 for CUDA 13. Machines without an NVIDIA GPU see no warning.
 
-**Prereqs (launch conditions):** the NVIDIA driver must support CUDA 13 (`nvcuda.dll` >= 32.0.15.8000, which is driver 580). Bypass this check with `SKIPCUDACHECK=1`.
-The VC++ 2015-2022 x64 runtime is also required. Bypass this check with `SKIPVCCHECK=1`. The installer doesn't bundle the CUDA toolkit, cudart, or cuBLAS. pyre.exe imports none of them.
+## NVRTC: `-CudaMajor` must match the exe
+cudarc 0.19.10 (`cuda-version-from-build-system`) runs the first `nvcc` on PATH during the build. On HYTE that is `C:\cuda\bin\nvcc` (12.6), so it bakes in
+CUDA_MAJOR/MINOR = 12/6, even though `CUDA_PATH` is v13.3. At runtime it tries, in this order: `nvrtc.dll`, `nvrtc64.dll`, `nvrtc64_12.dll`, `nvrtc64_126.dll`,
+`nvrtc64_126_0.dll`, `nvrtc64_120_6.dll`, `nvrtc64_10/11/12.dll`, then `nvrtc64_120_0.dll`. The last name is the real 12.x file. `nvrtc64_130_0.dll` is never tried
+for a 12.6 build, so a 12.6 build needs the 12.x pair (`nvrtc64_120_0.dll` + `nvrtc-builtins64_126.dll`). `build-installer.ps1` reads
+`release\build\cudarc-*\output` next to `-PyreExe` and refuses a mismatched `-CudaMajor`. To ship CUDA 13, put 13.3's nvcc first on PATH (or set
+`CUDARC_CUDA_VERSION=13030`) for the build, then pass `-CudaMajor 13`.
 
-**Config:** `%ProgramData%\pyre\config.toml` (or set `PYRE_CONFIG`). The launcher creates it from the template the first time it runs.
-pyre reads the top-level keys itself (`models_dir`, `offline`, `search_order`, `spec`, `route_prior`).
-`pyre-launch.ps1` maps `[serve]` to `serve` flags and env vars: `--host --port -m -b -c -n --image-model --stt-model --tts-model --vram-reserve --gpu-util-max`,
-`PYRE_QN_FAST`, `PYRE_VRAM_FLOOR_MB`, `PYRE_API_KEY`, `PYRE_METRICS_BIND`, `PYRE_METRICS_TOKEN`, `PYRE_LOG_FILE`, `PYRE_INSTANCE`.
-`[env]` passes any other variable through. To see the resolved command line without starting anything, run `pyre-launch.ps1 -DryRun`.
+## What gets installed
+`C:\Program Files\pyre` (added to PATH) gets:
+- `pyre.exe` and `pyre-gui.exe` (the GUI is built `+crt-static`).
+- The NVRTC pair.
+- The MSVC runtime DLLs (`vcruntime140`, `vcruntime140_1`, `msvcp140`) app-local, because pyre.exe can't be crt-static: the prebuilt LLVM in cubecl-llvm is /MD. So no VC++ redist prereq.
+- The launcher, first-run, and service scripts, `config.template.toml`, and `MANIFEST.txt`.
 
-**First run:** if `[serve] model` is empty, the launcher opens `pyre-firstrun.ps1`. You can download the IQ2_XS shards of
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` plus the tokenizer from `Qwen/Qwen3.8-Flash-Next` into `models_dir`. You can also point it at an existing
-folder, `.gguf` file, store name, or HF repo id, or skip. Use `HF_TOKEN` for gated repos. After that, manage models from the dashboard's Models page.
+Start-menu entries: Dashboard, Web Chat, Start/Stop server, Model Setup, Edit config, Uninstall. There is also an optional "Start server at logon" feature, off by default.
 
-**Background / service:** the default is per-user hidden start (Start-menu entry or the logon feature). `pyre-service.ps1 -Install` (run elevated, by hand)
-registers a boot-time SYSTEM Scheduled Task. The installer never registers it. Run `-Uninstall` before you remove pyre.
+## Config
+`%ProgramData%\pyre\config.toml` (or set `PYRE_CONFIG`). The launcher creates it from the template the first time it runs.
+- **Top-level keys** (`models_dir`, `offline`, `search_order`, `spec`, `route_prior`) are read by pyre itself.
+- **`[serve]`** is mapped by `pyre-launch.ps1` to flags: `--host --port -m -b -c -n --image-model --stt-model --tts-model --vram-reserve --gpu-util-max`.
+  It also sets these env vars: `PYRE_QN_FAST`, `PYRE_VRAM_FLOOR_MB`, `PYRE_API_KEY`, `PYRE_METRICS_BIND`, `PYRE_METRICS_TOKEN`, `PYRE_LOG_FILE`, `PYRE_INSTANCE`.
+  `-b` is only passed when `backend` is set.
+- **`[env]`** passes any other variable through.
 
-**Upgrade/uninstall:** MajorUpgrade with a fixed UpgradeCode. The MSI doesn't own the config, logs, or models (they live in `%ProgramData%\pyre`, `%LOCALAPPDATA%\pyre`, or the HF cache), so upgrade and uninstall keep them.
-`msiexec /x pyre.msi PURGEDATA=1` deletes `%ProgramData%\pyre`. Model folders and the HF cache elsewhere are never deleted.
+To see the resolved command line without starting anything, run `pyre-launch.ps1 -DryRun`.
+
+## First run
+If `[serve] model` is empty, the launcher opens `pyre-firstrun.ps1`, which offers three choices:
+1. Download the IQ2_XS shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` plus the tokenizer from `Qwen/Qwen3.8-Flash-Next` into `models_dir`
+   (curl, resumable; set `HF_TOKEN` for gated repos).
+2. Use an existing folder, `.gguf` file, store name, or HF repo id.
+3. Skip.
+
+## Background / service
+- **Default:** the server starts hidden for the current user, from the Start-menu entry or the logon feature.
+- **Boot-time option:** `pyre-service.ps1 -Install` (run by hand, elevated) registers a boot-time SYSTEM Scheduled Task. The installer never registers it, so run `-Uninstall` before you remove pyre.
+
+## Upgrade / uninstall
+- **Upgrade:** MajorUpgrade with a fixed UpgradeCode.
+- **Uninstall:** the MSI never owns config, logs, or models (`%ProgramData%\pyre`, `%LOCALAPPDATA%\pyre`, the HF cache), so they survive upgrade and uninstall.
+- **Opt-in purge:** `msiexec /x pyre.msi PURGEDATA=1` deletes only `%ProgramData%\pyre`.
