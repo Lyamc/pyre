@@ -182,7 +182,7 @@ async fn status(State(app): S) -> Json<Value> {
         "limits": crate::limits::status(),
         "metrics": crate::metrics::snapshot(),
         "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
-        "speculative": crate::spec::status()["speculative"], "route_prior": crate::spec::status()["route_prior"], "context": crate::spec::status()["context"],
+        "speculative": crate::spec::status()["speculative"], "route_prior": crate::spec::status()["route_prior"], "fast": crate::spec::fast(), "context": crate::spec::status()["context"],
     }))
 }
 

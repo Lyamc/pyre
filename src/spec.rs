@@ -46,9 +46,13 @@ pub fn route_prior() -> f32 {
     let p = std::env::var("PYRE_ROUTE_PRIOR").ok().and_then(|s| s.parse().ok()).unwrap_or(if fast() { 1.5 } else { 0.0f32 }).max(0.0);
     ROUTE_PRIOR.store(p.to_bits(), Relaxed); p
 }
-/// PYRE_QN_FAST=1 (opt-in, changes outputs): Strata 0.2.7's 12 GB NVIDIA settings in one switch, the route prior 1.5
-/// and the route tail skip at rank 7 (explicit PYRE_ROUTE_PRIOR / PYRE_QN_TAIL_SKIP values win)
-pub fn fast() -> bool { std::env::var("PYRE_QN_FAST").map(|v| v == "1").unwrap_or(false) }
+/// Lossy speed shortcuts in one switch (ON by default; PYRE_QN_FAST=0 or `serve --fast false` turns them off, and then
+/// outputs are exactly the exact path's). Reimplemented from Strata (github.com/Niko1221/Strata, MIT): the route prior
+/// 1.5 (STRATA_ROUTE_PRIOR, residency-biased routing) and the route tail skip at rank 7 (STRATA_ROUTE_TAIL_SKIP, Strata's
+/// CUDA default). Explicit PYRE_ROUTE_PRIOR / PYRE_QN_TAIL_SKIP values win. Drafting stays verified (lossless).
+static FAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub fn fast() -> bool { match FAST.load(Relaxed) { 0 => false, 1 => true, _ => std::env::var("PYRE_QN_FAST").map(|v| v != "0").unwrap_or(true) } }
+pub fn set_fast(on: bool) { FAST.store(on as u8, Relaxed); }
 pub fn set_route_prior(p: f32) { ROUTE_PRIOR.store(p.max(0.0).to_bits(), Relaxed); }
 
 // ---- statistics for /api/status ----
@@ -72,6 +76,7 @@ pub fn status() -> serde_json::Value {
             "acceptance": if d > 0 { a as f64 / d as f64 } else { 0.0 }, "tokens": EMITTED.load(Relaxed),
             "last": {"draft_len": LAST_DRAFT.load(Relaxed), "acceptance": f32::from_bits(LAST_ACC.load(Relaxed)), "tok_per_s": f32::from_bits(LAST_TPS.load(Relaxed))}},
         "route_prior": {"enabled": route_prior() > 0.0, "strength": route_prior()},
+        "fast": fast(),
         "context": {"used": CTX_USED.load(Relaxed), "max": CTX_MAX.load(Relaxed)},
     })
 }

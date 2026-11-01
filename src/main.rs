@@ -122,6 +122,9 @@ pub struct ServeArgs {
     /// Residency-biased expert routing strength for qwen-next (0 = off, the default; changes outputs; config `route_prior`, env PYRE_ROUTE_PRIOR)
     #[arg(long = "route-prior")]
     pub route_prior: Option<f32>,
+    /// Lossy speed shortcuts for qwen-next (route prior 1.5 + route tail skip 7, from Strata); on by default, `--fast false` = exact outputs (env PYRE_QN_FAST)
+    #[arg(long = "fast")]
+    pub fast: Option<bool>,
     /// Disable the prompt-lookup (n-gram) drafter
     #[arg(long = "no-ngram")]
     pub no_ngram: bool,
@@ -276,6 +279,7 @@ fn load_llm_parts(dir: &std::path::Path, backend_name: &str, dtype: &str, ctx_si
 fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     use registry::{Kind, LoadReq};
     limits::init(args.vram_reserve.as_deref(), args.gpu_util_max);
+    if let Some(f) = args.fast { spec::set_fast(f); }
     { let cfg = store::store::load_config();
       if let Some(n) = args.spec.or(cfg.spec) { spec::set_draft_len(n); }
       if let Some(p) = args.route_prior.or(cfg.route_prior) { spec::set_route_prior(p); }
