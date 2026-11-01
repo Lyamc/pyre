@@ -41,7 +41,18 @@ static G_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 pub fn add_cpu_expert_ns(ns: u64) { CPU_EXPERT_NS.fetch_add(ns, Relaxed); }
 pub fn add_gpu_ns(ns: u64) { GPU_NS.fetch_add(ns, Relaxed); }
-pub fn expert_cache(hits: u64, misses: u64) { CACHE_HIT.fetch_add(hits, Relaxed); CACHE_MISS.fetch_add(misses, Relaxed); }
+/// Recent window: two buckets of ~256 decode tokens each (48 layers x top-10 lookups per token); the ratio covers the
+/// previous full bucket plus the current one. Races at the rotation only blur the window slightly.
+const WBUCKET: u64 = 256 * 48 * 10;
+static W_H: AtomicU64 = AtomicU64::new(0); static W_M: AtomicU64 = AtomicU64::new(0);
+static W_PH: AtomicU64 = AtomicU64::new(0); static W_PM: AtomicU64 = AtomicU64::new(0);
+static LOG_WARN: AtomicU64 = AtomicU64::new(0);
+pub fn expert_cache(hits: u64, misses: u64) { CACHE_HIT.fetch_add(hits, Relaxed); CACHE_MISS.fetch_add(misses, Relaxed);
+    let h = W_H.fetch_add(hits, Relaxed) + hits; let m = W_M.fetch_add(misses, Relaxed) + misses;
+    if h + m >= WBUCKET { W_PH.store(W_H.swap(0, Relaxed), Relaxed); W_PM.store(W_M.swap(0, Relaxed), Relaxed); } }
+fn recent_hit() -> Option<f64> { let h = W_H.load(Relaxed) + W_PH.load(Relaxed); let m = W_M.load(Relaxed) + W_PM.load(Relaxed); if h + m > 0 { Some(h as f64 / (h + m) as f64) } else { None } }
+/// Any WARN/ERROR line from tracing (separate from `warning()`, which counts real operational warnings).
+pub fn log_warning() { LOG_WARN.fetch_add(1, Relaxed); }
 pub fn xcache_slots(resident: usize, slots: usize, slot_bytes: usize) { XC_RES.store(resident as u64, Relaxed); XC_SLOTS.store(slots as u64, Relaxed); XC_SLOT_B.store(slot_bytes as u64, Relaxed); }
 pub fn warning() { WARNINGS.fetch_add(1, Relaxed); }
 
@@ -170,13 +181,13 @@ pub fn snapshot() -> Value {
         "active": active,
         "recent": RECENT.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
         "totals": {"requests": TOTAL_REQ.load(Relaxed), "prompt_tokens": TOTAL_PROMPT.load(Relaxed), "cached_prompt_tokens": TOTAL_CACHED.load(Relaxed), "prefix_cache_hit_requests": PREFIX_HIT_REQ.load(Relaxed),
-            "generated_tokens": TOTAL_GEN.load(Relaxed), "errors": ERR_REQ.load(Relaxed), "cancelled": CANCEL_REQ.load(Relaxed), "warnings": WARNINGS.load(Relaxed)},
+            "generated_tokens": TOTAL_GEN.load(Relaxed), "errors": ERR_REQ.load(Relaxed), "cancelled": CANCEL_REQ.load(Relaxed), "warnings": WARNINGS.load(Relaxed), "log_warnings": LOG_WARN.load(Relaxed)},
         "throughput": {"last_prefill_tps": f64::from_bits(LAST_PPS.load(Relaxed)), "last_decode_tps": f64::from_bits(LAST_DPS.load(Relaxed)),
             "ttft_s": H_TTFT.json(), "latency_s": H_LAT.json(), "prefill_tps": H_PPS.json(), "decode_tps": H_DPS.json()},
         "compute": {"cpu_expert_ms": CPU_EXPERT_NS.load(Relaxed) as f64 / 1e6, "gpu_ms": gpu_wait_ns() as f64 / 1e6, "gpu_wait_ms": gpu_wait_ns() as f64 / 1e6,
             "cpu_expert_ms_per_token": if toks > 0 { Some(CPU_EXPERT_NS.load(Relaxed) as f64 / 1e6 / toks as f64) } else { None },
             "gpu_wait_ms_per_token": if toks > 0 { Some(gpu_wait_ns() as f64 / 1e6 / toks as f64) } else { None }},
-        "expert_cache": {"hits": h, "misses": m, "hit_rate": if h + m > 0 { Some(h as f64 / (h + m) as f64) } else { None },
+        "expert_cache": {"hits": h, "misses": m, "hit_rate": if h + m > 0 { Some(h as f64 / (h + m) as f64) } else { None }, "hit_rate_recent": recent_hit(), "recent_window_tokens": 512,
             "resident": res, "slots": slots, "slot_bytes": sb, "resident_gb": (res * sb) as f64 / 1e9, "capacity_gb": (slots * sb) as f64 / 1e9},
         "speculative": {"rounds": rounds, "drafted": drafted, "accepted": accepted, "acceptance": if drafted > 0 { Some(accepted as f64 / drafted as f64) } else { None }},
         "context": crate::spec::status()["context"],
@@ -197,7 +208,8 @@ pub fn prometheus() -> String {
     g(&mut o, "pyre_requests_total", "counter", "Finished requests.", f(&t["requests"]));
     g(&mut o, "pyre_request_errors_total", "counter", "Requests that ended in an error.", f(&t["errors"]));
     g(&mut o, "pyre_requests_cancelled_total", "counter", "Requests cancelled by the client.", f(&t["cancelled"]));
-    g(&mut o, "pyre_warnings_total", "counter", "Warnings logged by the metrics thread (VRAM pressure).", f(&t["warnings"]));
+    g(&mut o, "pyre_warnings_total", "counter", "Operational warnings (VRAM pressure, watchdog-style events).", f(&t["warnings"]));
+    g(&mut o, "pyre_log_warnings_total", "counter", "WARN/ERROR lines in the log (any source).", f(&t["log_warnings"]));
     g(&mut o, "pyre_prompt_tokens_total", "counter", "Prompt tokens (incl. prefix-cache hits).", f(&t["prompt_tokens"]));
     g(&mut o, "pyre_prompt_cached_tokens_total", "counter", "Prompt tokens served from the prefix cache.", f(&t["cached_prompt_tokens"]));
     g(&mut o, "pyre_prefix_cache_hit_requests_total", "counter", "Requests that reused a cached prefix.", f(&t["prefix_cache_hit_requests"]));
@@ -218,6 +230,7 @@ pub fn prometheus() -> String {
     g(&mut o, "pyre_expert_cache_hits_total", "counter", "Routed experts served from the GPU cache.", f(&x["hits"]));
     g(&mut o, "pyre_expert_cache_misses_total", "counter", "Routed experts run on the CPU.", f(&x["misses"]));
     g(&mut o, "pyre_expert_cache_hit_ratio", "gauge", "Expert cache hit ratio since start.", f(&x["hit_rate"]));
+    g(&mut o, "pyre_expert_cache_hit_ratio_recent", "gauge", "Expert cache hit ratio over roughly the last 256-512 decode tokens.", f(&x["hit_rate_recent"]));
     g(&mut o, "pyre_expert_cache_slots", "gauge", "Expert cache slots.", f(&x["slots"]));
     g(&mut o, "pyre_expert_cache_resident", "gauge", "Experts resident in the cache.", f(&x["resident"]));
     g(&mut o, "pyre_expert_cache_resident_bytes", "gauge", "Bytes of resident experts.", f(&x["resident_gb"]).map(|g| g * 1e9));

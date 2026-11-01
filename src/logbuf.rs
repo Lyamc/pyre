@@ -42,8 +42,16 @@ fn write_json(v: &Value) {
     }
     if let Some(f) = lf.f.as_mut() { if f.write_all(line.as_bytes()).is_ok() { lf.size += line.len() as u64; } }
 }
-fn ts() -> String { chrono_like() }
-fn chrono_like() -> String { let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default(); format!("{}.{:03}", d.as_secs(), d.subsec_millis()) }
+/// ISO-8601 UTC with milliseconds, e.g. 2026-11-01T18:00:17.943Z (civil-from-days, no extra crate).
+fn ts() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let s = d.as_secs() as i64; let (days, sod) = (s.div_euclid(86400), s.rem_euclid(86400));
+    let z = days + 719468; let era = z.div_euclid(146097); let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153; let day = doy - (153 * mp + 2) / 5 + 1; let mon = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mon <= 2 { 1 } else { 0 };
+    format!("{y:04}-{mon:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z", sod / 3600, sod / 60 % 60, sod % 60, d.subsec_millis())
+}
 
 fn push(line: String) -> u64 {
     let s = SEQ.fetch_add(1, Relaxed) + 1; let mut b = buf().lock().unwrap();
@@ -55,7 +63,7 @@ pub fn event(kind: &str, level: &str, fields: Value) {
     let mut v = json!({"ts": ts(), "level": level, "kind": kind, "instance": crate::metrics::instance()});
     if let (Some(o), Some(f)) = (v.as_object_mut(), fields.as_object()) { for (k, x) in f { o.insert(k.clone(), x.clone()); } }
     write_json(&v);
-    push(format!("{level} {kind}: {}", fields));
+    push(format!("{} {level} {kind}: {}", ts(), fields));
     if level != "INFO" && level != "DEBUG" { let _ = writeln!(std::io::stderr(), "{level} {kind}: {fields}"); }
 }
 
@@ -76,7 +84,7 @@ impl Write for Tee {
             // tracing's fmt line: "<time> <LEVEL> <target>: <msg>"
             let mut it = line.split_whitespace(); let _t = it.next(); let lvl = it.next().unwrap_or("INFO");
             let (lvl, rest) = if matches!(lvl, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR") { (lvl, line.splitn(3, char::is_whitespace).nth(2).unwrap_or("").trim_start()) } else { ("INFO", line) };
-            if lvl == "WARN" || lvl == "ERROR" { crate::metrics::warning(); }
+            if lvl == "WARN" || lvl == "ERROR" { crate::metrics::log_warning(); }
             let (target, msg) = match rest.split_once(": ") { Some((a, b)) if !a.contains(' ') => (a, b), _ => ("", rest) };
             write_json(&json!({"ts": ts(), "level": lvl, "kind": "log", "target": target, "msg": msg}));
         }
