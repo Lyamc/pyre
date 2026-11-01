@@ -220,6 +220,9 @@ pub fn prometheus() -> String {
     g(&mut o, "pyre_log_warnings_total", "counter", "WARN/ERROR lines in the log (any source).", f(&t["log_warnings"]));
     g(&mut o, "pyre_prompt_tokens_total", "counter", "Prompt tokens (incl. prefix-cache hits).", f(&t["prompt_tokens"]));
     g(&mut o, "pyre_prompt_cached_tokens_total", "counter", "Prompt tokens served from the prefix cache.", f(&t["cached_prompt_tokens"]));
+    g(&mut o, "pyre_ctx_tooltrim_requests_total", "counter", "Requests whose old tool outputs ctx-tooltrim elided.", Some(crate::ctx::TRIM_REQS.load(std::sync::atomic::Ordering::Relaxed) as f64));
+    g(&mut o, "pyre_ctx_tooltrim_messages_total", "counter", "Tool outputs elided by ctx-tooltrim.", Some(crate::ctx::TRIM_MSGS.load(std::sync::atomic::Ordering::Relaxed) as f64));
+    g(&mut o, "pyre_ctx_tooltrim_tokens_total", "counter", "Prompt tokens removed by ctx-tooltrim.", Some(crate::ctx::TRIM_TOKENS.load(std::sync::atomic::Ordering::Relaxed) as f64));
     g(&mut o, "pyre_prefix_cache_hit_requests_total", "counter", "Requests that reused a cached prefix.", f(&t["prefix_cache_hit_requests"]));
     g(&mut o, "pyre_generated_tokens_total", "counter", "Generated tokens.", f(&t["generated_tokens"]));
     let n_act = v["active"].as_array().map(|a| a.len()).unwrap_or(0) as f64;

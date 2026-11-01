@@ -373,10 +373,20 @@ fn norm_messages(m: &[Value]) -> Vec<Value> {
 
 async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let st = match app.llm(req.model.as_deref()) { Ok(m) => m, Err(r) => return r };
-    let prompt = match st.template.render(&norm_messages(&req.messages), true, req.tools.as_ref()) {
+    let mut msgs = norm_messages(&req.messages);
+    let prompt = match st.template.render(&msgs, true, req.tools.as_ref()) {
         Ok(p) => p, Err(e) => return err(StatusCode::BAD_REQUEST, format!("chat template: {e:#}")),
     };
-    let ids = match encode(&st, &prompt, false) { Ok(i) => i, Err(r) => return r };
+    let mut ids = match encode(&st, &prompt, false) { Ok(i) => i, Err(r) => return r };
+    let mut prompt = prompt;
+    // ctx-tooltrim: only above the threshold (below it the prompt is untouched)
+    let lim = crate::ctx::trim_at(st.n_ctx);
+    if crate::ctx::tooltrim_on() && ids.len() > lim {
+        let mut count = |m: &[Value]| -> Option<usize> { let p = st.template.render(m, true, req.tools.as_ref()).ok()?; encode(&st, &p, false).ok().map(|i| i.len()) };
+        if crate::ctx::tooltrim(&mut msgs, lim, &mut count) > 0 {
+            if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) { prompt = p; ids = i; } }
+        }
+    }
     let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
     let id = rid("chatcmpl");
     let created = now();
