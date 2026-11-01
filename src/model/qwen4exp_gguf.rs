@@ -960,7 +960,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn attn_tok(&self, cb: &super::qn_cube::Cube, idx: &Option<(QMat, QMat, Vec<f32>, Vec<f32>)>, g: &mut KvG, pj: &H, pr: usize, sp: &[usize], qnh: &H, knh: &H, src: &H, srcn: usize, so: usize, pos: usize, out: &H) {
         let c = &self.cfg; let (nh, nkv, hd, half) = (c.n_head, c.n_kv, c.hd, c.n_rot / 2);
-        let csb = self.rope_h(cb, pos, half);
+        let csb = self.rope_h(cb, pos, half); if let Ok(v) = env_var("PYRE_QN_QSABENCH") { for n in v.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) { cb.qsa_bench(n, nh, nkv, hd, half, c.idx_nh, c.idx_hd, c.idx_ratio, c.idx_budget / c.idx_ratio, pr, 50); } std::process::exit(0); }
         let ihd = c.idx_hd; let has = idx.is_some() && sp.len() > 5;
         if has { cb.copy(src, srcn, so + sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
         let sparse = has && pos + 1 > self.dense_n() && env_var("PYRE_QN_DENSE").is_err();
