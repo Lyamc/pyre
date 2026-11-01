@@ -387,6 +387,25 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
             if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) { prompt = p; ids = i; } }
         }
     }
+    // ctx-summarize: only above the threshold; one remembered compaction per history (prefix-cache friendly)
+    let slim = crate::ctx::sum_at(st.n_ctx);
+    if crate::ctx::summarize_on() && ids.len() > slim {
+        let mut changed = false; while crate::ctx::apply_memo(&mut msgs) { changed = true; }
+        let mut n = ids.len();
+        if changed { if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) { n = i.len(); prompt = p; ids = i; } } }
+        if n > slim { if let Some((h0, end)) = crate::ctx::span(&msgs) {
+            let sreq = crate::ctx::summary_request(&msgs[h0..end]);
+            if let Ok(sp) = st.template.render(&sreq, true, None) { if let Ok(si) = encode(&st, &sp, false) { if si.len() + 1500 < st.n_ctx {
+                let g = Gen { temperature: Some(0.0), max_tokens: Some(1500), ..Default::default() };
+                let mut th = Think::new(&sp);
+                if let Ok((text, _, t, _)) = collect(start(&st, si, &g)).await {
+                    let (_, mut c) = th.push(&text); let (_, c2) = th.finish(); c.push_str(&c2);
+                    if !c.trim().is_empty() {
+                        let v = crate::ctx::remember(&msgs, end, c.trim(), t.predicted_n); msgs.splice(h0..end, [v]);
+                        if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) {
+                            tracing::warn!("ctx-summarize: messages {h0}..{end} -> summary ({} tok), prompt {} -> {} tokens (limit {slim})", t.predicted_n, n, i.len()); prompt = p; ids = i; } }
+                    } } } } } } }
+    }
     let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
     let id = rid("chatcmpl");
     let created = now();
