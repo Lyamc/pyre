@@ -2,7 +2,8 @@
 
 ```powershell
 # Exes must already be built via C:\Temp\qnx\build.ps1: once in the repo root (pyre) and once in gui\ (pyre-gui, own workspace).
-.\installer\build-installer.ps1 -CudaMajor 12 -SourceCommit cf84f1d `
+# tray: cd installer\tray; & C:\Temp\qnx\build.ps1   (own workspace; RUSTFLAGS=-C target-feature=+crt-static optional)
+.\installer\build-installer.ps1 -CudaMajor 12 -TrayExe installer\tray\target\x86_64-pc-windows-msvc\release\pyre-tray.exe -SourceCommit cf84f1d `
    -PyreExe target\x86_64-pc-windows-msvc\release\pyre.exe `
    -GuiExe  gui\target\x86_64-pc-windows-msvc\release\pyre-gui.exe
 # -> installer\out\pyre-<ver>-x64.msi   (stage\ and out\ are git-ignored; stage\MANIFEST.txt records sources and hashes)
@@ -63,3 +64,25 @@ If `[serve] model` is empty, the launcher opens `pyre-firstrun.ps1`, which offer
 - **Upgrade:** MajorUpgrade with a fixed UpgradeCode.
 - **Uninstall:** the MSI never owns config, logs, or models (`%ProgramData%\pyre`, `%LOCALAPPDATA%\pyre`, the HF cache), so they survive upgrade and uninstall.
 - **Opt-in purge:** `msiexec /x pyre.msi PURGEDATA=1` deletes only `%ProgramData%\pyre`.
+
+## Icon
+`assets\pyre.svg` is a document page with a dog-eared corner, carrying a flame made of monospace ASCII glyphs. The glyphs are DejaVu Sans Mono Bold, converted to paths so there's no font dependency, and graded amber to orange to red from tip to base.
+- `pyre-small*.svg` are the 16-24 px variants: a heavier outline and a chunky three-block flame.
+- State variants: `pyre-starting` (lower flame) and `pyre-stopped` (embers only).
+- Regenerate with `assets\gen-icons.py` + `assets\render-icons.py` (fontTools, cairosvg, Pillow). They write the `.ico` files (16/20/24/32/40/48/64/128/256) and `preview.png`.
+- `pyre.ico` is used for ARPPRODUCTICON, every shortcut, and pyre-tray.exe.
+- `resources\pyre-icon.rc` embeds it into pyre.exe / pyre-gui.exe on their next build. It isn't applied yet; see the comment in the file.
+
+## Tray (`tray\`, pyre-tray.exe)
+pyre-tray.exe is a Rust GUI-subsystem app (tray-icon/muda, no console) and runs as a single instance (named mutex).
+- **Status:** polls `GET /health` every 3 s. Host and port come from `[serve]` in config.toml; `0.0.0.0` is treated as 127.0.0.1. `/health` is a public route even when `PYRE_API_KEY` is set.
+- **Icons:** full flame = running, low flame = starting (waiting for `/health`, up to 180 s), embers = stopped. The tooltip shows the state and port.
+- **Menu:**
+  - **Open pyre:** opens pyre-gui.exe at the URL, falling back to the browser.
+  - **Open web chat.**
+  - **Start/Stop server:** the label follows the state.
+  - **Quit tray:** closes only the tray; the server keeps running.
+  - **Stop server and quit.**
+- **Start:** calls `pyre-launch.ps1 -NoFirstRun -NoTray`. If the `pyre-server` scheduled task exists (service mode), it runs `schtasks /Run` instead.
+- **Stop:** calls `pyre-launch.ps1 -Stop`. That writes the graceful stop file (also into SystemTemp/Temp for the SYSTEM task) and waits for the grace period. If needed it then kills the pid. If `/health` is still up afterwards, for example because the server is a SYSTEM process and the user has no rights, a message box says to run "Stop pyre server" as administrator.
+- **Startup:** the "Tray icon at logon" feature is on by default and starts only the tray. Starting the server from the Start menu or the launcher also brings up the tray.

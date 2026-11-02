@@ -52,6 +52,8 @@
       <Component Id="c_msvcp140" Bitness="always64"><File Id="msvcp140" Source="$(var.StageDir)\msvcp140.dll" KeyPath="yes" /></Component>
       <Component Id="c_nvrtc" Bitness="always64"><File Id="nvrtc" Source="$(var.StageDir)\$(var.NvrtcDll)" KeyPath="yes" /></Component>
       <Component Id="c_nvrtcbuiltins" Bitness="always64"><File Id="nvrtcbuiltins" Source="$(var.StageDir)\$(var.NvrtcBuiltinsDll)" KeyPath="yes" /></Component>
+      <Component Id="c_tray" Bitness="always64"><File Id="pyretray.exe" Source="$(var.StageDir)\pyre-tray.exe" KeyPath="yes" /></Component>
+      <Component Id="c_icon" Bitness="always64"><File Id="pyreico" Source="$(var.StageDir)\pyre.ico" KeyPath="yes" /></Component>
       <Component Id="c_launch" Bitness="always64"><File Id="launch" Source="$(var.StageDir)\pyre-launch.ps1" KeyPath="yes" /></Component>
       <Component Id="c_firstrun" Bitness="always64"><File Id="firstrun" Source="$(var.StageDir)\pyre-firstrun.ps1" KeyPath="yes" /></Component>
       <Component Id="c_service" Bitness="always64"><File Id="service" Source="$(var.StageDir)\pyre-service.ps1" KeyPath="yes" /></Component>
@@ -71,14 +73,15 @@
 
     <ComponentGroup Id="Shortcuts" Directory="MenuDir">
       <Component Id="MenuShortcuts">
-        <Shortcut Id="scGui" Name="pyre Dashboard" Description="Start pyre (if needed) and open the desktop dashboard"
-                  Target="$(var.PS)" Arguments="$(var.PSARGS) -Gui" WorkingDirectory="INSTALLFOLDER" Icon="GuiIcon" />
-        <Shortcut Id="scServe" Name="Start pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS)" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="scStop" Name="Stop pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -Stop" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="scWeb" Name="pyre Web Chat" Target="$(var.PS)" Arguments="$(var.PSARGS) -Web" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="scModels" Name="pyre Model Setup" Target="$(var.PS)" Arguments="$(var.PSARGS) -FirstRun" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="scCfg" Name="Edit pyre config" Target="$(var.PS)" Arguments="$(var.PSARGS) -EditConfig" WorkingDirectory="INSTALLFOLDER" />
-        <Shortcut Id="scUninst" Name="Uninstall pyre" Target="[System64Folder]msiexec.exe" Arguments="/x [ProductCode]" />
+        <Shortcut Id="scGui" Icon="pyre.ico" Name="pyre Dashboard" Description="Start pyre (if needed) and open the desktop dashboard"
+                  Target="$(var.PS)" Arguments="$(var.PSARGS) -Gui" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scTray" Icon="pyre.ico" Name="pyre Tray" Description="Notification-area icon: status, open, start/stop" Target="[INSTALLFOLDER]pyre-tray.exe" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scServe" Icon="pyre.ico" Name="Start pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS)" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scStop" Icon="pyre.ico" Name="Stop pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -Stop" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scWeb" Icon="pyre.ico" Name="pyre Web Chat" Target="$(var.PS)" Arguments="$(var.PSARGS) -Web" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scModels" Icon="pyre.ico" Name="pyre Model Setup" Target="$(var.PS)" Arguments="$(var.PSARGS) -FirstRun" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scCfg" Icon="pyre.ico" Name="Edit pyre config" Target="$(var.PS)" Arguments="$(var.PSARGS) -EditConfig" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scUninst" Icon="pyre.ico" Name="Uninstall pyre" Target="[System64Folder]msiexec.exe" Arguments="/x [ProductCode]" />
         <RemoveFolder Id="RmMenu" On="uninstall" />
         <RegistryValue Root="HKLM" Key="Software\pyre" Name="menu" Type="integer" Value="1" KeyPath="yes" />
       </Component>
@@ -87,13 +90,21 @@
     <!-- Optional: start the server hidden at user logon (tray-less background mode). Off by default. -->
     <StandardDirectory Id="StartupFolder">
       <Component Id="AutoStart">
-        <Shortcut Id="scAuto" Name="pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -NoFirstRun" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scAuto" Icon="pyre.ico" Name="pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -NoFirstRun" WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue Root="HKLM" Key="Software\pyre" Name="autostart" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
 
-    <Icon Id="GuiIcon" SourceFile="$(var.StageDir)\pyre-gui.exe" />
-    <Property Id="ARPPRODUCTICON" Value="GuiIcon" />
+    <!-- Tray icon at logon (default ON). Starts only the tray, not the server. -->
+    <StandardDirectory Id="StartupFolder">
+      <Component Id="TrayAutoStart">
+        <Shortcut Id="scTrayAuto" Icon="pyre.ico" Name="pyre tray" Target="[INSTALLFOLDER]pyre-tray.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="Software\pyre" Name="trayautostart" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Icon Id="pyre.ico" SourceFile="$(var.StageDir)\pyre.ico" />
+    <Property Id="ARPPRODUCTICON" Value="pyre.ico" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
     <Feature Id="Main" Title="pyre server" Description="pyre.exe, NVRTC runtime, launcher scripts, Start-menu entries." Level="1" AllowAbsent="no" ConfigurableDirectory="INSTALLFOLDER">
@@ -102,6 +113,9 @@
     </Feature>
     <Feature Id="GuiFeature" Title="Desktop dashboard" Description="Native GPUI dashboard (pyre-gui.exe)." Level="1">
       <ComponentGroupRef Id="Gui" />
+    </Feature>
+    <Feature Id="TrayAutoStartFeature" Title="Tray icon at logon" Description="Show the pyre notification-area icon at every logon (status, open, start/stop). Does not start the server." Level="1">
+      <ComponentRef Id="TrayAutoStart" />
     </Feature>
     <Feature Id="AutoStartFeature" Title="Start server at logon" Description="Run the pyre server hidden at every logon (uses %ProgramData%\pyre\config.toml)." Level="1000">
       <ComponentRef Id="AutoStart" />

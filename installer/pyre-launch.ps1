@@ -5,9 +5,10 @@
     -FirstRun    open model setup (pyre-firstrun.ps1)
     -NoFirstRun  never open model setup (autostart / service)
     -EditConfig  open config.toml in Notepad
+    -NoTray      do not bring up pyre-tray.exe (the tray passes this when it starts the server)
     -DryRun      print the resolved command line + env and exit (safe; starts nothing)
 #>
-param([switch]$Gui, [switch]$Web, [switch]$Stop, [switch]$FirstRun, [switch]$NoFirstRun, [switch]$EditConfig, [switch]$DryRun, [string]$Config)
+param([switch]$Gui, [switch]$Web, [switch]$Stop, [switch]$FirstRun, [switch]$NoFirstRun, [switch]$EditConfig, [switch]$DryRun, [switch]$NoTray, [string]$Config)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $data = Join-Path $env:ProgramData 'pyre'
@@ -55,9 +56,11 @@ if ($Stop) {
   $p = Get-Content $pidFile -ea 0
   if ($p) {
     $proc = Get-Process -Id ([int]$p) -ea 0
-    if ($proc -and $proc.Path -eq $exe) {
+    if ($proc -and ($proc.Path -eq $exe -or (-not $proc.Path -and $proc.ProcessName -eq 'pyre'))) {
       $sf = Join-Path ([IO.Path]::GetTempPath()) "pyre\stop.$($proc.Id)"
       New-Item -ItemType Directory -Force (Split-Path $sf) | Out-Null; Set-Content $sf 'stop'
+      # SYSTEM-task server: its %TEMP% is %SystemRoot%\SystemTemp or %SystemRoot%\Temp (writable only when elevated)
+      foreach ($st in "$env:SystemRoot\SystemTemp", "$env:SystemRoot\Temp") { try { New-Item -ItemType Directory -Force "$st\pyre" -ea Stop | Out-Null; Set-Content "$st\pyre\stop.$($proc.Id)" 'stop' -ea Stop } catch {} }
       $grace = 10; if ($cfg['env'] -and $cfg['env'].PYRE_STOP_GRACE_S) { $grace = [int]$cfg['env'].PYRE_STOP_GRACE_S }
       if (-not $proc.WaitForExit(($grace + 5) * 1000)) { Stop-Process -Id $proc.Id -Force -ea 0 }
       Remove-Item $sf -ea 0
@@ -100,5 +103,7 @@ if (-not (Test-Port)) {
   Set-Content $pidFile $p.Id
   if ($Gui -or $Web) { for ($i = 0; $i -lt 240 -and -not (Test-Port); $i++) { Start-Sleep -Milliseconds 500 } }
 }
+$tray = Join-Path $here 'pyre-tray.exe'
+if (-not $NoTray -and (Test-Path $tray)) { Start-Process $tray }   # single-instance; brings up the tray icon
 if ($Gui) { Start-Process (Join-Path $here 'pyre-gui.exe') -ArgumentList $url }
 if ($Web) { Start-Process $url }

@@ -1,5 +1,5 @@
 <#  build-installer.ps1 - package ALREADY-BUILT exes into an MSI with WiX v5 (dotnet tool `wix`). Does not run cargo.
-    .\installer\build-installer.ps1 -PyreExe <path\pyre.exe> -GuiExe <path\pyre-gui.exe> -CudaMajor 12 [-SourceCommit cf84f1d]
+    .\installer\build-installer.ps1 -PyreExe <path\pyre.exe> -GuiExe <path\pyre-gui.exe> -TrayExe <installer\tray\target\...\pyre-tray.exe> -CudaMajor 12 [-SourceCommit cf84f1d]
     -CudaMajor picks which NVRTC pair is bundled. It MUST match the CUDA version cudarc baked into pyre.exe
       (cudarc's build.rs runs the first `nvcc` on PATH; see target\...\release\build\cudarc-*\output CUDA_MAJOR_VERSION).
       The script reads that file next to -PyreExe when present and refuses a mismatch.
@@ -10,6 +10,7 @@
 param(
   [Parameter(Mandatory)][string]$PyreExe,
   [Parameter(Mandatory)][string]$GuiExe,
+  [Parameter(Mandatory)][string]$TrayExe,
   [Parameter(Mandatory)][ValidateSet('12', '13')][string]$CudaMajor,
   [string]$NvrtcDir,
   [string]$CrtDir,
@@ -49,13 +50,14 @@ $crt | ForEach-Object { if (-not (Test-Path $_)) { throw "MSVC runtime not found
 $stage = Join-Path $PSScriptRoot 'stage'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }   # our own staging dir only
 New-Item -ItemType Directory -Force $stage, $OutDir | Out-Null
-Copy-Item $PyreExe (Join-Path $stage 'pyre.exe'); Copy-Item $GuiExe (Join-Path $stage 'pyre-gui.exe')
+Copy-Item $PyreExe (Join-Path $stage 'pyre.exe'); Copy-Item $GuiExe (Join-Path $stage 'pyre-gui.exe'); Copy-Item $TrayExe (Join-Path $stage 'pyre-tray.exe'); Copy-Item (Join-Path $PSScriptRoot 'assets\pyre.ico') $stage
 Copy-Item $nvrtc.FullName, $nvb.FullName $stage; Copy-Item $crt $stage
 foreach ($f in 'pyre-launch.ps1', 'pyre-firstrun.ps1', 'pyre-service.ps1', 'config.template.toml') { Copy-Item (Join-Path $PSScriptRoot $f) $stage }
 Copy-Item (Join-Path $repo 'THIRD_PARTY_NOTICES') (Join-Path $stage 'THIRD_PARTY_NOTICES.txt')
 $manifest = @("pyre $Version  source commit: $(if ($SourceCommit) { $SourceCommit } else { 'unspecified' })",
   "pyre.exe from: $PyreExe ($((Get-Item $PyreExe).LastWriteTime.ToString('s')))",
   "pyre-gui.exe from: $GuiExe ($((Get-Item $GuiExe).LastWriteTime.ToString('s')))",
+  "pyre-tray.exe from: $TrayExe ($((Get-Item $TrayExe).LastWriteTime.ToString('s'))); icon: installer\assets\pyre.svg -> pyre.ico",
   "CUDA major: $CudaMajor (cudarc baked: $(if ($baked) { $baked } else { 'unverified' })); NVRTC from: $NvrtcDir; driver notice below $($drv[1])",
   "MSVC runtime (app-local) from: $CrtDir", '')
 $manifest += Get-ChildItem $stage | ForEach-Object { '{0,12}  {1}  {2}' -f $_.Length, (Get-FileHash $_.FullName -Algorithm SHA256).Hash.Substring(0, 16), $_.Name }
