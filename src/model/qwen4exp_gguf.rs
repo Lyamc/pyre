@@ -602,6 +602,9 @@ impl Model {
                 // headroom, so the 1 GB floor holds (XEXACT output is the same for any cache size); an explicit PYRE_QN_XCACHE_GB wins
                 let cap = if super::mtp::gxr_on() && env_var("PYRE_QN_XCACHE_GB").is_err() && super::mtp::find().is_some() { let need = super::mtp::gxr_bytes(self.cfg.d, self.cfg.ff_exp, self.cfg.n_exp).saturating_sub(env_usize("PYRE_MTP_GXR_SLACK_MB").unwrap_or(300) << 20); eprintln!("gpu: resident drafter: expert cache cap -{:.2} GiB", need as f64 / (1u64 << 30) as f64); cap.saturating_sub(need) } else { cap };
                 let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(if xexact() { 512 } else { 2048 }) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
+                // PYRE_QN_XCACHE_PIN_GB (exactness checks, unset = unchanged): exactly this cache size, ignoring the XHEAD headroom,
+                // as long as it fits above the reserve + 1.5 GiB already held back (>= 1 GiB stays free); else the normal budget
+                let budget = match env_var("PYRE_QN_XCACHE_PIN_GB").ok().and_then(|v| v.parse::<f64>().ok()) { Some(p) => { let pb = ((p * (1u64 << 30) as f64) as usize).next_multiple_of(1 << 20); if pb <= left { eprintln!("gpu: expert cache pinned"); pb } else { eprintln!("gpu: expert cache pin {p} GiB does not fit ({} MiB left), normal budget", left >> 20); budget } }, None => budget };
                 if budget > 0 { g.budget.fetch_sub(budget as i64, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("gpu: expert cache budget {:.2} GiB", budget as f64 / (1u64 << 30) as f64);
                     let slot = self.layers.iter().filter_map(|l| Some((super::qn_cube::xtype(l.gate_e.ty)?, super::qn_cube::xtype(l.up_e.ty)?, super::qn_cube::xtype(l.down_e.ty)?))).map(|t| { let w = super::qn_cube::xwords(t, self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) }).max().unwrap_or(4usize).next_multiple_of(256);
