@@ -12,16 +12,30 @@
 //! `reasoning_effort` (OpenAI: none/minimal/low/medium/high/xhigh, plus very_high/max);
 //! `reasoning: {effort | enabled: false}` (OpenRouter style). `thinking_token_budget: N` (pi's budget field)
 //! overrides the level's budget. Unknown names (e.g. "auto") fall back to the default.
+//! auto (`reasoning_effort: "auto"`): the engine picks the level per request from the model itself (no second model).
+//! After prefill it snapshots the state, feeds PYRE_THINK_AUTO_PROMPT (a short self-rating question inside the open think
+//! block, ending in "["), reads the model's probabilities of the digits 0..4, and restores the snapshot (the answer never
+//! sees the probe; cost = one short forward + snapshot/restore). Signal E = expected rating in [0, 4].
+//! Bands PYRE_THINK_AUTO_T="a,b,c,d": E < a none, < b low, < c medium, < d high, else very_high.
+//! (Tried first and rejected: entropy of the first predicted think tokens. The first token has p1 ~1.0 on every prompt;
+//! the mean entropy of the first 8 tokens was 0.33-0.64 nats with no relation to difficulty: trivial 0.575, hard math 0.391.)
+//! Structural bias (server, auto_bias): last message is a tool result -> PYRE_THINK_AUTO_TOOL (default -1 level);
+//! last user message longer than PYRE_THINK_AUTO_LONG chars (default 2000) or containing a code fence -> +1.
+//! Result clamped to PYRE_THINK_AUTO_MIN..PYRE_THINK_AUTO_MAX (default none..very_high). The chosen level's budget
+//! (as above) then applies; "none" closes the think block right away.
 //! pi (openai-completions, default compat) sends `reasoning_effort` = its level (minimal/low/medium/high/xhigh)
 //! and nothing for "off" unless the model's thinkingLevelMap.off is set (use "none").
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Effort { None, Low, Medium, High, VeryHigh }
+pub enum Effort { None, Low, Medium, High, VeryHigh, Auto }
 
-pub const ALL: [Effort; 5] = [Effort::None, Effort::Low, Effort::Medium, Effort::High, Effort::VeryHigh];
-pub static REQS: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub const ALL: [Effort; 6] = [Effort::None, Effort::Low, Effort::Medium, Effort::High, Effort::VeryHigh, Effort::Auto];
+pub const LEVELS: [Effort; 5] = [Effort::None, Effort::Low, Effort::Medium, Effort::High, Effort::VeryHigh];
+pub static REQS: [AtomicU64; 6] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// auto's choices by level (LEVELS order)
+pub static AUTO_CHOICE: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 pub static FORCED: AtomicU64 = AtomicU64::new(0);
 pub static THINK_TOKENS: AtomicU64 = AtomicU64::new(0);
 
@@ -35,11 +49,12 @@ impl Effort {
             "medium" | "med" | "normal" => Effort::Medium,
             "high" => Effort::High,
             "xhigh" | "x_high" | "very_high" | "veryhigh" | "max" | "maximum" | "unlimited" | "full" => Effort::VeryHigh,
+            "auto" | "adaptive" => Effort::Auto,
             _ => return None,
         })
     }
     pub fn name(self) -> &'static str {
-        match self { Effort::None => "none", Effort::Low => "low", Effort::Medium => "medium", Effort::High => "high", Effort::VeryHigh => "very_high" }
+        match self { Effort::None => "none", Effort::Low => "low", Effort::Medium => "medium", Effort::High => "high", Effort::VeryHigh => "very_high", Effort::Auto => "auto" }
     }
     pub fn idx(self) -> usize { ALL.iter().position(|e| *e == self).unwrap() }
     /// Thinking-token budget: Some(0) = no thinking, None = unlimited.
@@ -50,10 +65,65 @@ impl Effort {
             Effort::Low => Some(env("PYRE_THINK_LOW", 512)),
             Effort::Medium => Some(env("PYRE_THINK_MED", 2048)),
             Effort::High => Some(env("PYRE_THINK_HIGH", 8192)),
-            Effort::VeryHigh => None,
+            Effort::VeryHigh | Effort::Auto => None,
         }
     }
 }
+
+/// Entropy (nats, T=1), top-1 probability and argmax of a logit vector.
+pub fn entropy(l: &[f32]) -> (f32, f32, u32) {
+    let (mut mx, mut am) = (f32::NEG_INFINITY, 0usize);
+    for (i, &x) in l.iter().enumerate() { if x > mx { mx = x; am = i; } }
+    let (mut z, mut s) = (0f64, 0f64);
+    for &x in l { let d = (x - mx) as f64; let e = d.exp(); z += e; s += e * d; }
+    if z <= 0.0 || !z.is_finite() { return (0.0, 1.0, am as u32); }
+    ((z.ln() - s / z) as f32, (1.0 / z) as f32, am as u32)
+}
+
+fn envf(k: &str) -> Option<String> { std::env::var(k).ok().filter(|s| !s.trim().is_empty()) }
+/// Entropy band edges (nats) between none|low|medium|high|very_high.
+pub fn auto_thresholds() -> [f32; 4] {
+    let d = [AUTO_T_DEFAULT[0], AUTO_T_DEFAULT[1], AUTO_T_DEFAULT[2], AUTO_T_DEFAULT[3]];
+    let Some(s) = envf("PYRE_THINK_AUTO_T") else { return d };
+    let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    if v.len() == 4 { [v[0], v[1], v[2], v[3]] } else { d }
+}
+/// Calibrated on P62 (int53d, 6 prompts, E): trivial 1.19, one-liner 1.79, bat/ball 2.18, x^2-y^2 2.23, ISO-duration code 2.44,
+/// after a tool result 1.37. The model's ratings are compressed (1.2-2.5), so the bands are narrow.
+pub const AUTO_T_DEFAULT: [f32; 4] = [1.0, 1.6, 2.3, 2.9];
+pub fn auto_prompt() -> String {
+    envf("PYRE_THINK_AUTO_PROMPT").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| "\nFirst, how much thinking does this request need? On a scale from 0 (none: trivial, answer directly) to 4 (very deep: hard multi-step problem), my rating is [".to_string())
+}
+/// Expected rating over the digit tokens (normalised among them) and their total probability mass.
+pub fn rating(logits: &[f32], digits: &[u32]) -> (f32, f32) {
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let z: f64 = logits.iter().map(|x| ((x - mx) as f64).exp()).sum();
+    let p: Vec<f64> = digits.iter().map(|&d| logits.get(d as usize).map(|x| ((x - mx) as f64).exp() / z).unwrap_or(0.0)).collect();
+    let m: f64 = p.iter().sum();
+    if m <= 0.0 { return (2.0, 0.0); }
+    ((p.iter().enumerate().map(|(i, v)| i as f64 * v).sum::<f64>() / m) as f32, m as f32)
+}
+/// Level when the probe could not run (no snapshot support): medium shifted by the structural bias.
+pub fn auto_fallback(bias: i32) -> Effort { LEVELS[(2 + bias).clamp(0, 4) as usize] }
+/// Level from the entropy signal plus a structural bias (in levels), clamped to PYRE_THINK_AUTO_MIN..MAX.
+pub fn auto_pick(h: f32, bias: i32) -> Effort {
+    let base = auto_thresholds().iter().filter(|t| h >= **t).count() as i32;
+    let lv = |k: &str, d: usize| envf(k).and_then(|v| Effort::parse(&v)).filter(|e| *e != Effort::Auto).map(|e| e.idx()).unwrap_or(d) as i32;
+    let (lo, hi) = (lv("PYRE_THINK_AUTO_MIN", 0), lv("PYRE_THINK_AUTO_MAX", 4));
+    LEVELS[(base + bias).clamp(lo.min(hi), hi) as usize]
+}
+/// Structural cue from the chat messages (see module docs).
+pub fn auto_bias(msgs: &[Value]) -> i32 {
+    let Some(last) = msgs.last() else { return 0 };
+    let iv = |k: &str, d: i64| envf(k).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(d);
+    match last.get("role").and_then(|r| r.as_str()) {
+        Some("tool") | Some("function") => iv("PYRE_THINK_AUTO_TOOL", -1) as i32,
+        Some("user") => { let c = last.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if c.chars().count() as i64 > iv("PYRE_THINK_AUTO_LONG", 2000) || c.contains("```") { 1 } else { 0 } }
+        _ => 0,
+    }
+}
+pub fn count_auto(e: Effort) { if let Some(i) = LEVELS.iter().position(|x| *x == e) { AUTO_CHOICE[i].fetch_add(1, Relaxed); } }
 
 pub fn default_effort() -> Effort {
     std::env::var("PYRE_REASONING_DEFAULT").ok().and_then(|v| Effort::parse(&v)).unwrap_or(Effort::VeryHigh)
@@ -108,7 +178,7 @@ mod tests {
         assert_eq!(Effort::parse("very high"), Some(Effort::VeryHigh));
         assert_eq!(Effort::parse("very-high"), Some(Effort::VeryHigh));
         assert_eq!(Effort::parse("max"), Some(Effort::VeryHigh));
-        assert_eq!(Effort::parse("auto"), None);
+        assert_eq!(Effort::parse("auto"), Some(Effort::Auto));
         assert_eq!(Effort::parse("bogus"), None);
     }
     #[test]
@@ -116,7 +186,7 @@ mod tests {
         if std::env::var("PYRE_REASONING_DEFAULT").is_err() {
             let p = resolve(None, None, None, None);
             assert_eq!((p.effort, p.budget, p.explicit), (Effort::VeryHigh, None, false));
-            assert_eq!(resolve(Some(&json!("auto")), None, None, None).effort, Effort::VeryHigh);
+            assert_eq!(resolve(Some(&json!("bogus")), None, None, None).effort, Effort::VeryHigh);
         }
         assert_eq!(resolve(Some(&json!("low")), None, None, None).effort, Effort::Low);
         assert_eq!(resolve(None, Some(&json!({"effort": "high"})), None, None).effort, Effort::High);
@@ -140,5 +210,33 @@ mod tests {
         assert!(over_budget(Some(512), 512, "thinking..."));
         assert!(!over_budget(Some(512), 900, "thought</think>answer"));
         assert!(close_text().ends_with("</think>\n\n"));
+    }
+    #[test]
+    fn auto_logic() {
+        assert_eq!(resolve(Some(&json!("auto")), None, None, None).effort, Effort::Auto);
+        assert_eq!(Effort::Auto.budget(), None);
+        let (h, p, a) = entropy(&[10.0, 0.0, 0.0]); assert!(h < 0.01 && p > 0.99 && a == 0);
+        let (h, p, _) = entropy(&[1.0; 4]); assert!((h - 4f32.ln()).abs() < 1e-4 && (p - 0.25).abs() < 1e-5);
+        let (e, m) = rating(&[0.0, 0.0, 0.0, 10.0, 0.0, 0.0], &[1, 2, 3, 4, 5]); assert!((e - 2.0).abs() < 0.01 && m > 0.99);
+        let (e, _) = rating(&[0.0; 6], &[1, 2, 3, 4, 5]); assert!((e - 2.0).abs() < 1e-4);
+        assert_eq!(auto_fallback(0), Effort::Medium); assert_eq!(auto_fallback(-1), Effort::Low);
+        if std::env::var("PYRE_THINK_AUTO_T").is_err() && std::env::var("PYRE_THINK_AUTO_MIN").is_err() && std::env::var("PYRE_THINK_AUTO_MAX").is_err() {
+            let t = AUTO_T_DEFAULT;
+            assert_eq!(auto_pick(t[0] - 0.01, 0), Effort::None);
+            assert_eq!(auto_pick(t[0], 0), Effort::Low);
+            assert_eq!(auto_pick(t[1], 0), Effort::Medium);
+            assert_eq!(auto_pick(t[2], 0), Effort::High);
+            assert_eq!(auto_pick(t[3] + 1.0, 0), Effort::VeryHigh);
+            assert_eq!(auto_pick(t[1], -1), Effort::Low);
+            assert_eq!(auto_pick(t[3] + 1.0, 1), Effort::VeryHigh);
+            assert_eq!(auto_pick(0.0, -1), Effort::None);
+        }
+        if std::env::var("PYRE_THINK_AUTO_TOOL").is_err() && std::env::var("PYRE_THINK_AUTO_LONG").is_err() {
+            assert_eq!(auto_bias(&[json!({"role": "user", "content": "hi"}), json!({"role": "tool", "content": "ok"})]), -1);
+            assert_eq!(auto_bias(&[json!({"role": "user", "content": "fix ```x```"})]), 1);
+            assert_eq!(auto_bias(&[json!({"role": "user", "content": "a".repeat(2500)})]), 1);
+            assert_eq!(auto_bias(&[json!({"role": "user", "content": "what is 2+2"})]), 0);
+            assert_eq!(auto_bias(&[]), 0);
+        }
     }
 }

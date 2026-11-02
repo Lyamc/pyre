@@ -155,14 +155,39 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     let mut sampler = Sampler::new(r.params);
     let max_stop = r.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     let (mut out, mut history) = (Vec::<u32>::new(), prompt.clone());
+    // reasoning effort auto (effort.rs): self-rating probe after prefill picks the level
+    let mut think_budget = r.think_budget; let mut auto_none = false;
+    if let Some(bias) = r.auto_bias {
+        // self-rating probe: snapshot the post-prefill state, feed PYRE_THINK_AUTO_PROMPT (ends in "[") inside the open think
+        // block, read the model's distribution over the digits 0..4, restore the snapshot (the generated output does not
+        // see the probe). Signal = expected rating E in [0, 4]; the first-token entropy of the real prefill is logged too.
+        let (h0, p0, _) = crate::effort::entropy(&logits);
+        let tp = Instant::now();
+        let pids: Vec<u32> = tok.encode(crate::effort::auto_prompt().as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+        let dig: Vec<Option<u32>> = (0..5).map(|d| tok.token_to_id(&d.to_string())).collect();
+        let mut rating: Option<(f32, f32)> = None;
+        if !pids.is_empty() && dig.iter().all(|d| d.is_some()) && prompt.len() + pids.len() < ctx {
+            if let Some(sn) = m.snapshot(&mut st) {
+                let pl = m.forward(&pids, &mut st);
+                st = m.restore(&sn);
+                rating = Some(crate::effort::rating(&pl, &dig.iter().map(|d| d.unwrap()).collect::<Vec<_>>()));
+            }
+        }
+        let probe_ms = tp.elapsed().as_secs_f64() * 1e3;
+        let lvl = match rating { Some((e, _)) => crate::effort::auto_pick(e, bias), None => crate::effort::auto_fallback(bias) };
+        crate::effort::count_auto(lvl);
+        think_budget = lvl.budget(); auto_none = lvl == crate::effort::Effort::None;
+        tracing::info!("reasoning auto: self-rating {:?} (digit mass {:?}) first-token entropy {h0:.3} bias {bias} -> {} (probe {} tokens, {probe_ms:.0} ms)", rating.map(|r| r.0), rating.map(|r| r.1), lvl.name(), pids.len());
+        let _ = r.tx.send(Event::Info(serde_json::json!({"auto": {"level": lvl.name(), "rating": rating.map(|r| r.0), "digit_mass": rating.map(|r| r.1), "entropy0": h0, "top1_p0": p0, "bias": bias, "probe_ms": probe_ms, "budget": think_budget}})));
+    }
     let (mut text, mut emitted, mut finish, mut stop_word) = (String::new(), 0usize, "length", String::new());
     crate::spec::CTX_MAX.store(ctx, std::sync::atomic::Ordering::Relaxed);
     // FAST loop guard: exact routing for the rest of this request once the output loops or the context is long
     let guard = crate::spec::route_guard() && crate::spec::route_prior() > 0.0; let gctx = crate::spec::route_prior_ctx();
     crate::spec::ROUTE_HOLD.store(guard && gctx > 0 && prompt.len() >= gctx, std::sync::atomic::Ordering::Relaxed);
-    let think_budget = r.think_budget;
     let t1 = Instant::now();
-    if r.max_tokens > 0 {
+    if auto_none { finish = "think_budget"; text = tok.decode(&out, true).unwrap_or_default(); }
+    if r.max_tokens > 0 && !auto_none {
         let mut emit = |next: u32| -> bool {
             if eos.contains(&next) { finish = "stop"; return false; }
             out.push(next);
@@ -188,6 +213,10 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         let o = crate::spec::generate(&mut tg, &mut sampler, &mut history, logits, k, usize::MAX, &mut emit);
         if o.rounds > 0 { tracing::info!("speculative: {} rounds, {} drafted, {} accepted ({:.0}%)", o.rounds, o.drafted, o.accepted, 100.0 * o.accepted as f64 / o.drafted.max(1) as f64); }
     }
+    // think_budget stop inside an accepted speculative window: the state already holds the window's accepted drafts past
+    // the stop token; take them into the output so the server's continuation (prompt + tokens + close) extends the state
+    if finish == "think_budget" { let base = prompt.len() + out.len();
+        if st.tokens.len() > base && st.tokens.len() <= base + 16 && st.tokens[..base] == history[..base] { let extra = st.tokens[base..].to_vec(); out.extend_from_slice(&extra); text = tok.decode(&out, true).unwrap_or_default(); } }
     if text.len() > emitted && finish != "abort" { let _ = r.tx.send(Event::Token(text[emitted..].to_string())); }
     if let Some(p) = tf.as_ref() { if !std::path::Path::new(p).exists() { let _ = std::fs::write(p, out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); } }
     tm.predicted_n = out.len();

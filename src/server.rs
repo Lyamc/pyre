@@ -167,14 +167,14 @@ impl Gen {
     }
 }
 
-fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> { start_tb(st, prompt, g, None) }
+fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> { start_tb(st, prompt, g, None, None) }
 
-fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize>) -> UnboundedReceiver<Event> {
+fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize>, auto_bias: Option<i32>) -> UnboundedReceiver<Event> {
     let (tx, mut rx_in) = unbounded_channel();
     let (tx_out, rx) = unbounded_channel();
     let max_tokens = g.max(st, prompt.len());
     let mid = crate::metrics::begin(&st.model_id, prompt.len(), st.n_ctx, max_tokens);
-    st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx, think_budget }));
+    st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx, think_budget, auto_bias }));
     // Forward engine events to the handler while recording live metrics (/api/metrics).
     // Dropping `rx_in` when the client goes away still cancels the job as before.
     tokio::spawn(async move {
@@ -227,23 +227,29 @@ fn sse(s: impl Stream<Item = Value> + Send + 'static, done: bool) -> SseStream {
 /// think block). Otherwise phase 1 runs with the budget; if it stops with "think_budget", the close text is streamed,
 /// appended to the sequence (prompt + generated ids + close ids, so the cached state is strictly extended) and phase 2
 /// generates the answer with the remaining max_tokens. The client sees one stream and one merged Done.
-fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, forced: Arc<std::sync::atomic::AtomicBool>) -> UnboundedReceiver<Event> {
-    let Some(tb) = budget.filter(|b| *b > 0) else { return start(st, ids, g) };
+/// `auto`: Some(bias) = reasoning effort auto; the engine reports its choice as Event::Info (kept in `info`).
+fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, auto: Option<i32>, forced: Arc<std::sync::atomic::AtomicBool>, info: Arc<std::sync::Mutex<Value>>) -> UnboundedReceiver<Event> {
+    let tb = budget.filter(|b| *b > 0);
+    if tb.is_none() && auto.is_none() { return start(st, ids, g) }
     let max = g.max(st, ids.len());
-    let mut rx1 = start_tb(st, ids.clone(), g, Some(tb));
+    let mut rx1 = start_tb(st, ids.clone(), g, tb, auto);
     let (tx, rx) = unbounded_channel();
     let (st, mut g2) = (st.clone(), g.clone());
     tokio::spawn(async move {
         while let Some(e) = rx1.recv().await {
             let (text, t1, tokens) = match e {
                 Event::Done { finish_reason: "think_budget", text, timings, tokens, .. } => (text, timings, tokens),
+                Event::Info(v) => { *info.lock().unwrap() = v; continue; }
                 other => { if tx.send(other).is_err() { return; } continue; }
             };
-            forced.store(true, std::sync::atomic::Ordering::Relaxed);
-            crate::effort::FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let close = crate::effort::close_text();
+            // auto chose none: close the (empty) think block right away; otherwise a budget force-close
+            let auto_none = info.lock().unwrap().pointer("/auto/level").and_then(|l| l.as_str()) == Some("none");
+            // (taking an accepted speculative window into the output can already contain the close: then nothing is added)
+            let closed = text.contains("</think>");
+            if !auto_none && !closed { forced.store(true, std::sync::atomic::Ordering::Relaxed); crate::effort::FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            let close = if closed { String::new() } else if auto_none { "\n</think>\n\n".to_string() } else { crate::effort::close_text() };
             let cids = st.tok.encode(close.as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
-            tracing::info!("reasoning: think budget {tb} reached ({} tokens), force-closing and continuing", tokens.len());
+            if !auto_none { tracing::info!("reasoning: think budget {:?} reached ({} tokens), force-closing and continuing", tb.or(info.lock().unwrap().pointer("/auto/budget").and_then(|b| b.as_u64()).map(|b| b as usize)), tokens.len()); }
             if tx.send(Event::Token(close.clone())).is_err() { return; }
             let mut ids2 = ids; ids2.extend_from_slice(&tokens); ids2.extend_from_slice(&cids);
             let rest = max.saturating_sub(tokens.len() + cids.len());
@@ -253,7 +259,7 @@ fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, force
                 return;
             }
             g2.max_tokens = Some(rest); g2.max_completion_tokens = None; g2.n_predict = None;
-            let mut rx2 = start_tb(&st, ids2, &g2, None);
+            let mut rx2 = start_tb(&st, ids2, &g2, None, None);
             while let Some(e2) = rx2.recv().await {
                 match e2 {
                     Event::Done { finish_reason, text: t2, timings: m2, stopping_word, tokens: k2 } => {
@@ -469,7 +475,9 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let thinking = prompt.trim_end().ends_with("<think>");
     if thinking && plan.budget == Some(0) { let p = crate::ctx::no_think(prompt.clone()); if let Ok(i) = encode(&st, &p, false) { prompt = p; ids = i; } }
     let budget = if thinking { plan.budget } else { None };
+    let auto = if thinking && plan.effort == crate::effort::Effort::Auto { Some(crate::effort::auto_bias(&msgs)) } else { None };
     let forced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let info = Arc::new(std::sync::Mutex::new(Value::Null));
     let tokc = st.tok.clone();
     let ntok = move |r: &str| -> usize { if r.is_empty() { 0 } else { tokc.encode(r, false).map(|e| e.len()).unwrap_or(0) } };
     let model = req.model.clone().unwrap_or_else(|| st.model_id.clone());
@@ -478,8 +486,8 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let mut think = Think::new(&prompt);
     let mut tools = Tools::new(req.tools.as_ref());
     let rlog = reqlog(json!({"req": &id, "stream": req.g.stream, "messages": &req.messages, "ntools": req.tools.as_ref().and_then(|t| t.as_array()).map(|a| a.len()),
-        "effort": plan.effort.name(), "effort_explicit": plan.explicit, "budget": budget}));
-    let rx = start_eff(&st, ids, &req.g, budget, forced.clone());
+        "effort": plan.effort.name(), "effort_explicit": plan.explicit, "budget": budget, "auto_bias": auto}));
+    let rx = start_eff(&st, ids, &req.g, budget, auto, forced.clone(), info.clone());
     if !req.g.stream {
         return match collect(rx).await {
             Ok((text, fin, t, _)) => {
@@ -490,12 +498,13 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 let tt = ntok(&r); crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
                 let fc = forced.load(std::sync::atomic::Ordering::Relaxed);
-                if rlog { reqlog(json!({"resp": &id, "finish": fin, "message": &msg, "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc})); }
+                let ai = info.lock().unwrap().get("auto").cloned();
+                if rlog { reqlog(json!({"resp": &id, "finish": fin, "message": &msg, "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
                 if !r.is_empty() { msg["reasoning_content"] = json!(r); }
                 let mut u = usage(&t); u["completion_tokens_details"] = json!({"reasoning_tokens": tt});
                 Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": fin, "logprobs": null}],
-                "usage": u, "timings": t, "reasoning": {"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc}})).into_response() }
+                "usage": u, "timings": t, "reasoning": {"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai}})).into_response() }
             Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
     }
@@ -511,13 +520,13 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
                 let (r, c) = think.finish(); let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
                 let mut v: Vec<Value> = think_delta(r.clone(), c.clone()).map(|d| chunk(d, Value::Null)).into_iter().collect();
                 acc_r.push_str(&r); let tt = ntok(&acc_r); crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
-                let fc = forced.load(std::sync::atomic::Ordering::Relaxed);
+                let fc = forced.load(std::sync::atomic::Ordering::Relaxed); let ai = info.lock().unwrap().get("auto").cloned();
                 if rlog { reqlog(json!({"resp": "stream", "finish": finish_reason, "reasoning": &acc_r, "content": format!("{acc_c}{c}"), "tool_calls": &calls,
-                    "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc})); }
+                    "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
                 if !calls.is_empty() { v.push(chunk(json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), Value::Null)); }
                 let mut f = chunk(json!({}), json!(if calls.is_empty() { finish_reason } else { "tool_calls" }));
                 f["timings"] = json!(timings);
-                f["reasoning"] = json!({"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc});
+                f["reasoning"] = json!({"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai});
                 v.push(f);
                 if inc { let mut u = chunk(json!({}), Value::Null); u["choices"] = json!([]); u["usage"] = usage(&timings); u["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": tt}); v.push(u); }
                 v

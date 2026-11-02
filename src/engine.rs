@@ -18,6 +18,8 @@ pub struct GenRequest {
     pub tx: UnboundedSender<Event>,
     /// thinking-token budget (effort.rs): stop with finish "think_budget" when reached inside the think block
     pub think_budget: Option<usize>,
+    /// reasoning effort auto (effort.rs): Some(structural bias) = the engine picks the budget from the prefill signal
+    pub auto_bias: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -37,6 +39,8 @@ pub enum Event {
     /// `tokens`: the generated ids (lets the server continue the exact sequence after a forced think close)
     Done { finish_reason: &'static str, text: String, timings: Timings, stopping_word: String, tokens: Vec<u32> },
     Embedding(Vec<f32>, usize),
+    /// side information for the server (e.g. reasoning auto's choice); not streamed to clients
+    Info(serde_json::Value),
     Error(String),
 }
 
