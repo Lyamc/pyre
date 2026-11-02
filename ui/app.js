@@ -268,9 +268,12 @@ $("#sttGo").onclick = async () => {
   try {
     const r = await fetch("/v1/audio/" + $("#sttTask").value, { method: "POST", headers: headers(), body: fd }); const j = await r.json();
     if (!r.ok) throw new Error(j.error?.message || r.statusText);
+    sttText = j.text || ""; $("#sttToChat").classList.toggle("hidden", !sttText.trim());
     $("#sttOut").textContent = `${j.text}\n\n(${((performance.now() - t0) / 1000).toFixed(2)} s${j.language ? ", language " + j.language : ""})`;
   } catch (e) { $("#sttOut").textContent = "error: " + e.message; }
 };
+let sttText = "";
+$("#sttToChat").onclick = () => { const i = $("#input"); i.value = (i.value ? i.value + " " : "") + sttText.trim(); document.querySelector('#tabs [data-tab="chat"]')?.click(); i.focus(); };
 $("#ttsGo").onclick = async () => {
   try {
     const r = await fetch("/v1/audio/speech", { method: "POST", headers: headers({ "Content-Type": "application/json" }), body: JSON.stringify({ model: kinds.tts?.[0]?.id, input: $("#ttsText").value, voice: $("#ttsVoice").value, speed: +$("#ttsSpeed").value, response_format: "wav" }) });

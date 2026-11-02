@@ -294,14 +294,16 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     let _ = pyre_sd::pipelines::stable_diffusion::STEP_HOOK.set(limits::pace);
     let defaults = registry::LoadDefaults { backend: args.backend.clone(), dtype: args.dtype.clone(), ctx_size: args.ctx_size, n_predict: args.n_predict };
     // collect (kind, ref)
-    let mut want: Vec<(Kind, String)> = args.model.iter().map(|m| (Kind::Llm, m.clone())).collect();
+    // (kind, ref, backend override): `--load stt:cpu=base` loads that model on its own backend
+    let mut want: Vec<(Kind, String, Option<String>)> = args.model.iter().map(|m| (Kind::Llm, m.clone(), None)).collect();
     for l in &args.load {
-        let (k, r) = l.split_once('=').context("--load expects kind=ref")?;
-        want.push((Kind::parse(k).with_context(|| format!("unknown kind {k}"))?, r.to_string()));
+        let (k, r) = l.split_once('=').context("--load expects kind[:backend]=ref")?;
+        let (k, b) = match k.split_once(':') { Some((k, b)) => (k, Some(b.to_string())), None => (k, None) };
+        want.push((Kind::parse(k).with_context(|| format!("unknown kind {k}"))?, r.to_string(), b));
     }
-    if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone())); }
-    if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone())); }
-    if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone())); }
+    if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone(), None)); }
+    if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone(), None)); }
+    if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone(), None)); }
 
     if let Some(p) = &args.prompt {
         let r = args.model.first().context("--prompt needs -m")?;
@@ -311,9 +313,9 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     }
 
     let app = Arc::new(registry::App { models: Default::default(), storage: sctx, defaults: defaults.clone(), api_key: args.api_key.clone(), started: std::time::Instant::now() });
-    for (i, (kind, r)) in want.iter().enumerate() {
+    for (i, (kind, r, be)) in want.iter().enumerate() {
         let alias = if i == 0 && *kind == Kind::Llm { args.alias.clone() } else { None };
-        let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: None, dtype: None, ctx_size: None })?;
+        let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: be.clone(), dtype: None, ctx_size: None })?;
         tracing::info!("loaded {} model '{}' on {}", kind.as_str(), m.id, m.backend);
         app.insert(m)?;
     }
