@@ -84,3 +84,8 @@ pub fn remember(msgs: &[Value], end: usize, summary: &str, ntok: usize) -> Value
     let mut m = MEMO.lock().unwrap(); m.push((hash(&msgs[..end]), end, v.clone())); if m.len() > 32 { m.remove(0); }
     SUM_EVENTS.fetch_add(1, Relaxed); SUM_TOKENS.fetch_add(ntok as u64, Relaxed); v
 }
+/// Summary requests skip reasoning: an empty think block is prefilled (Qwen3 templates open `<think>` themselves).
+pub fn no_think(mut p: String) -> String {
+    let t = p.trim_end(); if t.ends_with("<think>") { let n = t.len(); p.truncate(n); p.push_str("\n\n</think>\n\n"); } else if !p.contains("</think>") || !t.ends_with("</think>") { p.push_str("<think>\n\n</think>\n\n"); }
+    p
+}

@@ -395,8 +395,8 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
         if changed { if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) { n = i.len(); prompt = p; ids = i; } } }
         if n > slim { if let Some((h0, end)) = crate::ctx::span(&msgs) {
             let sreq = crate::ctx::summary_request(&msgs[h0..end]);
-            if let Ok(sp) = st.template.render(&sreq, true, None) { if let Ok(si) = encode(&st, &sp, false) { if si.len() + 1500 < st.n_ctx {
-                let g = Gen { temperature: Some(0.0), max_tokens: Some(1500), ..Default::default() };
+            if let Ok(sp) = st.template.render(&sreq, true, None) { let sp = crate::ctx::no_think(sp); if let Ok(si) = encode(&st, &sp, false) { if si.len() + 2500 < st.n_ctx {
+                let g = Gen { temperature: Some(0.0), max_tokens: Some(2500), ..Default::default() };
                 let mut th = Think::new(&sp);
                 if let Ok((text, _, t, _)) = collect(start(&st, si, &g)).await {
                     let (_, mut c) = th.push(&text); let (_, c2) = th.finish(); c.push_str(&c2);
