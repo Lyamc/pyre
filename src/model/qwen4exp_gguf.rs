@@ -1443,6 +1443,7 @@ impl Model {
         if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
         let dbg = env_var("PYRE_QN_KVDBG").is_ok(); if dbg { eprintln!("kvdbg push ai {ai} need {need} host_k {cl} host_ik {} gpu {:?}", st.ik.get(ai).map_or(0, |v| v.len() / self.cfg.idx_hd.max(1)), st.kvg[ai].as_ref().map(|g| (g.len, g.cap, g.nbp))); }
         self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
+        if let Some((bits, recent)) = kvq_measure() { let old = cl.saturating_sub(recent) * row; kvq_roundtrip(&mut st.k[ai][..old], bits); kvq_roundtrip(&mut st.v[ai][..old], bits); }
         if dbg { let nn = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count(); eprintln!("kvdbg pulled ai {ai} host_k {cl} host_ik {} nonfinite k {} v {} ik {}", st.ik[ai].len() / self.cfg.idx_hd.max(1), nn(&st.k[ai]), nn(&st.v[ai]), nn(&st.ik[ai])); }
         // int45: need + 1/8 headroom (>= 1024 rows), 1024-row multiples, instead of the next power of two (32769 -> 65536
         // doubled every attention layer at decode start: the +0.9 GiB spike before the 32k driver event). PYRE_QN_KVPOW2=1 = old
@@ -3198,4 +3199,22 @@ impl Model {
         st.tokens = s.tokens.clone(); st.conv = s.conv.clone(); st.ssm = s.ssm.clone(); st.k = s.k.clone(); st.v = s.v.clone(); st.ik = s.ik.clone(); st.ib = s.ib.clone(); st.ple_hist = s.ple_hist.clone(); st.mtp_r = s.mtp_r.clone();
         st
     }
+}
+
+/// ctx-kvquant measurement mode (int48, opt-in, lossy): PYRE_QN_KVQ_MEASURE=8|4 quantizes and restores the K/V of every
+/// position older than the last PYRE_QN_KVQ_RECENT (default 1024) when it is (re)uploaded to the GPU, with one absmax
+/// scale per 32-value block; memory is not saved, it measures the quality cost. Off by default (no code path change).
+fn kvq_measure() -> Option<(u32, usize)> {
+    // PYRE_QN_KVQ_MEASURE_FILE=<path>: read the bits (0/8/4) from that file at every upload, so one server can compare
+    // modes on one prefix-cached prefill
+    if let Ok(p) = env_var("PYRE_QN_KVQ_MEASURE_FILE") { let b: u32 = std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        return if b == 8 || b == 4 { Some((b, env_usize("PYRE_QN_KVQ_RECENT").unwrap_or(1024))) } else { None }; }
+    static M: std::sync::OnceLock<Option<(u32, usize)>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| { let b: u32 = env_var("PYRE_QN_KVQ_MEASURE").ok().and_then(|v| v.parse().ok()).filter(|b| *b == 8 || *b == 4)?;
+        Some((b, env_usize("PYRE_QN_KVQ_RECENT").unwrap_or(1024))) })
+}
+pub fn kvq_roundtrip(x: &mut [f32], bits: u32) {
+    let q = ((1i32 << (bits - 1)) - 1) as f32;
+    for b in x.chunks_mut(32) { let m = b.iter().fold(0f32, |a, v| a.max(v.abs())); if m == 0.0 || !m.is_finite() { continue; }
+        let s = m / q; for v in b.iter_mut() { *v = (*v / s).round().clamp(-q, q) * s; } }
 }
