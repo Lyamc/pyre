@@ -16,6 +16,8 @@ pub struct GenRequest {
     pub params: SamplingParams,
     pub stop: Vec<String>,
     pub tx: UnboundedSender<Event>,
+    /// thinking-token budget (effort.rs): stop with finish "think_budget" when reached inside the think block
+    pub think_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -32,7 +34,8 @@ pub struct Timings {
 #[derive(Debug)]
 pub enum Event {
     Token(String),
-    Done { finish_reason: &'static str, text: String, timings: Timings, stopping_word: String },
+    /// `tokens`: the generated ids (lets the server continue the exact sequence after a forced think close)
+    Done { finish_reason: &'static str, text: String, timings: Timings, stopping_word: String, tokens: Vec<u32> },
     Embedding(Vec<f32>, usize),
     Error(String),
 }
@@ -72,6 +75,7 @@ struct Seq {
     t1: Instant,
     logits: Vec<f32>,
     done: bool,
+    think_budget: Option<usize>,
 }
 
 pub fn spawn(model: Llama, tok: Arc<Tokenizer>, eos: Vec<u32>) -> EngineHandle {
@@ -208,7 +212,7 @@ fn start(model: &Llama, eos: &[u32], mut cache: KvCache, r: GenRequest) -> Optio
     Some(Seq {
         tx: r.tx, cache, sampler: Sampler::new(r.params), history: prompt, out: vec![], stop: r.stop, max_stop,
         max_tokens: r.max_tokens, emitted: 0, text: String::new(), finish: "length", stop_word: String::new(),
-        tm, t1: Instant::now(), logits, done: r.max_tokens == 0,
+        tm, t1: Instant::now(), logits, done: r.max_tokens == 0, think_budget: r.think_budget,
     })
 }
 
@@ -238,6 +242,7 @@ fn step_sample(s: &mut Seq, tok: &Tokenizer, eos: &[u32], ctx: usize) {
         if s.tx.send(Event::Token(s.text[s.emitted..safe].to_string())).is_err() { s.finish = "abort"; s.done = true; return; }
         s.emitted = safe;
     }
+    if crate::effort::over_budget(s.think_budget, s.out.len(), &s.text) { s.finish = "think_budget"; s.done = true; return; }
     if s.out.len() >= s.max_tokens || s.history.len() >= ctx { s.finish = "length"; s.done = true; }
 }
 
@@ -248,7 +253,7 @@ fn finish(mut s: Seq) -> KvCache {
     tm.predicted_ms = s.t1.elapsed().as_secs_f64() * 1e3;
     tm.predicted_per_second = if tm.predicted_ms > 0.0 { s.out.len() as f64 / (tm.predicted_ms / 1e3) } else { 0.0 };
     tracing::info!("prompt {} tok ({} cached) {:.1} tok/s | gen {} tok {:.1} tok/s | {}", tm.prompt_n, tm.cached_n, tm.prompt_per_second, tm.predicted_n, tm.predicted_per_second, s.finish);
-    let _ = s.tx.send(Event::Done { finish_reason: s.finish, text: std::mem::take(&mut s.text), timings: s.tm.clone(), stopping_word: std::mem::take(&mut s.stop_word) });
+    let _ = s.tx.send(Event::Done { finish_reason: s.finish, text: std::mem::take(&mut s.text), timings: s.tm.clone(), stopping_word: std::mem::take(&mut s.stop_word), tokens: s.out.clone() });
     // the cache's token list must match its contents: the last sampled token was never fed
     let n = s.history.len().saturating_sub(1);
     s.cache.tokens.truncate(n);

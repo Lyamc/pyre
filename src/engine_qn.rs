@@ -150,7 +150,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
                 o.push_str(&format!("{},{},{}", ix[0], lg[ix[0]], lse)); for &i in &ix { o.push_str(&format!(";{}:{}", i, lg[i])); } o.push('\n');
                 lg = m.forward(&[t], &mut st); }
             let _ = std::fs::write(format!("{p}.{n}.lp"), o); tracing::info!("teacher-forced {} tokens -> {p}.{n}.lp ({:.1} ms/token)", ids.len(), t0.elapsed().as_secs_f64() * 1e3 / ids.len().max(1) as f64);
-            let _ = r.tx.send(Event::Done { finish_reason: "stop", text: String::new(), timings: tm, stopping_word: String::new() }); return Some(st); } } }
+            let _ = r.tx.send(Event::Done { finish_reason: "stop", text: String::new(), timings: tm, stopping_word: String::new(), tokens: vec![] }); return Some(st); } } }
     let k = r.params.spec.or_else(crate::spec::draft_len_explicit).unwrap_or_else(|| m.spec_default()).min(8);
     let mut sampler = Sampler::new(r.params);
     let max_stop = r.stop.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -160,6 +160,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     // FAST loop guard: exact routing for the rest of this request once the output loops or the context is long
     let guard = crate::spec::route_guard() && crate::spec::route_prior() > 0.0; let gctx = crate::spec::route_prior_ctx();
     crate::spec::ROUTE_HOLD.store(guard && gctx > 0 && prompt.len() >= gctx, std::sync::atomic::Ordering::Relaxed);
+    let think_budget = r.think_budget;
     let t1 = Instant::now();
     if r.max_tokens > 0 {
         let mut emit = |next: u32| -> bool {
@@ -178,6 +179,8 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
             if max_stop > 0 { safe = safe.min(text.len().saturating_sub(max_stop - 1)); }
             while safe > emitted && !text.is_char_boundary(safe) { safe -= 1; }
             if safe > emitted { if r.tx.send(Event::Token(text[emitted..safe].to_string())).is_err() { finish = "abort"; return false; } emitted = safe; }
+            // reasoning effort budget (effort.rs): the server force-closes the think block and continues
+            if crate::effort::over_budget(think_budget, out.len(), &text) { finish = "think_budget"; return false; }
             if out.len() >= r.max_tokens || prompt.len() + out.len() >= ctx { finish = "length"; return false; }
             true
         };
@@ -193,7 +196,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     crate::spec::LAST_TPS.store((tm.predicted_per_second as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::spec::EMITTED.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("prompt {} tok ({} cached) {:.1} tok/s | gen {} tok {:.2} tok/s | {}", tm.prompt_n, tm.cached_n, tm.prompt_per_second, tm.predicted_n, tm.predicted_per_second, finish);
-    let _ = r.tx.send(Event::Done { finish_reason: finish, text, timings: tm, stopping_word: stop_word });
+    let _ = r.tx.send(Event::Done { finish_reason: finish, text, timings: tm, stopping_word: stop_word, tokens: out.clone() });
     Some(st)
 }
 
