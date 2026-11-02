@@ -1436,6 +1436,15 @@ impl Model {
         let old = st.kvg.get(ai).and_then(|g| g.as_ref()).map_or(0, |g| g.cap as u64 * row);
         let free = crate::limits::vram().map_or(u64::MAX, |v| v.free);
         if free >= bytes.saturating_sub(old) + ((fl + 256) << 20) { return true; }
+        // kv8 auto: the int8 layout of this layer (recent window f32 + older positions int8) instead of moving it to the host
+        if kv8_mode() == 2 && self.has_idx() && nn as usize > self.dense_n() + 2048 + 64 {
+            let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64) as u64; let rowkv = (self.cfg.n_kv * self.cfg.hd) as u64;
+            let q8n = ((nn - rec) / 64) * 64; let capn = nn + (nn / 8).max(1024);
+            let b8 = (capn - q8n) * rowkv * 8 + q8n * rowkv * 2 * 9 / 8 + capn * self.cfg.idx_hd as u64 * 4;
+            if free >= b8.saturating_sub(old) + ((fl + 256) << 20) {
+                KV8_ENGAGED.store(true, std::sync::atomic::Ordering::Relaxed); KV8_AUTO_ENGAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::logbuf::event("kv8_auto", "WARN", serde_json::json!({"layer": ai, "need": need, "free_mib": free >> 20, "f32_mib": bytes >> 20, "int8_mib": b8 >> 20}));
+                return true; } }
         if st.kvg.get(ai).map_or(false, |g| g.is_some()) { self.kv_pull(ai, st); st.kvg[ai] = None;
             crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host", "layer": ai, "need": need, "free_mib": free >> 20})); }
         false
@@ -3253,9 +3262,17 @@ fn mtp_qsample(lg: &[f32], ids: &[u32], s: &mut crate::sampler::Sampler) -> (u32
 }
 /// kv8 switch: Some(recent window) when PYRE_QN_KV8=1 (off by default).
 fn kv8_recent() -> Option<usize> {
+    // PYRE_QN_KV8_FILE=<path> (diagnostic A/B): "1" in that file enables kv8 for the next (re)uploads, anything else disables
+    if let Ok(p) = env_var("PYRE_QN_KV8_FILE") { return if std::fs::read_to_string(p).map(|s| s.trim() == "1").unwrap_or(false) { Some(env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64)) } else { None }; }
     static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *R.get_or_init(|| if env_var("PYRE_QN_KV8").map(|v| v == "1").unwrap_or(false) { Some(env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64)) } else { None })
+    let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64);
+    match kv8_mode() { 1 => Some(rec), 2 if KV8_ENGAGED.load(std::sync::atomic::Ordering::Relaxed) => Some(rec), _ => None }
 }
+/// PYRE_QN_KV8: 0 = off, 1 = always, unset/"auto" = 2: engage under VRAM pressure (kv_ok would otherwise move a layer
+/// KV to the host); once engaged, every eligible layer converts at its next KV upload.
+fn kv8_mode() -> u8 { static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new(); *M.get_or_init(|| match env_var("PYRE_QN_KV8").as_deref() { Ok("0") => 0, Ok("1") => 1, _ => 2 }) }
+pub static KV8_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static KV8_AUTO_ENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KV8_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// kv8 fallback: turn a layer's int8 region back into plain f32 GPU buffers (dequantized), logging a warning and counting
 /// it, instead of aborting on a case the int8 path does not cover.
