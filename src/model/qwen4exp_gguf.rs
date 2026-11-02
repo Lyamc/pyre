@@ -723,7 +723,7 @@ impl Model {
             q2 = std::time::Instant::now(); q3 = q2;
         } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (start + 1 <= self.dense_n() || qsa_gpu()) && self.kv_ok(st, *ai, start + 1)) {
             let (nh, hd) = (c.n_head, c.hd); let pos = start; let sp = &cl.min.splits;
-            self.kv_push(cb, *ai, st, pos + 1);
+            self.kv_push(cb, *ai, st, pos + 1); self.kv8_convert_all(cb, st, *ai);
             let g = st.kvg[*ai].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
             let att = cb.empty(nh * hd);
             self.attn_tok(cb, idx, g, &proj, cl.min.rows, sp, qnh, knh, &proj, cl.min.rows, 0, pos, &att);
@@ -1441,13 +1441,26 @@ impl Model {
             let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64) as u64; let rowkv = (self.cfg.n_kv * self.cfg.hd) as u64;
             let q8n = ((nn - rec) / 64) * 64; let capn = nn + (nn / 8).max(1024);
             let b8 = (capn - q8n) * rowkv * 8 + q8n * rowkv * 2 * 9 / 8 + capn * self.cfg.idx_hd as u64 * 4;
-            if free >= b8.saturating_sub(old) + ((fl + 256) << 20) {
-                KV8_ENGAGED.store(true, std::sync::atomic::Ordering::Relaxed); KV8_AUTO_ENGAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if free >= b8.saturating_sub(old) + ((fl + 128) << 20) { // smaller slack than f32 growth: the governor holds free near floor + ~200 MiB
+                KV8_ENGAGED.store(true, std::sync::atomic::Ordering::Relaxed); KV8_AUTO_ENGAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); KV8_CONVERT.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::logbuf::event("kv8_auto", "WARN", serde_json::json!({"layer": ai, "need": need, "free_mib": free >> 20, "f32_mib": bytes >> 20, "int8_mib": b8 >> 20}));
                 return true; } }
         if st.kvg.get(ai).map_or(false, |g| g.is_some()) { self.kv_pull(ai, st); st.kvg[ai] = None;
             crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host", "layer": ai, "need": need, "free_mib": free >> 20})); }
         false
+    }
+    /// kv8 auto: right after an engage, re-upload every other eligible f32 GPU layer KV as int8 (one layer at a time, so the
+    /// transient is one int8 copy) so the pressure is relieved before more layers fall back to the host.
+    fn kv8_convert_all(&self, cb: &super::qn_cube::Cube, st: &mut State, skip: usize) {
+        if !KV8_CONVERT.swap(false, std::sync::atomic::Ordering::Relaxed) || kv8_recent().is_none() { return; }
+        let rec = kv8_recent().unwrap_or(1024); let mut n = 0;
+        for j in 0..st.kvg.len() { if j == skip { continue; }
+            let (len, cap) = match &st.kvg[j] { Some(g) if g.q8.is_none() && g.len > self.dense_n() + rec + 64 => (g.len, g.cap), _ => continue };
+            // headroom for the transient (new int8 copy before the old f32 buffers return): stop converting when it is not there
+            let fl = crate::limits::vram_floor_mb() as u64; let free = crate::limits::vram().map_or(0, |v| v.free);
+            if free < ((cap as u64) * (self.cfg.n_kv * self.cfg.hd) as u64 * 3) + ((fl + 256) << 20) { break; }
+            self.kv_pull(j, st); st.kvg[j] = None; self.kv_push(cb, j, st, cap.max(len + 1)); n += 1; }
+        if n > 0 { crate::logbuf::event("kv8_convert", "WARN", serde_json::json!({"layers": n, "free_mib": crate::limits::vram().map_or(0, |v| v.free >> 20)})); }
     }
     /// Make the GPU KV hold every host position, with room for `need`.
     fn kv_push(&self, cb: &super::qn_cube::Cube, ai: usize, st: &mut State, need: usize) {
@@ -2642,7 +2655,7 @@ impl Model {
                     let (a, b) = &st.ck[off + ti][li0]; cb.copy(&cs, cn, 0, a, cn, 0, cn); cb.copy(&ss, sn, 0, b, sn, 0, sn); }
             } else if let (Mixer::Attn { idx, .. }, Some((qnh, knh)), true) = (&l.mix, &cl.an, attn_gpu(c) && (pos + 1 <= self.dense_n() || qsa_gpu()) && self.kv_ok(st, ai0, pos + 1)) {
                 let sp = &cl.min.splits;
-                self.kv_push(cb, ai0, st, pos + 1);
+                self.kv_push(cb, ai0, st, pos + 1); self.kv8_convert_all(cb, st, ai0);
                 let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, pos, "gpu kv out of step");
                 self.attn_tok(cb, idx, g, &pj, pr, sp, qnh, knh, &proj, t * pr, ti * pr, pos, &at(&core, ti * core_n));
                 g.len = pos + 1;
@@ -3285,6 +3298,7 @@ fn kv8_drop(cb: &super::qn_cube::Cube, g: &mut KvG, row: usize, why: &str) {
     KV8_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::logbuf::event("kv8_fallback", "WARN", serde_json::json!({"why": why, "q8n": o, "len": g.len}));
 }
+pub static KV8_CONVERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static KV8_DISENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// kv8 auto disengage: at the start of a new conversation (no state or prefix reused) with free VRAM at least
 /// floor + PYRE_QN_KV8_HYST_MB (default 2048) above the floor, later uploads go back to exact f32 KV.

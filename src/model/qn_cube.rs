@@ -7109,8 +7109,18 @@ fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, sc: &mut 
         while pp < pe {
             let kb = (pp * nkv + kvh) * hd;
             let mut dd = 0.0f32;
-            #[unroll]
-            for d in 0..nd { dd += qr[d as usize] * kv8_at(kq, ks, kc, q8n, pp, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            if pp < q8n {
+                // int8 row: one bounds check per position (last element), branch-free sign extension, shifts for word/scale
+                let eb = kb + lane; let el = eb + (nd - 1u32) * 32u32;
+                if ((el >> 2u32) as usize) < kq.len() && ((el >> 5u32) as usize) < ks.len() {
+                    #[unroll]
+                    for d in 0..nd { let e = eb + d * 32u32; let w = (kq[(e >> 2u32) as usize] >> ((e & 3u32) * 8u32)) & 255u32;
+                        dd += qr[d as usize] * (f32::cast_from(w) - 256.0f32 * f32::cast_from(w >> 7u32)) * ks[(e >> 5u32) as usize]; }
+                }
+            } else {
+                #[unroll]
+                for d in 0..nd { dd += qr[d as usize] * kv8_at(kq, ks, kc, q8n, pp, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            }
             let v = plane_sum(dd) * scale;
             if lane == 0u32 { sc[(h * cap + pp) as usize] = v; }
             mx = f32::max(mx, v);
@@ -7167,8 +7177,17 @@ fn k_attn3r8(vq: &[u32], vs: &[f32], vc: &[f32], q8n: u32, p: &[f32], sc: &mut [
         let mut t = b * ir;
         while t < pe {
             let e = sc[(h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
-            #[unroll]
-            for d in 0..nd { acc[d as usize] += e * kv8_at(vq, vs, vc, q8n, t, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            if t < q8n {
+                let eb = vb + lane; let el = eb + (nd - 1u32) * 32u32;
+                if ((el >> 2u32) as usize) < vq.len() && ((el >> 5u32) as usize) < vs.len() {
+                    #[unroll]
+                    for d in 0..nd { let x = eb + d * 32u32; let w = (vq[(x >> 2u32) as usize] >> ((x & 3u32) * 8u32)) & 255u32;
+                        acc[d as usize] += e * (f32::cast_from(w) - 256.0f32 * f32::cast_from(w >> 7u32)) * vs[(x >> 5u32) as usize]; }
+                }
+            } else {
+                #[unroll]
+                for d in 0..nd { acc[d as usize] += e * kv8_at(vq, vs, vc, q8n, t, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            }
             t += 1u32;
         }
     }
