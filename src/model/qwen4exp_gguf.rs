@@ -36,7 +36,9 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 /// GPU copy of one attention layer's KV cache: `len` positions valid, room for `cap`.
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize,
     /// QSA pooled block keys on the GPU (cap/ratio blocks) and how many leading blocks are pooled and still valid
-    pb: Option<burn_cubecl::cubecl::server::Handle>, nbp: usize }
+    pb: Option<burn_cubecl::cubecl::server::Handle>, nbp: usize,
+    /// kv8 (PYRE_QN_KV8, opt-in): positions [0, q8n) as int8 (kq, ks, vq, vs); k/v then hold positions [q8n, cap) at (pos - q8n)
+    q8: Option<[burn_cubecl::cubecl::server::Handle; 4]>, q8n: usize }
 /// Pre-packed host copies of missed experts in the GPU arena layout (Strata's host expert arena, expert_source.cpp:
 /// experts kept in the device layout in RAM so a PCIe upload is a plain copy). Filled on first use up to
 /// PYRE_QN_XARENA_GB, and never while less than PYRE_QN_RAM_RESERVE_GB (default 16) of RAM would stay free.
@@ -965,6 +967,7 @@ impl Model {
         let ihd = c.idx_hd; let has = idx.is_some() && sp.len() > 5;
         if has { cb.copy(src, srcn, so + sp[4], &g.ik, g.cap * ihd, pos * ihd, ihd); }
         let sparse = has && pos + 1 > self.dense_n() && env_var("PYRE_QN_DENSE").is_err();
+        if g.q8.is_some() && !(sparse && super::qn_cube::qsa2_ok(((pos + 1) / c.idx_ratio.max(1)), c.idx_budget / c.idx_ratio.max(1)) && pos >= g.q8n) { kv8_drop(cb, g, nkv * hd, "attention step outside the int8 qsa2 path"); }
         if !sparse { cb.attn(pj, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, out, nh, nkv, hd, half, pos, c.eps); return; }
         let Some((_, _, iqn, ikn)) = idx else { unreachable!() };
         let ir = c.idx_ratio; let nbc = g.cap / ir;
@@ -976,6 +979,7 @@ impl Model {
         g.nbp = g.nbp.min(pos / ir); let nb = (pos + 1) / ir;
         for b in g.nbp..nb { let cs = self.rope_h(cb, b * ir, half); cb.qsa_pool(&g.ik, g.cap * ihd, &ikh, &cs, &pb, nbc * ihd, b, ir, ihd, half, c.eps); }
         g.nbp = nb;
+        if let Some(q8) = &g.q8 { cb.attn_qsa8(q8, g.q8n, pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir); return; }
         cb.attn_qsa(pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir);
     }
     fn xpk_prefill(&self, skip: usize, cbp: Option<&super::qn_cube::Cube>) {
@@ -1416,9 +1420,10 @@ impl Model {
     /// Attention after the q/k/v projections; returns the gated heads before the output projection.
     /// GPU KV ahead of the host copy (tokens decoded on the GPU): append them to st.k / st.v.
     fn kv_pull(&self, ai: usize, st: &mut State) {
+        { let row = self.cfg.n_kv * self.cfg.hd; let hl = st.k[ai].len() / row; if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get_mut(ai)) { if hl < g.q8n { kv8_drop(cb, g, row, "host behind int8 region"); } } }
         let row = self.cfg.n_kv * self.cfg.hd;
         if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get(ai)) { let cl = st.k[ai].len() / row;
-            if g.len > cl { let (kk, vv) = (cb.read(&g.k), cb.read(&g.v)); st.k[ai].extend_from_slice(&kk[cl * row..g.len * row]); st.v[ai].extend_from_slice(&vv[cl * row..g.len * row]);
+            if g.len > cl { let o = g.q8n; let (kk, vv) = (cb.read(&g.k), cb.read(&g.v)); st.k[ai].extend_from_slice(&kk[(cl - o) * row..(g.len - o) * row]); st.v[ai].extend_from_slice(&vv[(cl - o) * row..(g.len - o) * row]);
                 let ih = self.cfg.idx_hd; if self.has_idx() { let ii = cb.read(&g.ik); st.ik[ai].extend_from_slice(&ii[cl * ih..g.len * ih]); } } }
     }
     /// int45f: can this attention layer keep (or grow) its KV on the GPU for `need` positions without going under the
@@ -1443,6 +1448,18 @@ impl Model {
         if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
         let dbg = env_var("PYRE_QN_KVDBG").is_ok(); if dbg { eprintln!("kvdbg push ai {ai} need {need} host_k {cl} host_ik {} gpu {:?}", st.ik.get(ai).map_or(0, |v| v.len() / self.cfg.idx_hd.max(1)), st.kvg[ai].as_ref().map(|g| (g.len, g.cap, g.nbp))); }
         self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
+        // kv8 (PYRE_QN_KV8=1, opt-in, lossy): positions older than the last PYRE_QN_KV8_RECENT (default 1024) as int8 on the
+        // GPU (sparse QSA decode reads them through kv8_at); only past the dense window, where every GPU step is attn_qsa
+        if let Some(recent) = kv8_recent() { if self.has_idx() && cl > self.dense_n() + recent + 64 {
+            let q8n = ((cl - recent) / 64) * 64; let nn = need.max(cl);
+            let gr = env_usize("PYRE_QN_KVGRAN").unwrap_or(1024).max(64); let cap = (nn + (nn / 8).max(1024)).next_multiple_of(gr);
+            let (kw, ks) = super::kv8::pack(&st.k[ai][..q8n * row]); let (vw, vs) = super::kv8::pack(&st.v[ai][..q8n * row]);
+            let mut kb = st.k[ai][q8n * row..].to_vec(); kb.resize((cap - q8n) * row, 0.0); let mut vb = st.v[ai][q8n * row..].to_vec(); vb.resize((cap - q8n) * row, 0.0);
+            let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
+            let q8 = [cb.hup_u32(&kw), cb.buf(&ks), cb.hup_u32(&vw), cb.buf(&vs)];
+            static LOGN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if LOGN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 { eprintln!("kv8: layer {ai} positions {cl} int8 {q8n} cap {cap} ({:.0} MiB f32 -> {:.0} MiB)", (2 * cap * row * 4) as f64 / 1048576.0, (2 * ((cap - q8n) * row * 4 + q8n * row + q8n * row / 8)) as f64 / 1048576.0); }
+            st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: Some(q8), q8n }); return; } }
         if let Some((bits, recent)) = kvq_measure() { let old = cl.saturating_sub(recent) * row; kvq_roundtrip(&mut st.k[ai][..old], bits); kvq_roundtrip(&mut st.v[ai][..old], bits); }
         if dbg { let nn = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count(); eprintln!("kvdbg pulled ai {ai} host_k {cl} host_ik {} nonfinite k {} v {} ik {}", st.ik[ai].len() / self.cfg.idx_hd.max(1), nn(&st.k[ai]), nn(&st.v[ai]), nn(&st.ik[ai])); }
         // int45: need + 1/8 headroom (>= 1024 rows), 1024-row multiples, instead of the next power of two (32769 -> 65536
@@ -1456,10 +1473,10 @@ impl Model {
             let src = if up.is_empty() { None } else { Some((cb.buf(&up), up.len())) };
             let mk = |n: usize, off: usize, used: usize| -> H { if n == 0 { return cb.buf(&[]); } let h = cb.empty(n); cb.copy(&zr.0, zr.1, 0, &h, n, 0, n); if used > 0 { if let Some((s, sn)) = &src { cb.copy(s, *sn, off, &h, n, 0, used); } } h };
             let (k, v, ik) = (mk(nk, 0, uk), mk(nk, uk, uk), mk(ni, 2 * uk, ui));
-            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl, pb: None, nbp: 0 }); return; }
+            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0 }); return; }
         let mut kb = st.k[ai].clone(); kb.resize(cap * row, 0.0); let mut vb = st.v[ai].clone(); vb.resize(cap * row, 0.0);
         let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
-        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0 });
+        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0 });
     }
 
     /// Visible tokens up to which every QSA block is selected (attention stays dense and exact).
@@ -2083,7 +2100,7 @@ impl Model {
     pub fn mtp_draft(&self, st: &mut State, history: &[u32], k: usize, s: Option<&mut crate::sampler::Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> {
         self.mtp_draft_in(st, history, k, s)
     }
-    fn mtp_draft_in(&self, st: &mut State, history: &[u32], k: usize, _s: Option<&mut crate::sampler::Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> {
+    fn mtp_draft_in(&self, st: &mut State, history: &[u32], k: usize, mut s: Option<&mut crate::sampler::Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> {
         let m = self.mtp.as_ref()?; let n = st.tokens.len(); let pending = *history.last()?;
         if n == 0 || k == 0 { return None; }
         let t0 = std::time::Instant::now(); let d = self.cfg.d; let row = m.row(); let w = m.rdim();
@@ -2132,7 +2149,8 @@ impl Model {
                 // PYRE_MTP_GRAPH (default on, =0 off): the step as two captured CUDA graphs (head included); pp24 A 33.5 vs 29.8* steady, B 27.2 vs 26.8, C 29.1 vs 29.2, greedy == refs
                 let gmode = env_var("PYRE_MTP_GRAPH").map(|v| v != "0").unwrap_or(true); let rid = gr.id;
                 // PYRE_MTP_GX=1: routed experts on the GPU (resident LRU pool) + the k draft steps chained on the GPU, one readback per run
-                let gxm = gmode && super::mtp::gx_on();
+                let qs = s.as_ref().map_or(false, |s| s.params.temperature > 0.0) && env_var("PYRE_MTP_QSAMPLE").map(|v| v != "0").unwrap_or(true);
+                let gxm = gmode && super::mtp::gx_on() && !qs;
                 if gxm { self.embd.row(tok as usize, &mut e); let th = std::time::Instant::now();
                     if let Some((bs, krow, vrow)) = m.draft_gx(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1, rid, k, &|t, o| self.embd.row(t as usize, o)) {
                         m.kv_push(&mut kv, &krow, &vrow);
@@ -2145,10 +2163,11 @@ impl Model {
                     self.embd.row(tok as usize, &mut e);
                     let Some((lg, rr2, krow, vrow)) = m.step_gpu_g(cb, &g, hm, &kc, &vc, cap, kc0, &rh, &e, n - 1 + j, rid) else { break };
                     if j == 0 { m.kv_push(&mut kv, &krow, &vrow); }
-                    let th = std::time::Instant::now(); let (i, p) = cb.best(&lg, hm.rows); let id = m.head_ids()[i.min(hm.rows - 1)];
+                    let th = std::time::Instant::now(); let (i, p) = cb.best(&lg, hm.rows); let mut id = m.head_ids()[i.min(hm.rows - 1)];
                     HEAD_NS.fetch_add(th.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     if !crate::spec::draft_gate(j, p, min_p) { break; }
-                    out.push((id, None)); rh = rr2; tok = id;
+                    let mut qd = None; if qs { if let Some(sm) = s.as_deref_mut() { let (t, q) = mtp_qsample(&cb.read(&lg)[..hm.rows], m.head_ids(), sm); id = t; qd = Some(q); } } // item 5: draw from the drafter distribution, attach q
+                    out.push((id, qd)); rh = rr2; tok = id;
                 }
                 for j in 0..(if gmode { 0 } else { k }) {
             if j > 0 && crate::spec::draft_stop() { break; }
@@ -2411,7 +2430,7 @@ impl Model {
         for pi in 0..st.ple_hist.len() { if let Some(h) = st.ple_ck.get(pi).and_then(|v| v.get(keep - 1)) { st.ple_hist[pi] = h.clone(); } }
         let row = c.n_kv * c.hd; let ihd = c.idx_hd; let ir = c.idx_ratio.max(1);
         for ai in 0..st.k.len() {
-            if let Some(Some(g)) = st.kvg.get_mut(ai) { g.len = g.len.min(n); }
+            if let Some(Some(g)) = st.kvg.get_mut(ai) { if n < g.q8n { if let Some(cb) = &self.cube { kv8_drop(cb, g, self.cfg.n_kv * self.cfg.hd, "rollback below int8 region"); } } g.len = g.len.min(n); }
             st.k[ai].truncate(n * row); st.v[ai].truncate(n * row);
             if ai < st.ik.len() { st.ik[ai].truncate(n * ihd); st.ib[ai].truncate((n / ir) * ihd); }
         }
@@ -3217,4 +3236,35 @@ pub fn kvq_roundtrip(x: &mut [f32], bits: u32) {
     let q = ((1i32 << (bits - 1)) - 1) as f32;
     for b in x.chunks_mut(32) { let m = b.iter().fold(0f32, |a, v| a.max(v.abs())); if m == 0.0 || !m.is_finite() { continue; }
         let s = m / q; for v in b.iter_mut() { *v = (*v / s).round().clamp(-q, q) * s; } }
+}
+
+/// Draft sampling for sampled requests (item 5): softmax(logits / T) over the drafter head, truncated to its top 64 and
+/// renormalized; the draft is drawn from exactly that distribution, which is returned as q for min(1, p/q) acceptance.
+fn mtp_qsample(lg: &[f32], ids: &[u32], s: &mut crate::sampler::Sampler) -> (u32, Vec<(u32, f32)>) {
+    let t = s.params.temperature.max(1e-3); let n = lg.len().min(ids.len());
+    let mut ix: Vec<usize> = (0..n).collect(); let kk = 64.min(n);
+    if n > kk { ix.select_nth_unstable_by(kk - 1, |a, b| lg[*b].total_cmp(&lg[*a])); ix.truncate(kk); }
+    let mx = ix.iter().map(|&i| lg[i]).fold(f32::NEG_INFINITY, f32::max);
+    let w: Vec<f32> = ix.iter().map(|&i| ((lg[i] - mx) / t).exp()).collect(); let sum: f32 = w.iter().sum();
+    let q: Vec<(u32, f32)> = ix.iter().zip(&w).map(|(&i, &x)| (ids[i], x / sum)).collect();
+    let mut u = s.uniform(); let mut pick = q[0].0;
+    for &(id, p) in &q { pick = id; if u < p { break; } u -= p; }
+    (pick, q)
+}
+/// kv8 switch: Some(recent window) when PYRE_QN_KV8=1 (off by default).
+fn kv8_recent() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| if env_var("PYRE_QN_KV8").map(|v| v == "1").unwrap_or(false) { Some(env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64)) } else { None })
+}
+pub static KV8_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// kv8 fallback: turn a layer's int8 region back into plain f32 GPU buffers (dequantized), logging a warning and counting
+/// it, instead of aborting on a case the int8 path does not cover.
+fn kv8_drop(cb: &super::qn_cube::Cube, g: &mut KvG, row: usize, why: &str) {
+    let Some(q8) = g.q8.take() else { return }; let o = g.q8n;
+    let (kw, ks, vw, vs) = (cb.read_u32(&q8[0]), cb.read(&q8[1]), cb.read_u32(&q8[2]), cb.read(&q8[3]));
+    let mut k = super::kv8::unpack(&kw, &ks, o * row); let mut v = super::kv8::unpack(&vw, &vs, o * row);
+    k.extend_from_slice(&cb.read(&g.k)[..(g.cap - o) * row]); v.extend_from_slice(&cb.read(&g.v)[..(g.cap - o) * row]);
+    g.k = cb.buf(&k); g.v = cb.buf(&v); g.q8n = 0;
+    KV8_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::logbuf::event("kv8_fallback", "WARN", serde_json::json!({"why": why, "q8n": o, "len": g.len}));
 }

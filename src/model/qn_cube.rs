@@ -5759,6 +5759,19 @@ fn k_qsa_score(iq: &[f32], ib: &[f32], sc: &mut [f32], inh: u32, ihd: u32, iscal
     }
     if lane == 0u32 { sc[b as usize] = s * iscale; }
 }
+/// kv8 (int50): dequantize n int8 values (4 per u32 word, one scale per 32) into f32; every index bounds-checked
+/// against the buffer lengths (out-of-range positions are left untouched). Must equal kv8::unpack exactly.
+#[cube(launch_unchecked)]
+fn k_kv8_deq(w: &[u32], sc: &[f32], out: &mut [f32], n: u32) {
+    let i = ABSOLUTE_POS_X;
+    let wi = i / 4u32; let si = i / 32u32;
+    if i < n && (i as usize) < out.len() && (wi as usize) < w.len() && (si as usize) < sc.len() {
+        let b = (w[wi as usize] >> (8u32 * (i % 4u32))) & 255u32;
+        let mut s = i32::cast_from(b);
+        if b >= 128u32 { s -= 256i32; }
+        out[i as usize] = f32::cast_from(s) * sc[si as usize];
+    }
+}
 /// QSA top-kk blocks: rank = #{s_j > s_b} + #{j < b, s_j == s_b}; sel[b] = rank < kk.
 #[cube(launch_unchecked)]
 fn k_qsa_sel(sc: &[f32], sel: &mut [f32], nb: u32, kk: u32) {
@@ -6018,6 +6031,13 @@ impl Cube {
         NATIVE_STAT.fetch_add((nnat * cols) as u64, std::sync::atomic::Ordering::Relaxed); NATIVE_STAT.fetch_add(((nq8 * cols) as u64) << 40, std::sync::atomic::Ordering::Relaxed);
         Some(CMat { w: self.hup(u32::as_bytes(&words)), s: self.hup(f32::as_bytes(&sc)), rows: r0, cols, splits, nat, qseg, kv: Some(kvh) })
     }    pub fn buf(&self, v: &[f32]) -> Handle { self.hup(f32::as_bytes(v)) }
+    /// kv8: dequantize n values of (w, sc) into a new f32 buffer.
+    pub fn kv8_deq(&self, w: &[u32], sc: &[f32], n: usize) -> Vec<f32> {
+        let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
+        let (wh, sh, o) = (self.hup(u32::as_bytes(w)), self.buf(sc), self.empty(n));
+        unsafe { k_kv8_deq::launch_unchecked(&self.client, CubeCount::Static(n.div_ceil(256) as u32, 1, 1), CubeDim::new_1d(256), a(&wh, w.len()), a(&sh, sc.len()), a(&o, n), n as u32); }
+        self.read(&o)
+    }
     pub fn empty(&self, n: usize) -> Handle { crate::limits::vram_check((n * 4) as u64); self.client.empty(n * 4) }
     /// CPU reference for the first native segment of m (first 64 rows, 3 columns, f64 from the packed IQ4_XS words),
     /// against gemv_m with iq4d_m and with iq4s_m. The GPU side quantizes x to Q8, so expect ~1e-2 relative error.
@@ -6068,6 +6088,7 @@ impl Cube {
         super::qn_gpu::GPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); super::qn_gpu::GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     }
+    pub fn read_u32(&self, h: &Handle) -> Vec<u32> { let b = self.client.read_one(h.clone()).expect("gpu readback"); u32::from_bytes(&b).to_vec() }
     pub fn read(&self, h: &Handle) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         let b = self.client.read_one(h.clone()).expect("gpu readback");
@@ -6459,6 +6480,21 @@ impl Cube {
                 a(&q, nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), a(p, pn), a(&sc, nh * cap), a(out, nh * hd), nh as u32, nkv as u32, hd as u32, (pos + 1) as u32, cap as u32, (hd as f32).sqrt().recip(), a(&sel, nb), ir as u32, nb as u32, (hd / 32) as u32);
         }
     }
+    /// kv8: attn_qsa over an int8 region [0, q8n) + f32 window (positions q8n..), qsa2 path only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_qsa8(&self, q8: &[Handle; 4], q8n: usize, p: &Handle, pn: usize, ko: usize, vo: usize, iqo: usize, qn: &Handle, kn: &Handle, iqn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, ib: &Handle, ibn: usize, nb: usize,
+                    out: &Handle, nh: usize, nkv: usize, hd: usize, half: usize, pos: usize, eps: f32, inh: usize, ihd: usize, ir: usize, kk: usize) {
+        let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
+        let q = self.empty(nh * hd); let sc = self.empty(nh * cap); let iq = self.empty(inh * ihd); let bs = self.empty(nb.max(1)); let sel = self.empty(nb.max(1));
+        unsafe {
+            k_attn_prep::launch_unchecked(&self.client, CubeCount::Static((nh + nkv) as u32, 1, 1), CubeDim::new_1d(32),
+                a(p, pn), a(qn, hd), a(kn, hd), a(cs, 2 * half), a(&q, nh * hd), a(kc, (cap - q8n) * nkv * hd), a(vc, (cap - q8n) * nkv * hd), ko as u32, vo as u32, nh as u32, nkv as u32, hd as u32, half as u32, (pos - q8n) as u32, eps);
+            k_qsa_q::launch_unchecked(&self.client, CubeCount::Static(inh as u32, 1, 1), CubeDim::new_1d(32), a(p, pn), a(iqn, ihd), a(cs, 2 * half), a(&iq, inh * ihd), iqo as u32, ihd as u32, half as u32, eps);
+            k_qsa_score::launch_unchecked(&self.client, CubeCount::Static(nb as u32, 1, 1), CubeDim::new_1d(32), a(&iq, inh * ihd), a(ib, ibn), a(&bs, nb), inh as u32, ihd as u32, (ihd as f32).sqrt().recip());
+            debug_assert!(qsa2_ok(nb, kk) && pos >= q8n, "kv8 needs the qsa2 decode path");
+            self.qsa2_tail8(q, &q8[0], &q8[1], &q8[2], &q8[3], q8n, kc, vc, cap - q8n, p, pn, &sc, &bs, &sel, out, nh, nkv, hd, pos + 1, cap, nb, ir, kk);
+        }
+    }
     /// PYRE_QN_QSABENCH (diagnostic): time the QSA decode kernels on synthetic data at context n (us per call,
     /// `it` back-to-back launches, then one readback). Prints one line per n.
     #[allow(clippy::too_many_arguments)]
@@ -6509,7 +6545,23 @@ impl Cube {
             k_attn3r::launch_unchecked(&self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_2d(32, 8),
                 a(vc, cap * nkv * hd), a(p, pn), a(sc, nh * cap), a(&pm, nh * gy), a(out, nh * hd), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
         }
-    }    pub fn xarena(&self, bytes: usize) -> Handle { crate::limits::vram_check(bytes as u64); self.client.empty(bytes) }
+    }    /// kv8: qsa2_tail with positions < q8n read from int8 (kq/ks, vq/vs) and the rest from the f32 window kc/vc
+    /// (positions q8n.., `wn` rows each of nkv*hd).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa2_tail8(&self, q: Handle, kq: &Handle, ks: &Handle, vq: &Handle, vs: &Handle, q8n: usize, kc: &Handle, vc: &Handle, wn: usize, p: &Handle, pn: usize, sc: &Handle, bs: &Handle, sel: &Handle, out: &Handle, nh: usize, nkv: usize, hd: usize, n: usize, cap: usize, nb: usize, ir: usize, kk: usize) {
+        let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
+        let row = nkv * hd; let (qw, qs) = (q8n * row / 4, q8n * row / 32);
+        let gy = (kk + 1).div_ceil(8); let lists = self.empty(9 * kk); let cnt = self.empty(9); let pm = self.empty(nh * gy);
+        unsafe {
+            k_qsa_sel2::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), a(bs, nb), a(sel, nb), a(&lists, 9 * kk), a(&cnt, 9), nb as u32, kk as u32);
+            k_attn3sc8::launch_unchecked(&self.client, CubeCount::Static(nh as u32, gy as u32, 1), CubeDim::new_2d(32, 8),
+                a(&q, nh * hd), a(kq, qw.max(1)), a(ks, qs.max(1)), a(kc, wn * row), q8n as u32, a(sc, nh * cap), a(&pm, nh * gy), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, (hd as f32).sqrt().recip(), ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
+            k_attn3r8::launch_unchecked(&self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_2d(32, 8),
+                a(vq, qw.max(1)), a(vs, qs.max(1)), a(vc, wn * row), q8n as u32, a(p, pn), a(sc, nh * cap), a(&pm, nh * gy), a(out, nh * hd), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
+        }
+    }
+    pub fn hup_u32(&self, v: &[u32]) -> Handle { self.hup(u32::as_bytes(v)) }
+    pub fn xarena(&self, bytes: usize) -> Handle { crate::limits::vram_check(bytes as u64); self.client.empty(bytes) }
     /// Repack one expert into arena slot `slot` (slot_bytes each; the arena is ar_bytes long).
     #[allow(clippy::too_many_arguments)]
     pub fn xupload(&self, ar: &Handle, ar_bytes: usize, slot: usize, slot_bytes: usize, g: &[u8], u: &[u8], d: &[u8], tys: (u32, u32, u32)) -> XEnt {
@@ -6980,3 +7032,157 @@ fn w8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new
 /// PYRE_QN_X8 (default on; only under T8): single-set xrun_fast_multi for 5-8 tokens
 fn x8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_X8").map(|v| v != "0").unwrap_or(true)) }
 fn gate8() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GATE8").map(|v| v != "0").unwrap_or(true)) }
+
+#[cfg(test)]
+mod kv8_gpu_tests {
+    /// GPU check of k_kv8_deq against the host reference on small shapes. Needs the GPU: run only inside a gpu_session
+    /// batch (`pyre-*.exe kv8_gpu --ignored`).
+    #[test] #[ignore]
+    fn kv8_gpu() {
+        let cb = super::Cube::new().unwrap();
+        for &n in &[32usize, 64, 256, 4096] {
+            let x: Vec<f32> = (0..n).map(|i| ((i * 7919 % 211) as f32 - 105.0) * 0.0371).collect();
+            let (w, s) = crate::model::kv8::pack(&x); let r = crate::model::kv8::unpack(&w, &s, n);
+            let g = cb.kv8_deq(&w, &s, n); assert_eq!(g.len(), n);
+            for i in 0..n { assert_eq!(g[i].to_bits(), r[i].to_bits(), "n {n} i {i}"); }
+        }
+        // qsa2 decode attention: f32 path on dequantized K/V vs kv8 path (int8 below q8n + f32 window) must be bit-identical
+        let (nh, nkv, hd, ir, kk) = (8usize, 2usize, 128usize, 64usize, 4usize); let row = nkv * hd;
+        for &(n, q8n) in &[(700usize, 0usize), (700, 512), (1000, 896)] {
+            let cap = n + 64; let nb = n / ir;
+            let rnd = |m: usize, s: u32| -> Vec<f32> { let mut x = s.wrapping_mul(2654435761) | 1; (0..m).map(|_| { x ^= x << 13; x ^= x >> 17; x ^= x << 5; (x as f32 / u32::MAX as f32 - 0.5) * 0.4 }).collect() };
+            let (k, v) = (rnd(cap * row, 1), rnd(cap * row, 2));
+            let (kw, ksc) = crate::model::kv8::pack(&k[..q8n * row]); let (vw, vsc) = crate::model::kv8::pack(&v[..q8n * row]);
+            let mut kd = k.clone(); kd[..q8n * row].copy_from_slice(&crate::model::kv8::unpack(&kw, &ksc, q8n * row));
+            let mut vd = v.clone(); vd[..q8n * row].copy_from_slice(&crate::model::kv8::unpack(&vw, &vsc, q8n * row));
+            let pn = nh * 2 * hd; let p = cb.buf(&rnd(pn, 3)); let qv = rnd(nh * hd, 4); let bsv = rnd(nb, 5);
+            let run = |eight: bool| -> Vec<f32> { let sc = cb.empty(nh * cap); let bs = cb.buf(&bsv); let sel = cb.empty(nb.max(1)); let out = cb.empty(nh * hd); let q = cb.buf(&qv);
+                if eight { let z = [0u32]; let zf = [0f32];
+                    let (kq, ks, vq, vs) = if q8n > 0 { (cb.hup_u32(&kw), cb.buf(&ksc), cb.hup_u32(&vw), cb.buf(&vsc)) } else { (cb.hup_u32(&z), cb.buf(&zf), cb.hup_u32(&z), cb.buf(&zf)) };
+                    cb.qsa2_tail8(q, &kq, &ks, &vq, &vs, q8n, &cb.buf(&k[q8n * row..]), &cb.buf(&v[q8n * row..]), cap - q8n, &p, pn, &sc, &bs, &sel, &out, nh, nkv, hd, n, cap, nb, ir, kk);
+                } else { cb.qsa2_tail(q, &cb.buf(&kd), &cb.buf(&vd), &p, pn, &sc, &bs, &sel, &out, nh, nkv, hd, n, cap, nb, ir, kk); }
+                cb.read(&out) };
+            let (a0, a8) = (run(false), run(true));
+            for i in 0..a0.len() { assert_eq!(a0[i].to_bits(), a8[i].to_bits(), "qsa2 n {n} q8n {q8n} i {i}: {} vs {}", a0[i], a8[i]); }
+            eprintln!("kv8 qsa2 n {n} q8n {q8n} identical ({} outputs)", a0.len());
+        }
+        eprintln!("kv8_gpu ok");
+    }
+}
+
+/// kv8 (int50): K or V element `rowoff` (= kv head * hd + dim) of position `pos`: int8 region for pos < q8n, else the
+/// f32 window at (pos - q8n); every index bounds-checked (out of range reads 0).
+#[cube]
+fn kv8_at(w: &[u32], s: &[f32], f: &[f32], q8n: u32, pos: u32, rowoff: u32, row: u32) -> f32 {
+    let mut r = 0.0f32;
+    if pos < q8n {
+        let e = pos * row + rowoff; let wi = e / 4u32; let si = e / 32u32;
+        if (wi as usize) < w.len() && (si as usize) < s.len() {
+            let b = (w[wi as usize] >> (8u32 * (e % 4u32))) & 255u32;
+            let mut v = i32::cast_from(b); if b >= 128u32 { v -= 256i32; }
+            r = f32::cast_from(v) * s[si as usize];
+        }
+    } else {
+        let e = (pos - q8n) * row + rowoff;
+        if (e as usize) < f.len() { r = f[e as usize]; }
+    }
+    r
+}
+/// kv8 copies of k_attn3sc / k_attn3r (K/V reads through kv8_at; everything else identical).
+#[cube(launch_unchecked)]
+fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, sc: &mut [f32], pm: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, scale: f32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
+    let h = CUBE_POS_X; let c = CUBE_POS_Y;
+    let lane = UNIT_POS_X; let wy = UNIT_POS_Y;
+    let kvh = h / (nh / nkv);
+    let mut red = Shared::<[f32]>::new_slice(32usize);
+    let mut mx = scale * -3.0e30f32;
+    let nf = cnt[8];
+    let mut tot = nf; if n > nbs * ir { tot = nf + 1u32; }
+    let e = c * 8u32 + wy;
+    if e < tot {
+        let mut b = nbs; if e < nf { b = lists[(8u32 * kk + e) as usize]; }
+        let mut qr = Array::<f32>::new(nd as usize);
+        #[unroll]
+        for d in 0..nd { qr[d as usize] = q[(h * hd + d * 32u32 + lane) as usize]; }
+        let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+        let mut pp = b * ir;
+        while pp < pe {
+            let kb = (pp * nkv + kvh) * hd;
+            let mut dd = 0.0f32;
+            #[unroll]
+            for d in 0..nd { dd += qr[d as usize] * kv8_at(kq, ks, kc, q8n, pp, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            let v = plane_sum(dd) * scale;
+            if lane == 0u32 { sc[(h * cap + pp) as usize] = v; }
+            mx = f32::max(mx, v);
+            pp += 1u32;
+        }
+    }
+    if lane == 0u32 { red[wy as usize] = mx; }
+    sync_cube();
+    if wy == 0u32 && lane == 0u32 {
+        let mut m = red[0];
+        for w in 1..8u32 { m = f32::max(m, red[w as usize]); }
+        pm[(h * gy + c) as usize] = m;
+    }
+}
+#[cube(launch_unchecked)]
+fn k_attn3r8(vq: &[u32], vs: &[f32], vc: &[f32], q8n: u32, p: &[f32], sc: &mut [f32], pm: &[f32], o: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
+    let h = CUBE_POS_X;
+    let lane = UNIT_POS_X;
+    let wy = UNIT_POS_Y;
+    let nw = CUBE_DIM_Y;
+    let tid = wy * 32u32 + lane;
+    let kvh = h / (nh / nkv);
+    let mut red = Shared::<[f32]>::new_slice(32usize);
+    let mut part = Shared::<[f32]>::new_slice(4096usize);
+    let mut m = pm[(h * gy) as usize];
+    for i in 1..gy { m = f32::max(m, pm[(h * gy + i) as usize]); }
+    let cw = cnt[wy as usize];
+    let tail = n > nbs * ir && (nbs % 8u32) == wy;
+    let mut ne = cw; if tail { ne = cw + 1u32; }
+    let mut sum = 0.0f32;
+    for k in 0..ne {
+        let mut b = nbs; if k < cw { b = lists[(wy * kk + k) as usize]; }
+        let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+        let mut pp = b * ir + lane;
+        while pp < pe {
+            let e = f32::exp(sc[(h * cap + pp) as usize] - m);
+            sc[(h * cap + pp) as usize] = e;
+            sum += e;
+            pp += 32u32;
+        }
+    }
+    let ws = plane_sum(sum);
+    if lane == 0u32 { red[(16u32 + wy) as usize] = ws; }
+    sync_cube();
+    let mut tot = 0.0f32;
+    for w in 0..nw { tot += red[(16u32 + w) as usize]; }
+    let inv = 1.0f32 / tot;
+    let mut acc = Array::<f32>::new(nd as usize);
+    #[unroll]
+    for d in 0..nd { acc[d as usize] = 0.0f32; }
+    for k in 0..ne {
+        let mut b = nbs; if k < cw { b = lists[(wy * kk + k) as usize]; }
+        let mut pe = (b + 1u32) * ir; if pe > n { pe = n; }
+        let mut t = b * ir;
+        while t < pe {
+            let e = sc[(h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
+            #[unroll]
+            for d in 0..nd { acc[d as usize] += e * kv8_at(vq, vs, vc, q8n, t, kvh * hd + d * 32u32 + lane, nkv * hd); }
+            t += 1u32;
+        }
+    }
+    #[unroll]
+    for d in 0..nd { part[(wy * hd + d * 32u32 + lane) as usize] = acc[d as usize]; }
+    sync_cube();
+    let mut j = tid;
+    while j < hd {
+        let mut a = 0.0f32;
+        for w in 0..nw { a += part[(w * hd + j) as usize]; }
+        let g = p[(h * 2 * hd + hd + j) as usize];
+        o[(h * hd + j) as usize] = a * inv * (1.0f32 / (1.0f32 + f32::exp(-g)));
+        j += nw * 32u32;
+    }
+}
+/// kv8: is the qsa2 decode path (the only one with an int8 variant) taken for nb blocks, top-kk?
+pub fn qsa2_ok(nb: usize, kk: usize) -> bool { qsa2() && nb <= 32768 && kk < 1023 }
