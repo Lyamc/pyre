@@ -3944,6 +3944,7 @@ dependencies = [
  "base64 0.22.1",
  "embed-manifest",
  "gpui",
+ "serde",
  "serde_json",
  "ureq",
 ]

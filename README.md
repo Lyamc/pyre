@@ -889,3 +889,13 @@ With VGRAPH on, the GPU side of each verify layer's MoE glue becomes one capture
 ### Expert cache policy checks (Oct 30, Q8 defaults, n=96, PYRE_QN_XSTAT=1 logs hit rate and misses/layer/token)
 
 There are 1691 uniform slots of 1.587 MB in 2.5 GiB. Expert sizes per layer are 1.28 MB (3 layers), 1.38 MB (11) and 1.587 MB (34), so slots sized per class would fit about 6% more. Baseline hits: A 58.9% (4.1 misses per layer per token, top-10 routing), B 38.5% (6.2), C 43.1% (5.7). XDECAY=5 or 3 leaves hits within 0.1%. PYRE_QN_XPERLAYER=1 (equal per-layer shares, like Strata's static per-layer slot ranges) is neutral (58.3/38.6/42.9%). Both keep greedy output identical. ADAPT=1 raises A to 66.1% but changes greedy output on A: which experts run on the GPU and which on the CPU can change results, so every placement change needs a greedy check.
+
+### pyre-chat (native GPUI chat client)
+`gui/` also builds `pyre-chat`, a chat-only desktop client: `cargo build --release --manifest-path gui/Cargo.toml --bin pyre-chat`
+(on HYTE: `cd gui; C:\Temp\qnx\build.ps1 --bin pyre-chat`). Run `pyre-chat.exe [server-url]` (default http://127.0.0.1:8099,
+or set it in Settings; e.g. http://192.168.0.30:8099 from another machine). Features: conversation sidebar (new/rename/delete,
+saved as JSON in %APPDATA%\pyre-chat or ~/.local/share/pyre-chat, override PYRE_CHAT_DIR), reasoning effort picker
+(none/low/medium/high/very high/auto, default medium) sent as `reasoning_effort`, collapsible thinking with thinking tokens and
+auto's choice/rating, Markdown with code blocks + Copy, Stop (Esc), system prompt / temperature / max tokens, tok/s and context
+usage. Keys: Enter send, Shift+Enter newline, Ctrl+N new chat, Ctrl+V paste, Ctrl+Backspace delete word.
+Scripted demo env: PYRE_CHAT_SEND, PYRE_CHAT_EFFORT, PYRE_CHAT_OPEN_THINK, PYRE_CHAT_SETTINGS, PYRE_CHAT_STOP_AFTER.

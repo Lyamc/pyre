@@ -13,6 +13,10 @@ description = "Native GPUI desktop front end for a pyre server (HTTP only; does 
 name = "pyre-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "pyre-chat"
+path = "src/chat.rs"
+
 [dependencies]
 # Lyamc's GPUI fork, same source and features as C:\Build\media\jellyfin-gpui (rev pinned to the
 # commit jellyfin-gpui's Cargo.lock resolves, 08629d4).
@@ -20,6 +24,7 @@ gpui = { git = "https://github.com/Lyamc/gpui", rev = "08629d460d9cb31aff51cb769
 # Plain-HTTP client for talking to pyre (no TLS stack -> no ring/cc).
 ureq = { version = "3", default-features = false }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 
 [build-dependencies]
