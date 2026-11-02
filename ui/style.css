@@ -75,3 +75,10 @@ table.mdt{border-collapse:collapse;margin:6px 0;font-size:13px}table.mdt td,tabl
   .composer textarea{font-size:16px}
 }
 .apps{display:flex;flex-direction:column;gap:8px;margin:8px 0}.appcard{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel2)}
+
+.spk { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.spk-row { border-left: 4px solid #888; padding: 4px 10px; background: rgba(127,127,127,.08); border-radius: 4px; }
+.spk-who { display: block; font-size: 12px; font-weight: 600; }
+.spk-text { white-space: pre-wrap; }
+#sttDiarL { display: inline-flex; align-items: center; gap: 4px; }
+

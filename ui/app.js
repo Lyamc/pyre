@@ -264,15 +264,34 @@ $("#sttGo").onclick = async () => {
   const f = recBlob || $("#sttFile").files[0]; if (!f) return alert("choose or record audio first");
   const fd = new FormData(); fd.append("file", f, f.name || "recording.webm"); fd.append("model", (kinds.stt?.[0]?.id) || "whisper"); fd.append("response_format", "verbose_json");
   if ($("#sttLang").value) fd.append("language", $("#sttLang").value);
+  const diar = $("#sttDiar").checked && !$("#sttDiar").disabled && $("#sttTask").value === "transcriptions";
+  if (diar) fd.append("diarize", "true");
+  $("#sttSpk").classList.add("hidden"); $("#sttSpk").innerHTML = "";
   $("#sttOut").textContent = "…"; const t0 = performance.now();
   try {
     const r = await fetch("/v1/audio/" + $("#sttTask").value, { method: "POST", headers: headers(), body: fd }); const j = await r.json();
     if (!r.ok) throw new Error(j.error?.message || r.statusText);
     sttText = j.text || ""; $("#sttToChat").classList.toggle("hidden", !sttText.trim());
+    if (diar && Array.isArray(j.segments)) { renderSpeakers(j.segments); $("#sttOut").textContent = `(${((performance.now() - t0) / 1000).toFixed(2)} s, ${new Set(j.segments.map(s => s.speaker)).size} speakers${j.language ? ", language " + j.language : ""})`; return; }
     $("#sttOut").textContent = `${j.text}\n\n(${((performance.now() - t0) / 1000).toFixed(2)} s${j.language ? ", language " + j.language : ""})`;
   } catch (e) { $("#sttOut").textContent = "error: " + e.message; }
 };
 let sttText = "";
+const SPK_COLORS = ["#2f7ed8", "#d8572f", "#2fa36b", "#9b4fd8", "#c9a227", "#d82f8a", "#2fb5c9", "#7a7a7a"];
+const fmtT = s => { const m = Math.floor(s / 60); return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`; };
+function renderSpeakers(segs) {
+  const box = $("#sttSpk"); box.innerHTML = ""; const ids = [];
+  for (const s of segs) {
+    const sp = s.speaker || "?"; if (!ids.includes(sp)) ids.push(sp);
+    const c = SPK_COLORS[ids.indexOf(sp) % SPK_COLORS.length];
+    const row = document.createElement("div"); row.className = "spk-row"; row.style.borderLeftColor = c;
+    const h = document.createElement("span"); h.className = "spk-who"; h.style.color = c; h.textContent = `${sp.replace("SPEAKER_", "Speaker ")} · ${fmtT(s.start)}–${fmtT(s.end)}`;
+    const t = document.createElement("span"); t.className = "spk-text"; t.textContent = (s.text || "").trim();
+    row.append(h, t); box.append(row);
+  }
+  box.classList.remove("hidden");
+}
+fetch("/api/diarizer", { headers: headers() }).then(r => r.json()).then(j => { const ok = !!j.loaded; $("#sttDiar").disabled = !ok; $("#sttDiarL").title = ok ? `Who spoke when: ${j.info.model} on ${j.info.backend}` : "No diarization model loaded (start with --load diar=nvidia/Nemotron-3-Diarization)"; }).catch(() => {});
 $("#sttToChat").onclick = () => { const i = $("#input"); i.value = (i.value ? i.value + " " : "") + sttText.trim(); document.querySelector('#tabs [data-tab="chat"]')?.click(); i.focus(); };
 $("#ttsGo").onclick = async () => {
   try {

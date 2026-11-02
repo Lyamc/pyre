@@ -130,7 +130,7 @@ pub fn download(cache: &Path, repo: &str, rev: Option<&str>, progress: &dyn Fn(&
     };
     // diffusers-style repos have model_index.json instead of config.json
     let (first, is_sd) = match get("config.json") { Ok(p) => (p, false), Err(_) => (get("model_index.json").context("neither config.json nor model_index.json found")?, true) };
-    let dir = first.parent().unwrap().to_path_buf();
+    let dir = first.parent().unwrap().to_path_buf(); let no_tok = !is_sd && std::fs::read_to_string(&first).map(|s| s.contains("\"audio_config\"") && !s.contains("\"text_config\"")).unwrap_or(false);
     let mut files: Vec<String> = vec![];
     if is_sd {
         for sub in ["text_encoder", "unet", "vae", "tokenizer", "scheduler"] {
@@ -152,7 +152,8 @@ pub fn download(cache: &Path, repo: &str, rev: Option<&str>, progress: &dyn Fn(&
     let n = files.len();
     for (i, f) in files.iter().enumerate() {
         progress(f, i, n);
-        let required = f.ends_with(".safetensors") && !is_sd || f == "tokenizer.json";
+        // tokenizer.json is required for language models only (audio models such as diarizers have none)
+        let required = f.ends_with(".safetensors") && !is_sd || (f == "tokenizer.json" && !no_tok);
         match get(f) { Ok(_) => {}, Err(e) if required => return Err(e.context(format!("downloading {f}"))), Err(_) => {} }
     }
     progress("done", n, n);

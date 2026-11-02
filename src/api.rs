@@ -35,6 +35,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/translations", post(translations))
         .route("/v1/audio/speech", post(speech))
+        .route("/v1/audio/diarize", post(crate::diar::handle))
+        .route("/api/diarizer", get(crate::diar::status))
         .merge(crate::ui::routes())
 }
 

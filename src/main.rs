@@ -7,6 +7,7 @@ mod api;
 mod logbuf;
 mod registry;
 mod stt;
+mod diar;
 mod tts;
 mod image;
 mod ui;
@@ -67,6 +68,9 @@ pub enum Cmd {
     },
     /// Run a Qwen3.8-Flash-Next (qwen4_exp) checkpoint directly: greedy text or logits dump
     QwenNext(qn_cli::QnArgs),
+    /// Speaker diarization (Nemotron-3-Diarization) of a 16 kHz-resampled audio file: prints segments as JSON
+    Diarize { file: PathBuf, #[arg(long, default_value = "nvidia/Nemotron-3-Diarization")] model: String, #[arg(long, default_value = "cpu")] backend: String, /// also write raw logits [T,8] (f32 LE) here
+        #[arg(long)] logits: Option<PathBuf> },
     /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
     App {
         #[command(subcommand)]
@@ -173,6 +177,7 @@ fn main() -> Result<()> {
         Cmd::Models { cmd } => cli_models::run(&ctx, cmd),
         Cmd::Serve(a) => serve(ctx, a),
         Cmd::QwenNext(a) => qn_cli::run(a),
+        Cmd::Diarize { file, model, backend, logits } => diar::cli(&ctx.hf_cache, &file, &model, &backend, logits.as_deref()),
         Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }
@@ -296,9 +301,11 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     // collect (kind, ref)
     // (kind, ref, backend override): `--load stt:cpu=base` loads that model on its own backend
     let mut want: Vec<(Kind, String, Option<String>)> = args.model.iter().map(|m| (Kind::Llm, m.clone(), None)).collect();
+    let mut diar_want: Option<(String, String)> = None;
     for l in &args.load {
         let (k, r) = l.split_once('=').context("--load expects kind[:backend]=ref")?;
         let (k, b) = match k.split_once(':') { Some((k, b)) => (k, Some(b.to_string())), None => (k, None) };
+        if k == "diar" { diar_want = Some((r.to_string(), b.unwrap_or_else(|| "auto".into()))); continue; }
         want.push((Kind::parse(k).with_context(|| format!("unknown kind {k}"))?, r.to_string(), b));
     }
     if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone(), None)); }
@@ -318,6 +325,9 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: be.clone(), dtype: None, ctx_size: None })?;
         tracing::info!("loaded {} model '{}' on {}", kind.as_str(), m.id, m.backend);
         app.insert(m)?;
+    }
+    if let Some((r, b)) = diar_want {
+        match diar::Diarizer::load(&r, &b, &app.storage.hf_cache) { Ok(d) => { let _ = diar::DIAR.set(Arc::new(d)); } Err(e) => tracing::error!("diarizer {r} not loaded: {e:#}") }
     }
     if want.is_empty() { tracing::warn!("no models given; load them from the web UI or POST /api/models/load"); }
     let rt = tokio::runtime::Runtime::new()?;

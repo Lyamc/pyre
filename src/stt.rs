@@ -110,6 +110,8 @@ struct Req {
     file: Vec<u8>, filename: String, model: Option<String>, format: String, language: Option<String>,
     // whisburn options (pyre extensions, used by peal): decoding + whisburn-identical rendering.
     beam_size: Option<usize>, max_tokens: Option<usize>, timestamps: Option<bool>, sentences: bool, stream: bool,
+    /// pyre extension: split by speaker with the loaded diarizer; `attribution` = turns (default) | midpoint
+    diarize: bool, attribution: String,
 }
 
 fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
@@ -119,7 +121,7 @@ fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str()
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
 async fn parse(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false };
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into() };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
@@ -131,6 +133,8 @@ async fn parse(mut mp: Multipart) -> Result<Req> {
             "timestamps" => q.timestamps = Some(parse_bool(&f.text().await?)),
             "sentences" => q.sentences = parse_bool(&f.text().await?),
             "stream" => q.stream = parse_bool(&f.text().await?),
+            "diarize" => q.diarize = parse_bool(&f.text().await?),
+            "attribution" => q.attribution = f.text().await?.trim().to_ascii_lowercase(),
             _ => { let _ = f.bytes().await; } // prompt, temperature, timestamp_granularities: accepted, ignored
         }
     }
@@ -140,11 +144,16 @@ async fn parse(mut mp: Multipart) -> Result<Req> {
 
 pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bool) -> Response {
     use crate::server::err;
-    let q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
+    let mut q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
     let m = match app.find(crate::registry::Kind::Stt, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch") };
     if !FORMATS.contains(&q.format.as_str()) {
         return err(StatusCode::BAD_REQUEST, format!("unsupported response_format '{}'", q.format));
+    }
+    if q.diarize {
+        if crate::diar::DIAR.get().is_none() { return err(StatusCode::SERVICE_UNAVAILABLE, "diarize=true but no diarization model is loaded (start pyre with --load diar=nvidia/Nemotron-3-Diarization)"); }
+        if !matches!(q.attribution.as_str(), "turns" | "midpoint") { return err(StatusCode::BAD_REQUEST, "attribution must be turns or midpoint"); }
+        if q.format == "json" { q.format = "verbose_json".into(); }
     }
     let id = m.id.clone();
     let stream = q.stream;
@@ -195,8 +204,57 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
     o.group_into_sentences = q.sentences;
     let t = std::time::Instant::now();
-    let r = rt.transcribe_waveform(&stt.name, wav.samples, wav.sample_rate, &o).map_err(|e| anyhow!("whisburn: {e}"))?;
+    let r = if q.diarize {
+        let tx = |s: Vec<f32>| rt.transcribe_waveform(&stt.name, s, 16_000, &o).map_err(|e| anyhow!("whisburn: {e}"));
+        diarized(&tx, wav.samples, &q.attribution)?
+    } else { rt.transcribe_waveform(&stt.name, wav.samples, wav.sample_rate, &o).map_err(|e| anyhow!("whisburn: {e}"))? };
     Ok((r, dur, t.elapsed().as_secs_f64(), q.format.clone()))
+}
+
+/// Speaker-attributed transcript. `turns`: diarize, then run Whisper on each speaker turn (same-speaker
+/// pauses < 1.0 s merged, 0.15 s padding), so every segment has exactly one speaker and overlapped
+/// speech is transcribed once per speaker. `midpoint`: one Whisper pass, each segment goes to the
+/// speaker active longest within it (ties/none: the turn nearest its midpoint).
+#[cfg(feature = "stt")]
+fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode: &str) -> Result<Transcript> {
+    use pyre_whisper_core::TranscriptSegment as TS;
+    let d = crate::diar::DIAR.get().ok_or_else(|| anyhow!("no diarization model loaded"))?;
+    let t = std::time::Instant::now();
+    let turns = d.turns(&samples, if mode == "midpoint" { 0.3 } else { 1.0 });
+    tracing::info!("diarize: {} turns in {:.2}s", turns.len(), t.elapsed().as_secs_f64());
+    let mut out: Option<Transcript> = None;
+    let mut segs: Vec<TS> = vec![];
+    if mode == "midpoint" {
+        let mut r = tx(samples)?;
+        for s in &mut r.segments {
+            let ov = |a: &crate::diar::Seg| (s.end.min(a.end) - s.start.max(a.start)).max(0.0);
+            let mid = (s.start + s.end) / 2.0;
+            let dist = |a: &crate::diar::Seg| if mid >= a.start && mid <= a.end { 0.0 } else { (a.start - mid).abs().min((a.end - mid).abs()) };
+            let best = turns.iter().max_by(|a, b| ov(a).partial_cmp(&ov(b)).unwrap().then(dist(b).partial_cmp(&dist(a)).unwrap()));
+            s.speaker = best.map(|b| crate::diar::label(b.speaker));
+        }
+        segs = r.segments.clone();
+        out = Some(r);
+    } else {
+        let n = samples.len();
+        for tu in &turns {
+            let a = (((tu.start - 0.15) * 16_000.0).max(0.0) as usize).min(n);
+            let b = (((tu.end + 0.15) * 16_000.0) as usize).min(n);
+            if b <= a + 4_800 { continue; } // < 0.3 s: Whisper only hallucinates on these
+            let r = tx(samples[a..b].to_vec())?;
+            let text = r.text.trim().to_string();
+            if !text.is_empty() {
+                let mut s = TS::new(tu.start, tu.end, text);
+                s.speaker = Some(crate::diar::label(tu.speaker));
+                segs.push(s);
+            }
+            if out.is_none() { out = Some(r); }
+        }
+    }
+    let mut r = out.unwrap_or_else(|| Transcript::empty("whisper", "transcribe"));
+    r.text = segs.iter().map(|s| format!("{}: {}", s.speaker.as_deref().unwrap_or("?"), s.text.trim())).collect::<Vec<_>>().join("\n");
+    r.segments = segs;
+    Ok(r)
 }
 
 #[cfg(feature = "stt")]

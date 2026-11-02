@@ -121,8 +121,10 @@
           <button id="recBtn" type="button">● Record</button>
           <select id="sttTask"><option value="transcriptions">Transcribe</option><option value="translations">Translate to English</option></select>
           <input id="sttLang" placeholder="language (auto)" size="10">
+          <label id="sttDiarL" title="Needs a diarization model (--load diar=nvidia/Nemotron-3-Diarization)"><input type="checkbox" id="sttDiar" disabled> Separate speakers</label>
           <button id="sttGo" class="primary" type="button">Run</button></div>
         <audio id="sttAudio" controls class="hidden"></audio>
+        <div id="sttSpk" class="spk hidden"></div>
         <pre id="sttOut" class="out"></pre>
         <div class="row"><button id="sttToChat" type="button" class="hidden">Send transcript to chat</button></div>
       </fieldset>
