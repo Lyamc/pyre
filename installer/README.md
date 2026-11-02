@@ -66,9 +66,9 @@ If `[serve] model` is empty, the launcher opens `pyre-firstrun.ps1`, which offer
 - **Opt-in purge:** `msiexec /x pyre.msi PURGEDATA=1` deletes only `%ProgramData%\pyre`.
 
 ## Icon
-`assets\pyre.svg` is a document page with a dog-eared corner, carrying a flame made of monospace ASCII glyphs. The glyphs are DejaVu Sans Mono Bold, converted to paths so there's no font dependency, and graded amber to orange to red from tip to base.
-- `pyre-small*.svg` are the 16-24 px variants: a heavier outline and a chunky three-block flame.
-- State variants: `pyre-starting` (lower flame) and `pyre-stopped` (embers only).
+`assets\pyre.svg` is a flame made only of large monospace ASCII glyphs on a transparent background, with no page and no background. The flame has 5 rows (`^ (*) (#@) (%@#) \@##@/`). The glyphs are DejaVu Sans Mono Bold, converted to paths, and graded amber to orange to red from tip to base. A single dark-brown silhouette outline around the whole composition (traced from the closed and dilated shape) gives contrast on light taskbars. The glyphs themselves are unstroked.
+- `pyre-small*.svg` are the 16-24 px variants: a chunky three-block flame silhouette with a thicker outline.
+- State variants: `pyre-starting` (lower 3 rows) and `pyre-stopped` (large bright `* ~ * , *` embers with an orange glow).
 - Regenerate with `assets\gen-icons.py` + `assets\render-icons.py` (fontTools, cairosvg, Pillow). They write the `.ico` files (16/20/24/32/40/48/64/128/256) and `preview.png`.
 - `pyre.ico` is used for ARPPRODUCTICON, every shortcut, and pyre-tray.exe.
 - `resources\pyre-icon.rc` embeds it into pyre.exe / pyre-gui.exe on their next build. It isn't applied yet; see the comment in the file.
