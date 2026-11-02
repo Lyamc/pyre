@@ -70,7 +70,7 @@ function splitThink(text) {
 function renderAssistant(m) {
   const t = splitThink(m.content); const think = (m.reasoning || "") + t.think;
   let h = "";
-  if (think.trim()) h += `<details class="think"><summary>${t.done && m.content.length > 0 && (t.answer.trim() || !m.streaming) ? "Thought process" : "Thinking…"} <span class="muted">(${think.trim().split(/\s+/).length} words)</span></summary><div class="thinkbody">${md(think.trim())}</div></details>`;
+  if (think.trim()) h += `<details class="think"><summary>${t.done && m.content.length > 0 && (t.answer.trim() || !m.streaming) ? "Thought process" : "Thinking…"} <span class="muted">(${m.rinfo ? rinfoText(m.rinfo) : think.trim().split(/\s+/).length + " words"})</span></summary><div class="thinkbody">${md(think.trim())}</div></details>`;
   h += md(t.answer);
   if (m.error) h += `<div class="err">⚠ ${esc(m.error)}</div>`;
   if (m.streaming && !t.answer && !think) h += `<span class="dots">…</span>`;
@@ -116,12 +116,14 @@ function renderMsgs() {
   if (!c) { box.innerHTML = `<div class="muted" style="margin:auto">Start a new chat.</div>`; return; }
   c.messages.forEach((m, i) => box.appendChild(msgEl(m, i))); box.scrollTop = box.scrollHeight;
 }
+function rinfoText(r) { let s = `${r.thinking_tokens ?? "?"} tokens · ${r.effort}`; if (r.auto && r.auto.level) s += ` → ${r.auto.level} (rating ${(+r.auto.rating).toFixed(2)})`; if (r.forced_close) s += " · budget reached"; return s; }
+$("#effortPick").value = localStorage.getItem("pyre.effort") || "medium"; $("#effortPick").onchange = () => localStorage.setItem("pyre.effort", $("#effortPick").value);
 async function generate() {
   const c = conv(); const model = $("#modelPick").value;
   const msgs = []; const sys = $("#sysPrompt").value.trim(); if (sys) msgs.push({ role: "system", content: sys });
   c.messages.forEach(m => { if (m.role === "assistant" && m.error && !m.content) return; msgs.push({ role: m.role, content: m.role === "assistant" ? plainAnswer(m) : m.content }); });
   const body = { model, messages: msgs, stream: true, stream_options: { include_usage: true },
-    temperature: +$("#sTemp").value, top_p: +$("#sTopP").value, top_k: +$("#sTopK").value, max_tokens: +$("#sMax").value };
+    temperature: +$("#sTemp").value, top_p: +$("#sTopP").value, top_k: +$("#sTopK").value, max_tokens: +$("#sMax").value, reasoning_effort: $("#effortPick").value };
   if ($("#sSeed").value !== "") body.seed = +$("#sSeed").value;
   if (!model) { const a = { role: "assistant", content: "", error: "No text model is loaded. Load one on the Models page (or start pyre with -m <model>)." }; c.messages.push(a); save(); renderMsgs(); return; }
   const a = { role: "assistant", content: "", reasoning: "", streaming: true }; c.messages.push(a);
@@ -136,7 +138,7 @@ async function generate() {
       if (ch.error) throw new Error(ch.error.message);
       const dl = ch.choices?.[0]?.delta || {}; const d = dl.content, r = dl.reasoning_content;
       if (d || r) { if (!first) first = performance.now(); n++; if (d) a.content += d; if (r) a.reasoning += r; paint(); }
-      if (ch.timings) timings = ch.timings;
+      if (ch.timings) timings = ch.timings; if (ch.reasoning) { a.rinfo = ch.reasoning; paint(); }
     }
   } catch (e) { if (e.name !== "AbortError") a.error = e.message || String(e); else a.stats = "stopped"; }
   finally {

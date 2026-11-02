@@ -35,6 +35,7 @@
     <div class="chatbar">
       <button id="convToggle" class="ghost" title="Conversations">☰</button>
       <select id="modelPick" title="Model"></select>
+<select id="effortPick" title="Reasoning effort"><option value="none">none</option><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option><option value="very_high">very high</option><option value="auto">auto</option></select>
       <span id="tps" class="muted"></span>
       <button id="settingsBtn" class="ghost">⚙ Settings</button>
     </div>
@@ -43,7 +44,7 @@
       <label>Temperature<input id="sTemp" type="number" step="0.05" min="0" max="2" value="0.7"></label>
       <label>top_p<input id="sTopP" type="number" step="0.05" min="0" max="1" value="0.95"></label>
       <label>top_k<input id="sTopK" type="number" step="1" min="0" value="40"></label>
-      <label>Max tokens<input id="sMax" type="number" step="16" min="1" value="512"></label>
+      <label>Max tokens<input id="sMax" type="number" step="16" min="1" value="4096"></label>
       <label>Seed<input id="sSeed" type="number" placeholder="random"></label>
     </div>
     <div id="messages" class="messages"></div>
