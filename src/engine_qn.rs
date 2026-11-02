@@ -111,6 +111,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         (p, Some((i, n))) => { drop(p); let s = pc.remove(i); let st = m.restore(&s); pc.push(s); (st, n) }
         _ => (m.new_state(), 0),
     };
+    if cached == 0 { crate::model::qwen4exp_gguf::kv8_new_conversation(); }
     let restore_ms = t0.elapsed().as_secs_f64() * 1e3;
     let mut tm = Timings { prompt_n: prompt.len() - cached, cached_n: cached, ..Default::default() };
     let chunk: usize = std::env::var("PYRE_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256).max(1);

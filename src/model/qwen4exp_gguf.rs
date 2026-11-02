@@ -3285,3 +3285,14 @@ fn kv8_drop(cb: &super::qn_cube::Cube, g: &mut KvG, row: usize, why: &str) {
     KV8_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::logbuf::event("kv8_fallback", "WARN", serde_json::json!({"why": why, "q8n": o, "len": g.len}));
 }
+pub static KV8_DISENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// kv8 auto disengage: at the start of a new conversation (no state or prefix reused) with free VRAM at least
+/// floor + PYRE_QN_KV8_HYST_MB (default 2048) above the floor, later uploads go back to exact f32 KV.
+pub fn kv8_new_conversation() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if kv8_mode() != 2 || !KV8_ENGAGED.load(Relaxed) { return; }
+    let fl = crate::limits::vram_floor_mb() as u64; let h = env_usize("PYRE_QN_KV8_HYST_MB").unwrap_or(2048) as u64;
+    let free = crate::limits::vram().map_or(0, |v| v.free) >> 20;
+    if free >= fl + h { KV8_ENGAGED.store(false, Relaxed); KV8_DISENGAGES.fetch_add(1, Relaxed);
+        crate::logbuf::event("kv8_auto_off", "INFO", serde_json::json!({"free_mib": free, "floor_mib": fl})); }
+}
