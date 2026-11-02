@@ -163,14 +163,18 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         // see the probe). Signal = expected rating E in [0, 4]; the first-token entropy of the real prefill is logged too.
         let (h0, p0, _) = crate::effort::entropy(&logits);
         let tp = Instant::now();
-        let pids: Vec<u32> = tok.encode(crate::effort::auto_prompt().as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+        // exact routing during the probe (FAST's residency-dependent routing made the rating vary by up to 0.5 between runs);
+        // ROUTE_HOLD is set again for the real generation below. Phrasings are averaged (effort::auto_prompts).
+        crate::spec::ROUTE_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
+        let probes: Vec<Vec<u32>> = crate::effort::auto_prompts().iter().map(|p| tok.encode(p.as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default()).filter(|v| !v.is_empty()).collect();
+        let pids: Vec<u32> = probes.iter().flatten().copied().collect();
         let dig: Vec<Option<u32>> = (0..5).map(|d| tok.token_to_id(&d.to_string())).collect();
         let mut rating: Option<(f32, f32)> = None;
-        if !pids.is_empty() && dig.iter().all(|d| d.is_some()) && prompt.len() + pids.len() < ctx {
+        if !probes.is_empty() && dig.iter().all(|d| d.is_some()) && prompt.len() + probes.iter().map(|p| p.len()).max().unwrap_or(0) < ctx {
             if let Some(sn) = m.snapshot(&mut st) {
-                let pl = m.forward(&pids, &mut st);
-                st = m.restore(&sn);
-                rating = Some(crate::effort::rating(&pl, &dig.iter().map(|d| d.unwrap()).collect::<Vec<_>>()));
+                let dg: Vec<u32> = dig.iter().map(|d| d.unwrap()).collect(); let (mut se, mut sm) = (0f32, 0f32);
+                for p in &probes { let pl = m.forward(p, &mut st); st = m.restore(&sn); let (e, ms) = crate::effort::rating(&pl, &dg); se += e; sm += ms; }
+                let n = probes.len() as f32; rating = Some((se / n, sm / n));
             }
         }
         let probe_ms = tp.elapsed().as_secs_f64() * 1e3;

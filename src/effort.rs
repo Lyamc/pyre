@@ -21,7 +21,8 @@
 //! the mean entropy of the first 8 tokens was 0.33-0.64 nats with no relation to difficulty: trivial 0.575, hard math 0.391.)
 //! Structural bias (server, auto_bias): last message is a tool result -> PYRE_THINK_AUTO_TOOL (default -1 level);
 //! last user message longer than PYRE_THINK_AUTO_LONG chars (default 2000) or containing a code fence -> +1.
-//! Result clamped to PYRE_THINK_AUTO_MIN..PYRE_THINK_AUTO_MAX (default none..very_high). The chosen level's budget
+//! Result clamped to PYRE_THINK_AUTO_MIN..PYRE_THINK_AUTO_MAX (default none..high), with a medium ceiling unless the
+//! rating clears the band edge by PYRE_THINK_AUTO_MARGIN (see auto_pick). The chosen level's budget
 //! (as above) then applies; "none" closes the think block right away.
 //! pi (openai-completions, default compat) sends `reasoning_effort` = its level (minimal/low/medium/high/xhigh)
 //! and nothing for "off" unless the model's thinkingLevelMap.off is set (use "none").
@@ -94,6 +95,12 @@ pub const AUTO_T_DEFAULT: [f32; 4] = [1.0, 1.6, 2.3, 2.9];
 pub fn auto_prompt() -> String {
     envf("PYRE_THINK_AUTO_PROMPT").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| "\nFirst, how much thinking does this request need? On a scale from 0 (none: trivial, answer directly) to 4 (very deep: hard multi-step problem), my rating is [".to_string())
 }
+/// The probe phrasings (PYRE_THINK_AUTO_NPROBE, default 2, are averaged; PYRE_THINK_AUTO_PROMPT2 overrides the second).
+pub fn auto_prompts() -> Vec<String> {
+    let n = envf("PYRE_THINK_AUTO_NPROBE").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2).clamp(1, 2);
+    let p2 = envf("PYRE_THINK_AUTO_PROMPT2").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| "\nLet me first judge the difficulty. 0 = trivial, 1 = easy, 2 = moderate, 3 = hard, 4 = very hard. Difficulty: [".to_string());
+    let mut v = vec![auto_prompt()]; if n > 1 { v.push(p2); } v
+}
 /// Expected rating over the digit tokens (normalised among them) and their total probability mass.
 pub fn rating(logits: &[f32], digits: &[u32]) -> (f32, f32) {
     let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -106,10 +113,17 @@ pub fn rating(logits: &[f32], digits: &[u32]) -> (f32, f32) {
 /// Level when the probe could not run (no snapshot support): medium shifted by the structural bias.
 pub fn auto_fallback(bias: i32) -> Effort { LEVELS[(2 + bias).clamp(0, 4) as usize] }
 /// Level from the entropy signal plus a structural bias (in levels), clamped to PYRE_THINK_AUTO_MIN..MAX.
+/// Ceiling: medium unless the rating is clearly in the upper bands (>= band edge + PYRE_THINK_AUTO_MARGIN, default 0.4):
+/// then high, and very_high only when also allowed by PYRE_THINK_AUTO_MAX (default high). High's 8192-token budget is
+/// long (t4 at auto: rating 2.62 -> high -> 8175 thinking tokens, 927 s vs 358 s at medium), so it needs strong evidence;
+/// the structural bias never lifts a level above that ceiling.
 pub fn auto_pick(h: f32, bias: i32) -> Effort {
-    let base = auto_thresholds().iter().filter(|t| h >= **t).count() as i32;
+    let t = auto_thresholds();
+    let base = t.iter().filter(|x| h >= **x).count() as i32;
     let lv = |k: &str, d: usize| envf(k).and_then(|v| Effort::parse(&v)).filter(|e| *e != Effort::Auto).map(|e| e.idx()).unwrap_or(d) as i32;
-    let (lo, hi) = (lv("PYRE_THINK_AUTO_MIN", 0), lv("PYRE_THINK_AUTO_MAX", 4));
+    let margin = envf("PYRE_THINK_AUTO_MARGIN").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.4);
+    let strong = if h >= t[3] + margin { 4 } else if h >= t[2] + margin { 3 } else { 2 };
+    let (lo, hi) = (lv("PYRE_THINK_AUTO_MIN", 0), lv("PYRE_THINK_AUTO_MAX", 3).min(strong));
     LEVELS[(base + bias).clamp(lo.min(hi), hi) as usize]
 }
 /// Structural cue from the chat messages (see module docs).
@@ -225,10 +239,11 @@ mod tests {
             assert_eq!(auto_pick(t[0] - 0.01, 0), Effort::None);
             assert_eq!(auto_pick(t[0], 0), Effort::Low);
             assert_eq!(auto_pick(t[1], 0), Effort::Medium);
-            assert_eq!(auto_pick(t[2], 0), Effort::High);
-            assert_eq!(auto_pick(t[3] + 1.0, 0), Effort::VeryHigh);
+            assert_eq!(auto_pick(t[2], 0), Effort::Medium);          // in the high band but not clearly: medium
+            assert_eq!(auto_pick(t[2] + 0.41, 0), Effort::High);
+            assert_eq!(auto_pick(t[3] + 1.0, 0), Effort::High);      // PYRE_THINK_AUTO_MAX default high
+            assert_eq!(auto_pick(t[1], 1), Effort::Medium);          // bias cannot pass the medium ceiling
             assert_eq!(auto_pick(t[1], -1), Effort::Low);
-            assert_eq!(auto_pick(t[3] + 1.0, 1), Effort::VeryHigh);
             assert_eq!(auto_pick(0.0, -1), Effort::None);
         }
         if std::env::var("PYRE_THINK_AUTO_TOOL").is_err() && std::env::var("PYRE_THINK_AUTO_LONG").is_err() {
