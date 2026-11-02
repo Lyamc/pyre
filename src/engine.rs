@@ -20,6 +20,8 @@ pub struct GenRequest {
     pub think_budget: Option<usize>,
     /// reasoning effort auto (effort.rs): Some(structural bias) = the engine picks the budget from the prefill signal
     pub auto_bias: Option<i32>,
+    /// the request offers tools (auto's none floor)
+    pub auto_tools: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

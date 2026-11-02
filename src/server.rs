@@ -167,14 +167,14 @@ impl Gen {
     }
 }
 
-fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> { start_tb(st, prompt, g, None, None) }
+fn start(st: &AppState, prompt: Vec<u32>, g: &Gen) -> UnboundedReceiver<Event> { start_tb(st, prompt, g, None, None, false) }
 
-fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize>, auto_bias: Option<i32>) -> UnboundedReceiver<Event> {
+fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize>, auto_bias: Option<i32>, auto_tools: bool) -> UnboundedReceiver<Event> {
     let (tx, mut rx_in) = unbounded_channel();
     let (tx_out, rx) = unbounded_channel();
     let max_tokens = g.max(st, prompt.len());
     let mid = crate::metrics::begin(&st.model_id, prompt.len(), st.n_ctx, max_tokens);
-    st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx, think_budget, auto_bias }));
+    st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx, think_budget, auto_bias, auto_tools }));
     // Forward engine events to the handler while recording live metrics (/api/metrics).
     // Dropping `rx_in` when the client goes away still cancels the job as before.
     tokio::spawn(async move {
@@ -228,11 +228,11 @@ fn sse(s: impl Stream<Item = Value> + Send + 'static, done: bool) -> SseStream {
 /// appended to the sequence (prompt + generated ids + close ids, so the cached state is strictly extended) and phase 2
 /// generates the answer with the remaining max_tokens. The client sees one stream and one merged Done.
 /// `auto`: Some(bias) = reasoning effort auto; the engine reports its choice as Event::Info (kept in `info`).
-fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, auto: Option<i32>, forced: Arc<std::sync::atomic::AtomicBool>, info: Arc<std::sync::Mutex<Value>>) -> UnboundedReceiver<Event> {
+fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, auto: Option<i32>, auto_tools: bool, forced: Arc<std::sync::atomic::AtomicBool>, info: Arc<std::sync::Mutex<Value>>) -> UnboundedReceiver<Event> {
     let tb = budget.filter(|b| *b > 0);
     if tb.is_none() && auto.is_none() { return start(st, ids, g) }
     let max = g.max(st, ids.len());
-    let mut rx1 = start_tb(st, ids.clone(), g, tb, auto);
+    let mut rx1 = start_tb(st, ids.clone(), g, tb, auto, auto_tools);
     let (tx, rx) = unbounded_channel();
     let (st, mut g2) = (st.clone(), g.clone());
     tokio::spawn(async move {
@@ -259,7 +259,8 @@ fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, auto:
                 return;
             }
             g2.max_tokens = Some(rest); g2.max_completion_tokens = None; g2.n_predict = None;
-            let mut rx2 = start_tb(&st, ids2, &g2, None, None);
+            crate::effort::CONTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut rx2 = start_tb(&st, ids2, &g2, None, None, false);
             while let Some(e2) = rx2.recv().await {
                 match e2 {
                     Event::Done { finish_reason, text: t2, timings: m2, stopping_word, tokens: k2 } => {
@@ -487,7 +488,8 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let mut tools = Tools::new(req.tools.as_ref());
     let rlog = reqlog(json!({"req": &id, "stream": req.g.stream, "messages": &req.messages, "ntools": req.tools.as_ref().and_then(|t| t.as_array()).map(|a| a.len()),
         "effort": plan.effort.name(), "effort_explicit": plan.explicit, "budget": budget, "auto_bias": auto}));
-    let rx = start_eff(&st, ids, &req.g, budget, auto, forced.clone(), info.clone());
+    let has_tools = req.tools.as_ref().and_then(|t| t.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let rx = start_eff(&st, ids, &req.g, budget, auto, has_tools, forced.clone(), info.clone());
     if !req.g.stream {
         return match collect(rx).await {
             Ok((text, fin, t, _)) => {

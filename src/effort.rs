@@ -38,6 +38,8 @@ pub static REQS: [AtomicU64; 6] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU
 /// auto's choices by level (LEVELS order)
 pub static AUTO_CHOICE: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 pub static FORCED: AtomicU64 = AtomicU64::new(0);
+/// Engine requests that were continuations of a forced think close (subtracted from pyre_requests_total).
+pub static CONTS: AtomicU64 = AtomicU64::new(0);
 pub static THINK_TOKENS: AtomicU64 = AtomicU64::new(0);
 
 impl Effort {
@@ -91,7 +93,7 @@ pub fn auto_thresholds() -> [f32; 4] {
 }
 /// Calibrated on P62 (int53d, 6 prompts, E): trivial 1.19, one-liner 1.79, bat/ball 2.18, x^2-y^2 2.23, ISO-duration code 2.44,
 /// after a tool result 1.37. The model's ratings are compressed (1.2-2.5), so the bands are narrow.
-pub const AUTO_T_DEFAULT: [f32; 4] = [1.0, 1.6, 2.3, 2.9];
+pub const AUTO_T_DEFAULT: [f32; 4] = [0.9, 1.5, 2.3, 2.9];
 pub fn auto_prompt() -> String {
     envf("PYRE_THINK_AUTO_PROMPT").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| "\nFirst, how much thinking does this request need? On a scale from 0 (none: trivial, answer directly) to 4 (very deep: hard multi-step problem), my rating is [".to_string())
 }
@@ -117,14 +119,21 @@ pub fn auto_fallback(bias: i32) -> Effort { LEVELS[(2 + bias).clamp(0, 4) as usi
 /// then high, and very_high only when also allowed by PYRE_THINK_AUTO_MAX (default high). High's 8192-token budget is
 /// long (t4 at auto: rating 2.62 -> high -> 8175 thinking tokens, 927 s vs 358 s at medium), so it needs strong evidence;
 /// the structural bias never lifts a level above that ceiling.
-pub fn auto_pick(h: f32, bias: i32) -> Effort {
+pub fn auto_pick(h: f32, bias: i32) -> Effort { auto_pick_t(h, bias, false) }
+/// `tools`: the request offers tools. none needs a clearly low rating (< band edge - PYRE_THINK_AUTO_NONE_MARGIN, 0.15),
+/// and with tools offered a rating below PYRE_THINK_AUTO_TOOLS_NONE (0.5); otherwise the floor is low (P64: a TCP/UDP
+/// question rated 0.88 at none answered with a stray tool call).
+pub fn auto_pick_t(h: f32, bias: i32, tools: bool) -> Effort {
     let t = auto_thresholds();
     let base = t.iter().filter(|x| h >= **x).count() as i32;
     let lv = |k: &str, d: usize| envf(k).and_then(|v| Effort::parse(&v)).filter(|e| *e != Effort::Auto).map(|e| e.idx()).unwrap_or(d) as i32;
     let margin = envf("PYRE_THINK_AUTO_MARGIN").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.4);
     let strong = if h >= t[3] + margin { 4 } else if h >= t[2] + margin { 3 } else { 2 };
     let (lo, hi) = (lv("PYRE_THINK_AUTO_MIN", 0), lv("PYRE_THINK_AUTO_MAX", 3).min(strong));
-    LEVELS[(base + bias).clamp(lo.min(hi), hi) as usize]
+    let mut i = (base + bias).clamp(lo.min(hi), hi);
+    let fv = |k: &str, d: f32| envf(k).and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(d);
+    if i == 0 && (h >= t[0] - fv("PYRE_THINK_AUTO_NONE_MARGIN", 0.15) || (tools && h >= fv("PYRE_THINK_AUTO_TOOLS_NONE", 0.5))) { i = 1.min(hi.max(1)); }
+    LEVELS[i as usize]
 }
 /// Structural cue from the chat messages (see module docs).
 pub fn auto_bias(msgs: &[Value]) -> i32 {
@@ -236,7 +245,10 @@ mod tests {
         assert_eq!(auto_fallback(0), Effort::Medium); assert_eq!(auto_fallback(-1), Effort::Low);
         if std::env::var("PYRE_THINK_AUTO_T").is_err() && std::env::var("PYRE_THINK_AUTO_MIN").is_err() && std::env::var("PYRE_THINK_AUTO_MAX").is_err() {
             let t = AUTO_T_DEFAULT;
-            assert_eq!(auto_pick(t[0] - 0.01, 0), Effort::None);
+            assert_eq!(auto_pick(t[0] - 0.01, 0), Effort::Low);       // not clearly low
+            assert_eq!(auto_pick(t[0] - 0.2, 0), Effort::None);
+            assert_eq!(auto_pick_t(t[0] - 0.2, 0, true), Effort::Low);  // tools offered: floor low
+            assert_eq!(auto_pick_t(0.3, 0, true), Effort::None);
             assert_eq!(auto_pick(t[0], 0), Effort::Low);
             assert_eq!(auto_pick(t[1], 0), Effort::Medium);
             assert_eq!(auto_pick(t[2], 0), Effort::Medium);          // in the high band but not clearly: medium
@@ -244,6 +256,7 @@ mod tests {
             assert_eq!(auto_pick(t[3] + 1.0, 0), Effort::High);      // PYRE_THINK_AUTO_MAX default high
             assert_eq!(auto_pick(t[1], 1), Effort::Medium);          // bias cannot pass the medium ceiling
             assert_eq!(auto_pick(t[1], -1), Effort::Low);
+            assert_eq!(auto_pick(t[0] + 0.1, -1), Effort::Low);      // tool-result bias to none, rating not clearly low
             assert_eq!(auto_pick(0.0, -1), Effort::None);
         }
         if std::env::var("PYRE_THINK_AUTO_TOOL").is_err() && std::env::var("PYRE_THINK_AUTO_LONG").is_err() {

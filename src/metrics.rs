@@ -213,7 +213,7 @@ pub fn prometheus() -> String {
         env!("CARGO_PKG_VERSION"), option_env!("PYRE_BUILD").unwrap_or("dev"), v["flags"]["fast"], v["flags"]["xexact"]);
     g(&mut o, "pyre_uptime_seconds", "gauge", "Seconds since start.", f(&v["uptime_s"]));
     let t = &v["totals"];
-    g(&mut o, "pyre_requests_total", "counter", "Finished requests.", f(&t["requests"]));
+    g(&mut o, "pyre_requests_total", "counter", "Finished requests.", f(&t["requests"]).map(|v| (v - crate::effort::CONTS.load(std::sync::atomic::Ordering::Relaxed) as f64).max(0.0)));
     g(&mut o, "pyre_request_errors_total", "counter", "Requests that ended in an error.", f(&t["errors"]));
     g(&mut o, "pyre_requests_cancelled_total", "counter", "Requests cancelled by the client.", f(&t["cancelled"]));
     g(&mut o, "pyre_warnings_total", "counter", "Operational warnings (VRAM pressure, watchdog-style events).", f(&t["warnings"]));

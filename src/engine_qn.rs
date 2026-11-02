@@ -178,7 +178,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
             }
         }
         let probe_ms = tp.elapsed().as_secs_f64() * 1e3;
-        let lvl = match rating { Some((e, _)) => crate::effort::auto_pick(e, bias), None => crate::effort::auto_fallback(bias) };
+        let lvl = match rating { Some((e, _)) => crate::effort::auto_pick_t(e, bias, r.auto_tools), None => crate::effort::auto_fallback(bias) };
         crate::effort::count_auto(lvl);
         think_budget = lvl.budget(); auto_none = lvl == crate::effort::Effort::None;
         tracing::info!("reasoning auto: self-rating {:?} (digit mass {:?}) first-token entropy {h0:.3} bias {bias} -> {} (probe {} tokens, {probe_ms:.0} ms)", rating.map(|r| r.0), rating.map(|r| r.1), lvl.name(), pids.len());
