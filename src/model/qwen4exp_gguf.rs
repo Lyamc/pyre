@@ -1458,7 +1458,7 @@ impl Model {
             let (len, cap) = match &st.kvg[j] { Some(g) if g.q8.is_none() && g.len > self.dense_n() + rec + 64 => (g.len, g.cap), _ => continue };
             // headroom for the transient (new int8 copy before the old f32 buffers return): stop converting when it is not there
             let fl = crate::limits::vram_floor_mb() as u64; let free = crate::limits::vram().map_or(0, |v| v.free);
-            if free < ((cap as u64) * (self.cfg.n_kv * self.cfg.hd) as u64 * 3) + ((fl + 256) << 20) { break; }
+            if free < ((cap as u64) * (self.cfg.n_kv * self.cfg.hd) as u64 * 3) + ((fl + 128) << 20) { break; }
             self.kv_pull(j, st); st.kvg[j] = None; self.kv_push(cb, j, st, cap.max(len + 1)); n += 1; }
         if n > 0 { crate::logbuf::event("kv8_convert", "WARN", serde_json::json!({"layers": n, "free_mib": crate::limits::vram().map_or(0, |v| v.free >> 20)})); }
     }
@@ -1469,7 +1469,8 @@ impl Model {
         let cl = st.k[ai].len() / row;
         if matches!(&st.kvg[ai], Some(g) if g.cap >= need && g.len >= cl) { return; }
         let dbg = env_var("PYRE_QN_KVDBG").is_ok(); if dbg { eprintln!("kvdbg push ai {ai} need {need} host_k {cl} host_ik {} gpu {:?}", st.ik.get(ai).map_or(0, |v| v.len() / self.cfg.idx_hd.max(1)), st.kvg[ai].as_ref().map(|g| (g.len, g.cap, g.nbp))); }
-        self.kv_pull(ai, st); let cl = st.k[ai].len() / row;
+        // the host copy is complete after kv_pull: release the old GPU buffers before allocating the new ones (no transient double copy)
+        self.kv_pull(ai, st); st.kvg[ai] = None; let cl = st.k[ai].len() / row;
         // kv8 (PYRE_QN_KV8=1, opt-in, lossy): positions older than the last PYRE_QN_KV8_RECENT (default 1024) as int8 on the
         // GPU (sparse QSA decode reads them through kv8_at); only past the dense window, where every GPU step is attn_qsa
         if let Some(recent) = kv8_recent() { if self.has_idx() && cl > self.dense_n() + recent + 64 {
