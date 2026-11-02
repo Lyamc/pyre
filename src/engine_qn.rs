@@ -138,6 +138,18 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     if pcache_on() { tracing::info!("prefix cache: resumed at {cached} (restore {restore_ms:.0} ms), {} snapshots {:.0} MB, snapshot time {snap_ms:.0} ms", pc.len(), pc.iter().map(|s| s.bytes).sum::<usize>() as f64 / 1048576.0); }
     tm.prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
     tm.prompt_per_second = tm.prompt_n as f64 / (tm.prompt_ms / 1e3);
+    // PYRE_QN_TF_FILE=<path> (diagnostic, off by default): if <path> holds token ids (one line, comma separated), the
+    // request is teacher-forced with them instead of generating and writes "top1,lp_top1,lse;id:logit;..." per position to
+    // <path>.<n>.lp (top-20 logits); otherwise the generated ids are recorded into <path> at the end
+    let tf = std::env::var("PYRE_QN_TF_FILE").ok();
+    if let Some(p) = tf.as_ref() { if let Ok(s) = std::fs::read_to_string(p) { let ids: Vec<u32> = s.trim().split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if !ids.is_empty() { static N: AtomicU64 = AtomicU64::new(0); let n = N.fetch_add(1, Ordering::Relaxed); let mut o = String::new(); let mut lg = logits;
+            for &t in &ids { let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max); let lse = mx + lg.iter().map(|x| (x - mx).exp()).sum::<f32>().ln();
+                let mut ix: Vec<usize> = (0..lg.len()).collect(); ix.select_nth_unstable_by(20, |a, b| lg[*b].total_cmp(&lg[*a])); ix.truncate(20); ix.sort_by(|a, b| lg[*b].total_cmp(&lg[*a]));
+                o.push_str(&format!("{},{},{}", ix[0], lg[ix[0]], lse)); for &i in &ix { o.push_str(&format!(";{}:{}", i, lg[i])); } o.push('\n');
+                lg = m.forward(&[t], &mut st); }
+            let _ = std::fs::write(format!("{p}.{n}.lp"), o); tracing::info!("teacher-forced {} tokens -> {p}.{n}.lp", ids.len());
+            let _ = r.tx.send(Event::Done { finish_reason: "stop", text: String::new(), timings: tm, stopping_word: String::new() }); return Some(st); } } }
     let k = r.params.spec.or_else(crate::spec::draft_len_explicit).unwrap_or_else(|| m.spec_default()).min(8);
     let mut sampler = Sampler::new(r.params);
     let max_stop = r.stop.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -173,6 +185,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         if o.rounds > 0 { tracing::info!("speculative: {} rounds, {} drafted, {} accepted ({:.0}%)", o.rounds, o.drafted, o.accepted, 100.0 * o.accepted as f64 / o.drafted.max(1) as f64); }
     }
     if text.len() > emitted && finish != "abort" { let _ = r.tx.send(Event::Token(text[emitted..].to_string())); }
+    if let Some(p) = tf.as_ref() { if !std::path::Path::new(p).exists() { let _ = std::fs::write(p, out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); } }
     tm.predicted_n = out.len();
     tm.predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
     tm.predicted_per_second = if tm.predicted_ms > 0.0 { out.len() as f64 / (tm.predicted_ms / 1e3) } else { 0.0 };
