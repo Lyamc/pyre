@@ -14,6 +14,8 @@ mod isnet;
 mod segformer;
 mod lcm;
 mod rife;
+mod triposr;
+mod mc_tables;
 mod tts;
 mod image;
 mod tagger;

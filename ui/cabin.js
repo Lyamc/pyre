@@ -221,7 +221,12 @@ BUILD.tagger = (f, res, input) => {
     if (!src.url) throw new Error("choose an image"); res.busy("loading the tagger (CPU) and tagging…"); const t0 = performance.now();
     const j = await tagImage(src.url, +thr.input.value); const d = j.data[0];
     const rows = []; const push = (arr, cat) => { for (const t of arr || []) { const [n, s] = Array.isArray(t) ? t : [t.name || t.tag, t.score ?? t.prob]; rows.push({ n, s: +s, cat }); } };
-    if (Array.isArray(d.tags)) push(d.tags, "tag"); else { push(d.rating, "rating"); push(d.character, "character"); push(d.general, "general"); if (d.tags && !Array.isArray(d.tags)) push(Object.entries(d.tags), "tag"); }
+    // tagger response: tags {general: [{tag, score}], character: [...], ...} (older: flat arrays), rating {label, scores}
+    const list = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.entries(v) : []);
+    if (Array.isArray(d.tags)) push(d.tags, "tag");
+    else if (d.tags && typeof d.tags === "object") { for (const [cat, arr] of Object.entries(d.tags)) { if (Array.isArray(arr)) push(arr, cat); } }
+    else { push(list(d.character), "character"); push(list(d.general), "general"); }
+    if (d.rating?.scores) push(Object.entries(d.rating.scores).filter(([, v]) => v >= 0.2), "rating"); else if (Array.isArray(d.rating)) push(d.rating, "rating");
     rows.sort((a, b) => b.s - a.s);
     res.innerHTML = ""; const prompt = rows.filter(r => r.cat !== "rating").map(r => r.n.replace(/_/g, " ")).join(", ");
     res.append(el("div", { class: "row" }, el("button", { type: "button", onclick: () => navigator.clipboard.writeText(prompt) }, "Copy as prompt"), el("button", { type: "button", onclick: () => openWorkflow("txt2img", null, prompt) }, "Use in Text to image"), el("small", {}, `${rows.length} tags · ${((performance.now() - t0) / 1000).toFixed(1)} s`)),
@@ -428,6 +433,72 @@ BUILD.character = (f, res) => {
     }
     dirty.clear(); ch.history.push({ url: r.url, change, fields: Object.fromEntries(CH_FIELDS.map(([k]) => [k, inputs[k].value])) }); if (ch.history.length > 12) ch.history.shift(); save(); drawHist(); me.setImage(r.url);
     res.show(r.url, `character_v${ch.history.length}.png`, { info: `v${ch.history.length} · ${change} · seed ${seed.value} · ${r.secs.toFixed(1)} s` });
+  };
+};
+// ---------- 2D -> 3D: GLB (our layout: POSITION, NORMAL, COLOR_0 u8, u32 indices) + WebGL orbit viewer ----------
+function parseGlb(buf) {
+  const dv = new DataView(buf); if (dv.getUint32(0, true) !== 0x46546C67) throw new Error("not a GLB");
+  const jl = dv.getUint32(12, true); const js = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jl)));
+  const bo = 20 + jl + 8; const pr = js.meshes[0].primitives[0];
+  const acc = i => { const a = js.accessors[i], v = js.bufferViews[a.bufferView], off = bo + (v.byteOffset || 0) + (a.byteOffset || 0); const n = a.count * { SCALAR: 1, VEC3: 3, VEC4: 4 }[a.type];
+    return a.componentType === 5126 ? new Float32Array(buf.slice(off, off + n * 4)) : a.componentType === 5125 ? new Uint32Array(buf.slice(off, off + n * 4)) : new Uint8Array(buf.slice(off, off + n)); };
+  return { pos: acc(pr.attributes.POSITION), nor: acc(pr.attributes.NORMAL), col: acc(pr.attributes.COLOR_0), idx: acc(pr.indices), min: js.accessors[pr.attributes.POSITION].min, max: js.accessors[pr.attributes.POSITION].max };
+}
+function meshViewer(m) {
+  const c = el("canvas", { width: 640, height: 640, class: "glview", title: "drag: orbit · right-drag / shift-drag: pan · wheel: zoom · double-click: reset" });
+  const gl = c.getContext("webgl", { antialias: true, preserveDrawingBuffer: true }); if (!gl) return el("p", {}, "WebGL is not available");
+  gl.getExtension("OES_element_index_uint");
+  const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, "attribute vec3 a_p,a_n;attribute vec4 a_c;uniform mat4 u_mv,u_pr;varying vec3 v_n;varying vec4 v_c;void main(){v_n=mat3(u_mv)*a_n;v_c=a_c;gl_Position=u_pr*u_mv*vec4(a_p,1.0);}"));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, "precision mediump float;varying vec3 v_n;varying vec4 v_c;uniform float u_lit;void main(){vec3 n=normalize(v_n);float d=abs(n.z)*0.6+max(dot(n,normalize(vec3(0.4,0.6,0.7))),0.0)*0.25+0.3;gl_FragColor=vec4(v_c.rgb*mix(1.0,d,u_lit),1.0);}"));
+  gl.linkProgram(p); gl.useProgram(p);
+  const buf = (data, loc, n, type, norm) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); const l = gl.getAttribLocation(p, loc); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, n, type, norm, 0, 0); };
+  buf(m.pos, "a_p", 3, gl.FLOAT, false); buf(m.nor, "a_n", 3, gl.FLOAT, false); buf(m.col, "a_c", 4, gl.UNSIGNED_BYTE, true);
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+  const ctr = [0, 1, 2].map(i => (m.min[i] + m.max[i]) / 2), rad = Math.max(...[0, 1, 2].map(i => m.max[i] - m.min[i])) * 0.75 || 1;
+  const st = { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0], lit: 1 }; const reset = () => Object.assign(st, { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0] });
+  const mul = (a, b) => { const o = new Float32Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k]; o[i * 4 + j] = s; } return o; };
+  const draw = () => {
+    gl.viewport(0, 0, c.width, c.height); gl.clearColor(0.13, 0.14, 0.16, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+    const cy = Math.cos(st.yaw), sy = Math.sin(st.yaw), cp = Math.cos(st.pitch), sp = Math.sin(st.pitch);
+    const T = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -ctr[0], -ctr[1], -ctr[2], 1]);
+    const Ry = new Float32Array([cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1]);
+    const Rx = new Float32Array([1, 0, 0, 0, 0, cp, sp, 0, 0, -sp, cp, 0, 0, 0, 0, 1]);
+    const V = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, st.pan[0], st.pan[1], -st.dist, 1]);
+    const mv = mul(V, mul(Rx, mul(Ry, T)));
+    const f = 1 / Math.tan(0.4), nr = st.dist / 50, fr = st.dist * 10;
+    const pr = new Float32Array([f, 0, 0, 0, 0, f, 0, 0, 0, 0, (fr + nr) / (nr - fr), -1, 0, 0, 2 * fr * nr / (nr - fr), 0]);
+    gl.uniformMatrix4fv(gl.getUniformLocation(p, "u_mv"), false, mv); gl.uniformMatrix4fv(gl.getUniformLocation(p, "u_pr"), false, pr); gl.uniform1f(gl.getUniformLocation(p, "u_lit"), st.lit);
+    gl.drawElements(gl.TRIANGLES, m.idx.length, gl.UNSIGNED_INT, 0);
+  };
+  let drag = null;
+  c.addEventListener("contextmenu", e => e.preventDefault());
+  c.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey }; c.setPointerCapture(e.pointerId); });
+  c.addEventListener("pointermove", e => { if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) { st.pan[0] += dx * st.dist / 600; st.pan[1] -= dy * st.dist / 600; } else { st.yaw += dx * 0.01; st.pitch = Math.max(-1.5, Math.min(1.5, st.pitch + dy * 0.01)); } draw(); });
+  c.addEventListener("pointerup", () => drag = null);
+  c.addEventListener("wheel", e => { e.preventDefault(); st.dist *= Math.exp(e.deltaY * 0.001); draw(); }, { passive: false });
+  c.addEventListener("dblclick", () => { reset(); draw(); });
+  const w = el("div", { class: "glwrap" }, c); w.view = (yaw, pitch) => { st.yaw = yaw; st.pitch = pitch; draw(); }; w.setLit = v => { st.lit = v; draw(); };
+  draw(); return w;
+}
+BUILD.to3d = (f, res, input) => {
+  const src = imageSource(); if (input) src.set(input);
+  const model = sel([["general", "General / photo (RMBG-1.4)"], ["anime", "Anime / illustration (anime-seg)"]], "anime");
+  const reso = sel([["128", "Fast (128³ grid)"], ["192", "Medium (192³)"], ["256", "Fine (256³)"]], "256");
+  const thr = range(25, 5, 60, 1), ratio = range(0.85, 0.6, 1, 0.05);
+  f.append(field("Image", src, "the subject is cut out first (IS-Net), then TripoSR builds the mesh"), el("div", { class: "row" }, field("Background removal", model), field("Mesh detail", reso)), el("div", { class: "row" }, field("Surface threshold", thr, "lower = fatter, higher = thinner"), field("Subject size", ratio, "share of the frame (TripoSR default 0.85)")));
+  return async () => {
+    if (!src.url) throw new Error("choose an image"); res.busy("cutting out the subject and building the 3D model…");
+    const j = await api("/api/cabin/to3d", { image: await prep(src.url, 1536, 16), model: model.value, resolution: +reso.value, threshold: +thr.input.value, ratio: +ratio.input.value });
+    const bin = Uint8Array.from(atob(j.glb), ch => ch.charCodeAt(0)); const url = URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" }));
+    const v = meshViewer(parseGlb(bin.buffer)); res.innerHTML = ""; res.viewer = v;
+    const lit = el("input", { type: "checkbox", checked: true }); lit.onchange = () => v.setLit(lit.checked ? 1 : 0);
+    res.append(v, el("div", { class: "row" }, el("a", { href: url, download: "model_" + Date.now() + ".glb", class: "btnlink" }, `Download GLB (${(j.glb_bytes / 1048576).toFixed(1)} MB)`),
+      el("button", { type: "button", onclick: () => v.view(0, 0.15) }, "Front"), el("button", { type: "button", onclick: () => v.view(Math.PI / 2, 0.15) }, "Side"), el("button", { type: "button", onclick: () => v.view(Math.PI, 0.15) }, "Back"),
+      el("label", { class: "inl" }, lit, "shading"), el("small", {}, `${j.vertices} vertices · ${j.triangles} triangles · ${j.seconds.toFixed(1)} s · ${j.info}`)),
+      el("div", { class: "side" }, el("figure", {}, el("img", { src: j.cutout.startsWith("data:") ? j.cutout : "data:image/png;base64," + j.cutout }), el("figcaption", {}, "cut-out")), el("figure", {}, el("img", { src: j.input.startsWith("data:") ? j.input : "data:image/png;base64," + j.input }), el("figcaption", {}, "TripoSR input"))));
   };
 };
 // ---------- shell ----------

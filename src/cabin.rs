@@ -128,7 +128,8 @@ async fn workflows(State(app): S) -> Json<Value> {
     w.insert("layers".into(), if isn && sd { ok("IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers") } else { wip("needs IS-Net weights and SD 1.5") });
     let rf = crate::rife::available(&crate::rife::weights_dir(&app.storage.store.root));
     w.insert("animate".into(), if rf { ok("RIFE 4.6 frame interpolation (GPU) -> GIF + PNG frames") } else { wip("RIFE weights missing in <store>/cabin/rife") });
-    w.insert("to3d".into(), wip("image-to-mesh model (TripoSR-class) port planned"));
+    let tsr = crate::triposr::available(&crate::triposr::weights_dir(&app.storage.store.root));
+    w.insert("to3d".into(), if tsr && isn { ok("IS-Net cut-out + TripoSR (native, f16 weights) -> marching cubes, vertex colours, GLB") } else { wip("TripoSR weights missing in <store>/cabin/triposr (or IS-Net)") });
     let seg = crate::segformer::available(&crate::segformer::weights_dir(&app.storage.store.root));
     w.insert("clothes".into(), if seg && sd { ok("SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting") } else { wip("SegFormer clothes weights missing in <store>/cabin/segformer") });
     let op = app.storage.store.root.join("cabin").join("controlnet-openpose").join("diffusion_pytorch_model.fp16.safetensors").is_file();
@@ -293,6 +294,45 @@ async fn rmbg(State(app): S, Json(b): Json<Value>) -> Response {
     }).await)
 }
 
+/// `POST /api/cabin/to3d {image, resolution: 64..320 (256), threshold (25), ratio (0.85), model: general|anime,
+/// cutout: bool (image already has alpha)}` -> {glb (base64), input (prepared 512 px PNG), cutout, info}.
+async fn to3d(State(app): S, Json(b): Json<Value>) -> Response {
+    let isd = crate::isnet::weights_dir(&app.storage.store.root);
+    let tdir = crate::triposr::weights_dir(&app.storage.store.root);
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let t = Instant::now();
+        let src = b64_image(&b["image"])?;
+        let res = b["resolution"].as_u64().unwrap_or(256).clamp(64, 320) as usize;
+        let thr = b["threshold"].as_f64().unwrap_or(25.0) as f32;
+        let ratio = b["ratio"].as_f64().unwrap_or(0.85).clamp(0.5, 1.0) as f32;
+        let rgba = if b["cutout"].as_bool().unwrap_or(false) && src.color().has_alpha() { src.to_rgba8() } else {
+            let img = src.to_rgb8();
+            let name = match b["model"].as_str().unwrap_or("general") { "anime" => "anime", _ => "rmbg" };
+            let m = small_gpu(1_600 << 20, "IS-Net background removal", |dev| crate::isnet::IsNet::load(&isd, name, dev)?.matte(&img, 1024, dev))?;
+            let mut o = image::RgbaImage::new(img.width(), img.height());
+            for (x, y, p) in o.enumerate_pixels_mut() { let c = img.get_pixel(x, y); *p = image::Rgba([c[0], c[1], c[2], m.get_pixel(x, y)[0]]); }
+            o
+        };
+        let t_cut = t.elapsed().as_secs_f64();
+        let inp = crate::triposr::prepare(&rgba, ratio)?;
+        // ~840 MB f16 weights + f32 activations (self-attention scores in 4-head groups, 2^18-point query chunks)
+        let (mesh, info) = small_gpu(2_300 << 20, "TripoSR image to 3D", |dev| { let m = crate::triposr::Tsr::load(&tdir, dev)?; crate::triposr::image_to_mesh(&m, &inp, res, thr) })?;
+        let glb = crate::triposr::glb(&mesh);
+        let mut pim = image::RgbImage::new(512, 512);
+        for (i, p) in pim.pixels_mut().enumerate() { for c in 0..3 { p[c] = (inp[i * 3 + c] * 255.0).round() as u8; } }
+        use base64::Engine;
+        Ok(json!({"glb": base64::engine::general_purpose::STANDARD.encode(&glb), "glb_bytes": glb.len(), "input": png_b64(&image::DynamicImage::ImageRgb8(pim))?,
+            "cutout": png_b64(&image::DynamicImage::ImageRgba8(rgba))?, "vertices": mesh.pos.len(), "triangles": mesh.tri.len(),
+            "info": format!("cut-out {t_cut:.1}s; {info}"), "seconds": t.elapsed().as_secs_f64()}))
+    }).await)
+}
+/// `POST /api/cabin/tsr_check {refdir}`.
+async fn tsr_check(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::triposr::weights_dir(&app.storage.store.root);
+    let rd = std::path::PathBuf::from(b["refdir"].as_str().unwrap_or(""));
+    json_or_err(tokio::task::spawn_blocking(move || small_gpu(2_300 << 20, "TripoSR check", |dev| crate::triposr::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
+}
+
 /// Label ids for a part name (character creator fields and the clothes workflow).
 fn part_labels(p: &str) -> &'static [u8] {
     match p { "hair" => &[2], "hat" => &[1], "face" | "eyes" | "expr" => &[11], "top" | "upper" => &[4, 17], "sleeves" => &[4, 14, 15], "bottom" => &[5, 6, 7], "skirt" => &[5], "pants" => &[6], "dress" => &[4, 5, 6, 7], "shoes" => &[9, 10], "acc" => &[1, 3, 8, 16, 17], "legs" => &[12, 13], "arms" => &[14, 15], "person" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], _ => &[] }
@@ -424,6 +464,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/cabin/seg_check", post(seg_check))
         .route("/api/cabin/animate", post(animate).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/rife_check", post(rife_check))
+        .route("/api/cabin/to3d", post(to3d).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
+        .route("/api/cabin/tsr_check", post(tsr_check))
         .route("/api/cabin/pack", post(pack).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

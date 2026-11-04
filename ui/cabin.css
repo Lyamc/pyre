@@ -31,3 +31,6 @@
 .chgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
 .hist{display:flex;gap:6px;overflow-x:auto}.hist figure{margin:0;width:96px;flex:none}.hist img{width:96px;height:128px;object-fit:cover;border-radius:6px;cursor:pointer;border:2px solid transparent}.hist figure.on img{border-color:var(--accent)}.hist figcaption{font-size:10px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #cabinStatus{font-size:11px;color:var(--muted)}
+
+.glview{max-width:100%;border-radius:8px;touch-action:none;cursor:grab;display:block}
+.glwrap{margin-bottom:8px}
