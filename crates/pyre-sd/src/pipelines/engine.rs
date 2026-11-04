@@ -139,7 +139,15 @@ fn host_tensor<const D: usize>(data: Vec<f32>, shape: [usize; D], dev: &Device, 
     Tensor::<D>::cast(Tensor::<D>::from_data(TensorData::new(data, shape), dev), dtype)
 }
 
+/// Attention slice (batch*heads per chunk) for SD1.x/2.x: bounds the attention-matrix peak so
+/// 768px inpaint/outpaint fits next to the LLM (PYRE_SD_SLICE=off disables, default 8).
+fn sd_slice() -> Option<usize> { match std::env::var("PYRE_SD_SLICE").ok().as_deref() { Some("off") | Some("0") => None, Some(v) => v.parse().ok(), None => Some(8) } }
 fn unet_config(family: Family) -> UNet2DConditionModelConfig {
+    let mut c = unet_config_base(family);
+    if matches!(family, Family::Sd15 | Family::Sd2) { c.sliced_attention_size = sd_slice(); }
+    c
+}
+fn unet_config_base(family: Family) -> UNet2DConditionModelConfig {
     match family {
         Family::Sd15 => StableDiffusionConfig::v1_5(None, None, None).unet,
         Family::Sd2 => StableDiffusionConfig::v2_1(None, None, None).unet,

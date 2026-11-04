@@ -192,9 +192,12 @@ impl ImageModel {
                 let (w, h) = ((img.width() as usize) / 8 * 8, (img.height() as usize) / 8 * 8);
                 let img = image::imageops::crop_imm(&img, 0, 0, w as u32, h as u32).to_image();
                 q.width = w; q.height = h;
-                if w > self.max_side() || h > self.max_side() {
-                    // keep the aspect, fit the long side to the model limit
-                    let s = self.max_side() as f64 / w.max(h) as f64;
+                // edits also cap the pixel area (PYRE_SD_MAX_AREA, SD1.x default 512x512): a 768px outpaint
+                // canvas otherwise needs ~2 GB of activations next to the LLM
+                let cap = std::env::var("PYRE_SD_MAX_AREA").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(if self.native >= 1024 { usize::MAX } else { 512 * 512 });
+                if w > self.max_side() || h > self.max_side() || w * h > cap {
+                    // keep the aspect, fit the long side to the model limit and the area to the cap
+                    let s = (self.max_side() as f64 / w.max(h) as f64).min((cap as f64 / (w * h) as f64).sqrt()).min(1.0);
                     let (nw, nh) = (((w as f64 * s) as usize) / 8 * 8, ((h as f64 * s) as usize) / 8 * 8);
                     let r = image::imageops::resize(&img, nw as u32, nh as u32, image::imageops::FilterType::Lanczos3);
                     q.width = nw; q.height = nh;
@@ -218,7 +221,12 @@ impl ImageModel {
         let per = if self.native >= 1024 { 2048u64 << 20 } else { 1024u64 << 20 };
         if area > seen {
             let base = (self.native * self.native) as u64;
-            crate::limits::check_alloc(if seen == 0 { per * area.max(base) / base } else { per * (area - seen) / base }, "an image generation at this size")?;
+            // attention activations grow with the square of the token count (cabin: 768x512 on SD1.5 peaked
+            // ~2.1 GB over the weights vs ~1 GB at 512x512); lease it so the LLM expert cache shrinks first
+            let sq = |a: u64| { let r = a.max(base) as f64 / base as f64; (per as f64 * r * r) as u64 };
+            let need = sq(area).saturating_sub(if seen == 0 { 0 } else { sq(seen) });
+            crate::limits::lease(need, "an image generation at this size")?;
+            crate::limits::lease_end(need);
         }
         let mut eng = self.eng.lock().unwrap();
         self.queued.fetch_sub(1, Ordering::SeqCst);
