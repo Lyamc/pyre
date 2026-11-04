@@ -54,16 +54,20 @@ pub fn merged(lora: &Path, model_dir: &Path) -> Result<PathBuf> {
         let (u, d, mut wv) = (to_f32(&up)?, to_f32(&down)?, to_f32(&w)?);
         let sc = alpha / r as f32;
         for oi in 0..o { let row = &mut wv[oi * inner..(oi + 1) * inner]; for ri in 0..r { let c = u[oi * r + ri] * sc; if c == 0.0 { continue; } let dr = &d[ri * inner..(ri + 1) * inner]; for (x, y) in row.iter_mut().zip(dr) { *x += c * y; } } }
-        Ok((k.clone(), Some((ws, from_f32(&wv, w.dtype())))))
+        Ok((k.clone(), Some((ws, from_f32(&wv, Dtype::F16)))))
     }).collect::<Result<Vec<_>>>()?;
     let mut owned: HashMap<String, (Vec<usize>, Vec<u8>)> = HashMap::new();
     for (k, v) in merged { if let Some(k2) = k.strip_prefix('!') { skipped.push(k2.to_string()); continue; } if let Some(v) = v { hits += 1; owned.insert(k, v); } }
+    let mut conv: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
     let mut views: Vec<(String, TensorView)> = Vec::with_capacity(names.len());
     for k in &names {
         let t = bs.tensor(k)?;
-        let v = match owned.get(k) { Some((s, b)) => TensorView::new(t.dtype(), s.clone(), b)?, None => t };
+        // always f16 on disk (the base SD 1.5 UNet ships f32; loading a 3.4 GB f32 UNet next to the resident
+        // models breached the VRAM floor)
+        let v = match owned.get(k) { Some((s, b)) => TensorView::new(Dtype::F16, s.clone(), b)?, None if t.dtype() == Dtype::F32 => { conv.push((k.clone(), t.shape().to_vec(), from_f32(&to_f32(&t)?, Dtype::F16))); continue; } None => t };
         views.push((k.clone(), v));
     }
+    for (k, s, b) in &conv { views.push((k.clone(), TensorView::new(Dtype::F16, s.clone(), b)?)); }
     std::fs::create_dir_all(dst.parent().unwrap())?;
     let tmp = dst.with_extension("partial");
     safetensors::serialize_to_file(views, None, &tmp)?;

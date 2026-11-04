@@ -60,7 +60,18 @@ pub async fn ensure(app: &Arc<App>, kind: Kind, r: &str, backend: &str, lease: u
     }
 }
 
+static APP: std::sync::OnceLock<Arc<App>> = std::sync::OnceLock::new();
+/// Unload every idle on-demand GPU model (SD etc.) right now, to make room for a small GPU job.
+fn evict_idle_gpu() -> usize {
+    let Some(app) = APP.get() else { return 0 };
+    let live = app.loaded();
+    let ids: Vec<(String, u64)> = { let mut h = held().lock().unwrap(); let v: Vec<(String, u64)> = h.iter().filter(|x| x.gpu && live.iter().any(|m| m.id == x.id && !m.busy() && m.queued() == 0)).map(|x| (x.id.clone(), x.lease)).collect(); h.retain(|x| !v.iter().any(|d| d.0 == x.id)); v };
+    for (id, lease) in &ids { app.unload(id); std::thread::sleep(Duration::from_millis(300)); cleanup(); crate::limits::lease_end(*lease); tracing::info!("cabin: unloaded '{id}' to make room (VRAM free now {:?} MiB)", crate::limits::vram().map(|v| v.free >> 20)); }
+    ids.len()
+}
+
 fn reaper_start(app: Arc<App>) {
+    let _ = APP.set(app.clone());
     static R: std::sync::Once = std::sync::Once::new();
     R.call_once(move || { let _ = std::thread::Builder::new().name("cabin-reaper".into()).spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
@@ -115,11 +126,13 @@ async fn workflows(State(app): S) -> Json<Value> {
     let isn = crate::isnet::available(&isd, "rmbg") || crate::isnet::available(&isd, "anime");
     w.insert("rmbg".into(), if isn { ok("IS-Net: BRIA RMBG-1.4 (general, non-commercial) / anime-seg (anime), GPU") } else { wip("IS-Net weights missing in <store>/cabin/isnet") });
     w.insert("layers".into(), if isn && sd { ok("IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers") } else { wip("needs IS-Net weights and SD 1.5") });
-    w.insert("animate".into(), wip("frame interpolation model (RIFE / FILM) port planned"));
+    let rf = crate::rife::available(&crate::rife::weights_dir(&app.storage.store.root));
+    w.insert("animate".into(), if rf { ok("RIFE 4.6 frame interpolation (GPU) -> GIF + PNG frames") } else { wip("RIFE weights missing in <store>/cabin/rife") });
     w.insert("to3d".into(), wip("image-to-mesh model (TripoSR-class) port planned"));
     let seg = crate::segformer::available(&crate::segformer::weights_dir(&app.storage.store.root));
     w.insert("clothes".into(), if seg && sd { ok("SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting") } else { wip("SegFormer clothes weights missing in <store>/cabin/segformer") });
-    w.insert("pose".into(), wip("needs ControlNet OpenPose weights + pose editor"));
+    let op = app.storage.store.root.join("cabin").join("controlnet-openpose").join("diffusion_pytorch_model.fp16.safetensors").is_file();
+    w.insert("pose".into(), if op && sd { ok("SD 1.5 + ControlNet v1.1 OpenPose, pose editor with presets") } else { wip("ControlNet OpenPose weights missing in <store>/cabin/controlnet-openpose") });
     let (n, b) = crate::limits::leases();
     Json(json!({"workflows": w, "loaded": app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend})).collect::<Vec<_>>(),
         "vram": crate::limits::vram().map(|v| json!({"free_mib": v.free >> 20, "used_mib": v.used >> 20})), "leases": n, "leased_mib": b >> 20, "idle_unload_s": idle().as_secs()}))
@@ -143,6 +156,8 @@ async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
             }
             let lcm = crate::lcm::lora_file(&app.storage.store.root);
             if std::env::var_os("PYRE_SD_LCM_LORA").is_none() && lcm.is_file() { std::env::set_var("PYRE_SD_LCM_LORA", &lcm); }
+            let op = app.storage.store.root.join("cabin").join("controlnet-openpose");
+            if std::env::var_os("PYRE_SD_CONTROLNET_OPENPOSE").is_none() && op.join("diffusion_pytorch_model.fp16.safetensors").is_file() { std::env::set_var("PYRE_SD_CONTROLNET_OPENPOSE", &op); }
             ensure(&app, Kind::Image, b["model"].as_str().unwrap_or(SD15), "cuda", SD15_LEASE).await
         }
         "tagger" => ensure(&app, Kind::Tagger, TAGGER, b["backend"].as_str().unwrap_or("cpu"), 1_800 << 20).await,
@@ -203,7 +218,8 @@ static GPU_SMALL: Mutex<()> = Mutex::new(());
 /// Run a small GPU job under a VRAM lease (the expert cache shrinks first if needed).
 fn small_gpu<T>(lease: u64, what: &str, f: impl FnOnce(&burn::tensor::Device) -> anyhow::Result<T>) -> anyhow::Result<T> {
     let _g = GPU_SMALL.lock().unwrap();
-    crate::limits::lease(lease, what)?;
+    // not enough room (e.g. SD resident): unload idle on-demand models once and retry; it reloads on next use
+    if let Err(e) = crate::limits::lease(lease, what) { if evict_idle_gpu() == 0 { return Err(e); } crate::limits::lease(lease, what)?; }
     let r = (|| { let (dev, _, _) = crate::backend::select("cuda", "f32", None)?; let r = f(&dev); dev.memory_cleanup(); r })();
     crate::limits::lease_end(lease);
     r
@@ -328,6 +344,44 @@ async fn parse(State(app): S, Json(b): Json<Value>) -> Response {
     }).await)
 }
 
+/// `POST /api/cabin/animate {a, b, frames: 7, fps: 12, pingpong: true}` -> RIFE in-betweens a -> b as an animated
+/// GIF plus the PNG frames (b is resized to a's size; longest side capped at 768).
+async fn animate(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::rife::weights_dir(&app.storage.store.root);
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        use base64::Engine;
+        let t = Instant::now();
+        let mut a = b64_image(&b["a"])?.to_rgb8();
+        let s = 768.0 / a.width().max(a.height()) as f32;
+        if s < 1.0 { a = image::imageops::resize(&a, (a.width() as f32 * s) as u32, (a.height() as f32 * s) as u32, image::imageops::FilterType::Lanczos3); }
+        let bb = b64_image(&b["b"])?.to_rgb8();
+        let bb = if bb.dimensions() == a.dimensions() { bb } else { image::imageops::resize(&bb, a.width(), a.height(), image::imageops::FilterType::Lanczos3) };
+        let n = b["frames"].as_u64().unwrap_or(7).clamp(1, 31) as usize;
+        let fps = b["fps"].as_u64().unwrap_or(12).clamp(1, 60);
+        let times: Vec<f32> = (1..=n).map(|i| i as f32 / (n + 1) as f32).collect();
+        let (w, h) = a.dimensions();
+        let lease = (((w as u64).div_ceil(64) * 64 * (h as u64).div_ceil(64) * 64) * 4 * 400).max(600 << 20);
+        let mids = small_gpu(lease, "RIFE frame interpolation", |dev| crate::rife::Rife::load(&dir, dev)?.frames(&a, &bb, &times))?;
+        let mut seq: Vec<image::RgbImage> = std::iter::once(a.clone()).chain(mids).chain(std::iter::once(bb.clone())).collect();
+        let frames_png: Vec<String> = seq.iter().map(|f| png_b64(&image::DynamicImage::ImageRgb8(f.clone()))).collect::<anyhow::Result<_>>()?;
+        if b["pingpong"].as_bool().unwrap_or(true) && seq.len() > 2 { let back: Vec<_> = seq[1..seq.len() - 1].iter().rev().cloned().collect(); seq.extend(back); }
+        let mut gif = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new_with_speed(&mut gif, 10);
+            enc.set_repeat(image::codecs::gif::Repeat::Infinite)?;
+            let d = image::Delay::from_numer_denom_ms(1000, fps as u32);
+            enc.encode_frames(seq.into_iter().map(|f| image::Frame::from_parts(image::DynamicImage::ImageRgb8(f).to_rgba8(), 0, 0, d)))?;
+        }
+        Ok(json!({"gif": format!("data:image/gif;base64,{}", base64::engine::general_purpose::STANDARD.encode(&gif)), "frames": frames_png, "width": w, "height": h, "fps": fps, "model": "RIFE 4.6", "seconds": t.elapsed().as_secs_f64()}))
+    }).await)
+}
+/// `POST /api/cabin/rife_check {refdir}`.
+async fn rife_check(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::rife::weights_dir(&app.storage.store.root);
+    let rd = std::path::PathBuf::from(b["refdir"].as_str().unwrap_or(""));
+    json_or_err(tokio::task::spawn_blocking(move || small_gpu(800 << 20, "rife check", |dev| crate::rife::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
+}
+
 /// `POST /api/cabin/seg_check {refdir}`.
 async fn seg_check(State(app): S, Json(b): Json<Value>) -> Response {
     let dir = crate::segformer::weights_dir(&app.storage.store.root);
@@ -366,8 +420,10 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/cabin/esr_check", post(esr_check))
         .route("/api/cabin/rmbg", post(rmbg).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/isnet_check", post(isnet_check))
-        .route("/api/cabin/parse", post(parse))
+        .route("/api/cabin/parse", post(parse).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/seg_check", post(seg_check))
+        .route("/api/cabin/animate", post(animate).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
+        .route("/api/cabin/rife_check", post(rife_check))
         .route("/api/cabin/pack", post(pack).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

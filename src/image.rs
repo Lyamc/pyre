@@ -39,11 +39,14 @@ pub struct GenParams {
     pub inpaint_model: bool,
     /// LCM-LoRA fast mode (SD 1.5): merged UNet, LCM sampler, few steps, low guidance (PYRE_SD_LCM_LORA).
     pub fast: bool,
+    /// ControlNet OpenPose hint (PNG/JPEG bytes of a rendered skeleton; SD 1.5, PYRE_SD_CONTROLNET_OPENPOSE).
+    pub control_image: Option<std::sync::Arc<Vec<u8>>>,
+    pub control_scale: f64,
 }
 
 impl GenParams {
     pub fn new(prompt: &str, width: usize, height: usize, steps: usize, guidance: f64, seed: u64) -> Self {
-        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0, inpaint_model: true, fast: false }
+        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0, inpaint_model: true, fast: false, control_image: None, control_scale: 1.0 }
     }
 }
 
@@ -214,7 +217,7 @@ impl ImageModel {
             crate::limits::lease(need, "an image generation at this size")?;
             crate::limits::lease_end(need);
         }
-        let mut eng = self.eng.lock().unwrap();
+        let mut eng = self.eng.lock().unwrap_or_else(|e| e.into_inner()); // a panicked request must not brick SD
         self.queued.fetch_sub(1, Ordering::SeqCst);
         self.busy.store(true, Ordering::SeqCst);
         self.progress.store(0, Ordering::SeqCst);
@@ -225,8 +228,25 @@ impl ImageModel {
             let lcm = if q.fast && self.native < 1024 { std::env::var_os("PYRE_SD_LCM_LORA").map(std::path::PathBuf::from).filter(|p| p.is_file()) } else { None };
             let unet_dir = match &lcm { Some(l) => Some(crate::lcm::merged(l, ip_dir.as_deref().unwrap_or(&self.dir))?), None => ip_dir.clone() };
             eng.select_unet(unet_dir.as_deref())?;
+            // OpenPose ControlNet: loaded on demand (~700 MB f16) under a lease, dropped again by the next plain request
+            let control = match &q.control_image {
+                Some(bytes) if self.native < 1024 => {
+                    let dir = std::env::var_os("PYRE_SD_CONTROLNET_OPENPOSE").map(std::path::PathBuf::from).ok_or_else(|| anyhow!("no OpenPose ControlNet configured (PYRE_SD_CONTROLNET_OPENPOSE)"))?;
+                    crate::limits::lease(900 << 20, "loading the OpenPose ControlNet")?;
+                    let r = eng.set_controlnet(Some(&dir));
+                    crate::limits::lease_end(900 << 20);
+                    r?;
+                    let im = image::load_from_memory(bytes).context("decoding the control image")?.to_rgb8();
+                    let im = image::imageops::resize(&im, q.width as u32, q.height as u32, image::imageops::FilterType::Triangle);
+                    let n = q.width * q.height; let mut v = vec![0f32; 3 * n];
+                    for (i, p) in im.pixels().enumerate() { for c in 0..3 { v[c * n + i] = p[c] as f32 / 255.0; } }
+                    Some((std::sync::Arc::new(v), q.control_scale.clamp(0.0, 2.0)))
+                }
+                Some(_) => bail!("ControlNet OpenPose is SD 1.5 only"),
+                None => { eng.set_controlnet(None)?; None }
+            };
             let req = Request { prompt: q.prompt.clone(), negative: q.negative.clone(), width: q.width, height: q.height, steps: q.steps, guidance: q.guidance, seed: q.seed,
-                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None, inpaint_latent: None };
+                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None, inpaint_latent: None, control };
             let req = if lcm.is_some() { Request { sampler: "lcm".into(), guidance: q.guidance.min(2.0), ..req } } else { req };
             let prog = &self.progress;
             let mut on_step = |i: usize, n: usize| prog.store(((i as u64) << 32) | n as u64, Ordering::SeqCst);

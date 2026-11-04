@@ -254,6 +254,14 @@ where
     P: AsRef<Path>,
 {
     let key_mappings: Vec<(&str, &str)> = vec![
+        // diffusers: flat blocks.0..5 (pairs of in/strided convs) -> (c1, c2) tuples
+        ("^controlnet_cond_embedding\\.blocks\\.0\\.(weight|bias)$", "controlnet_cond_embedding.blocks.0.0.$1"),
+        ("^controlnet_cond_embedding\\.blocks\\.1\\.(weight|bias)$", "controlnet_cond_embedding.blocks.0.1.$1"),
+        ("^controlnet_cond_embedding\\.blocks\\.2\\.(weight|bias)$", "controlnet_cond_embedding.blocks.1.0.$1"),
+        ("^controlnet_cond_embedding\\.blocks\\.3\\.(weight|bias)$", "controlnet_cond_embedding.blocks.1.1.$1"),
+        ("^controlnet_cond_embedding\\.blocks\\.4\\.(weight|bias)$", "controlnet_cond_embedding.blocks.2.0.$1"),
+        ("^controlnet_cond_embedding\\.blocks\\.5\\.(weight|bias)$", "controlnet_cond_embedding.blocks.2.1.$1"),
+
         ("^mid_block\\.resnets\\.0\\.", "mid_block.resnet."),
         (
             "^mid_block\\.resnets\\.1\\.",

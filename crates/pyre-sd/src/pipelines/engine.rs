@@ -19,7 +19,8 @@ use crate::models::unet_2d::{AddedCondKwargs, BlockConfig, UNet2DConditionModel,
 use crate::models::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 use crate::pipelines::stable_diffusion::{StableDiffusionConfig, STEP_HOOK, VAE_SCALE};
 use crate::pipelines::stable_diffusion_xl::{StableDiffusionXLConfig, VAE_SCALE_XL};
-use crate::pipelines::weights::{load_clip_safetensors, load_clip_with_projection_safetensors, load_unet_safetensors, load_vae_safetensors_as, set_load_dtype};
+use crate::models::controlnet::{ControlNet, ControlNetConfig};
+use crate::pipelines::weights::{load_controlnet_safetensors, load_clip_safetensors, load_clip_with_projection_safetensors, load_unet_safetensors, load_vae_safetensors_as, set_load_dtype};
 use crate::sampling::{noise::gaussian, schedule, tiles};
 use crate::transformers::clip::{CLIPTextModelWithProjection, ClipTextTransformer};
 use crate::transformers::{SimpleTokenizer, SimpleTokenizerConfig};
@@ -112,6 +113,9 @@ pub struct Request {
     /// `[4 * h/8 * w/8]`. Set together with `mask`; the UNet then sees `[x, mask, masked_latent]` and the
     /// per-step latent blending is skipped (the model keeps the unmasked area itself).
     pub inpaint_latent: Option<std::sync::Arc<Vec<f32>>>,
+    /// ControlNet hint (SD 1.5): planar RGB `[3 * height * width]` in 0..1 and the conditioning scale; needs
+    /// `Engine::set_controlnet` first.
+    pub control: Option<(std::sync::Arc<Vec<f32>>, f64)>,
 }
 
 pub struct Cond { embeds: Tensor<3>, pooled: Option<Tensor<2>> }
@@ -131,6 +135,7 @@ pub struct Engine {
     unet: Option<UNet2DConditionModel>,
     /// The resident UNet is the 9-channel inpainting one (loaded from this folder).
     unet_inpaint: Option<PathBuf>,
+    controlnet: Option<(PathBuf, ControlNet)>,
     vae: AutoEncoderKL,
     vae_scale: f64,
 }
@@ -205,7 +210,7 @@ impl Engine {
             let vae_cfg: AutoEncoderKLConfig = if xl { StableDiffusionXLConfig::xl(None, None).vae } else { sd.vae.clone() };
             let vae_m = load_vae_safetensors_as(vae_cfg.init(3, 3, dev), &vae_path, dev, Some(vae_dtype)).map_err(|e| anyhow!("{}: {e}", vae_path.display()))?;
             let unet = Some(load_unet(dir, family, dev, dtype)?);
-            Ok(Engine { family, dir: dir.to_path_buf(), dtype, vae_dtype, vae_path, dev: dev.clone(), sd, tok, clip, penultimate: family != Family::Sd15, enc2, unet, unet_inpaint: None, vae: vae_m, vae_scale: if xl { VAE_SCALE_XL } else { VAE_SCALE } })
+            Ok(Engine { family, dir: dir.to_path_buf(), dtype, vae_dtype, vae_path, dev: dev.clone(), sd, tok, clip, penultimate: family != Family::Sd15, enc2, unet, unet_inpaint: None, controlnet: None, vae: vae_m, vae_scale: if xl { VAE_SCALE_XL } else { VAE_SCALE } })
         })();
         set_load_dtype(None);
         r
@@ -221,6 +226,19 @@ impl Engine {
         self.unet = None; self.unet_inpaint = None; self.release_free_memory();
         self.unet = Some(match inpaint { Some(d) => load_unet_ch(d, self.family, &self.dev, self.dtype, unet_in_channels(d))?, None => load_unet(&self.dir, self.family, &self.dev, self.dtype)? });
         self.unet_inpaint = inpaint.map(Path::to_path_buf);
+        Ok(())
+    }
+    /// Load (or drop, with None) an SD 1.5 ControlNet from a diffusers folder / safetensors file.
+    pub fn set_controlnet(&mut self, path: Option<&Path>) -> Result<()> {
+        if self.controlnet.as_ref().map(|c| c.0.as_path()) == path { return Ok(()); }
+        self.controlnet = None; self.release_free_memory();
+        if let Some(p) = path {
+            let f = if p.is_dir() { weights_file(p, "", "diffusion_pytorch_model")? } else { p.to_path_buf() };
+            set_load_dtype(Some(self.dtype));
+            let r = load_controlnet_safetensors(ControlNetConfig::default().init(4, &self.dev), &f, &self.dev).map_err(|e| anyhow!("{}: {e}", f.display()));
+            set_load_dtype(None);
+            self.controlnet = Some((p.to_path_buf(), r?));
+        }
         Ok(())
     }
     pub fn inpaint_unet_active(&self) -> bool { self.unet_inpaint.as_deref().map(|d| unet_in_channels(d) == 9).unwrap_or(false) }
@@ -270,9 +288,22 @@ impl Engine {
         };
         let prepared = schedule::sampler_inputs(q.seed, q.steps, if q.sampler == "lcm" { "euler" } else { &q.sampler }, &q.scheduler, 4, h, w)?;
         let noise = host_tensor(prepared.noise.clone(), prepared.shape, &self.dev, self.dtype);
+        let hint = match (&q.control, &self.controlnet) {
+            (Some((hv, sc)), Some((_, cn))) => {
+                if hv.len() != 3 * q.height * q.width { bail!("control image must be {}x{}", q.width, q.height); }
+                if q.inpaint_latent.is_some() { bail!("ControlNet with the 9-channel inpainting UNet is not supported"); }
+                let t = host_tensor(hv.to_vec(), [1, 3, q.height, q.width], &self.dev, self.dtype);
+                Some((cn, if use_cfg { Tensor::cat(vec![t.clone(), t], 0) } else { t }, *sc))
+            }
+            (Some(_), None) => bail!("a control image needs a ControlNet loaded"),
+            _ => None,
+        };
         let guided = |x: Tensor<4>, t: f64| -> Tensor<4> {
             let x2 = if use_cfg { Tensor::cat(vec![x.clone(), x], 0) } else { x };
-            let eps = match &added { Some(a) => unet.forward_with_additional_residuals(x2, t, cond.clone(), None, None, Some(a)), None => unet.forward(x2, t, cond.clone()) };
+            let eps = match &hint {
+                Some((cn, h, sc)) => { let (down, mid) = cn.forward(x2.clone(), t, cond.clone(), h.clone(), *sc); unet.forward_with_additional_residuals(x2, t, cond.clone(), Some(&down), Some(&mid), added.as_ref()) }
+                None => match &added { Some(a) => unet.forward_with_additional_residuals(x2, t, cond.clone(), None, None, Some(a)), None => unet.forward(x2, t, cond.clone()) },
+            };
             if !use_cfg { return eps; }
             let [u, c]: [Tensor<4>; 2] = eps.chunk(2, 0).try_into().expect("batch of 2");
             u.clone() + (c - u) * cfg

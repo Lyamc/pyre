@@ -12,7 +12,7 @@ use burn::nn::PaddingConfig2d;
 use burn::tensor::activation::silu;
 use burn::tensor::Tensor;
 
-use super::embeddings::{get_timestep_embedding, TimestepEmbedding, TimestepEmbeddingConfig};
+use super::embeddings::{timestep_embedding_host, TimestepEmbedding, TimestepEmbeddingConfig};
 use super::unet_2d::{BlockConfig, UNetDownBlock};
 use super::unet_2d_blocks::{
     CrossAttnDownBlock2DConfig, DownBlock2DConfig, UNetMidBlock2DCrossAttn,
@@ -315,13 +315,8 @@ impl ControlNet {
         let device = xs.device();
 
         // 1. Time embedding
-        let timesteps: Tensor<1> = Tensor::full([bsize], timestep as f32, &device);
-        let emb = get_timestep_embedding(
-            timesteps,
-            self.time_proj_channels,
-            self.flip_sin_to_cos,
-            self.freq_shift,
-        );
+        // host f64 sin/cos (as the UNet), cast to the model dtype (f16 weights)
+        let emb = timestep_embedding_host(timestep, bsize, self.time_proj_channels, self.flip_sin_to_cos, self.freq_shift, &device).cast(xs.dtype());
         let emb = self.time_embedding.forward(emb);
 
         // 2. Pre-process

@@ -13,6 +13,7 @@ mod esr;
 mod isnet;
 mod segformer;
 mod lcm;
+mod rife;
 mod tts;
 mod image;
 mod tagger;

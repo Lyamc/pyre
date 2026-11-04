@@ -293,6 +293,9 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
     p.scheduler = s("scheduler").map(|x| x.to_ascii_lowercase());
     p.refiner = b["refiner"].as_bool().unwrap_or(false);
     p.refiner_denoise = b["refiner_denoise"].as_f64();
+    p.fast = b["fast"].as_bool().unwrap_or(false);
+    if let Some(s) = b["control_image"].as_str() { use base64::Engine; let s = s.split_once("base64,").map(|(_, d)| d).unwrap_or(s); if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.control_image = Some(std::sync::Arc::new(bytes)); } }
+    if let Some(v) = b["control_scale"].as_f64() { p.control_scale = v; }
     // img2img (`/v1/images/edits` JSON body `image`, or A1111 `init_images[0]`): base64 PNG/JPEG, data URLs too.
     let img = b["image"].as_str().or(b["init_images"][0].as_str());
     if let Some(s) = img {
@@ -305,7 +308,7 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.mask = Some(std::sync::Arc::new(bytes)); }
             if b["strength"].is_null() && b["denoising_strength"].is_null() { p.strength = 1.0; }
         }
-        if let Some(v) = b["mask_blur"].as_f64() { p.mask_blur = v.clamp(0.0, 64.0); } if let Some(v) = b["inpaint_model"].as_bool() { p.inpaint_model = v; } if let Some(v) = b["fast"].as_bool() { p.fast = v; }
+        if let Some(v) = b["mask_blur"].as_f64() { p.mask_blur = v.clamp(0.0, 64.0); } if let Some(v) = b["inpaint_model"].as_bool() { p.inpaint_model = v; }
     }
     p
 }

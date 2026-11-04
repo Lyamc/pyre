@@ -260,6 +260,59 @@ BUILD.rmbg = (f, res, input) => {
   };
 };
 function dilateMask(url, px) { return loadImg(url).then(i => { const c = el("canvas", { width: i.naturalWidth, height: i.naturalHeight }); const g = c.getContext("2d"); g.filter = `blur(${px}px)`; g.drawImage(i, 0, 0); const d = g.getImageData(0, 0, c.width, c.height); for (let k = 0; k < d.data.length; k += 4) { const v = d.data[k] > 8 ? 255 : 0; d.data[k] = d.data[k + 1] = d.data[k + 2] = v; d.data[k + 3] = 255; } g.filter = "none"; g.putImageData(d, 0, 0); return c.toDataURL("image/png"); }); }
+// OpenPose (COCO-18) skeleton editor: drag joints, presets; rendered like controlnet_aux draw_bodypose.
+const OP_LIMBS = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]];
+const OP_COL = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]];
+const OP_BASE = [[.5, .13], [.5, .21], [.40, .22], [.37, .35], [.36, .47], [.60, .22], [.63, .35], [.64, .47], [.44, .50], [.44, .68], [.44, .86], [.56, .50], [.56, .68], [.56, .86], [.48, .115], [.52, .115], [.46, .125], [.54, .125]];
+const OP_PRESETS = {
+  standing: {},
+  "arms up": { 3: [.36, .12], 4: [.33, .03], 6: [.64, .12], 7: [.67, .03] },
+  waving: { 6: [.70, .16], 7: [.72, .05] },
+  walking: { 3: [.40, .35], 4: [.45, .46], 6: [.60, .35], 7: [.55, .46], 9: [.41, .68], 10: [.36, .85], 12: [.59, .67], 13: [.63, .84] },
+  "hands on hips": { 3: [.32, .33], 4: [.42, .47], 6: [.68, .33], 7: [.58, .47] },
+  sitting: { 8: [.44, .55], 11: [.56, .55], 9: [.38, .62], 12: [.62, .62], 10: [.40, .82], 13: [.60, .82], 3: [.36, .37], 4: [.40, .52], 6: [.64, .37], 7: [.60, .52] },
+};
+function poseEditor(W = 512, H = 768) {
+  let pts = OP_BASE.map(p => [...p]); const c = el("canvas", { width: W, height: H, class: "pose" }); c.style.cssText = "width:256px;height:384px;background:#000;cursor:crosshair;touch-action:none";
+  const draw = () => { const g = c.getContext("2d"); g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    OP_LIMBS.forEach(([a, b], i) => { const [x1, y1] = [pts[a][0] * W, pts[a][1] * H], [x2, y2] = [pts[b][0] * W, pts[b][1] * H]; const L = Math.hypot(x2 - x1, y2 - y1); g.save(); g.translate((x1 + x2) / 2, (y1 + y2) / 2); g.rotate(Math.atan2(y2 - y1, x2 - x1)); g.globalAlpha = 0.6; g.fillStyle = `rgb(${OP_COL[i]})`; g.beginPath(); g.ellipse(0, 0, L / 2, 4, 0, 0, Math.PI * 2); g.fill(); g.restore(); });
+    pts.forEach(([x, y], i) => { g.fillStyle = `rgb(${OP_COL[i]})`; g.beginPath(); g.arc(x * W, y * H, 4, 0, Math.PI * 2); g.fill(); }); };
+  let drag = -1; const at = e => { const r = c.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
+  c.onpointerdown = e => { const [x, y] = at(e); let best = -1, bd = 0.03; pts.forEach((p, i) => { const d = Math.hypot((p[0] - x) * W / H, p[1] - y); if (d < bd) { bd = d; best = i; } }); drag = best; if (drag >= 0) c.setPointerCapture(e.pointerId); };
+  c.onpointermove = e => { if (drag < 0) return; const [x, y] = at(e); pts[drag] = [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]; draw(); };
+  c.onpointerup = () => { drag = -1; };
+  const preset = sel(Object.keys(OP_PRESETS).map(k => [k, k]), "standing"); preset.onchange = () => { pts = OP_BASE.map((p, i) => [...(OP_PRESETS[preset.value][i] || p)]); draw(); };
+  const flip = el("button", { type: "button", onclick: () => { pts = pts.map(([x, y]) => [1 - x, y]); const sw = [[2, 5], [3, 6], [4, 7], [8, 11], [9, 12], [10, 13], [14, 15], [16, 17]]; for (const [a, b] of sw) [pts[a], pts[b]] = [pts[b], pts[a]]; draw(); } }, "Mirror");
+  const w = el("div", {}, el("div", { class: "row" }, preset, flip, el("small", {}, "drag the dots to pose")), c); draw();
+  w.image = () => c.toDataURL("image/png"); w.set = name => { preset.value = name; preset.onchange(); }; return w;
+}
+BUILD.pose = (f, res, input) => {
+  const pe = poseEditor(); const src = imageSource(); if (input) src.set(input);
+  const p = el("textarea", { rows: 2, placeholder: "who / what, e.g. young woman adventurer, red hair, leather jacket" }); const st = stylePicker("anime");
+  const scale = range(1, 0.3, 1.5, 0.05), keep = range(0.85, 0.5, 1, 0.05), steps = num(25, 1, 60), seed = seedBox();
+  f.append(el("div", { class: "row" }, field("Pose", pe), field("Character image (optional: keeps colours/look)", src)), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Pose strength", scale), field("Change amount", keep, "with a character image: 1 = fully re-drawn"), field("Steps", steps), field("Seed", seed)));
+  return async () => {
+    if (!p.value.trim()) throw new Error("describe the character"); const sp = styled(p.value + ", full body", "lowres, bad anatomy, extra limbs, deformed", st.value);
+    const body = { prompt: sp.prompt, negative_prompt: sp.negative, size: "512x768", steps: +steps.value, seed: seed.get(), control_image: pe.image(), control_scale: +scale.input.value, fast: false };
+    if (src.url) Object.assign(body, { image: await prep(src.url), strength: +keep.input.value });
+    const r = await sd(body, res, "posing"); seed.after(r.seed);
+    res.show(r.url, `pose_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` });
+    res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: body.control_image }), el("figcaption", {}, "pose"))));
+  };
+};
+BUILD.animate = (f, res, input) => {
+  const a = imageSource(), b = imageSource(); if (input) a.set(input);
+  const n = num(7, 1, 31), fps = num(12, 1, 60); const pp = el("input", { type: "checkbox", checked: true });
+  f.append(el("div", { class: "row" }, field("Start image", a), field("End image", b)), el("div", { class: "row" }, field("In-between frames", n), field("FPS", fps), el("label", { class: "inl" }, pp, " ping-pong loop")));
+  return async () => {
+    if (!a.url || !b.url) throw new Error("choose both images"); res.busy("interpolating frames on the GPU…");
+    const j = await api("/api/cabin/animate", { a: await prep(a.url), b: await prep(b.url), frames: +n.value, fps: +fps.value, pingpong: pp.checked });
+    res.show(j.gif, "animation.gif", { info: `${j.model} · ${j.frames.length} frames ${j.width}x${j.height} @ ${j.fps} fps · ${j.seconds.toFixed(1)} s` });
+    const z = await api("/api/cabin/pack", { files: j.frames.map((u, i) => ({ name: `frame_${String(i).padStart(3, "0")}.png`, image: u })) });
+    const zurl = URL.createObjectURL(new Blob([Uint8Array.from(atob(z.zip), c => c.charCodeAt(0))], { type: "application/zip" }));
+    res.append(el("div", { class: "row" }, el("a", { href: zurl, download: "frames.zip", class: "btnlink" }, `Download PNG frames (${j.frames.length})`)));
+  };
+};
 BUILD.clothes = (f, res, input) => {
   const src = imageSource(); if (input) src.set(input);
   const part = sel([["top", "Top / shirt / jacket"], ["sleeves", "Top incl. sleeves (arms)"], ["bottom", "Bottom (pants / skirt)"], ["dress", "Whole outfit / dress"], ["shoes", "Shoes"], ["hair", "Hair"], ["hat", "Hat"], ["acc", "Accessories / bag / scarf"]], "top");
@@ -349,8 +402,11 @@ BUILD.character = (f, res) => {
       let m = how.value === "mask" ? me.mask() : null;
       if (!m && WF.clothes?.ready) { res.busy("finding " + changed.join(", ") + "…"); const regs = changed.filter(k => REGION[k]); const j = await api("/api/cabin/parse", { image: last.url, parts: regs, grow: regs.includes("hair") ? 24 : 14 }); if (j.mask && j.selected_fraction > 0.003) m = j.mask; }
       if (!m) { const i = await loadImg(last.url); const W = i.naturalWidth, H = i.naturalHeight; const mc = el("canvas", { width: W, height: H }); const g = mc.getContext("2d"); g.fillStyle = "#000"; g.fillRect(0, 0, W, H); g.fillStyle = "#fff"; for (const k of changed) { const b = REGION[k]; if (b) g.fillRect(b[0] * W, b[1] * H, b[2] * W, b[3] * H); } m = mc.toDataURL("image/png"); }
-      const fp = styled([...changed.map(k => inputs[k].value.trim()), ...CH_FIELDS.map(([k]) => k).filter(k => !changed.includes(k)).map(k => inputs[k].value.trim())].filter(Boolean).join(", "), "lowres, bad anatomy, extra limbs, deformed", st.value);
-      r = await sd({ image: last.url, mask: m, mask_blur: 8, prompt: fp.prompt, negative_prompt: sp.negative, strength: 1, steps: +steps.value, seed: +seed.value }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
+      // changed attributes first and repeated (SD 1.5 has no prompt weights; 77-token limit drops the tail)
+      const fp = styled([...changed.map(k => inputs[k].value.trim()), ...changed.map(k => inputs[k].value.trim()), ...CH_FIELDS.map(([k]) => k).filter(k => !changed.includes(k)).map(k => inputs[k].value.trim())].filter(Boolean).join(", "), "lowres, bad anatomy, extra limbs, deformed" + (changed.includes("hair") ? ", bald, shaved head, bald patch" : ""), st.value);
+      // base model + latent blending: the 9-channel inpainting UNet copies the old colours from the context
+      // (red hair stayed red); the base model follows the new description
+      r = await sd({ image: last.url, mask: m, mask_blur: 8, prompt: fp.prompt, negative_prompt: fp.negative, strength: 1, steps: +steps.value, guidance_scale: 8.5, seed: +seed.value, inpaint_model: false }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
     }
     dirty.clear(); ch.history.push({ url: r.url, change, fields: Object.fromEntries(CH_FIELDS.map(([k]) => [k, inputs[k].value])) }); if (ch.history.length > 12) ch.history.shift(); save(); drawHist(); me.setImage(r.url);
     res.show(r.url, `character_v${ch.history.length}.png`, { info: `v${ch.history.length} · ${change} · seed ${seed.value} · ${r.secs.toFixed(1)} s` });
