@@ -37,11 +37,13 @@ pub struct GenParams {
     pub mask_blur: f64,
     /// Masked edits use the 9-channel SD 1.5 inpainting UNet when one is configured (PYRE_SD_INPAINT_DIR).
     pub inpaint_model: bool,
+    /// LCM-LoRA fast mode (SD 1.5): merged UNet, LCM sampler, few steps, low guidance (PYRE_SD_LCM_LORA).
+    pub fast: bool,
 }
 
 impl GenParams {
     pub fn new(prompt: &str, width: usize, height: usize, steps: usize, guidance: f64, seed: u64) -> Self {
-        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0, inpaint_model: true }
+        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0, inpaint_model: true, fast: false }
     }
 }
 
@@ -220,9 +222,12 @@ impl ImageModel {
         let r = (|| -> Result<Vec<u8>> {
             // SD1.5 inpainting UNet (cabin: <store>/cabin/sd15-inpaint, or PYRE_SD_INPAINT_DIR) for masked edits
             let ip_dir = if q.mask.is_some() && init.is_some() && q.inpaint_model && self.native < 1024 { std::env::var_os("PYRE_SD_INPAINT_DIR").map(std::path::PathBuf::from).filter(|d| d.join("unet").is_dir()) } else { None };
-            eng.select_unet(ip_dir.as_deref())?;
+            let lcm = if q.fast && self.native < 1024 { std::env::var_os("PYRE_SD_LCM_LORA").map(std::path::PathBuf::from).filter(|p| p.is_file()) } else { None };
+            let unet_dir = match &lcm { Some(l) => Some(crate::lcm::merged(l, ip_dir.as_deref().unwrap_or(&self.dir))?), None => ip_dir.clone() };
+            eng.select_unet(unet_dir.as_deref())?;
             let req = Request { prompt: q.prompt.clone(), negative: q.negative.clone(), width: q.width, height: q.height, steps: q.steps, guidance: q.guidance, seed: q.seed,
                 sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None, inpaint_latent: None };
+            let req = if lcm.is_some() { Request { sampler: "lcm".into(), guidance: q.guidance.min(2.0), ..req } } else { req };
             let prog = &self.progress;
             let mut on_step = |i: usize, n: usize| prog.store(((i as u64) << 32) | n as u64, Ordering::SeqCst);
             let mut req = req;
@@ -240,7 +245,7 @@ impl ImageModel {
                 req.inpaint_latent = Some(std::sync::Arc::new(l));
             }
             let init_lat = match &init { Some(rgb) if q.strength < 1.0 || pmask.is_some() => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
-            if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral") { req.sampler = "euler".into(); }
+            if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral" | "lcm") { req.sampler = "euler".into(); }
             let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
             eng.release_free_memory();
             if q.refiner {

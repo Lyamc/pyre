@@ -99,6 +99,7 @@ async fn workflows(State(app): S) -> Json<Value> {
     let sdw = |m: &str| if sd { ok(m) } else { json!({"ready": false, "status": "missing model", "reason": sd_why}) };
     let mut w = serde_json::Map::new();
     w.insert("txt2img".into(), sdw("SD 1.5 (f16, GPU on demand)"));
+    if sd && crate::lcm::lora_file(&app.storage.store.root).is_file() { if let Some(o) = w.get_mut("txt2img") { o["lcm"] = json!(true); } }
     w.insert("img2img".into(), sdw("SD 1.5 img2img"));
     w.insert("restyle".into(), sdw("SD 1.5 img2img + style templates"));
     let ipm = app.storage.store.root.join("cabin").join("sd15-inpaint").join("unet").join("diffusion_pytorch_model.fp16.safetensors").is_file();
@@ -116,7 +117,8 @@ async fn workflows(State(app): S) -> Json<Value> {
     w.insert("layers".into(), if isn && sd { ok("IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers") } else { wip("needs IS-Net weights and SD 1.5") });
     w.insert("animate".into(), wip("frame interpolation model (RIFE / FILM) port planned"));
     w.insert("to3d".into(), wip("image-to-mesh model (TripoSR-class) port planned"));
-    w.insert("clothes".into(), wip("needs a human-parsing segmenter for the clothes mask; manual-mask version via Inpaint works now"));
+    let seg = crate::segformer::available(&crate::segformer::weights_dir(&app.storage.store.root));
+    w.insert("clothes".into(), if seg && sd { ok("SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting") } else { wip("SegFormer clothes weights missing in <store>/cabin/segformer") });
     w.insert("pose".into(), wip("needs ControlNet OpenPose weights + pose editor"));
     let (n, b) = crate::limits::leases();
     Json(json!({"workflows": w, "loaded": app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend})).collect::<Vec<_>>(),
@@ -139,6 +141,8 @@ async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
             if std::env::var_os("PYRE_SD_INPAINT_DIR").is_none() && ip.join("unet").join("config.json").is_file() && std::fs::read_dir(ip.join("unet")).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))).unwrap_or(false) {
                 std::env::set_var("PYRE_SD_INPAINT_DIR", &ip);
             }
+            let lcm = crate::lcm::lora_file(&app.storage.store.root);
+            if std::env::var_os("PYRE_SD_LCM_LORA").is_none() && lcm.is_file() { std::env::set_var("PYRE_SD_LCM_LORA", &lcm); }
             ensure(&app, Kind::Image, b["model"].as_str().unwrap_or(SD15), "cuda", SD15_LEASE).await
         }
         "tagger" => ensure(&app, Kind::Tagger, TAGGER, b["backend"].as_str().unwrap_or("cpu"), 1_800 << 20).await,
@@ -273,6 +277,64 @@ async fn rmbg(State(app): S, Json(b): Json<Value>) -> Response {
     }).await)
 }
 
+/// Label ids for a part name (character creator fields and the clothes workflow).
+fn part_labels(p: &str) -> &'static [u8] {
+    match p { "hair" => &[2], "hat" => &[1], "face" | "eyes" | "expr" => &[11], "top" | "upper" => &[4, 17], "sleeves" => &[4, 14, 15], "bottom" => &[5, 6, 7], "skirt" => &[5], "pants" => &[6], "dress" => &[4, 5, 6, 7], "shoes" => &[9, 10], "acc" => &[1, 3, 8, 16, 17], "legs" => &[12, 13], "arms" => &[14, 15], "person" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], _ => &[] }
+}
+/// Square max-filter (dilation) of a 0/1 mask, radius r.
+fn dilate(m: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    if r == 0 { return m.to_vec(); }
+    let mut t = vec![0u8; w * h];
+    for y in 0..h { let row = &m[y * w..(y + 1) * w]; let mut last: isize = -1_000_000; for x in 0..w { if row[x] > 0 { last = x as isize; } if (x as isize - last) as usize <= r { t[y * w + x] = 1; } } let mut next: isize = 1_000_000; for x in (0..w).rev() { if row[x] > 0 { next = x as isize; } if (next - x as isize) as usize <= r { t[y * w + x] = 1; } } }
+    let mut o = vec![0u8; w * h];
+    for x in 0..w { let mut last: isize = -1_000_000; for y in 0..h { if t[y * w + x] > 0 { last = y as isize; } if (y as isize - last) as usize <= r { o[y * w + x] = 1; } } let mut next: isize = 1_000_000; for y in (0..h).rev() { if t[y * w + x] > 0 { next = y as isize; } if (next - y as isize) as usize <= r { o[y * w + x] = 1; } } }
+    o
+}
+
+/// `POST /api/cabin/parse {image, parts?: ["hair", ...] | labels?: [ids], grow: 12, protect?: [parts]}` ->
+/// SegFormer clothes parsing: label map (grey = class id), colour preview, per-label coverage, and when parts or
+/// labels are given a white-on-black edit mask = dilate(selected, grow) minus protected labels (default: face
+/// unless the face itself is selected).
+async fn parse(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::segformer::weights_dir(&app.storage.store.root);
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let t = Instant::now();
+        let img = b64_image(&b["image"])?.to_rgb8();
+        let lab = small_gpu(1_200 << 20, "SegFormer clothes parsing", |dev| crate::segformer::SegFormer::load(&dir, dev)?.parse(&img))?;
+        let (w, h) = (lab.width() as usize, lab.height() as usize);
+        let mut cnt = [0usize; 18]; for p in lab.pixels() { cnt[p[0] as usize % 18] += 1; }
+        let cover: serde_json::Map<String, Value> = (0..18).filter(|&i| cnt[i] > 0).map(|i| (crate::segformer::LABELS[i].to_string(), json!(cnt[i] as f64 / (w * h) as f64))).collect();
+        const PAL: [[u8; 3]; 18] = [[0, 0, 0], [128, 0, 0], [0, 64, 255], [255, 255, 0], [255, 140, 100], [200, 0, 200], [0, 160, 80], [255, 0, 120], [120, 80, 0], [0, 200, 200], [0, 120, 200], [255, 220, 170], [140, 140, 0], [100, 100, 0], [255, 180, 0], [200, 140, 0], [120, 0, 255], [255, 90, 0]];
+        let mut prev = image::RgbImage::new(w as u32, h as u32);
+        for (x, y, p) in prev.enumerate_pixels_mut() { let c = img.get_pixel(x, y); let l = PAL[lab.get_pixel(x, y)[0] as usize % 18]; *p = image::Rgb([((c[0] as u16 + l[0] as u16 * 2) / 3) as u8, ((c[1] as u16 + l[1] as u16 * 2) / 3) as u8, ((c[2] as u16 + l[2] as u16 * 2) / 3) as u8]); }
+        let mut sel: Vec<u8> = b["labels"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u8).collect()).unwrap_or_default();
+        let parts: Vec<String> = b["parts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        for p in &parts { sel.extend_from_slice(part_labels(p)); }
+        let mut out = json!({"labels": png_b64(&image::DynamicImage::ImageLuma8(lab.clone()))?, "preview": png_b64(&image::DynamicImage::ImageRgb8(prev))?, "coverage": cover, "names": crate::segformer::LABELS});
+        if !sel.is_empty() {
+            let grow = b["grow"].as_u64().unwrap_or(12).min(96) as usize;
+            let mut prot: Vec<u8> = match b["protect"].as_array() { Some(a) => a.iter().filter_map(|v| v.as_str()).flat_map(|p| part_labels(p).iter().copied()).collect(), None => vec![11] };
+            prot.retain(|l| !sel.contains(l));
+            let raw: Vec<u8> = lab.pixels().map(|p| sel.contains(&p[0]) as u8).collect();
+            let sel_px = raw.iter().filter(|&&v| v > 0).count();
+            let d = dilate(&raw, w, h, grow);
+            let mut m = image::GrayImage::new(w as u32, h as u32);
+            for (i, p) in m.pixels_mut().enumerate() { let l = lab.as_raw()[i]; p.0[0] = if d[i] > 0 && !prot.contains(&l) { 255 } else { 0 }; }
+            out["mask"] = json!(png_b64(&image::DynamicImage::ImageLuma8(m))?);
+            out["selected_fraction"] = json!(sel_px as f64 / (w * h) as f64);
+        }
+        out["seconds"] = json!(t.elapsed().as_secs_f64());
+        Ok(out)
+    }).await)
+}
+
+/// `POST /api/cabin/seg_check {refdir}`.
+async fn seg_check(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::segformer::weights_dir(&app.storage.store.root);
+    let rd = std::path::PathBuf::from(b["refdir"].as_str().unwrap_or(""));
+    json_or_err(tokio::task::spawn_blocking(move || small_gpu(1_200 << 20, "segformer check", |dev| crate::segformer::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
+}
+
 /// `POST /api/cabin/isnet_check {refdir}`.
 async fn isnet_check(State(app): S, Json(b): Json<Value>) -> Response {
     let dir = crate::isnet::weights_dir(&app.storage.store.root);
@@ -304,6 +366,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/cabin/esr_check", post(esr_check))
         .route("/api/cabin/rmbg", post(rmbg).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/isnet_check", post(isnet_check))
+        .route("/api/cabin/parse", post(parse))
+        .route("/api/cabin/seg_check", post(seg_check))
         .route("/api/cabin/pack", post(pack).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

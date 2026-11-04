@@ -305,7 +305,7 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.mask = Some(std::sync::Arc::new(bytes)); }
             if b["strength"].is_null() && b["denoising_strength"].is_null() { p.strength = 1.0; }
         }
-        if let Some(v) = b["mask_blur"].as_f64() { p.mask_blur = v.clamp(0.0, 64.0); } if let Some(v) = b["inpaint_model"].as_bool() { p.inpaint_model = v; }
+        if let Some(v) = b["mask_blur"].as_f64() { p.mask_blur = v.clamp(0.0, 64.0); } if let Some(v) = b["inpaint_model"].as_bool() { p.inpaint_model = v; } if let Some(v) = b["fast"].as_bool() { p.fast = v; }
     }
     p
 }

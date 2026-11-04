@@ -11,6 +11,8 @@ mod diar;
 mod cabin;
 mod esr;
 mod isnet;
+mod segformer;
+mod lcm;
 mod tts;
 mod image;
 mod tagger;

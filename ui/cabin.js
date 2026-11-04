@@ -121,8 +121,11 @@ function resultBox() {
 // ---------- generation calls ----------
 async function ensureImage(res) { if (!loadedImage()) res.busy("loading Stable Diffusion 1.5 on the GPU (on demand, ~20-40 s; the LLM's expert cache shrinks to make room)…"); const j = await api("/api/cabin/ensure", { what: "image" }); markLoaded("image"); return j; }
 let loadedKinds = new Set(); const loadedImage = () => loadedKinds.has("image"); const markLoaded = k => loadedKinds.add(k);
+// ⚡ fast mode: LCM-LoRA (SD 1.5), ~6 steps at guidance 1.5 instead of 20-30 steps
+const fastMode = () => localStorage.getItem("cabin.fast") === "1" && !!WF.txt2img?.lcm;
 async function sd(body, res, label = "generating") {
   await ensureImage(res); res.busy(label + "…"); const t0 = performance.now();
+  if (fastMode() && body.fast !== false) body = Object.assign({}, body, { fast: true, steps: Math.min(body.steps || 6, 6), guidance_scale: 1.5 });
   const path = body.image ? "/v1/images/edits" : "/v1/images/generations";
   const j = await api(path, Object.assign({ model: "stable-diffusion-v1-5/stable-diffusion-v1-5", n: 1 }, body));
   const tm = j.timings?.[0] || {}; return { url: "data:image/png;base64," + j.data[0].b64_json, seed: tm.seed, secs: (performance.now() - t0) / 1000, gen: tm.seconds };
@@ -257,17 +260,38 @@ BUILD.rmbg = (f, res, input) => {
   };
 };
 function dilateMask(url, px) { return loadImg(url).then(i => { const c = el("canvas", { width: i.naturalWidth, height: i.naturalHeight }); const g = c.getContext("2d"); g.filter = `blur(${px}px)`; g.drawImage(i, 0, 0); const d = g.getImageData(0, 0, c.width, c.height); for (let k = 0; k < d.data.length; k += 4) { const v = d.data[k] > 8 ? 255 : 0; d.data[k] = d.data[k + 1] = d.data[k + 2] = v; d.data[k + 3] = 255; } g.filter = "none"; g.putImageData(d, 0, 0); return c.toDataURL("image/png"); }); }
+BUILD.clothes = (f, res, input) => {
+  const src = imageSource(); if (input) src.set(input);
+  const part = sel([["top", "Top / shirt / jacket"], ["sleeves", "Top incl. sleeves (arms)"], ["bottom", "Bottom (pants / skirt)"], ["dress", "Whole outfit / dress"], ["shoes", "Shoes"], ["hair", "Hair"], ["hat", "Hat"], ["acc", "Accessories / bag / scarf"]], "top");
+  const p = el("textarea", { rows: 2, placeholder: "the new garment, e.g. a red hoodie" }); const st = stylePicker("none");
+  const grow = range(14, 0, 48, 1), steps = num(30, 1, 60), seed = seedBox();
+  f.append(field("Image", src), field("Change", part), field("New look", p), field("Style", st), el("div", { class: "row" }, field("Grow mask px", grow, "room for a different shape"), field("Steps", steps), field("Seed", seed)));
+  return async () => {
+    if (!src.url) throw new Error("choose an image"); if (!p.value.trim()) throw new Error("describe the new look");
+    res.busy("segmenting clothes…"); const img = await prep(src.url);
+    const j = await api("/api/cabin/parse", { image: img, parts: [part.value], grow: +grow.input.value });
+    if (!j.mask || j.selected_fraction < 0.002) throw new Error(`no ${part.value} found in the image (found: ${Object.keys(j.coverage).join(", ")})`);
+    const sp = styled(p.value, "", st.value);
+    const r = await sd({ image: img, mask: j.mask, mask_blur: 8, prompt: sp.prompt, negative_prompt: sp.negative, strength: 1, steps: +steps.value, seed: seed.get() }, res, "dressing"); seed.after(r.seed);
+    res.show(r.url, `clothes_${r.seed}.png`, { info: `${part.value} → ${p.value} · seed ${r.seed} · ${r.secs.toFixed(1)} s` });
+    res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: j.preview }), el("figcaption", {}, "parsing")), el("figure", {}, el("img", { src: j.mask }), el("figcaption", {}, "mask"))));
+  };
+};
+// Bounding box (padded) of a white-on-black mask: a silhouette-shaped hole makes SD paint the subject back in.
+function boxMask(url, pad) { return loadImg(url).then(i => { const W = i.naturalWidth, H = i.naturalHeight; const c = el("canvas", { width: W, height: H }); const g = c.getContext("2d"); g.drawImage(i, 0, 0); const d = g.getImageData(0, 0, W, H).data; let x0 = W, y0 = H, x1 = -1, y1 = -1; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (d[(y * W + x) * 4] > 127) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } g.fillStyle = "#000"; g.fillRect(0, 0, W, H); if (x1 >= 0) { g.fillStyle = "#fff"; g.fillRect(Math.max(0, x0 - pad), Math.max(0, y0 - pad), Math.min(W, x1 + pad) - Math.max(0, x0 - pad) + 1, Math.min(H, y1 + pad) - Math.max(0, y0 - pad) + 1); } return c.toDataURL("image/png"); }); }
+const NO_PEOPLE = "person, people, girl, boy, man, woman, character, human, figure, face, body, silhouette, clothes";
 BUILD.layers = (f, res, input) => {
   const src = imageSource(); if (input) src.set(input);
   const model = sel([["general", "General / photo"], ["anime", "Anime / illustration"]], "general");
   const bgp = el("textarea", { rows: 2 }, "empty background scenery, nothing in the foreground");
   f.append(field("Image", src), el("div", { class: "row" }, field("Cut-out model", model)), field("Background fill prompt", bgp, "the hole left by the subject is inpainted with SD 1.5"));
+  const hole = sel([["box", "Box around the subject (removes it reliably)"], ["shape", "Subject outline only (keeps more original background)"]], "box"); f.append(field("Fill area", hole));
   return async () => {
     if (!src.url) throw new Error("choose an image"); const t0 = performance.now();
     res.busy("1/3 cutting out the subject…"); const j = await cutout(src.url, model.value);
-    res.busy("2/3 growing the mask…"); const m = await dilateMask(j.mask, 10);
+    res.busy("2/3 growing the mask…"); const sil = await dilateMask(j.mask, 16); const m = hole.value === "box" ? await boxMask(sil, 8) : sil;
     const base = await prep(src.url, 768, 64);
-    const bg = await sd({ prompt: bgp.value, image: base, mask: m, mask_blur: 8, steps: 25, response_format: "b64_json" }, res, "3/3 filling the background");
+    const bg = await sd({ prompt: bgp.value, negative_prompt: NO_PEOPLE, image: base, mask: m, mask_blur: 8, steps: 25, response_format: "b64_json" }, res, "3/3 filling the background");
     res.busy("packing layers…");
     const files = [{ name: "1_background.png", image: bg.url }, { name: "2_subject.png", image: j.image }, { name: "subject_mask.png", image: j.mask }, { name: "0_original.png", image: src.url }];
     const z = await api("/api/cabin/pack", { files });
@@ -323,8 +347,10 @@ BUILD.character = (f, res) => {
       r = await sd({ image: last.url, prompt: sp.prompt, negative_prompt: sp.negative, strength: 0.45, steps: +steps.value, seed: +seed.value }, res, "adjusting (img2img 0.45)"); change = "img2img: " + changed.join(", ");
     } else {
       let m = how.value === "mask" ? me.mask() : null;
+      if (!m && WF.clothes?.ready) { res.busy("finding " + changed.join(", ") + "…"); const regs = changed.filter(k => REGION[k]); const j = await api("/api/cabin/parse", { image: last.url, parts: regs, grow: regs.includes("hair") ? 24 : 14 }); if (j.mask && j.selected_fraction > 0.003) m = j.mask; }
       if (!m) { const i = await loadImg(last.url); const W = i.naturalWidth, H = i.naturalHeight; const mc = el("canvas", { width: W, height: H }); const g = mc.getContext("2d"); g.fillStyle = "#000"; g.fillRect(0, 0, W, H); g.fillStyle = "#fff"; for (const k of changed) { const b = REGION[k]; if (b) g.fillRect(b[0] * W, b[1] * H, b[2] * W, b[3] * H); } m = mc.toDataURL("image/png"); }
-      r = await sd({ image: last.url, mask: m, mask_blur: 12, prompt: sp.prompt, negative_prompt: sp.negative, strength: 1, steps: +steps.value, seed: +seed.value }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
+      const fp = styled([...changed.map(k => inputs[k].value.trim()), ...CH_FIELDS.map(([k]) => k).filter(k => !changed.includes(k)).map(k => inputs[k].value.trim())].filter(Boolean).join(", "), "lowres, bad anatomy, extra limbs, deformed", st.value);
+      r = await sd({ image: last.url, mask: m, mask_blur: 8, prompt: fp.prompt, negative_prompt: sp.negative, strength: 1, steps: +steps.value, seed: +seed.value }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
     }
     dirty.clear(); ch.history.push({ url: r.url, change, fields: Object.fromEntries(CH_FIELDS.map(([k]) => [k, inputs[k].value])) }); if (ch.history.length > 12) ch.history.shift(); save(); drawHist(); me.setImage(r.url);
     res.show(r.url, `character_v${ch.history.length}.png`, { info: `v${ch.history.length} · ${change} · seed ${seed.value} · ${r.secs.toFixed(1)} s` });
@@ -355,6 +381,7 @@ async function init() {
   if (!$c("#tab-cabin")) return;
   try { STYLES = (await api("/api/cabin/styles")).styles; } catch { STYLES = [{ id: "none", name: "No style", positive: "{prompt}", negative: "" }]; }
   await refreshStatus(); renderCards();
+  if (WF.txt2img?.lcm) { const cb = el("input", { type: "checkbox", id: "cabinFast" }); cb.checked = localStorage.getItem("cabin.fast") === "1"; cb.onchange = () => localStorage.setItem("cabin.fast", cb.checked ? "1" : "0"); $c("#cabinCards").before(el("label", { class: "inl", title: "LCM-LoRA: about 6 steps at guidance 1.5 instead of 20-30 steps" }, cb, " ⚡ Fast mode (LCM-LoRA, ~4x faster, slightly softer)")); }
   setInterval(() => { if ($c("#tab-cabin").classList.contains("active")) refreshStatus(); }, 10000);
 }
 window.cabin = { openWorkflow, refreshStatus };

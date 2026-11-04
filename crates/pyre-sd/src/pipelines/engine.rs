@@ -24,7 +24,7 @@ use crate::sampling::{noise::gaussian, schedule, tiles};
 use crate::transformers::clip::{CLIPTextModelWithProjection, ClipTextTransformer};
 use crate::transformers::{SimpleTokenizer, SimpleTokenizerConfig};
 
-pub const SAMPLERS: [&str; 4] = ["euler", "euler_ancestral", "ddim", "dpmpp_2m"];
+pub const SAMPLERS: [&str; 5] = ["euler", "euler_ancestral", "ddim", "dpmpp_2m", "lcm"];
 pub use crate::sampling::schedule::SCHEDULERS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +163,10 @@ fn unet_config_base(family: Family) -> UNet2DConditionModelConfig {
 }
 
 pub fn load_unet(dir: &Path, family: Family, dev: &Device, dtype: DType) -> Result<UNet2DConditionModel> { load_unet_ch(dir, family, dev, dtype, 4) }
+/// `in_channels` of `<dir>/unet/config.json` (4 unless it says otherwise; 9 = inpainting UNet).
+pub fn unet_in_channels(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("unet").join("config.json")).ok().and_then(|s| { let i = s.find("\"in_channels\"")?; let r = &s[i + 13..]; let r = r[r.find(':')? + 1..].trim_start(); r[..r.find(|c: char| !c.is_ascii_digit())?].parse().ok() }).unwrap_or(4)
+}
 /// `in_ch` 9 = the SD inpainting UNet (latent + mask + masked-image latent).
 pub fn load_unet_ch(dir: &Path, family: Family, dev: &Device, dtype: DType, in_ch: usize) -> Result<UNet2DConditionModel> {
     let path = weights_file(dir, "unet", "diffusion_pytorch_model")?;
@@ -215,11 +219,11 @@ impl Engine {
     pub fn select_unet(&mut self, inpaint: Option<&Path>) -> Result<()> {
         if self.unet.is_some() && self.unet_inpaint.as_deref() == inpaint { return Ok(()); }
         self.unet = None; self.unet_inpaint = None; self.release_free_memory();
-        self.unet = Some(match inpaint { Some(d) => load_unet_ch(d, self.family, &self.dev, self.dtype, 9)?, None => load_unet(&self.dir, self.family, &self.dev, self.dtype)? });
+        self.unet = Some(match inpaint { Some(d) => load_unet_ch(d, self.family, &self.dev, self.dtype, unet_in_channels(d))?, None => load_unet(&self.dir, self.family, &self.dev, self.dtype)? });
         self.unet_inpaint = inpaint.map(Path::to_path_buf);
         Ok(())
     }
-    pub fn inpaint_unet_active(&self) -> bool { self.unet_inpaint.is_some() }
+    pub fn inpaint_unet_active(&self) -> bool { self.unet_inpaint.as_deref().map(|d| unet_in_channels(d) == 9).unwrap_or(false) }
 
     /// cabin's CLIP Text Encode: SD1.5 last layer, SD2 penultimate, SDXL CLIP-L penultimate ++
     /// OpenCLIP-G penultimate with the pooled projection; the refiner uses OpenCLIP-G only.
@@ -264,7 +268,7 @@ impl Engine {
                 Some(AddedCondKwargs { text_embeds, time_ids: host_tensor(data, [batch, cols], &self.dev, self.dtype) })
             }
         };
-        let prepared = schedule::sampler_inputs(q.seed, q.steps, &q.sampler, &q.scheduler, 4, h, w)?;
+        let prepared = schedule::sampler_inputs(q.seed, q.steps, if q.sampler == "lcm" { "euler" } else { &q.sampler }, &q.scheduler, 4, h, w)?;
         let noise = host_tensor(prepared.noise.clone(), prepared.shape, &self.dev, self.dtype);
         let guided = |x: Tensor<4>, t: f64| -> Tensor<4> {
             let x2 = if use_cfg { Tensor::cat(vec![x.clone(), x], 0) } else { x };
@@ -275,9 +279,9 @@ impl Engine {
         };
         let pace = |t0: std::time::Instant| if let Some(hk) = STEP_HOOK.get() { let _ = self.dev.sync(); hk(t0); };
         let denoise = q.denoise.clamp(0.0, 1.0);
-        if denoise < 1.0 && !matches!(q.sampler.as_str(), "euler" | "euler_ancestral") { bail!("denoise below 1 is supported for euler and euler_ancestral"); }
+        if denoise < 1.0 && !matches!(q.sampler.as_str(), "euler" | "euler_ancestral" | "lcm") { bail!("denoise below 1 is supported for euler and euler_ancestral"); }
         if denoise < 1.0 && init.is_none() { bail!("denoise below 1 needs an init latent"); }
-        if q.mask.is_some() && (init.is_none() || !matches!(q.sampler.as_str(), "euler" | "euler_ancestral")) { bail!("inpainting needs an init image and an euler sampler"); }
+        if q.mask.is_some() && (init.is_none() || !matches!(q.sampler.as_str(), "euler" | "euler_ancestral" | "lcm")) { bail!("inpainting needs an init image and an euler sampler"); }
         let mask = match &q.mask { Some(m) => { if m.len() != h * w { bail!("mask must be {}x{} (latent size)", w, h); } Some(host_tensor(m.to_vec(), [1, 1, h, w], &self.dev, self.dtype)) } None => None };
         // 9-channel inpainting UNet: extra input channels [mask, masked-image latent]
         let extra = match (&q.inpaint_latent, &mask) {
@@ -341,6 +345,42 @@ impl Engine {
                 let c = DDIMSchedulerConfig { beta_start: self.sd.beta_start, beta_end: self.sd.beta_end, beta_schedule: self.sd.beta_schedule, prediction_type: self.sd.prediction_type, train_timesteps: self.sd.train_timesteps, steps_offset: schedule::ddim_offset(&q.scheduler)?, ..DDIMSchedulerConfig::default() };
                 let s = DDIMScheduler::new(q.steps, c, &self.dev);
                 run!(s, |t: usize| t as f64)
+            }
+            "lcm" => {
+                // LCM multistep sampler (diffusers LCMScheduler: 50 original steps, timestep_scaling 10,
+                // sigma_data 0.5, epsilon prediction); for an LCM-LoRA merged UNet, guidance ~1-2, 4-8 steps.
+                let tn = self.sd.train_timesteps;
+                let (b0, b1) = (self.sd.beta_start.sqrt(), self.sd.beta_end.sqrt());
+                let mut ac = Vec::with_capacity(tn); let mut prod = 1.0f64;
+                for i in 0..tn { let b = b0 + (b1 - b0) * i as f64 / (tn - 1) as f64; prod *= 1.0 - b * b; ac.push(prod); }
+                let k = tn / 50;
+                let origin: Vec<usize> = (1..=50).rev().map(|i| i * k - 1).collect();
+                let n = q.steps.clamp(1, 50);
+                let mut ts: Vec<usize> = (0..n).map(|i| origin[i * 50 / n]).collect();
+                let keep = if denoise < 1.0 || mask.is_some() { ((n as f64) * denoise).round().max(1.0) as usize } else { n };
+                ts.drain(..n - keep);
+                let mut rng = q.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5DEE_CE66;
+                let mut fresh = || { rng = rng.wrapping_add(1); host_tensor(crate::sampling::noise::gaussian(rng, 4 * h * w), [1, 4, h, w], &self.dev, self.dtype) };
+                let noised = |l: &Tensor<4>, t: usize, nz: Tensor<4>| l.clone() * ac[t].sqrt() + nz * (1.0 - ac[t]).sqrt();
+                let mut x = match init { Some(l) if keep < n || mask.is_some() => noised(l, ts[0], noise.clone()), _ => noise.clone() };
+                let m_steps = ts.len();
+                for (i, &t) in ts.iter().enumerate() {
+                    let t0 = std::time::Instant::now();
+                    let eps = guided(x.clone(), t as f64);
+                    let (a, st) = (ac[t], (t * 10) as f64);
+                    let c_skip = 0.25 / (st * st + 0.25);
+                    let c_out = st / (st * st + 0.25).sqrt();
+                    let x0 = (x.clone() - eps * (1.0 - a).sqrt()) / a.sqrt();
+                    let den = x0 * c_out + x * c_skip;
+                    x = if i + 1 < m_steps { noised(&den, ts[i + 1], fresh()) } else { den };
+                    if let (Some(m), true, Some(l)) = (&mask, blend, init) {
+                        let known = if i + 1 < m_steps { noised(l, ts[i + 1], noise.clone()) } else { l.clone() };
+                        x = x * m.clone() + known * (m.clone().neg() + 1.0);
+                    }
+                    pace(t0);
+                    on_step(i + 1, m_steps);
+                }
+                x
             }
             "dpmpp_2m" => { let mut s = self.sd.build_dpm_solver_scheduler(q.steps, &self.dev); run!(s, |t: usize| t as f64) }
             other => bail!("unknown sampler `{other}` (have: {})", SAMPLERS.join(", ")),
