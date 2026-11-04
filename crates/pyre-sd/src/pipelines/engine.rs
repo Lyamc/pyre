@@ -241,6 +241,27 @@ impl Engine {
         }
         Ok(())
     }
+    /// Compare the loaded ControlNet's residuals with diffusers reference dumps in `rd` (ref_in_x [1,4,32,24],
+    /// ref_in_cond [1,77,768], ref_in_hint [1,3,256,192], t = 500, scale 1; ref_mid, ref_down0..11).
+    pub fn controlnet_check(&self, rd: &Path) -> Result<String> {
+        let cn = &self.controlnet.as_ref().ok_or_else(|| anyhow!("no ControlNet loaded"))?.1;
+        let rf = |n: &str| -> Result<Vec<f32>> { let b = std::fs::read(rd.join(format!("ref_{n}.bin"))).map_err(|e| anyhow!("ref_{n}.bin: {e}"))?; Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()) };
+        let x = host_tensor(rf("in_x")?, [1, 4, 32, 24], &self.dev, self.dtype);
+        let c = host_tensor(rf("in_cond")?, [1, 77, 768], &self.dev, self.dtype);
+        let h = host_tensor(rf("in_hint")?, [1, 3, 256, 192], &self.dev, self.dtype);
+        let (down, mid) = cn.forward(x, 500.0, c, h, 1.0);
+        let cmp = |t: Tensor<4>, n: &str| -> Result<String> {
+            let a = t.cast(DType::F32).into_data().to_vec::<f32>().map_err(|e| anyhow!("{e:?}"))?;
+            let r = rf(n)?;
+            if a.len() != r.len() { bail!("{n}: {} values vs ref {}", a.len(), r.len()); }
+            let (mut mx, mut s, mut sr) = (0f32, 0f64, 0f64);
+            for (p, q) in a.iter().zip(&r) { let d = (p - q).abs(); mx = mx.max(d); s += d as f64; sr += q.abs() as f64; }
+            Ok(format!("{n}: max {:.2e} mean {:.2e} (ref mean|x| {:.2e}); ", mx, s / a.len() as f64, sr / a.len() as f64))
+        };
+        let mut out = cmp(mid, "mid")?;
+        for (i, t) in down.into_iter().enumerate() { out += &cmp(t, &format!("down{i}"))?; }
+        Ok(out)
+    }
     pub fn inpaint_unet_active(&self) -> bool { self.unet_inpaint.as_deref().map(|d| unet_in_channels(d) == 9).unwrap_or(false) }
 
     /// cabin's CLIP Text Encode: SD1.5 last layer, SD2 penultimate, SDXL CLIP-L penultimate ++
@@ -293,12 +314,20 @@ impl Engine {
                 if hv.len() != 3 * q.height * q.width { bail!("control image must be {}x{}", q.width, q.height); }
                 if q.inpaint_latent.is_some() { bail!("ControlNet with the 9-channel inpainting UNet is not supported"); }
                 let t = host_tensor(hv.to_vec(), [1, 3, q.height, q.width], &self.dev, self.dtype);
-                Some((cn, if use_cfg { Tensor::cat(vec![t.clone(), t], 0) } else { t }, *sc))
+                Some((cn, t, *sc))
             }
             (Some(_), None) => bail!("a control image needs a ControlNet loaded"),
             _ => None,
         };
         let guided = |x: Tensor<4>, t: f64| -> Tensor<4> {
+            // ControlNet: run uncond and cond as two batch-1 passes (halves the peak activation memory)
+            if let (Some((cn, h, sc)), true, None) = (&hint, use_cfg, &added) {
+                let cs: Vec<Tensor<3>> = cond.clone().chunk(2, 0);
+                let one = |c: Tensor<3>| { let (down, mid) = cn.forward(x.clone(), t, c.clone(), h.clone(), *sc); unet.forward_with_additional_residuals(x.clone(), t, c, Some(&down), Some(&mid), None) };
+                let u = one(cs[0].clone());
+                let c = one(cs[1].clone());
+                return u.clone() + (c - u) * cfg;
+            }
             let x2 = if use_cfg { Tensor::cat(vec![x.clone(), x], 0) } else { x };
             let eps = match &hint {
                 Some((cn, h, sc)) => { let (down, mid) = cn.forward(x2.clone(), t, cond.clone(), h.clone(), *sc); unet.forward_with_additional_residuals(x2, t, cond.clone(), Some(&down), Some(&mid), added.as_ref()) }

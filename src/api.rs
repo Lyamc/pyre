@@ -317,6 +317,11 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
 async fn images(State(app): S, Json(b): Json<Value>) -> Response {
     use base64::Engine;
     let im = match image_model(&app, b["model"].as_str()) { Ok(i) => i, Err(r) => return r };
+    #[cfg(feature = "image")]
+    if let Some(rd) = b["cn_check"].as_str() {
+        let rd = std::path::PathBuf::from(rd);
+        return match tokio::task::spawn_blocking(move || im.controlnet_check(&rd)).await { Ok(Ok(s)) => Json(serde_json::json!({"report": s})).into_response(), Ok(Err(e)) => err(StatusCode::BAD_REQUEST, &format!("{e:#}")), Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()) };
+    }
     let Some(prompt) = b["prompt"].as_str() else { return err(StatusCode::BAD_REQUEST, "missing prompt") };
     let (w, h) = match b["size"].as_str().filter(|s| *s != "auto").unwrap_or("0x0").split_once('x').and_then(|(a, c)| Some((a.parse().ok()?, c.parse().ok()?))) { Some(x) => x, None => return err(StatusCode::BAD_REQUEST, "size must look like 512x512") };
     let n = b["n"].as_u64().unwrap_or(1).clamp(1, 8) as usize;

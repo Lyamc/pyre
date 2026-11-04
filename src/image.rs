@@ -169,6 +169,16 @@ impl ImageModel {
 
     fn max_side(&self) -> usize { if self.native >= 1024 { 1536 } else { 1024 } }
 
+    #[cfg(feature = "image")]
+    pub fn controlnet_check(&self, rd: &Path) -> Result<String> {
+        let mut eng = self.eng.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::var_os("PYRE_SD_CONTROLNET_OPENPOSE").map(std::path::PathBuf::from).ok_or_else(|| anyhow!("no OpenPose ControlNet configured"))?;
+        crate::limits::lease(900 << 20, "loading the OpenPose ControlNet")?;
+        let r = eng.set_controlnet(Some(&dir));
+        crate::limits::lease_end(900 << 20);
+        r?;
+        eng.controlnet_check(rd)
+    }
     #[cfg(not(feature = "image"))]
     pub fn generate(&self, _q: &GenParams) -> Result<Generated> { bail!("built without image") }
 
@@ -266,6 +276,11 @@ impl ImageModel {
             }
             let init_lat = match &init { Some(rgb) if q.strength < 1.0 || pmask.is_some() => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
             if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral" | "lcm") { req.sampler = "euler".into(); }
+            // ControlNet doubles the UNet's activation footprint: keep VRAM leased for the whole sampling run
+            // (the load lease above only covered the weights) so the LLM expert cache gives way first.
+            struct LeaseGuard(u64); impl Drop for LeaseGuard { fn drop(&mut self) { crate::limits::lease_end(self.0); } }
+            let cn_act: u64 = if req.control.is_some() { ((q.width * q.height) as u64 * 4 << 10).max(1024 << 20) } else { 0 };
+            let _cn_guard = if cn_act > 0 { crate::limits::lease(cn_act, "ControlNet sampling")?; Some(LeaseGuard(cn_act)) } else { None };
             let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
             eng.release_free_memory();
             if q.refiner {

@@ -28,7 +28,7 @@ function styled(prompt, neg, sid) { const s = STYLES.find(x => x.id === sid) || 
 // ---------- shared form widgets ----------
 function field(label, input, hint) { return el("label", { class: "cf" }, el("span", {}, label), input, hint ? el("small", {}, hint) : null); }
 function num(v, min, max, step = 1) { return el("input", { type: "number", value: v, min, max, step }); }
-function range(v, min, max, step, fmt = x => x) { const i = el("input", { type: "range", value: v, min, max, step }); const o = el("output", {}, fmt(v)); i.oninput = () => o.textContent = fmt(i.value); const w = el("span", { class: "rng" }, i, o); w.input = i; return w; }
+function range(v, min, max, step, fmt = x => x) { const i = el("input", { type: "range", min, max, step }); i.value = v; /* value last: set before min/step it snaps to the default step grid (1 became 1.3 with min 0.3) */ const o = el("output", {}, fmt(v)); i.oninput = () => o.textContent = fmt(i.value); const w = el("span", { class: "rng" }, i, o); w.input = i; return w; }
 function sel(opts, v) { const s = el("select", {}); for (const o of opts) { const [val, lab] = Array.isArray(o) ? o : [o, o]; s.append(el("option", { value: val, selected: val === v }, lab)); } return s; }
 function stylePicker(def = "none") {
   const box = el("div", { class: "styles" }); box.value = def;
@@ -289,12 +289,12 @@ function poseEditor(W = 512, H = 768) {
 BUILD.pose = (f, res, input) => {
   const pe = poseEditor(); const src = imageSource(); if (input) src.set(input);
   const p = el("textarea", { rows: 2, placeholder: "who / what, e.g. young woman adventurer, red hair, leather jacket" }); const st = stylePicker("anime");
-  const scale = range(1, 0.3, 1.5, 0.05), keep = range(0.85, 0.5, 1, 0.05), steps = num(25, 1, 60), seed = seedBox();
-  f.append(el("div", { class: "row" }, field("Pose", pe), field("Character image (optional: keeps colours/look)", src)), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Pose strength", scale), field("Change amount", keep, "with a character image: 1 = fully re-drawn"), field("Steps", steps), field("Seed", seed)));
+  const scale = range(1, 0.3, 1.5, 0.05), keep = range(1, 0.5, 1, 0.05), steps = num(25, 1, 60), seed = seedBox();
+  f.append(el("div", { class: "row" }, field("Pose", pe), field("Character image (optional: keeps colours/look)", src)), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Pose strength", scale), field("Change amount", keep, "1 = follow the pose (look from the prompt); lower keeps more of the character image but the pose follows less"), field("Steps", steps), field("Seed", seed)));
   return async () => {
     if (!p.value.trim()) throw new Error("describe the character"); const sp = styled(p.value + ", full body", "lowres, bad anatomy, extra limbs, deformed", st.value);
     const body = { prompt: sp.prompt, negative_prompt: sp.negative, size: "512x768", steps: +steps.value, seed: seed.get(), control_image: pe.image(), control_scale: +scale.input.value, fast: false };
-    if (src.url) Object.assign(body, { image: await prep(src.url), strength: +keep.input.value });
+    if (src.url && +keep.input.value < 0.99) Object.assign(body, { image: await prep(src.url), strength: +keep.input.value });
     const r = await sd(body, res, "posing"); seed.after(r.seed);
     res.show(r.url, `pose_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` });
     res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: body.control_image }), el("figcaption", {}, "pose"))));
@@ -313,6 +313,18 @@ BUILD.animate = (f, res, input) => {
     res.append(el("div", { class: "row" }, el("a", { href: zurl, download: "frames.zip", class: "btnlink" }, `Download PNG frames (${j.frames.length})`)));
   };
 };
+// Colour pre-fill for masked edits: SD 1.5 at strength 1 keeps drifting back to the surrounding colours
+// (a "red hoodie" came out white). Painting the masked area in the asked colour first and denoising from
+// there (strength ~0.9) fixes the colour while the shape and shading are still re-drawn.
+const COLOURS = { red: [200, 30, 40], crimson: [160, 20, 40], scarlet: [220, 40, 30], pink: [240, 140, 180], orange: [240, 130, 30], yellow: [240, 210, 50], gold: [210, 170, 60], blonde: [235, 205, 130], green: [40, 150, 60], teal: [30, 140, 140], blue: [40, 80, 210], navy: [25, 35, 90], cyan: [60, 200, 230], purple: [120, 50, 170], violet: [140, 80, 200], brown: [110, 70, 40], black: [25, 25, 28], grey: [128, 128, 128], gray: [128, 128, 128], silver: [190, 190, 200], white: [240, 240, 240], beige: [215, 195, 160] };
+function colourOf(text) { const m = (text || "").toLowerCase().match(new RegExp("\\b(" + Object.keys(COLOURS).join("|") + ")\\b")); return m ? COLOURS[m[1]] : null; }
+async function colourFill(url, maskUrl, rgb, maxY = 1) {
+  const [i, m] = await Promise.all([loadImg(url), loadImg(maskUrl)]); const W = i.naturalWidth, H = i.naturalHeight;
+  const c = el("canvas", { width: W, height: H }); const g = c.getContext("2d"); g.drawImage(i, 0, 0); const d = g.getImageData(0, 0, W, H);
+  const mc = el("canvas", { width: W, height: H }); const mg = mc.getContext("2d"); mg.drawImage(m, 0, 0, W, H); const md = mg.getImageData(0, 0, W, H).data;
+  const yMax = maxY * H; for (let k = 0; k < W * H; k++) { const a = md[k * 4] / 255; if (a <= 0.02 || k / W > yMax) continue; const lum = (d.data[k * 4] + d.data[k * 4 + 1] + d.data[k * 4 + 2]) / 765; const shade = 0.6 + 0.6 * lum; for (let ch = 0; ch < 3; ch++) { const v = Math.min(255, rgb[ch] * shade + (Math.random() - 0.5) * 24); d.data[k * 4 + ch] = d.data[k * 4 + ch] * (1 - 0.85 * a) + v * 0.85 * a; } }
+  g.putImageData(d, 0, 0); return c.toDataURL("image/png");
+}
 BUILD.clothes = (f, res, input) => {
   const src = imageSource(); if (input) src.set(input);
   const part = sel([["top", "Top / shirt / jacket"], ["sleeves", "Top incl. sleeves (arms)"], ["bottom", "Bottom (pants / skirt)"], ["dress", "Whole outfit / dress"], ["shoes", "Shoes"], ["hair", "Hair"], ["hat", "Hat"], ["acc", "Accessories / bag / scarf"]], "top");
@@ -324,8 +336,12 @@ BUILD.clothes = (f, res, input) => {
     res.busy("segmenting clothes…"); const img = await prep(src.url);
     const j = await api("/api/cabin/parse", { image: img, parts: [part.value], grow: +grow.input.value });
     if (!j.mask || j.selected_fraction < 0.002) throw new Error(`no ${part.value} found in the image (found: ${Object.keys(j.coverage).join(", ")})`);
-    const sp = styled(p.value, "", st.value);
-    const r = await sd({ image: img, mask: j.mask, mask_blur: 8, prompt: sp.prompt, negative_prompt: sp.negative, strength: 1, steps: +steps.value, seed: seed.get() }, res, "dressing"); seed.after(r.seed);
+    const sp = styled(p.value + ", " + p.value, "", st.value); const rgb = colourOf(p.value);
+    // pre-fill only the garment itself (un-grown parse), so the grown margin keeps its own colours
+    const core = rgb ? await api("/api/cabin/parse", { image: img, parts: [part.value], grow: 0 }) : null;
+    const init = rgb ? await colourFill(img, core.mask || j.mask, rgb, part.value === "hair" ? 0.32 : 1) : img;
+    // base model (the 9-channel inpainting UNet copies the old garment's colours) + colour pre-fill
+    const r = await sd({ image: init, mask: j.mask, mask_blur: 8, prompt: sp.prompt, negative_prompt: sp.negative, strength: rgb ? 0.9 : 1, steps: +steps.value, guidance_scale: 8.5, seed: seed.get(), inpaint_model: false }, res, "dressing"); seed.after(r.seed);
     res.show(r.url, `clothes_${r.seed}.png`, { info: `${part.value} → ${p.value} · seed ${r.seed} · ${r.secs.toFixed(1)} s` });
     res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: j.preview }), el("figcaption", {}, "parsing")), el("figure", {}, el("img", { src: j.mask }), el("figcaption", {}, "mask"))));
   };
@@ -406,7 +422,9 @@ BUILD.character = (f, res) => {
       const fp = styled([...changed.map(k => inputs[k].value.trim()), ...changed.map(k => inputs[k].value.trim()), ...CH_FIELDS.map(([k]) => k).filter(k => !changed.includes(k)).map(k => inputs[k].value.trim())].filter(Boolean).join(", "), "lowres, bad anatomy, extra limbs, deformed" + (changed.includes("hair") ? ", bald, shaved head, bald patch" : ""), st.value);
       // base model + latent blending: the 9-channel inpainting UNet copies the old colours from the context
       // (red hair stayed red); the base model follows the new description
-      r = await sd({ image: last.url, mask: m, mask_blur: 8, prompt: fp.prompt, negative_prompt: fp.negative, strength: 1, steps: +steps.value, guidance_scale: 8.5, seed: +seed.value, inpaint_model: false }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
+      const rgb = changed.length === 1 && REGION[changed[0]] ? colourOf(inputs[changed[0]].value) : null; let init = last.url;
+      if (rgb) { let core = null; if (WF.clothes?.ready && how.value !== "mask") { const c = await api("/api/cabin/parse", { image: last.url, parts: [changed[0]], grow: 0 }); if (c.mask && c.selected_fraction > 0.003) core = c.mask; } init = await colourFill(last.url, core || m, rgb, changed[0] === "hair" ? 0.32 : 1); }
+      r = await sd({ image: init, mask: m, mask_blur: 8, prompt: fp.prompt, negative_prompt: fp.negative, strength: rgb ? 0.9 : 1, steps: +steps.value, guidance_scale: 8.5, seed: +seed.value, inpaint_model: false }, res, "editing " + (changed.join(", ") || "masked area")); change = "inpaint: " + (changed.join(", ") || "mask");
     }
     dirty.clear(); ch.history.push({ url: r.url, change, fields: Object.fromEntries(CH_FIELDS.map(([k]) => [k, inputs[k].value])) }); if (ch.history.length > 12) ch.history.shift(); save(); drawHist(); me.setImage(r.url);
     res.show(r.url, `character_v${ch.history.length}.png`, { info: `v${ch.history.length} · ${change} · seed ${seed.value} · ${r.secs.toFixed(1)} s` });
