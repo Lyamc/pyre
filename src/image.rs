@@ -31,11 +31,15 @@ pub struct GenParams {
     pub init_image: Option<std::sync::Arc<Vec<u8>>>,
     /// img2img denoise strength (cabin's KSampler `denoise`), 0..=1.
     pub strength: f64,
+    /// Inpainting: an encoded mask image (white / opaque = repaint), resized to the init image.
+    pub mask: Option<std::sync::Arc<Vec<u8>>>,
+    /// Mask feather radius in pixels (default 8): softens the latent mask and the final pixel composite.
+    pub mask_blur: f64,
 }
 
 impl GenParams {
     pub fn new(prompt: &str, width: usize, height: usize, steps: usize, guidance: f64, seed: u64) -> Self {
-        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0 }
+        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0 }
     }
 }
 
@@ -118,7 +122,27 @@ impl ImageModel {
         let need: u64 = match (family, dtype == burn::tensor::DType::F32) { (Family::Sdxl, _) => 7_200 << 20, (_, true) => 4_100 << 20, _ => 2_100 << 20 };
         crate::limits::check_alloc(need, &format!("loading {}", family.label()))?;
         let t = std::time::Instant::now();
-        let eng = Engine::load(dir, &dev, dtype, vae.as_deref())?;
+        tracing::info!("SD pool before load: {:?}", dev.memory_pool_usage());
+        if std::env::var("PYRE_SD_PROBE").is_ok() {
+            use burn::tensor::{Tensor as T, TensorData as TD, DType as DT};
+            let mb = |d: &burn::tensor::Device| d.memory_pool_usage().map(|u| u.bytes_in_use >> 20).unwrap_or(0);
+            let n = 64usize << 20; let m0 = mb(&dev);
+            let a = T::<1>::from_data(TD::new(vec![0.5f32; n], [n]).convert_dtype(DT::F16), (&dev, DT::F16)); let _ = dev.sync(); let m1 = mb(&dev);
+            let b = T::<1>::from_data(TD::new(vec![half::f16::from_f32(0.5); n], [n]), (&dev, DT::F16)); let _ = dev.sync(); let m2 = mb(&dev);
+            let c = T::<2>::from_data(TD::new(vec![0.5f32; n], [4096, n/4096]).convert_dtype(DT::F16), (&dev, DT::F16)).transpose(); let _ = dev.sync(); let m3 = mb(&dev);
+            tracing::info!("SD probe MiB (expect 128 each): converted {} native {} transposed {}; dtypes {:?} {:?} {:?}", m1-m0, m2-m1, m3-m2, a.dtype(), b.dtype(), c.dtype());
+            drop((a, b, c));
+        }
+        // weights in exact-size (persistent) buffers: the pooled pages otherwise hold ~2x the f16 footprint
+        let eng = if std::env::var("PYRE_SD_POOLED_WEIGHTS").is_ok() { Engine::load(dir, &dev, dtype, vae.as_deref())? } else { dev.memory_persistent_allocations((), |_| Engine::load(dir, &dev, dtype, vae.as_deref()))? };
+        // f32 safetensors are cast to f16 on the device: hand the f32 staging buffers back to the driver
+        tracing::info!("SD pool after load: {:?}", dev.memory_pool_usage());
+        let _ = dev.sync(); dev.memory_cleanup();
+        tracing::info!("SD pool after sync+cleanup: {:?}", dev.memory_pool_usage());
+        eng.release_free_memory();
+        tracing::info!("SD pool after release: {:?}", dev.memory_pool_usage());
+        crate::limits::vlog("sd loaded");
+        tracing::info!("SD weights resident; VRAM free now {:?} MiB", crate::limits::vram().map(|v| v.free >> 20));
         tracing::info!("{} weights loaded in {:.1}s ({precision}, VAE {} in {:?})", family.label(), t.elapsed().as_secs_f64(), eng.vae_path.display(), eng.vae_dtype);
         let refiner_dir = if xl { find_refiner(dir) } else { None };
         let vae_desc = format!("{} ({:?})", eng.vae_path.display(), eng.vae_dtype);
@@ -168,7 +192,14 @@ impl ImageModel {
                 let (w, h) = ((img.width() as usize) / 8 * 8, (img.height() as usize) / 8 * 8);
                 let img = image::imageops::crop_imm(&img, 0, 0, w as u32, h as u32).to_image();
                 q.width = w; q.height = h;
-                Some(img.into_raw())
+                if w > self.max_side() || h > self.max_side() {
+                    // keep the aspect, fit the long side to the model limit
+                    let s = self.max_side() as f64 / w.max(h) as f64;
+                    let (nw, nh) = (((w as f64 * s) as usize) / 8 * 8, ((h as f64 * s) as usize) / 8 * 8);
+                    let r = image::imageops::resize(&img, nw as u32, nh as u32, image::imageops::FilterType::Lanczos3);
+                    q.width = nw; q.height = nh;
+                    Some(r.into_raw())
+                } else { Some(img.into_raw()) }
             }
             None => None,
         };
@@ -197,11 +228,18 @@ impl ImageModel {
         let r = (|| -> Result<Vec<u8>> {
             eng.ensure_unet()?;
             let req = Request { prompt: q.prompt.clone(), negative: q.negative.clone(), width: q.width, height: q.height, steps: q.steps, guidance: q.guidance, seed: q.seed,
-                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0 };
+                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None };
             let prog = &self.progress;
             let mut on_step = |i: usize, n: usize| prog.store(((i as u64) << 32) | n as u64, Ordering::SeqCst);
             let mut req = req;
-            let init_lat = match &init { Some(rgb) if q.strength < 1.0 => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
+            // inpainting: pixel mask (feathered) and its latent-resolution average
+            let pmask: Option<Vec<f32>> = match (&q.mask, &init) {
+                (Some(mb), Some(_)) => Some(load_mask(mb, q.width, q.height, q.mask_blur)?),
+                (Some(_), None) => bail!("a mask needs an init image"),
+                _ => None,
+            };
+            if let Some(pm) = &pmask { req.mask = Some(std::sync::Arc::new(latent_mask(pm, q.width, q.height))); }
+            let init_lat = match &init { Some(rgb) if q.strength < 1.0 || pmask.is_some() => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
             if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral") { req.sampler = "euler".into(); }
             let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
             eng.release_free_memory();
@@ -212,7 +250,11 @@ impl ImageModel {
                 rq.denoise = q.refiner_denoise.unwrap_or(0.3);
                 lat = engine::refine(&mut eng, &dir, lat, &rq, &mut on_step)?;
             }
-            let (rgb, w, h) = eng.decode(lat)?;
+            let (mut rgb, w, h) = eng.decode(lat)?;
+            if let (Some(pm), Some(orig)) = (&pmask, &init) {
+                // seamless composite: original pixels outside the (feathered) mask
+                for i in 0..w * h { let a = pm[i]; for c in 0..3 { let k = i * 3 + c; rgb[k] = (orig[k] as f32 * (1.0 - a) + rgb[k] as f32 * a).round().clamp(0.0, 255.0) as u8; } }
+            }
             eng.release_free_memory();
             if q.refiner { eng.ensure_unet()?; }
             png(&rgb, w, h)
@@ -222,4 +264,41 @@ impl ImageModel {
         self.max_area.fetch_max(area, Ordering::SeqCst);
         Ok(Generated { png, seconds: t.elapsed().as_secs_f64(), seed: q.seed })
     }
+}
+
+/// Decode a mask image (white or opaque = 1) to `[h*w]` in 0..1 at the given size, feathered by a box blur.
+#[cfg(feature = "image")]
+fn load_mask(bytes: &[u8], w: usize, h: usize, blur: f64) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes).context("decoding the mask")?.to_rgba8();
+    let img = image::imageops::resize(&img, w as u32, h as u32, image::imageops::FilterType::Triangle);
+    let has_alpha = img.pixels().any(|p| p[3] < 250);
+    let mut m: Vec<f32> = img.pixels().map(|p| {
+        let lum = (p[0] as f32 + p[1] as f32 + p[2] as f32) / 765.0;
+        if has_alpha { p[3] as f32 / 255.0 } else { lum }
+    }).collect();
+    let r = blur.max(0.0).round() as usize;
+    if r > 0 { for _ in 0..2 { m = box_blur(&m, w, h, r); } }
+    Ok(m)
+}
+#[cfg(feature = "image")]
+fn box_blur(m: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut t = vec![0f32; w * h];
+    for y in 0..h { let row = &m[y * w..(y + 1) * w]; let mut acc = 0f32; let mut n = 0f32;
+        for x in 0..(r.min(w)) { acc += row[x]; n += 1.0; }
+        for x in 0..w { if x + r < w { acc += row[x + r]; n += 1.0; } t[y * w + x] = acc / n; if x >= r { acc -= row[x - r]; n -= 1.0; } } }
+    let mut o = vec![0f32; w * h];
+    for x in 0..w { let mut acc = 0f32; let mut n = 0f32;
+        for y in 0..(r.min(h)) { acc += t[y * w + x]; n += 1.0; }
+        for y in 0..h { if y + r < h { acc += t[(y + r) * w + x]; n += 1.0; } o[y * w + x] = acc / n; if y >= r { acc -= t[(y - r) * w + x]; n -= 1.0; } } }
+    o
+}
+/// 8x8 max-pool-ish average (any coverage counts more) of the pixel mask, at latent resolution.
+#[cfg(feature = "image")]
+fn latent_mask(m: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let (lw, lh) = (w / 8, h / 8);
+    let mut o = vec![0f32; lw * lh];
+    for y in 0..lh { for x in 0..lw { let mut s = 0f32; let mut mx = 0f32;
+        for dy in 0..8 { for dx in 0..8 { let v = m[(y * 8 + dy) * w + x * 8 + dx]; s += v; mx = mx.max(v); } }
+        o[y * lw + x] = (0.5 * s / 64.0 + 0.5 * mx).min(1.0); } }
+    o
 }

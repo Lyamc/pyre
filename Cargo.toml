@@ -92,6 +92,8 @@ burn-cubecl = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a
 # Image generation: Stable Diffusion, vendored from oxiglade/diffusers-burn (MIT/Apache) and ported to the workspace Burn.
 pyre-sd = { path = "crates/pyre-sd", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"], optional = true }
+vtracer = { version = "0.6", default-features = false }
+visioncortex = "0.8"
 # Image tagger: reads PyTorch .pt checkpoints in place (same Burn fork, no torch).
 pytorch-reader = { path = "../burn-pyre/crates/pytorch-reader" }
 base64 = "0.22"

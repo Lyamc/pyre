@@ -8,6 +8,7 @@ mod logbuf;
 mod registry;
 mod stt;
 mod diar;
+mod cabin;
 mod tts;
 mod image;
 mod tagger;

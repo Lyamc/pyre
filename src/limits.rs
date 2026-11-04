@@ -239,6 +239,40 @@ fn emergency_shrink(free: u64) -> bool {
     true
 }
 /// Bytes the expert cache will release at the next step (decided shrink not yet applied).
+// ---- VRAM leases (cabin on-demand models): borrow VRAM from the expert cache while a side model is resident.
+static LEASES: AtomicU64 = AtomicU64::new(0);
+static LEASED: AtomicU64 = AtomicU64::new(0);
+/// Make `need` bytes allocatable on top of the reserve (default 1 GiB+) by shrinking the expert-cache target,
+/// then wait (<= 20 s) until the model has applied it (at its next step or idle tick). While any lease is held the
+/// governor does not grow the cache back; when the last lease ends it regrows on its normal 30 s schedule.
+/// Each successful call must be paired with `lease_end(need)`.
+pub fn lease(need: u64, what: &str) -> anyhow::Result<()> {
+    let Some(v) = vram() else { LEASES.fetch_add(1, Ordering::SeqCst); return Ok(()) };
+    let want = need + reserve().max(vram_floor_mb() << 20) + (128 << 20);
+    LEASES.fetch_add(1, Ordering::SeqCst);
+    if v.free >= want { LEASED.fetch_add(need, Ordering::SeqCst); return Ok(()); }
+    let (cfg, tgt) = (XC_CFG.load(Ordering::Relaxed), XC_TGT.load(Ordering::Relaxed));
+    let deficit = (want - v.free).next_multiple_of(64 << 20);
+    if cfg == 0 || tgt < deficit + (128 << 20) {
+        LEASES.fetch_sub(1, Ordering::SeqCst);
+        anyhow::bail!("{what} needs ~{} MiB of VRAM; {} MiB is free and the LLM expert cache can only give back {} MiB", need >> 20, v.free >> 20, tgt.saturating_sub(128 << 20) >> 20);
+    }
+    let nt = tgt - deficit;
+    XC_TGT.store(nt, Ordering::SeqCst); XC_SHRINKS.fetch_add(1, Ordering::Relaxed);
+    crate::logbuf::event("vram_lease", "INFO", serde_json::json!({"what": what, "need_mib": need >> 20, "free_mib": v.free >> 20, "xcache_from_mib": tgt >> 20, "xcache_to_mib": nt >> 20}));
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(20) {
+        if XC_CUR.load(Ordering::SeqCst) <= nt && vram().map_or(true, |v| v.free >= want) { LEASED.fetch_add(need, Ordering::SeqCst); return Ok(()); }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    LEASES.fetch_sub(1, Ordering::SeqCst);
+    anyhow::bail!("{what}: the LLM did not release its expert cache within 20 s (busy?); try again when the chat is idle")
+}
+pub fn lease_end(need: u64) {
+    if LEASES.load(Ordering::SeqCst) > 0 { LEASES.fetch_sub(1, Ordering::SeqCst); }
+    let _ = LEASED.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(need)));
+}
+pub fn leases() -> (u64, u64) { (LEASES.load(Ordering::SeqCst), LEASED.load(Ordering::SeqCst)) }
 pub fn xc_pending_bytes() -> u64 { XC_CUR.load(Ordering::Relaxed).saturating_sub(XC_TGT.load(Ordering::Relaxed)) }
 pub fn vram_adapt_on() -> bool { std::env::var("PYRE_VRAM_ADAPT").map(|v| v != "0").unwrap_or(true) }
 fn adaptive_vram() -> bool { vram_adapt_on() }
@@ -312,7 +346,7 @@ pub fn governor_start() {
                             let nt = tgt.saturating_sub(deficit);
                             XC_TGT.store(nt, Ordering::Relaxed); XC_SHRINKS.fetch_add(1, Ordering::Relaxed); crate::metrics::warning(); high_since = 0; last_grow = t;
                             crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "shrink_expert_cache", "free_mib": free >> 20, "floor_mib": fl >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20}));
-                        } else if free > fl + (832 << 20) && applied && tgt < cfg {
+                        } else if free > fl + (832 << 20) && applied && tgt < cfg && LEASES.load(Ordering::SeqCst) == 0 {
                             if high_since == 0 { high_since = t; }
                             if t - high_since > 30_000 && t - last_grow > 30_000 {
                                 let room = free - (fl + (768 << 20)); let step = room.min(512 << 20).min(cfg - tgt) & !((64u64 << 20) - 1);

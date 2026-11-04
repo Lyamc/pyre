@@ -1981,6 +1981,11 @@ impl Model {
         if crate::limits::stop_requested() { let t = cb.empty(1); let _ = cb.read(&t); crate::limits::stop_now(); }
         if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 { let mut x = xm.lock().unwrap(); if tgt != x.budget && x.sloc.is_empty() { self.xc_resize(cb, &mut x, tgt); } } }
     }
+    /// Called by the serve worker while idle: apply a changed expert-cache target (VRAM leases) without a request.
+    pub fn idle_hook(&self) {
+        let Some(cb) = &self.cube else { return };
+        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 { let mut x = xm.lock().unwrap(); if tgt != x.budget && x.sloc.is_empty() { self.xc_resize(cb, &mut x, tgt); } } }
+    }
     fn xc_resize(&self, cb: &super::qn_cube::Cube, x: &mut XCache, tgt: usize) {
         let t0 = std::time::Instant::now(); let old = x.budget;
         { let t = cb.empty(1); let _ = cb.read(&t); } // drain: no kernel may still read the old arenas

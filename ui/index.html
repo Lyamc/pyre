@@ -6,6 +6,7 @@
 <title>pyre</title>
 <link rel="icon" href="/favicon.svg">
 <link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/cabin.css">
 </head>
 <body>
 <header class="top">
@@ -15,6 +16,7 @@
     <button data-tab="models">Models</button>
     <button data-tab="images">Images</button>
     <button data-tab="audio">Audio</button>
+    <button data-tab="cabin">Cabin</button>
     <button data-tab="apps">Apps</button>
     <button data-tab="status">Server</button>
   </nav>
@@ -142,6 +144,15 @@
 </section>
 
 <!-- APPS -->
+<section id="tab-cabin" class="tab">
+  <div class="cside">
+    <div id="cabinCards"></div>
+    <div id="cabinStatus"></div>
+    <b>Results</b>
+    <div id="cabinGallery"></div>
+  </div>
+  <div id="cabinPane"><h3>Cabin workflows</h3><p class="muted">Pick a workflow on the left. Models load on demand (GPU models borrow VRAM from the LLM's expert cache and are unloaded after a couple of idle minutes).</p></div>
+</section>
 <section id="tab-apps" class="tab">
   <div class="card"><h3>Apps <span class="muted small" id="appsInfo"></span></h3>
     <p class="muted small">Companion programs that use this pyre server. Install builds the app into pyre's apps folder and configures it with this server's URL. "Run" starts it on the machine pyre runs on.</p>
@@ -164,5 +175,6 @@
 
 <dialog id="dlg"><form method="dialog"><p id="dlgText"></p><div id="dlgExtra"></div><menu><button value="cancel">Cancel</button><button value="ok" class="primary" id="dlgOk">OK</button></menu></form></dialog>
 <script src="/ui/app.js"></script>
+<script src="/ui/cabin.js"></script>
 </body>
 </html>

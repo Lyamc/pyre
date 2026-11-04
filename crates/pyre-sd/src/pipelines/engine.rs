@@ -1,4 +1,4 @@
-﻿//! One Stable Diffusion engine for every UNet family cabin runs (SD 1.x, SD 2.x, SDXL base,
+//! One Stable Diffusion engine for every UNet family cabin runs (SD 1.x, SD 2.x, SDXL base,
 //! SDXL refiner), ported from cabin's loader / CLIP Text Encode / KSampler / VAE Decode nodes
 //! (cabin-nodes/src/nodes/sd.rs) onto the workspace Burn.
 //!
@@ -105,6 +105,9 @@ pub struct Request {
     pub scheduler: String,
     /// < 1 starts from `init` partly noised (euler samplers only).
     pub denoise: f64,
+    /// Inpainting: latent-resolution mask `[h/8 * w/8]`, 1 = repaint, 0 = keep `init` (blended back at every
+    /// step at the matching noise level; euler samplers). Needs `init`.
+    pub mask: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 pub struct Cond { embeds: Tensor<3>, pooled: Option<Tensor<2>> }
@@ -145,10 +148,34 @@ fn unet_config(family: Family) -> UNet2DConditionModelConfig {
     }
 }
 
+struct DtVis(std::collections::BTreeMap<String, (usize, usize)>);
+impl burn::module::ModuleVisitor for DtVis {
+    fn visit_float<const D: usize>(&mut self, p: &burn::module::Param<Tensor<D>>) { let t = p.val(); let e = self.0.entry(format!("{:?}", t.dtype())).or_default(); e.0 += 1; e.1 += t.shape().num_elements(); }
+}
+/// Parameter count and elements per float dtype (diagnostics).
+pub fn dtype_census<M: burn::module::Module>(m: &M) -> String { let mut v = DtVis(Default::default()); m.visit(&mut v); format!("{:?}", v.0) }
+
+fn t_shape<const D: usize>(d: &burn::tensor::TensorData) -> [usize; D] { let mut s = [0usize; D]; s.copy_from_slice(&d.shape()[..]); s }
+struct Repack(DType, usize);
+impl burn::module::ModuleMapper for Repack {
+    fn map_float<const D: usize>(&mut self, p: burn::module::Param<Tensor<D>>) -> burn::module::Param<Tensor<D>> {
+        let dt = self.0; let first = self.1 == 0; self.1 += 1;
+        p.map(move |t| { let d = t.device(); let data = t.into_data(); if first { eprintln!("sd repack: first param data {:?} {} bytes", data.dtype(), data.as_bytes().len()); } let shape = t_shape::<D>(&data); let n = data.num_elements(); let flat = burn::tensor::TensorData::from_bytes_vec(data.convert_dtype(dt).as_bytes().to_vec(), [n], dt); Tensor::<1>::from_data(flat, (&d, dt)).reshape(shape) })
+    }
+}
+/// Re-upload every float parameter as exact `dtype` buffers (the store path leaves f16 weights
+/// in f32-sized allocations).
+pub fn repack<M: burn::module::Module>(m: M, dtype: DType) -> M { m.map(&mut Repack(dtype, 0)) }
+
 pub fn load_unet(dir: &Path, family: Family, dev: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
     let path = weights_file(dir, "unet", "diffusion_pytorch_model")?;
     set_load_dtype(Some(dtype));
-    let r = load_unet_safetensors(unet_config(family).init(4, 4, dev), &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
+    let u0 = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20); let m = unet_config(family).init(4, 4, dev); let u1 = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20);
+    let r = load_unet_safetensors(m, &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
+    let ua = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20);
+    let r = if std::env::var("PYRE_SD_REPACK").is_ok() { r.map(|u| repack(u, dtype)) } else { r }; let _ = dev.sync(); dev.memory_cleanup();
+    eprintln!("sd unet repack: pool MiB {:?} -> {:?}", ua, dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20));
+    eprintln!("sd unet pool MiB: dtype {:?} before init {:?}, after init {:?}, after load {:?}", r.as_ref().ok().map(|u| dtype_census(u)), u0, u1, dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20));
     set_load_dtype(None);
     r
 }
@@ -251,6 +278,8 @@ impl Engine {
         let denoise = q.denoise.clamp(0.0, 1.0);
         if denoise < 1.0 && !matches!(q.sampler.as_str(), "euler" | "euler_ancestral") { bail!("denoise below 1 is supported for euler and euler_ancestral"); }
         if denoise < 1.0 && init.is_none() { bail!("denoise below 1 needs an init latent"); }
+        if q.mask.is_some() && (init.is_none() || !matches!(q.sampler.as_str(), "euler" | "euler_ancestral")) { bail!("inpainting needs an init image and an euler sampler"); }
+        let mask = match &q.mask { Some(m) => { if m.len() != h * w { bail!("mask must be {}x{} (latent size)", w, h); } Some(host_tensor(m.to_vec(), [1, 1, h, w], &self.dev, self.dtype)) } None => None };
         macro_rules! run {
             ($s:expr, $tf:expr) => {{
                 let ts = $s.timesteps().to_vec();
@@ -270,7 +299,7 @@ impl Engine {
             ($s:expr) => {{
                 let mut s = $s;
                 s.set_schedule(prepared.timesteps.clone(), prepared.sigmas.clone().expect("euler sigmas"));
-                if denoise < 1.0 {
+                if denoise < 1.0 || mask.is_some() {
                     let keep = ((s.timesteps().len() as f64) * denoise).round().max(1.0) as usize;
                     let drop_n = s.timesteps().len() - keep;
                     let ts: Vec<f64> = s.timesteps().iter().copied().skip(drop_n).collect();
@@ -285,6 +314,11 @@ impl Engine {
                         let t0 = std::time::Instant::now();
                         let eps = guided(s.scale_model_input(x.clone(), t), t);
                         x = s.step(&eps, t, &x);
+                        if let Some(m) = &mask {
+                            // keep the unmasked area on the original latent, noised to the next step level
+                            let known = if i + 1 < n { s.add_noise(l, noise.clone(), ts[i + 1]) } else { l.clone() };
+                            x = x * m.clone() + known * (m.clone().neg() + 1.0);
+                        }
                         pace(t0);
                         on_step(i + 1, n);
                     }

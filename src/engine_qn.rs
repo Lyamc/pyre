@@ -45,7 +45,7 @@ pub fn spawn_init<R: Send + 'static>(init: impl FnOnce() -> anyhow::Result<(Mode
 
 fn worker(model: &Model, tok: &Tokenizer, eos: &[u32], rx: mpsc::Receiver<Job>, b: Arc<AtomicBool>, q: Arc<AtomicU64>) {
     let mut last: Option<State> = None; let mut pc: Vec<Snap> = vec![];
-    while let Ok(j) = rx.recv() {
+    loop { let j = match rx.recv_timeout(std::time::Duration::from_millis(250)) { Ok(j) => j, Err(mpsc::RecvTimeoutError::Timeout) => { model.idle_hook(); continue } Err(_) => break };
         q.fetch_sub(1, Ordering::SeqCst);
         b.store(true, Ordering::SeqCst);
         match j {
@@ -69,7 +69,7 @@ pub fn spawn(model: Arc<Model>, tok: Arc<Tokenizer>, eos: Vec<u32>) -> EngineHan
     let (b, q) = (busy.clone(), queued.clone());
     std::thread::Builder::new().name("qn-worker".into()).spawn(move || {
         let mut last: Option<State> = None; let mut pc: Vec<Snap> = vec![];
-        while let Ok(j) = rx.recv() {
+        loop { let j = match rx.recv_timeout(std::time::Duration::from_millis(250)) { Ok(j) => j, Err(mpsc::RecvTimeoutError::Timeout) => { model.idle_hook(); continue } Err(_) => break };
             q.fetch_sub(1, Ordering::SeqCst);
             b.store(true, Ordering::SeqCst);
             match j {

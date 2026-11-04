@@ -28,9 +28,9 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/metrics", get(metrics))
         .route("/api/logs", get(logs))
         .route("/metrics", get(prom))
-        .route("/v1/images/generations", post(images))
+        .route("/v1/images/generations", post(images).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/sdapi/v1/txt2img", post(txt2img))
-        .route("/v1/images/edits", post(images))
+        .route("/v1/images/edits", post(images).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/sdapi/v1/img2img", post(txt2img))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/translations", post(translations))
@@ -38,6 +38,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/v1/audio/diarize", post(crate::diar::handle))
         .route("/api/diarizer", get(crate::diar::status))
         .route("/v1/images/tags", post(tags).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
+        .merge(crate::cabin::routes(Router::new()))
         .merge(crate::ui::routes())
 }
 
@@ -299,6 +300,12 @@ fn gen_params(b: &Value, prompt: &str, w: usize, h: usize, steps: Option<u64>, g
         let s = s.split_once("base64,").map(|(_, d)| d).unwrap_or(s);
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.init_image = Some(std::sync::Arc::new(bytes)); }
         p.strength = b["strength"].as_f64().or(b["denoising_strength"].as_f64()).unwrap_or(0.75).clamp(0.0, 1.0);
+        if let Some(s) = b["mask"].as_str() {
+            let s = s.split_once("base64,").map(|(_, d)| d).unwrap_or(s);
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.trim()) { p.mask = Some(std::sync::Arc::new(bytes)); }
+            if b["strength"].is_null() && b["denoising_strength"].is_null() { p.strength = 1.0; }
+        }
+        if let Some(v) = b["mask_blur"].as_f64() { p.mask_blur = v.clamp(0.0, 64.0); }
     }
     p
 }

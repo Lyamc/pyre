@@ -1,0 +1,26 @@
+{
+  "_doc": "Cabin style presets. 'positive' must contain {prompt}; 'negative' is appended to the user's negative prompt. Optional: 'strength' (restyle default), 'cfg', 'steps', 'lora' (reserved). Override by copying this file to <pyre store>/cabin/styles.json.",
+  "styles": [
+    {"id": "none", "name": "No style", "swatch": "#888888", "positive": "{prompt}", "negative": ""},
+    {"id": "ghibli", "name": "Studio Ghibli", "swatch": "#7fb77e", "positive": "{prompt}, studio ghibli style, hayao miyazaki, hand-painted anime background, soft watercolor shading, warm natural light, lush details", "negative": "photo, 3d render, realistic, harsh lighting, lowres"},
+    {"id": "pixel", "name": "Pixel art", "swatch": "#5a6bff", "positive": "pixel art of {prompt}, 16-bit sprite, limited palette, crisp pixels, retro game", "negative": "blurry, smooth gradients, photo, realistic, anti-aliasing"},
+    {"id": "concept", "name": "Concept art", "swatch": "#b07a4f", "positive": "concept art of {prompt}, digital painting, matte painting, dramatic lighting, artstation, highly detailed", "negative": "photo, lowres, flat colors"},
+    {"id": "pencil", "name": "Pencil drawing", "swatch": "#9a9a9a", "positive": "pencil sketch of {prompt}, graphite drawing, cross-hatching, detailed linework, white paper, monochrome", "negative": "color, colorful, photo, painting"},
+    {"id": "mspaint", "name": "MS Paint", "swatch": "#ff4040", "positive": "crude ms paint drawing of {prompt}, simple shapes, flat bright colors, thick aliased lines, amateur doodle, white background", "negative": "detailed, realistic, shading, photo, professional"},
+    {"id": "crayon", "name": "Crayon", "swatch": "#f2a33a", "positive": "crayon drawing of {prompt}, child's drawing, waxy texture, colorful scribbles, paper texture", "negative": "photo, realistic, digital, clean lines"},
+    {"id": "anime", "name": "Anime", "swatch": "#ff7eb6", "positive": "anime style {prompt}, cel shading, vibrant colors, clean lineart, detailed eyes, key visual", "negative": "photo, realistic, 3d, lowres, bad anatomy, blurry"},
+    {"id": "anime3d", "name": "3D anime", "swatch": "#c47eff", "positive": "3d anime style {prompt}, cel-shaded 3d render, genshin impact style, soft rim light, smooth shading", "negative": "photo, flat 2d, sketch, lowres"},
+    {"id": "cartoon", "name": "Cartoon", "swatch": "#3fc1ff", "positive": "cartoon style {prompt}, bold outlines, flat bright colors, playful, saturday morning cartoon", "negative": "photo, realistic, gritty, lowres"},
+    {"id": "disney", "name": "Disney / Pixar", "swatch": "#2b6fff", "positive": "{prompt}, disney pixar style, 3d animated movie still, expressive big eyes, soft cinematic lighting, highly detailed", "negative": "photo, realistic skin, 2d sketch, lowres, creepy"},
+    {"id": "watercolor", "name": "Watercolor", "swatch": "#6fc2c9", "positive": "watercolor painting of {prompt}, soft washes, paper texture, loose brush strokes, pastel colors", "negative": "photo, 3d, hard edges"},
+    {"id": "oil", "name": "Oil painting", "swatch": "#a0522d", "positive": "oil painting of {prompt}, impasto brush strokes, rich colors, classical fine art, canvas texture", "negative": "photo, digital, flat, lowres"},
+    {"id": "comic", "name": "Comic book", "swatch": "#ffd23f", "positive": "comic book illustration of {prompt}, bold ink lines, halftone dots, dynamic, vibrant flat colors", "negative": "photo, realistic, blurry"},
+    {"id": "manga", "name": "Manga (B&W)", "swatch": "#222222", "positive": "manga panel of {prompt}, black and white, screentone, ink lineart, detailed", "negative": "color, photo, 3d"},
+    {"id": "photo", "name": "Photorealistic", "swatch": "#d9c7a7", "positive": "photo of {prompt}, 35mm, natural light, sharp focus, highly detailed, realistic", "negative": "cartoon, anime, painting, drawing, lowres, deformed"},
+    {"id": "lowpoly", "name": "Low poly", "swatch": "#4fd1a5", "positive": "low poly 3d render of {prompt}, flat shaded polygons, minimal, isometric", "negative": "photo, detailed texture, noisy"},
+    {"id": "clay", "name": "Claymation", "swatch": "#e08a5a", "positive": "claymation {prompt}, plasticine figure, stop motion, handmade clay texture, soft studio light", "negative": "photo, 2d, sketch"},
+    {"id": "chibi", "name": "Chibi", "swatch": "#ffb3c7", "positive": "chibi {prompt}, super deformed, big head small body, cute, pastel colors, simple background", "negative": "realistic proportions, photo, lowres"},
+    {"id": "sticker", "name": "Sticker", "swatch": "#ffffff", "positive": "die-cut sticker of {prompt}, thick white border, flat vector colors, simple, white background", "negative": "photo, realistic, busy background"},
+    {"id": "inkwash", "name": "Ink wash", "swatch": "#4a4a4a", "positive": "sumi-e ink wash painting of {prompt}, minimal brush strokes, rice paper, monochrome", "negative": "color, photo, detailed"}
+  ]
+}
