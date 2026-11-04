@@ -186,7 +186,8 @@ BUILD.inpaint = (f, res, input) => {
   const p = el("textarea", { rows: 2, placeholder: "what to paint in the masked area" }); const st = stylePicker("none");
   const s = range(1, 0.3, 1, 0.05), blur = range(8, 0, 32, 1), steps = num(30, 1, 60), seed = seedBox();
   f.append(field("Image", src), field("Mask (paint the area to change)", me), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Strength", s, "1 = fully new content"), field("Feather px", blur), field("Steps", steps), field("Seed", seed)));
-  return async () => { if (!src.url) throw new Error("choose an image"); const m = me.mask(); if (!m) throw new Error("paint a mask first"); const sp = styled(p.value, "", st.value); const r = await sd({ image: await prep(src.url), mask: m, mask_blur: +blur.input.value, prompt: sp.prompt, negative_prompt: sp.negative, strength: +s.input.value, steps: +steps.value, seed: seed.get() }, res, "inpainting"); seed.after(r.seed); res.show(r.url, `inpaint_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` }); };
+  const ipm = el("input", { type: "checkbox", checked: true }); f.append(el("label", { class: "inl" }, ipm, " use the SD 1.5 inpainting model (better blending; off = base model + latent blending)"));
+  return async () => { if (!src.url) throw new Error("choose an image"); const m = me.mask(); if (!m) throw new Error("paint a mask first"); const sp = styled(p.value, "", st.value); const r = await sd({ image: await prep(src.url), mask: m, mask_blur: +blur.input.value, prompt: sp.prompt, negative_prompt: sp.negative, strength: +s.input.value, steps: +steps.value, seed: seed.get(), inpaint_model: ipm.checked }, res, "inpainting"); seed.after(r.seed); res.show(r.url, `inpaint_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` }); };
 };
 // --- outpaint
 BUILD.outpaint = (f, res, input) => {

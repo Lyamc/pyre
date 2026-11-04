@@ -101,7 +101,8 @@ async fn workflows(State(app): S) -> Json<Value> {
     w.insert("txt2img".into(), sdw("SD 1.5 (f16, GPU on demand)"));
     w.insert("img2img".into(), sdw("SD 1.5 img2img"));
     w.insert("restyle".into(), sdw("SD 1.5 img2img + style templates"));
-    w.insert("inpaint".into(), sdw("SD 1.5, masked latent blending + feathered composite"));
+    let ipm = app.storage.store.root.join("cabin").join("sd15-inpaint").join("unet").join("diffusion_pytorch_model.fp16.safetensors").is_file();
+    w.insert("inpaint".into(), sdw(if ipm { "SD 1.5 inpainting UNet (9-channel) + feathered composite" } else { "SD 1.5, masked latent blending + feathered composite" }));
     w.insert("outpaint".into(), sdw("SD 1.5, masked latent blending on an extended canvas"));
     w.insert("character".into(), sdw("SD 1.5, locked seed + region inpaint"));
     w.insert("tagger".into(), if tg { ok("Kagami-24k EVA02-L (CPU)") } else { json!({"ready": false, "status": "missing model", "reason": "Redstonexs/kagami-24k is not downloaded"}) });
@@ -132,7 +133,14 @@ async fn styles(State(app): S) -> Response {
 async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
     let t = Instant::now();
     let r = match b["what"].as_str().unwrap_or("image") {
-        "image" => ensure(&app, Kind::Image, b["model"].as_str().unwrap_or(SD15), "cuda", SD15_LEASE).await,
+        "image" => {
+            // masked edits switch to the SD 1.5 inpainting UNet when it is in the store
+            let ip = app.storage.store.root.join("cabin").join("sd15-inpaint");
+            if std::env::var_os("PYRE_SD_INPAINT_DIR").is_none() && ip.join("unet").join("config.json").is_file() && std::fs::read_dir(ip.join("unet")).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))).unwrap_or(false) {
+                std::env::set_var("PYRE_SD_INPAINT_DIR", &ip);
+            }
+            ensure(&app, Kind::Image, b["model"].as_str().unwrap_or(SD15), "cuda", SD15_LEASE).await
+        }
         "tagger" => ensure(&app, Kind::Tagger, TAGGER, b["backend"].as_str().unwrap_or("cpu"), 1_800 << 20).await,
         w => return err(StatusCode::BAD_REQUEST, format!("unknown model kind '{w}'")),
     };
@@ -239,7 +247,7 @@ fn zip_store(files: &[(String, Vec<u8>)]) -> Vec<u8> {
             h.extend(20u16.to_le_bytes()); h.extend(0u16.to_le_bytes()); h.extend(0u16.to_le_bytes()); h.extend(0u32.to_le_bytes());
             h.extend(crc.to_le_bytes()); h.extend((data.len() as u32).to_le_bytes()); h.extend((data.len() as u32).to_le_bytes());
             h.extend((n.len() as u16).to_le_bytes()); h.extend(0u16.to_le_bytes());
-            if central { h.extend([0u8; 8]); h.extend(0u32.to_le_bytes()); h.extend(off.to_le_bytes()); }
+            if central { h.extend([0u8; 6]); h.extend(0u32.to_le_bytes()); h.extend(off.to_le_bytes()); } // comment len, disk, internal attr; external attr; offset
             h.extend(n); h };
         out.extend(hdr(0x0403_4b50, false)); out.extend(data); cd.extend(hdr(0x0201_4b50, true));
     }

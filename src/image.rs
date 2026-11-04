@@ -35,11 +35,13 @@ pub struct GenParams {
     pub mask: Option<std::sync::Arc<Vec<u8>>>,
     /// Mask feather radius in pixels (default 8): softens the latent mask and the final pixel composite.
     pub mask_blur: f64,
+    /// Masked edits use the 9-channel SD 1.5 inpainting UNet when one is configured (PYRE_SD_INPAINT_DIR).
+    pub inpaint_model: bool,
 }
 
 impl GenParams {
     pub fn new(prompt: &str, width: usize, height: usize, steps: usize, guidance: f64, seed: u64) -> Self {
-        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0 }
+        Self { prompt: prompt.into(), negative: String::new(), width, height, steps, guidance, seed, sampler: None, scheduler: None, refiner: false, refiner_denoise: None, init_image: None, strength: 1.0, mask: None, mask_blur: 8.0, inpaint_model: true }
     }
 }
 
@@ -216,9 +218,11 @@ impl ImageModel {
         self.progress.store(0, Ordering::SeqCst);
         let t = std::time::Instant::now();
         let r = (|| -> Result<Vec<u8>> {
-            eng.ensure_unet()?;
+            // SD1.5 inpainting UNet (cabin: <store>/cabin/sd15-inpaint, or PYRE_SD_INPAINT_DIR) for masked edits
+            let ip_dir = if q.mask.is_some() && init.is_some() && q.inpaint_model && self.native < 1024 { std::env::var_os("PYRE_SD_INPAINT_DIR").map(std::path::PathBuf::from).filter(|d| d.join("unet").is_dir()) } else { None };
+            eng.select_unet(ip_dir.as_deref())?;
             let req = Request { prompt: q.prompt.clone(), negative: q.negative.clone(), width: q.width, height: q.height, steps: q.steps, guidance: q.guidance, seed: q.seed,
-                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None };
+                sampler: q.sampler.clone().unwrap_or_else(|| "euler".into()), scheduler: q.scheduler.clone().unwrap_or_else(|| "normal".into()), denoise: 1.0, mask: None, inpaint_latent: None };
             let prog = &self.progress;
             let mut on_step = |i: usize, n: usize| prog.store(((i as u64) << 32) | n as u64, Ordering::SeqCst);
             let mut req = req;
@@ -229,6 +233,12 @@ impl ImageModel {
                 _ => None,
             };
             if let Some(pm) = &pmask { req.mask = Some(std::sync::Arc::new(latent_mask(pm, q.width, q.height))); }
+            if let (true, Some(pm), Some(orig)) = (eng.inpaint_unet_active(), &pmask, &init) {
+                // the inpainting UNet's conditioning: the image with the masked area grey (0 in [-1, 1])
+                let masked: Vec<u8> = (0..q.width * q.height * 3).map(|k| if pm[k / 3] >= 0.5 { 128 } else { orig[k] }).collect();
+                let l = eng.encode_image(&masked, q.width, q.height)?.cast(burn::tensor::DType::F32).into_data().to_vec::<f32>().map_err(|e| anyhow!("{e:?}"))?;
+                req.inpaint_latent = Some(std::sync::Arc::new(l));
+            }
             let init_lat = match &init { Some(rgb) if q.strength < 1.0 || pmask.is_some() => { req.denoise = q.strength.max(0.0); Some(eng.encode_image(rgb, q.width, q.height)?) } _ => None };
             if init_lat.is_some() && !matches!(req.sampler.as_str(), "euler" | "euler_ancestral") { req.sampler = "euler".into(); }
             let mut lat = eng.sample(&req, None, init_lat.as_ref(), &mut on_step)?;
@@ -247,6 +257,7 @@ impl ImageModel {
             }
             eng.release_free_memory();
             if q.refiner { eng.ensure_unet()?; }
+            let _ = &ip_dir;
             png(&rgb, w, h)
         })();
         self.busy.store(false, Ordering::SeqCst);

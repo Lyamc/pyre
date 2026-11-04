@@ -108,6 +108,10 @@ pub struct Request {
     /// Inpainting: latent-resolution mask `[h/8 * w/8]`, 1 = repaint, 0 = keep `init` (blended back at every
     /// step at the matching noise level; euler samplers). Needs `init`.
     pub mask: Option<std::sync::Arc<Vec<f32>>>,
+    /// 9-channel inpainting UNet (SD 1.5 inpainting): VAE latent of the image with the masked area greyed out,
+    /// `[4 * h/8 * w/8]`. Set together with `mask`; the UNet then sees `[x, mask, masked_latent]` and the
+    /// per-step latent blending is skipped (the model keeps the unmasked area itself).
+    pub inpaint_latent: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 pub struct Cond { embeds: Tensor<3>, pooled: Option<Tensor<2>> }
@@ -125,6 +129,8 @@ pub struct Engine {
     penultimate: bool,
     enc2: Option<(CLIPTextModelWithProjection, SimpleTokenizer)>,
     unet: Option<UNet2DConditionModel>,
+    /// The resident UNet is the 9-channel inpainting one (loaded from this folder).
+    unet_inpaint: Option<PathBuf>,
     vae: AutoEncoderKL,
     vae_scale: f64,
 }
@@ -156,10 +162,12 @@ fn unet_config_base(family: Family) -> UNet2DConditionModelConfig {
     }
 }
 
-pub fn load_unet(dir: &Path, family: Family, dev: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
+pub fn load_unet(dir: &Path, family: Family, dev: &Device, dtype: DType) -> Result<UNet2DConditionModel> { load_unet_ch(dir, family, dev, dtype, 4) }
+/// `in_ch` 9 = the SD inpainting UNet (latent + mask + masked-image latent).
+pub fn load_unet_ch(dir: &Path, family: Family, dev: &Device, dtype: DType, in_ch: usize) -> Result<UNet2DConditionModel> {
     let path = weights_file(dir, "unet", "diffusion_pytorch_model")?;
     set_load_dtype(Some(dtype));
-    let r = load_unet_safetensors(unet_config(family).init(4, 4, dev), &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
+    let r = load_unet_safetensors(unet_config(family).init(in_ch, 4, dev), &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
     set_load_dtype(None);
     r
 }
@@ -193,7 +201,7 @@ impl Engine {
             let vae_cfg: AutoEncoderKLConfig = if xl { StableDiffusionXLConfig::xl(None, None).vae } else { sd.vae.clone() };
             let vae_m = load_vae_safetensors_as(vae_cfg.init(3, 3, dev), &vae_path, dev, Some(vae_dtype)).map_err(|e| anyhow!("{}: {e}", vae_path.display()))?;
             let unet = Some(load_unet(dir, family, dev, dtype)?);
-            Ok(Engine { family, dir: dir.to_path_buf(), dtype, vae_dtype, vae_path, dev: dev.clone(), sd, tok, clip, penultimate: family != Family::Sd15, enc2, unet, vae: vae_m, vae_scale: if xl { VAE_SCALE_XL } else { VAE_SCALE } })
+            Ok(Engine { family, dir: dir.to_path_buf(), dtype, vae_dtype, vae_path, dev: dev.clone(), sd, tok, clip, penultimate: family != Family::Sd15, enc2, unet, unet_inpaint: None, vae: vae_m, vae_scale: if xl { VAE_SCALE_XL } else { VAE_SCALE } })
         })();
         set_load_dtype(None);
         r
@@ -201,10 +209,17 @@ impl Engine {
 
     /// Release the UNet (the biggest part) so another one fits, e.g. the SDXL refiner's.
     pub fn unload_unet(&mut self) { self.unet = None; }
-    pub fn ensure_unet(&mut self) -> Result<()> {
-        if self.unet.is_none() { self.unet = Some(load_unet(&self.dir, self.family, &self.dev, self.dtype)?); }
+    pub fn ensure_unet(&mut self) -> Result<()> { self.select_unet(None) }
+    /// Make the base UNet (None) or the 9-channel inpainting UNet in `inpaint` resident, swapping out the
+    /// other one first (only one UNet's VRAM at a time).
+    pub fn select_unet(&mut self, inpaint: Option<&Path>) -> Result<()> {
+        if self.unet.is_some() && self.unet_inpaint.as_deref() == inpaint { return Ok(()); }
+        self.unet = None; self.unet_inpaint = None; self.release_free_memory();
+        self.unet = Some(match inpaint { Some(d) => load_unet_ch(d, self.family, &self.dev, self.dtype, 9)?, None => load_unet(&self.dir, self.family, &self.dev, self.dtype)? });
+        self.unet_inpaint = inpaint.map(Path::to_path_buf);
         Ok(())
     }
+    pub fn inpaint_unet_active(&self) -> bool { self.unet_inpaint.is_some() }
 
     /// cabin's CLIP Text Encode: SD1.5 last layer, SD2 penultimate, SDXL CLIP-L penultimate ++
     /// OpenCLIP-G penultimate with the pooled projection; the refiner uses OpenCLIP-G only.
@@ -264,6 +279,14 @@ impl Engine {
         if denoise < 1.0 && init.is_none() { bail!("denoise below 1 needs an init latent"); }
         if q.mask.is_some() && (init.is_none() || !matches!(q.sampler.as_str(), "euler" | "euler_ancestral")) { bail!("inpainting needs an init image and an euler sampler"); }
         let mask = match &q.mask { Some(m) => { if m.len() != h * w { bail!("mask must be {}x{} (latent size)", w, h); } Some(host_tensor(m.to_vec(), [1, 1, h, w], &self.dev, self.dtype)) } None => None };
+        // 9-channel inpainting UNet: extra input channels [mask, masked-image latent]
+        let extra = match (&q.inpaint_latent, &mask) {
+            (Some(l), Some(m)) => { if l.len() != 4 * h * w { bail!("inpaint latent must be 4x{h}x{w}"); } Some(Tensor::cat(vec![m.clone(), host_tensor(l.to_vec(), [1, 4, h, w], &self.dev, self.dtype)], 1)) }
+            (Some(_), None) => bail!("inpaint_latent needs a mask"),
+            _ => None,
+        };
+        let guided = |x: Tensor<4>, t: f64| -> Tensor<4> { match &extra { Some(e) => guided(Tensor::cat(vec![x, e.clone()], 1), t), None => guided(x, t) } };
+        let blend = extra.is_none();
         macro_rules! run {
             ($s:expr, $tf:expr) => {{
                 let ts = $s.timesteps().to_vec();
@@ -298,7 +321,7 @@ impl Engine {
                         let t0 = std::time::Instant::now();
                         let eps = guided(s.scale_model_input(x.clone(), t), t);
                         x = s.step(&eps, t, &x);
-                        if let Some(m) = &mask {
+                        if let (Some(m), true) = (&mask, blend) {
                             // keep the unmasked area on the original latent, noised to the next step level
                             let known = if i + 1 < n { s.add_noise(l, noise.clone(), ts[i + 1]) } else { l.clone() };
                             x = x * m.clone() + known * (m.clone().neg() + 1.0);
