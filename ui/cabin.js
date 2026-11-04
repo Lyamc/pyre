@@ -225,6 +225,21 @@ BUILD.tagger = (f, res, input) => {
     if (!rows.length) res.append(el("pre", {}, JSON.stringify(d, null, 1)));
   };
 };
+// --- upscale / denoise (Real-ESRGAN compact)
+function esrBuilder(def) {
+  return (f, res, input) => {
+    const src = imageSource(); if (input) src.set(input);
+    const scale = sel([["2", "2x"], ["4", "4x"], ["1", "1x (restore only)"]], def.scale), model = sel([["general", "General / photo"], ["anime", "Anime / illustration"]], "general"), dn = range(def.dn, 0, 1, 0.05, v => (+v).toFixed(2));
+    f.append(field("Image", src), el("div", { class: "row" }, field("Scale", scale), field("Model", model), field("Denoise strength", dn, "general model only: 0 keeps fine texture/grain, 1 removes the most noise")));
+    return async () => {
+      if (!src.url) throw new Error("choose an image"); res.busy("upscaling on the GPU…"); const t0 = performance.now();
+      const j = await api("/api/cabin/upscale", { image: await prep(src.url, 1536, 16), scale: +scale.value, model: model.value, denoise: +dn.input.value });
+      res.show(j.image, `${def.name}_${j.width}x${j.height}.png`, { info: `${j.model}, denoise ${j.denoise} · ${j.width}×${j.height} · ${((performance.now() - t0) / 1000).toFixed(1)} s` });
+    };
+  };
+}
+BUILD.upscale = esrBuilder({ scale: "2", dn: 0.5, name: "upscaled" });
+BUILD.denoise = esrBuilder({ scale: "1", dn: 1.0, name: "restored" });
 // --- image to SVG
 BUILD.svg = (f, res, input) => {
   const src = imageSource(); if (input) src.set(input);

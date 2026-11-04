@@ -66,7 +66,7 @@ pub fn cast_tensor(t: StoreTensor, target: burn::tensor::DType) -> StoreTensor {
     if !dt.is_float() || dt == target { return t; }
     let name = t.name().to_string();
     let shape = burn::tensor::Shape::from(t.shape().to_vec());
-    burn_store::bridge::map_data(t, name, target, shape, move |d| { let d = d.convert_dtype(target); let shape = d.shape().clone(); burn::tensor::TensorData::from_bytes_vec(d.as_bytes().to_vec(), shape, target) })
+    burn_store::bridge::map_data(t, name, target, shape, move |d| d.convert_dtype(target))
 }
 
 /// Burn -> Burn adapter that only casts floats.

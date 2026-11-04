@@ -122,26 +122,8 @@ impl ImageModel {
         let need: u64 = match (family, dtype == burn::tensor::DType::F32) { (Family::Sdxl, _) => 7_200 << 20, (_, true) => 4_100 << 20, _ => 2_100 << 20 };
         crate::limits::check_alloc(need, &format!("loading {}", family.label()))?;
         let t = std::time::Instant::now();
-        tracing::info!("SD pool before load: {:?}", dev.memory_pool_usage());
-        if std::env::var("PYRE_SD_PROBE").is_ok() {
-            use burn::tensor::{Tensor as T, TensorData as TD, DType as DT};
-            let mb = |d: &burn::tensor::Device| d.memory_pool_usage().map(|u| u.bytes_in_use >> 20).unwrap_or(0);
-            let n = 64usize << 20; let m0 = mb(&dev);
-            let a = T::<1>::from_data(TD::new(vec![0.5f32; n], [n]).convert_dtype(DT::F16), (&dev, DT::F16)); let _ = dev.sync(); let m1 = mb(&dev);
-            let b = T::<1>::from_data(TD::new(vec![half::f16::from_f32(0.5); n], [n]), (&dev, DT::F16)); let _ = dev.sync(); let m2 = mb(&dev);
-            let c = T::<2>::from_data(TD::new(vec![0.5f32; n], [4096, n/4096]).convert_dtype(DT::F16), (&dev, DT::F16)).transpose(); let _ = dev.sync(); let m3 = mb(&dev);
-            tracing::info!("SD probe MiB (expect 128 each): converted {} native {} transposed {}; dtypes {:?} {:?} {:?}", m1-m0, m2-m1, m3-m2, a.dtype(), b.dtype(), c.dtype());
-            drop((a, b, c));
-        }
-        // weights in exact-size (persistent) buffers: the pooled pages otherwise hold ~2x the f16 footprint
-        let eng = if std::env::var("PYRE_SD_POOLED_WEIGHTS").is_ok() { Engine::load(dir, &dev, dtype, vae.as_deref())? } else { dev.memory_persistent_allocations((), |_| Engine::load(dir, &dev, dtype, vae.as_deref()))? };
-        // f32 safetensors are cast to f16 on the device: hand the f32 staging buffers back to the driver
-        tracing::info!("SD pool after load: {:?}", dev.memory_pool_usage());
-        let _ = dev.sync(); dev.memory_cleanup();
-        tracing::info!("SD pool after sync+cleanup: {:?}", dev.memory_pool_usage());
+        let eng = Engine::load(dir, &dev, dtype, vae.as_deref())?;
         eng.release_free_memory();
-        tracing::info!("SD pool after release: {:?}", dev.memory_pool_usage());
-        crate::limits::vlog("sd loaded");
         tracing::info!("SD weights resident; VRAM free now {:?} MiB", crate::limits::vram().map(|v| v.free >> 20));
         tracing::info!("{} weights loaded in {:.1}s ({precision}, VAE {} in {:?})", family.label(), t.elapsed().as_secs_f64(), eng.vae_path.display(), eng.vae_dtype);
         let refiner_dir = if xl { find_refiner(dir) } else { None };

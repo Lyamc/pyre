@@ -156,34 +156,10 @@ fn unet_config_base(family: Family) -> UNet2DConditionModelConfig {
     }
 }
 
-struct DtVis(std::collections::BTreeMap<String, (usize, usize)>);
-impl burn::module::ModuleVisitor for DtVis {
-    fn visit_float<const D: usize>(&mut self, p: &burn::module::Param<Tensor<D>>) { let t = p.val(); let e = self.0.entry(format!("{:?}", t.dtype())).or_default(); e.0 += 1; e.1 += t.shape().num_elements(); }
-}
-/// Parameter count and elements per float dtype (diagnostics).
-pub fn dtype_census<M: burn::module::Module>(m: &M) -> String { let mut v = DtVis(Default::default()); m.visit(&mut v); format!("{:?}", v.0) }
-
-fn t_shape<const D: usize>(d: &burn::tensor::TensorData) -> [usize; D] { let mut s = [0usize; D]; s.copy_from_slice(&d.shape()[..]); s }
-struct Repack(DType, usize);
-impl burn::module::ModuleMapper for Repack {
-    fn map_float<const D: usize>(&mut self, p: burn::module::Param<Tensor<D>>) -> burn::module::Param<Tensor<D>> {
-        let dt = self.0; let first = self.1 == 0; self.1 += 1;
-        p.map(move |t| { let d = t.device(); let data = t.into_data(); if first { eprintln!("sd repack: first param data {:?} {} bytes", data.dtype(), data.as_bytes().len()); } let shape = t_shape::<D>(&data); let n = data.num_elements(); let flat = burn::tensor::TensorData::from_bytes_vec(data.convert_dtype(dt).as_bytes().to_vec(), [n], dt); Tensor::<1>::from_data(flat, (&d, dt)).reshape(shape) })
-    }
-}
-/// Re-upload every float parameter as exact `dtype` buffers (the store path leaves f16 weights
-/// in f32-sized allocations).
-pub fn repack<M: burn::module::Module>(m: M, dtype: DType) -> M { m.map(&mut Repack(dtype, 0)) }
-
 pub fn load_unet(dir: &Path, family: Family, dev: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
     let path = weights_file(dir, "unet", "diffusion_pytorch_model")?;
     set_load_dtype(Some(dtype));
-    let u0 = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20); let m = unet_config(family).init(4, 4, dev); let u1 = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20);
-    let r = load_unet_safetensors(m, &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
-    let ua = dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20);
-    let r = if std::env::var("PYRE_SD_REPACK").is_ok() { r.map(|u| repack(u, dtype)) } else { r }; let _ = dev.sync(); dev.memory_cleanup();
-    eprintln!("sd unet repack: pool MiB {:?} -> {:?}", ua, dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20));
-    eprintln!("sd unet pool MiB: dtype {:?} before init {:?}, after init {:?}, after load {:?}", r.as_ref().ok().map(|u| dtype_census(u)), u0, u1, dev.memory_pool_usage().map(|u| u.bytes_in_use >> 20));
+    let r = load_unet_safetensors(unet_config(family).init(4, 4, dev), &path, dev).map_err(|e| anyhow!("{}: {e}", path.display()));
     set_load_dtype(None);
     r
 }

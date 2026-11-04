@@ -106,8 +106,9 @@ async fn workflows(State(app): S) -> Json<Value> {
     w.insert("character".into(), sdw("SD 1.5, locked seed + region inpaint"));
     w.insert("tagger".into(), if tg { ok("Kagami-24k EVA02-L (CPU)") } else { json!({"ready": false, "status": "missing model", "reason": "Redstonexs/kagami-24k is not downloaded"}) });
     w.insert("svg".into(), ok("vtracer (CPU)"));
-    w.insert("upscale".into(), wip("Real-ESRGAN (SRVGGNet / RRDBNet) Burn port in progress"));
-    w.insert("denoise".into(), wip("Real-ESRGAN general-x4v3 with denoise strength: Burn port in progress"));
+    let esr = crate::esr::available(&crate::esr::weights_dir(&app.storage.store.root));
+    w.insert("upscale".into(), if esr { ok("Real-ESRGAN compact x4 (general / anime), GPU") } else { wip("Real-ESRGAN weights missing in <store>/cabin/realesr") });
+    w.insert("denoise".into(), if esr { ok("Real-ESRGAN general-x4v3 + wdn blend (denoise strength)") } else { wip("Real-ESRGAN weights missing") });
     w.insert("rmbg".into(), wip("IS-Net (isnet-anime / general) Burn port in progress"));
     w.insert("layers".into(), wip("needs background removal (IS-Net) + inpaint; after rmbg"));
     w.insert("animate".into(), wip("frame interpolation model (RIFE / FILM) port planned"));
@@ -172,9 +173,64 @@ async fn vectorize(Json(b): Json<Value>) -> Response {
     match r { Ok(Ok(v)) => Json(v).into_response(), Ok(Err(e)) => err(StatusCode::BAD_REQUEST, format!("{e:#}")), Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
 }
 
+fn b64_image(v: &Value) -> anyhow::Result<image::DynamicImage> {
+    use base64::Engine;
+    let s = v.as_str().ok_or_else(|| anyhow::anyhow!("missing image"))?;
+    let s = s.split_once("base64,").map(|x| x.1).unwrap_or(s);
+    Ok(image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(s.trim())?)?)
+}
+fn png_b64(img: &image::DynamicImage) -> anyhow::Result<String> {
+    use base64::Engine;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png)?;
+    Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf.into_inner())))
+}
+static GPU_SMALL: Mutex<()> = Mutex::new(());
+/// Run a small GPU job under a VRAM lease (the expert cache shrinks first if needed).
+fn small_gpu<T>(lease: u64, what: &str, f: impl FnOnce(&burn::tensor::Device) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let _g = GPU_SMALL.lock().unwrap();
+    crate::limits::lease(lease, what)?;
+    let r = (|| { let (dev, _, _) = crate::backend::select("cuda", "f32", None)?; let r = f(&dev); dev.memory_cleanup(); r })();
+    crate::limits::lease_end(lease);
+    r
+}
+fn json_or_err(r: Result<anyhow::Result<Value>, tokio::task::JoinError>) -> Response {
+    match r { Ok(Ok(v)) => Json(v).into_response(), Ok(Err(e)) => err(StatusCode::BAD_REQUEST, format!("{e:#}")), Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) }
+}
+
+/// `POST /api/cabin/upscale {image, scale: 2|4, model: general|anime, denoise: 0..1}` (Real-ESRGAN compact).
+async fn upscale(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::esr::weights_dir(&app.storage.store.root);
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let t = Instant::now();
+        let img = b64_image(&b["image"])?.to_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        if w * h > 1536 * 1536 { anyhow::bail!("image too large ({w}x{h}); max 1536x1536 in"); }
+        let scale = b["scale"].as_u64().unwrap_or(4).clamp(1, 4) as usize;
+        let model = b["model"].as_str().unwrap_or("general").to_string();
+        let dn = b["denoise"].as_f64().unwrap_or(0.5) as f32;
+        let out = small_gpu(700 << 20, "Real-ESRGAN upscale", |dev| {
+            let e = crate::esr::Esr::load(&dir, &model, dn, dev)?;
+            e.upscale_rgb(img.as_raw(), w, h, 160, 10)
+        })?;
+        let mut o = image::DynamicImage::ImageRgb8(image::RgbImage::from_raw((w * 4) as u32, (h * 4) as u32, out).ok_or_else(|| anyhow::anyhow!("bad output"))?);
+        if scale != 4 { o = o.resize_exact((w * scale) as u32, (h * scale) as u32, image::imageops::FilterType::Lanczos3); }
+        Ok(json!({"image": png_b64(&o)?, "width": o.width(), "height": o.height(), "model": format!("realesr-{model}-x4v3"), "denoise": dn, "seconds": t.elapsed().as_secs_f64()}))
+    }).await)
+}
+
+/// `POST /api/cabin/esr_check {refdir}`: compare the Burn port with PyTorch reference outputs.
+async fn esr_check(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::esr::weights_dir(&app.storage.store.root);
+    let rd = std::path::PathBuf::from(b["refdir"].as_str().unwrap_or(""));
+    json_or_err(tokio::task::spawn_blocking(move || small_gpu(300 << 20, "esr check", |dev| crate::esr::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
+}
+
 pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
     r.route("/api/cabin/workflows", get(workflows))
         .route("/api/cabin/styles", get(styles))
         .route("/api/cabin/ensure", post(ensure_ep))
+        .route("/api/cabin/upscale", post(upscale).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
+        .route("/api/cabin/esr_check", post(esr_check))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

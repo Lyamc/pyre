@@ -9,6 +9,7 @@ mod registry;
 mod stt;
 mod diar;
 mod cabin;
+mod esr;
 mod tts;
 mod image;
 mod tagger;
