@@ -240,6 +240,43 @@ function esrBuilder(def) {
 }
 BUILD.upscale = esrBuilder({ scale: "2", dn: 0.5, name: "upscaled" });
 BUILD.denoise = esrBuilder({ scale: "1", dn: 1.0, name: "restored" });
+// --- remove background / layers (IS-Net)
+const checker = "background:repeating-conic-gradient(#888 0 25%,#bbb 0 50%) 0 0/16px 16px";
+async function cutout(url, model) { return api("/api/cabin/rmbg", { image: await prep(url, 2048, 16), model }); }
+BUILD.rmbg = (f, res, input) => {
+  const src = imageSource(); if (input) src.set(input);
+  const model = sel([["general", "General / photo (RMBG-1.4)"], ["anime", "Anime / illustration (anime-seg)"]], "general");
+  f.append(field("Image", src), field("Model", model));
+  return async () => {
+    if (!src.url) throw new Error("choose an image"); res.busy("removing the background on the GPU…"); const t0 = performance.now();
+    const j = await cutout(src.url, model.value);
+    res.show(j.image, "cutout.png", { info: `${j.model} · foreground ${(j.foreground_fraction * 100).toFixed(0)}% · ${((performance.now() - t0) / 1000).toFixed(1)} s` });
+    const im = res.querySelector("img"); if (im) im.style.cssText = checker;
+    res.append(el("div", { class: "row" }, el("a", { href: j.mask, download: "mask.png", class: "btnlink" }, "Download mask")));
+  };
+};
+function dilateMask(url, px) { return loadImg(url).then(i => { const c = el("canvas", { width: i.naturalWidth, height: i.naturalHeight }); const g = c.getContext("2d"); g.filter = `blur(${px}px)`; g.drawImage(i, 0, 0); const d = g.getImageData(0, 0, c.width, c.height); for (let k = 0; k < d.data.length; k += 4) { const v = d.data[k] > 8 ? 255 : 0; d.data[k] = d.data[k + 1] = d.data[k + 2] = v; d.data[k + 3] = 255; } g.filter = "none"; g.putImageData(d, 0, 0); return c.toDataURL("image/png"); }); }
+BUILD.layers = (f, res, input) => {
+  const src = imageSource(); if (input) src.set(input);
+  const model = sel([["general", "General / photo"], ["anime", "Anime / illustration"]], "general");
+  const bgp = el("textarea", { rows: 2 }, "empty background scenery, nothing in the foreground");
+  f.append(field("Image", src), el("div", { class: "row" }, field("Cut-out model", model)), field("Background fill prompt", bgp, "the hole left by the subject is inpainted with SD 1.5"));
+  return async () => {
+    if (!src.url) throw new Error("choose an image"); const t0 = performance.now();
+    res.busy("1/3 cutting out the subject…"); const j = await cutout(src.url, model.value);
+    res.busy("2/3 growing the mask…"); const m = await dilateMask(j.mask, 10);
+    const base = await prep(src.url, 768, 64);
+    const bg = await sd({ prompt: bgp.value, image: base, mask: m, mask_blur: 8, steps: 25, response_format: "b64_json" }, res, "3/3 filling the background");
+    res.busy("packing layers…");
+    const files = [{ name: "1_background.png", image: bg.url }, { name: "2_subject.png", image: j.image }, { name: "subject_mask.png", image: j.mask }, { name: "0_original.png", image: src.url }];
+    const z = await api("/api/cabin/pack", { files });
+    const zurl = URL.createObjectURL(new Blob([Uint8Array.from(atob(z.zip), c => c.charCodeAt(0))], { type: "application/zip" }));
+    res.innerHTML = "";
+    res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: bg.url }), el("figcaption", {}, "background (filled)")), el("figure", {}, el("img", { src: j.image, style: checker }), el("figcaption", {}, "subject (transparent)"))),
+      el("div", { class: "row" }, el("a", { href: zurl, download: "layers.zip", class: "btnlink" }, `Download layers.zip (${(z.bytes / 1024).toFixed(0)} KB)`), el("small", {}, `${((performance.now() - t0) / 1000).toFixed(1)} s`)));
+    addResult(bg.url, "background.png", "layers"); addResult(j.image, "subject.png", "layers");
+  };
+};
 // --- image to SVG
 BUILD.svg = (f, res, input) => {
   const src = imageSource(); if (input) src.set(input);

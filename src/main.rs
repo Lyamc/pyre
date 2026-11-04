@@ -10,6 +10,7 @@ mod stt;
 mod diar;
 mod cabin;
 mod esr;
+mod isnet;
 mod tts;
 mod image;
 mod tagger;

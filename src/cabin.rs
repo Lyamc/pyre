@@ -109,8 +109,10 @@ async fn workflows(State(app): S) -> Json<Value> {
     let esr = crate::esr::available(&crate::esr::weights_dir(&app.storage.store.root));
     w.insert("upscale".into(), if esr { ok("Real-ESRGAN compact x4 (general / anime), GPU") } else { wip("Real-ESRGAN weights missing in <store>/cabin/realesr") });
     w.insert("denoise".into(), if esr { ok("Real-ESRGAN general-x4v3 + wdn blend (denoise strength)") } else { wip("Real-ESRGAN weights missing") });
-    w.insert("rmbg".into(), wip("IS-Net (isnet-anime / general) Burn port in progress"));
-    w.insert("layers".into(), wip("needs background removal (IS-Net) + inpaint; after rmbg"));
+    let isd = crate::isnet::weights_dir(&app.storage.store.root);
+    let isn = crate::isnet::available(&isd, "rmbg") || crate::isnet::available(&isd, "anime");
+    w.insert("rmbg".into(), if isn { ok("IS-Net: BRIA RMBG-1.4 (general, non-commercial) / anime-seg (anime), GPU") } else { wip("IS-Net weights missing in <store>/cabin/isnet") });
+    w.insert("layers".into(), if isn && sd { ok("IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers") } else { wip("needs IS-Net weights and SD 1.5") });
     w.insert("animate".into(), wip("frame interpolation model (RIFE / FILM) port planned"));
     w.insert("to3d".into(), wip("image-to-mesh model (TripoSR-class) port planned"));
     w.insert("clothes".into(), wip("needs a human-parsing segmenter for the clothes mask; manual-mask version via Inpaint works now"));
@@ -226,11 +228,74 @@ async fn esr_check(State(app): S, Json(b): Json<Value>) -> Response {
     json_or_err(tokio::task::spawn_blocking(move || small_gpu(300 << 20, "esr check", |dev| crate::esr::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
 }
 
+/// Minimal stored (uncompressed) zip: PNG layers are already compressed.
+fn zip_store(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    fn crc32(d: &[u8]) -> u32 { let mut c = !0u32; for &b in d { c ^= b as u32; for _ in 0..8 { c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 }; } } !c }
+    let (mut out, mut cd) = (Vec::new(), Vec::new());
+    for (name, data) in files {
+        let (crc, off, n) = (crc32(data), out.len() as u32, name.as_bytes());
+        let hdr = |sig: u32, central: bool| -> Vec<u8> {
+            let mut h = Vec::new(); h.extend(sig.to_le_bytes()); if central { h.extend(20u16.to_le_bytes()); }
+            h.extend(20u16.to_le_bytes()); h.extend(0u16.to_le_bytes()); h.extend(0u16.to_le_bytes()); h.extend(0u32.to_le_bytes());
+            h.extend(crc.to_le_bytes()); h.extend((data.len() as u32).to_le_bytes()); h.extend((data.len() as u32).to_le_bytes());
+            h.extend((n.len() as u16).to_le_bytes()); h.extend(0u16.to_le_bytes());
+            if central { h.extend([0u8; 8]); h.extend(0u32.to_le_bytes()); h.extend(off.to_le_bytes()); }
+            h.extend(n); h };
+        out.extend(hdr(0x0403_4b50, false)); out.extend(data); cd.extend(hdr(0x0201_4b50, true));
+    }
+    let (cdo, cdl) = (out.len() as u32, cd.len() as u32); out.extend(cd);
+    out.extend(0x0605_4b50u32.to_le_bytes()); out.extend([0u8; 4]); out.extend((files.len() as u16).to_le_bytes()); out.extend((files.len() as u16).to_le_bytes());
+    out.extend(cdl.to_le_bytes()); out.extend(cdo.to_le_bytes()); out.extend(0u16.to_le_bytes());
+    out
+}
+
+/// `POST /api/cabin/rmbg {image, model: general|anime, side: 1024}` -> RGBA cut-out + mask (IS-Net).
+async fn rmbg(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::isnet::weights_dir(&app.storage.store.root);
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let t = Instant::now();
+        let img = b64_image(&b["image"])?.to_rgb8();
+        let name = match b["model"].as_str().unwrap_or("general") { "anime" => "anime", _ => "rmbg" };
+        let side = b["side"].as_u64().unwrap_or(1024).clamp(256, 1280) as u32 / 32 * 32;
+        let m = small_gpu(1_600 << 20, "IS-Net background removal", |dev| crate::isnet::IsNet::load(&dir, name, dev)?.matte(&img, side, dev))?;
+        let mut rgba = image::RgbaImage::new(img.width(), img.height());
+        for (x, y, p) in rgba.enumerate_pixels_mut() { let c = img.get_pixel(x, y); *p = image::Rgba([c[0], c[1], c[2], m.get_pixel(x, y)[0]]); }
+        let fg = m.pixels().filter(|p| p[0] > 127).count() as f64 / (m.width() * m.height()) as f64;
+        Ok(json!({"image": png_b64(&image::DynamicImage::ImageRgba8(rgba))?, "mask": png_b64(&image::DynamicImage::ImageLuma8(m))?, "model": if name == "anime" { "isnet anime-seg" } else { "BRIA RMBG-1.4 (IS-Net)" }, "foreground_fraction": fg, "seconds": t.elapsed().as_secs_f64()}))
+    }).await)
+}
+
+/// `POST /api/cabin/isnet_check {refdir}`.
+async fn isnet_check(State(app): S, Json(b): Json<Value>) -> Response {
+    let dir = crate::isnet::weights_dir(&app.storage.store.root);
+    let rd = std::path::PathBuf::from(b["refdir"].as_str().unwrap_or(""));
+    json_or_err(tokio::task::spawn_blocking(move || small_gpu(1_200 << 20, "isnet check", |dev| crate::isnet::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
+}
+
+/// `POST /api/cabin/pack {name, files: [{name, image}]}` -> `{zip: base64}` (stored zip of the layers).
+async fn pack(Json(b): Json<Value>) -> Response {
+    use base64::Engine;
+    json_or_err(tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let mut files = Vec::new();
+        for f in b["files"].as_array().ok_or_else(|| anyhow::anyhow!("files[] missing"))? {
+            let name = f["name"].as_str().unwrap_or("layer.png").replace(['/', '\\'], "_");
+            let s = f["image"].as_str().ok_or_else(|| anyhow::anyhow!("{name}: image missing"))?;
+            let s = s.split_once("base64,").map(|x| x.1).unwrap_or(s);
+            files.push((name, base64::engine::general_purpose::STANDARD.decode(s.trim())?));
+        }
+        let z = zip_store(&files);
+        Ok(json!({"zip": base64::engine::general_purpose::STANDARD.encode(&z), "bytes": z.len(), "files": files.len()}))
+    }).await)
+}
+
 pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
     r.route("/api/cabin/workflows", get(workflows))
         .route("/api/cabin/styles", get(styles))
         .route("/api/cabin/ensure", post(ensure_ep))
         .route("/api/cabin/upscale", post(upscale).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/esr_check", post(esr_check))
+        .route("/api/cabin/rmbg", post(rmbg).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
+        .route("/api/cabin/isnet_check", post(isnet_check))
+        .route("/api/cabin/pack", post(pack).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

@@ -106,7 +106,7 @@ pub fn check(dir: &Path, refdir: &Path, dev: &Device) -> Result<String> {
     let rd = |f: &str| -> Result<Vec<f32>> { Ok(std::fs::read(refdir.join(f))?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()) };
     let x = rd("ref_in.bin")?;
     let mut s = String::new();
-    for (m, dn, f) in [("general", 0.0, "ref_out_general.bin"), ("anime", 0.0, "ref_out_anime.bin"), ("general", 0.5, "ref_out_dni05.bin")] {
+    for (m, dn, f) in [("general", 1.0, "ref_out_general.bin"), ("anime", 0.0, "ref_out_anime.bin"), ("general", 0.5, "ref_out_dni05.bin")] {
         let e = Esr::load(dir, m, dn, dev)?;
         let y = e.forward(Tensor::<4>::from_data(TensorData::new(x.clone(), [1, 3, 48, 40]), dev)).into_data().to_vec::<f32>().map_err(|e| anyhow!("{e:?}"))?;
         let r = rd(f)?;
