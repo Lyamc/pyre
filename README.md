@@ -53,6 +53,46 @@ pyre models alias <name> <alias>
 pyre models info <name>
 ```
 
+## Image tagging (EVA02 Danbooru tagger, e.g. Kagami-24k)
+
+Model kind `tagger` (task `image-classification`). [Redstonexs/kagami-24k](https://huggingface.co/Redstonexs/kagami-24k)
+is an EVA02-Large/14 @ 448 Danbooru tagger with 24,000 general tags, written natively in Burn
+(`src/tagger.rs`): no onnxruntime, no torch. Weights load in place from the HF cache: the repo's
+`weights.pt` is read by the Burn fork's own `pytorch-reader` (no conversion; a timm `model.safetensors`
+works too) and `selected_tags.csv` provides the vocabulary.
+
+```
+pyre models pull Redstonexs/kagami-24k            # or: hf download Redstonexs/kagami-24k
+pyre tag page.jpg some\folder --jsonl out.jsonl   # folders are walked recursively; --batch 4 default
+pyre serve --port 8099 --tagger-model Redstonexs/kagami-24k     # or --load tagger=Redstonexs/kagami-24k
+```
+
+`POST /v1/images/tags` with JSON `{"image": "<base64|data URL>", "images": [...], "threshold": 0.37,
+"top_k": 50, "watch": ["tag", ...], "rating_threshold": 0.5, "include_probs": false}` or multipart
+(`image` parts + the same fields). Each result has `tags` grouped by Danbooru category (all `general`
+for Kagami), `watch` (scores of censorship / content / manga-format tags, always reported), and
+`rating`. Kagami has **no rating tags** (and no character tags), so `rating_source: "derived"`: the
+explicit / questionable / sensitive scores are the max over evidence tags (e.g. `sex`, `penis`,
+`censored`, `mosaic_censoring` -> explicit; `nude`, `nipples`, `convenient_censoring` -> questionable;
+`cleavage`, `swimsuit`, `underwear` -> sensitive) with the evidence listed. Taggers that ship rating
+tags (WD v3 style, category 9) report them directly (`rating_source: "model"`).
+
+Model-card details implemented: alpha over white, white square pad (centred), bicubic resize to 448
+(Pillow's resampler reproduced exactly, `pil_bicubic`), [-1, 1] (mean = std = 0.5), **RGB -> BGR**,
+NCHW; default threshold 0.37 (macro-F1; 0.54 for micro-F1). Note: Kagami's shipped ONNX uses the
+raw 32x32 RoPE grid, *not* timm's default 16x16 rescale for `eva02_large_patch14_448`; with the
+rescale probabilities differ by up to 0.96, so pyre follows the ONNX.
+
+Reference check (`C:\Build\ai\kagami-ref`: timm + torch CPU with `ref_feat_shape=(32,32)`, which
+matches the ONNX to 0.004): same preprocessed input -> max |dp| 0.0022 (TF32 matmuls); end to end
+from files (pyre's own decode + resize) -> max |dp| 0.005 over 9 manga pages (PNG ~0.001, JPEG
+decoder differences up to 0.005); top-10 tags identical in order on all 9; 1 tag flips across 0.37.
+
+RTX 3060, f32: ~215 ms/image at batch 1, ~195 ms/image at batch 8 (~5 img/s); VRAM ~1.7 GB (b1),
+~2.3 GB (b4), ~2.9 GB (b8) including the CUDA context. `PYRE_TAGGER_PRECISION=f16` exists but is
+**not accurate** (EVA02 overflows in half precision here: up to 0.97 prob error); keep f32.
+Env: `PYRE_TAGGER_BATCH` (default 4), `PYRE_TAGGER_WARMUP=0`, `PYRE_TAGGER_RGB=1` (feed RGB).
+
 ## Speech to text (whisburn)
 
 STT is backed by [whisburn](file:///C:/Build/machine-learning/whisburn), Lyam's Burn speech project. pyre

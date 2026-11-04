@@ -17,6 +17,7 @@ pub enum Inner {
     Stt(Arc<crate::stt::SttModel>),
     Image(Arc<crate::image::ImageModel>),
     Tts(Arc<crate::tts::TtsModel>),
+    Tagger(Arc<crate::tagger::TaggerModel>),
     /// Registered but not runnable in this build (e.g. image/TTS before their backends land).
     Placeholder(String),
 }
@@ -37,14 +38,15 @@ impl Loaded {
             Inner::Stt(s) => json!({"backend": self.backend, "path": self.path, "engine": s.describe()}),
             Inner::Image(i) => json!({"backend": self.backend, "path": self.path, "engine": i.describe(), "image": i.info()}),
             Inner::Tts(t) => json!({"backend": self.backend, "path": self.path, "engine": t.describe()}),
+            Inner::Tagger(t) => json!({"backend": self.backend, "path": self.path, "engine": t.describe(), "tagger": t.info()}),
             Inner::Placeholder(r) => json!({"backend": self.backend, "path": self.path, "status": "not-runnable", "reason": r}),
         }
     }
     pub fn busy(&self) -> bool {
-        match &self.inner { Inner::Llm(l) => l.engine.busy.load(Ordering::SeqCst), Inner::Stt(s) => s.busy(), Inner::Image(i) => i.busy.load(Ordering::SeqCst), Inner::Tts(t) => t.busy.load(Ordering::SeqCst), _ => false }
+        match &self.inner { Inner::Llm(l) => l.engine.busy.load(Ordering::SeqCst), Inner::Stt(s) => s.busy(), Inner::Image(i) => i.busy.load(Ordering::SeqCst), Inner::Tts(t) => t.busy.load(Ordering::SeqCst), Inner::Tagger(t) => t.busy.load(Ordering::SeqCst), _ => false }
     }
     pub fn queued(&self) -> u64 {
-        match &self.inner { Inner::Llm(l) => l.engine.queued.load(Ordering::SeqCst), Inner::Stt(s) => s.queued(), Inner::Image(i) => i.queued.load(Ordering::SeqCst), Inner::Tts(t) => t.queued.load(Ordering::SeqCst), _ => 0 }
+        match &self.inner { Inner::Llm(l) => l.engine.queued.load(Ordering::SeqCst), Inner::Stt(s) => s.queued(), Inner::Image(i) => i.queued.load(Ordering::SeqCst), Inner::Tts(t) => t.queued.load(Ordering::SeqCst), Inner::Tagger(t) => t.queued.load(Ordering::SeqCst), _ => 0 }
     }
 }
 
@@ -78,9 +80,9 @@ impl App {
             }
         }
         all.iter().find(|m| m.kind == kind).cloned().ok_or_else(|| {
-            let code = if matches!(kind, Kind::Image | Kind::Tts) { StatusCode::NOT_IMPLEMENTED } else { StatusCode::BAD_REQUEST };
+            let code = if matches!(kind, Kind::Image | Kind::Tts | Kind::Tagger) { StatusCode::NOT_IMPLEMENTED } else { StatusCode::BAD_REQUEST };
             err(code, format!("no {} model is loaded; start pyre with {} or load one via POST /api/models/load", kind.task(),
-                match kind { Kind::Llm => "-m <model>", Kind::Image => "--image-model <model>", Kind::Stt => "--stt-model <model>", Kind::Tts => "--tts-model <model>", Kind::Unknown => "--load kind=ref" }))
+                match kind { Kind::Llm => "-m <model>", Kind::Image => "--image-model <model>", Kind::Stt => "--stt-model <model>", Kind::Tts => "--tts-model <model>", Kind::Tagger => "--tagger-model <model>", Kind::Unknown => "--load kind=ref" }))
         })
     }
 
@@ -158,6 +160,7 @@ fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
         Kind::Stt => unreachable!(),
         Kind::Image => Inner::Image(Arc::new(crate::image::ImageModel::load(&dir, &backend).context("loading image model")?)),
         Kind::Tts => Inner::Tts(Arc::new(crate::tts::TtsModel::load(&dir, &backend).context("loading text-to-speech model")?)),
+        Kind::Tagger => Inner::Tagger(Arc::new(crate::tagger::TaggerModel::load(&dir, &backend).context("loading image tagger")?)),
         Kind::Unknown => anyhow::bail!("unknown model kind for {}", q.r),
     };
     Ok(Loaded { id, kind: q.kind, backend, path: dir.display().to_string(), created: now(), inner })

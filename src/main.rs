@@ -10,6 +10,7 @@ mod stt;
 mod diar;
 mod tts;
 mod image;
+mod tagger;
 mod ui;
 mod cli_models;
 mod storage;
@@ -71,6 +72,8 @@ pub enum Cmd {
     /// Speaker diarization (Nemotron-3-Diarization) of a 16 kHz-resampled audio file: prints segments as JSON
     Diarize { file: PathBuf, #[arg(long, default_value = "nvidia/Nemotron-3-Diarization")] model: String, #[arg(long, default_value = "cpu")] backend: String, /// also write raw logits [T,8] (f32 LE) here
         #[arg(long)] logits: Option<PathBuf> },
+    /// Tag images (or folders of images) with an EVA02 Danbooru tagger (default Redstonexs/kagami-24k)
+    Tag(tagger::TagArgs),
     /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
     App {
         #[command(subcommand)]
@@ -83,7 +86,7 @@ pub struct ServeArgs {
     /// Text-generation model: alias, store name, HF repo id[@rev] or folder
     #[arg(short = 'm', long = "model")]
     pub model: Vec<String>,
-    /// Extra models as kind=ref (kind: llm|image|stt|tts); repeatable
+    /// Extra models as kind=ref (kind: llm|image|stt|tts|tagger); repeatable
     #[arg(long = "load", value_name = "KIND=REF")]
     pub load: Vec<String>,
     #[arg(long = "image-model")]
@@ -92,6 +95,9 @@ pub struct ServeArgs {
     pub stt_model: Option<String>,
     #[arg(long = "tts-model")]
     pub tts_model: Option<String>,
+    /// Image tagger (EVA02 Danbooru tagger, e.g. Redstonexs/kagami-24k) for POST /v1/images/tags
+    #[arg(long = "tagger-model")]
+    pub tagger_model: Option<String>,
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = 8080)]
@@ -178,6 +184,7 @@ fn main() -> Result<()> {
         Cmd::Serve(a) => serve(ctx, a),
         Cmd::QwenNext(a) => qn_cli::run(a),
         Cmd::Diarize { file, model, backend, logits } => diar::cli(&ctx.hf_cache, &file, &model, &backend, logits.as_deref()),
+        Cmd::Tag(a) => tagger::run_cli(&ctx, a),
         Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }
@@ -311,6 +318,7 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     if let Some(r) = &args.image_model { want.push((Kind::Image, r.clone(), None)); }
     if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone(), None)); }
     if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone(), None)); }
+    if let Some(r) = &args.tagger_model { want.push((Kind::Tagger, r.clone(), None)); }
 
     if let Some(p) = &args.prompt {
         let r = args.model.first().context("--prompt needs -m")?;
