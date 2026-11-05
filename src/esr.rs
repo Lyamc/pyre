@@ -26,7 +26,7 @@ fn read(path: &Path) -> Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
 
 /// The weight folder: `PYRE_ESR_DIR`, else `<store>/cabin/realesr`.
 pub fn weights_dir(store_root: &Path) -> PathBuf { std::env::var("PYRE_ESR_DIR").map(PathBuf::from).unwrap_or_else(|_| store_root.join("cabin").join("realesr")) }
-pub fn available(dir: &Path) -> bool { dir.join("realesr_general_x4v3.safetensors").is_file() }
+pub fn available(dir: &Path) -> bool { ["realesr_general_x4v3.safetensors", "realesr_anime_x4v3.safetensors"].iter().any(|f| dir.join(f).is_file()) }
 
 impl Esr {
     /// `model`: "general" (with `denoise` 0..1 blending in the wdn weights) or "anime".

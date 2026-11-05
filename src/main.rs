@@ -9,6 +9,7 @@ mod registry;
 mod stt;
 mod diar;
 mod cabin;
+mod cabin_catalog;
 mod esr;
 mod isnet;
 mod segformer;
@@ -106,6 +107,9 @@ pub struct ServeArgs {
     /// Image tagger (EVA02 Danbooru tagger, e.g. Redstonexs/kagami-24k) for POST /v1/images/tags
     #[arg(long = "tagger-model")]
     pub tagger_model: Option<String>,
+    /// Do not treat HF-cache / store image & tagger snapshots as available unless loaded via a flag
+    #[arg(long = "no-auto-models")]
+    pub no_auto_models: bool,
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = 8080)]
@@ -327,6 +331,8 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     if let Some(r) = &args.stt_model { want.push((Kind::Stt, r.clone(), None)); }
     if let Some(r) = &args.tts_model { want.push((Kind::Tts, r.clone(), None)); }
     if let Some(r) = &args.tagger_model { want.push((Kind::Tagger, r.clone(), None)); }
+    if args.no_auto_models { std::env::set_var("PYRE_NO_AUTO_MODELS", "1"); }
+
 
     if let Some(p) = &args.prompt {
         let r = args.model.first().context("--prompt needs -m")?;

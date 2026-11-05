@@ -5,7 +5,7 @@
 //! (1 GiB+) free, and regrows on its normal schedule once the lease ends. Small CPU models skip the lease.
 use crate::registry::{App, Kind, LoadReq, Loaded};
 use crate::server::err;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -98,45 +98,67 @@ fn reaper_start(app: Arc<App>) {
 
 fn cleanup() { if let Ok((dev, _, _)) = crate::backend::select("cuda", "f32", None) { let _ = dev.sync(); dev.memory_cleanup(); } }
 
-fn hf_has(app: &App, repo: &str) -> bool { crate::store::hfcache::find(&app.storage.hf_cache, repo, None).is_some() }
-
-/// Workflow cards: what is ready, what is missing (and why).
+/// Workflow cards: readiness is computed on demand (no startup scan). Missing components include a
+/// `downloads` list of known-compatible models the user can fetch into the HF cache / cabin store.
 async fn workflows(State(app): S) -> Json<Value> {
-    let sd = hf_has(&app, SD15);
-    let tg = hf_has(&app, TAGGER);
-    let sd_why = if sd { "" } else { "Stable Diffusion 1.5 is not downloaded (Models tab: pull stable-diffusion-v1-5/stable-diffusion-v1-5)" };
-    let wip = |why: &str| json!({"ready": false, "status": "in progress", "reason": why});
     let ok = |m: &str| json!({"ready": true, "status": "ready", "model": m});
-    let sdw = |m: &str| if sd { ok(m) } else { json!({"ready": false, "status": "missing model", "reason": sd_why}) };
+    let missing = |app: &App, why: &str, comps: &[&str]| {
+        let mut downloads = Vec::new();
+        for c in comps {
+            if crate::cabin_catalog::present(app, c) { continue; }
+            for o in crate::cabin_catalog::offers_for(c) {
+                let mut j = crate::cabin_catalog::offer_json(o);
+                j["present"] = json!(false);
+                downloads.push(j);
+            }
+        }
+        json!({"ready": false, "status": "missing model", "reason": why, "needs": comps, "downloads": downloads})
+    };
+    let card = |app: &App, comps: &[&str], ready_model: &str, why: &str| {
+        if comps.iter().all(|c| crate::cabin_catalog::present(app, c)) { ok(ready_model) } else { missing(app, why, comps) }
+    };
     let mut w = serde_json::Map::new();
-    w.insert("txt2img".into(), sdw("SD 1.5 (f16, GPU on demand)"));
-    if sd && crate::lcm::lora_file(&app.storage.store.root).is_file() { if let Some(o) = w.get_mut("txt2img") { o["lcm"] = json!(true); } }
-    w.insert("img2img".into(), sdw("SD 1.5 img2img"));
-    w.insert("restyle".into(), sdw("SD 1.5 img2img + style templates"));
-    let ipm = app.storage.store.root.join("cabin").join("sd15-inpaint").join("unet").join("diffusion_pytorch_model.fp16.safetensors").is_file();
-    w.insert("inpaint".into(), sdw(if ipm { "SD 1.5 inpainting UNet (9-channel) + feathered composite" } else { "SD 1.5, masked latent blending + feathered composite" }));
-    w.insert("outpaint".into(), sdw("SD 1.5, masked latent blending on an extended canvas"));
-    w.insert("character".into(), sdw("SD 1.5, locked seed + region inpaint"));
-    w.insert("tagger".into(), if tg { ok("Kagami-24k EVA02-L (CPU)") } else { json!({"ready": false, "status": "missing model", "reason": "Redstonexs/kagami-24k is not downloaded"}) });
+    w.insert("txt2img".into(), card(&app, &["sd15"], "SD 1.5 (f16, GPU on demand)", "no image model in the HF cache or pyre store"));
+    if crate::cabin_catalog::present(&app, "sd15") && crate::cabin_catalog::present(&app, "lcm") {
+        if let Some(o) = w.get_mut("txt2img") { o["lcm"] = json!(true); }
+    }
+    w.insert("img2img".into(), card(&app, &["sd15"], "SD 1.5 img2img", "no image model in the HF cache or pyre store"));
+    w.insert("restyle".into(), card(&app, &["sd15"], "SD 1.5 img2img + style templates", "no image model in the HF cache or pyre store"));
+    let ipm = crate::cabin_catalog::present(&app, "sd15-inpaint");
+    w.insert("inpaint".into(), card(&app, &["sd15"], if ipm { "SD 1.5 inpainting UNet (9-channel) + feathered composite" } else { "SD 1.5, masked latent blending + feathered composite" }, "no image model in the HF cache or pyre store"));
+    w.insert("outpaint".into(), card(&app, &["sd15"], "SD 1.5, masked latent blending on an extended canvas", "no image model in the HF cache or pyre store"));
+    w.insert("character".into(), card(&app, &["sd15"], "SD 1.5, locked seed + region inpaint", "no image model in the HF cache or pyre store"));
+    w.insert("tagger".into(), card(&app, &["tagger"], "Kagami-24k EVA02-L (CPU)", "no tagger in the HF cache or pyre store"));
     w.insert("svg".into(), ok("vtracer (CPU)"));
-    let esr = crate::esr::available(&crate::esr::weights_dir(&app.storage.store.root));
-    w.insert("upscale".into(), if esr { ok("Real-ESRGAN compact x4 (general / anime), GPU") } else { wip("Real-ESRGAN weights missing in <store>/cabin/realesr") });
-    w.insert("denoise".into(), if esr { ok("Real-ESRGAN general-x4v3 + wdn blend (denoise strength)") } else { wip("Real-ESRGAN weights missing") });
-    let isd = crate::isnet::weights_dir(&app.storage.store.root);
-    let isn = crate::isnet::available(&isd, "rmbg") || crate::isnet::available(&isd, "anime");
-    w.insert("rmbg".into(), if isn { ok("IS-Net: BRIA RMBG-1.4 (general, non-commercial) / anime-seg (anime), GPU") } else { wip("IS-Net weights missing in <store>/cabin/isnet") });
-    w.insert("layers".into(), if isn && sd { ok("IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers") } else { wip("needs IS-Net weights and SD 1.5") });
-    let rf = crate::rife::available(&crate::rife::weights_dir(&app.storage.store.root));
-    w.insert("animate".into(), if rf { ok("RIFE 4.6 frame interpolation (GPU) -> GIF + PNG frames") } else { wip("RIFE weights missing in <store>/cabin/rife") });
-    let tsr = crate::triposr::available(&crate::triposr::weights_dir(&app.storage.store.root));
-    w.insert("to3d".into(), if tsr && isn { ok("IS-Net cut-out + TripoSR (native, f16 weights) -> marching cubes, vertex colours, GLB") } else { wip("TripoSR weights missing in <store>/cabin/triposr (or IS-Net)") });
-    let seg = crate::segformer::available(&crate::segformer::weights_dir(&app.storage.store.root));
-    w.insert("clothes".into(), if seg && sd { ok("SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting") } else { wip("SegFormer clothes weights missing in <store>/cabin/segformer") });
-    let op = app.storage.store.root.join("cabin").join("controlnet-openpose").join("diffusion_pytorch_model.fp16.safetensors").is_file();
-    w.insert("pose".into(), if op && sd { ok("SD 1.5 + ControlNet v1.1 OpenPose, pose editor with presets") } else { wip("ControlNet OpenPose weights missing in <store>/cabin/controlnet-openpose") });
+    w.insert("upscale".into(), card(&app, &["esr"], "Real-ESRGAN compact x4 (general / anime), GPU", "Real-ESRGAN weights missing"));
+    w.insert("denoise".into(), card(&app, &["esr"], "Real-ESRGAN general-x4v3 + wdn blend (denoise strength)", "Real-ESRGAN weights missing"));
+    w.insert("rmbg".into(), card(&app, &["isnet"], "IS-Net: BRIA RMBG-1.4 (general, non-commercial) / anime-seg (anime), GPU", "IS-Net weights missing"));
+    w.insert("layers".into(), card(&app, &["isnet", "sd15"], "IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers", "needs IS-Net weights and an image model"));
+    w.insert("animate".into(), card(&app, &["rife"], "RIFE 4.6 frame interpolation (GPU) -> GIF + PNG frames", "RIFE weights missing"));
+    w.insert("to3d".into(), card(&app, &["triposr", "isnet"], "IS-Net cut-out + TripoSR (native, f16 weights) -> marching cubes, vertex colours, GLB", "TripoSR and/or IS-Net weights missing"));
+    w.insert("clothes".into(), card(&app, &["segformer", "sd15"], "SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting", "SegFormer clothes weights and/or image model missing"));
+    w.insert("pose".into(), card(&app, &["openpose", "sd15"], "SD 1.5 + ControlNet v1.1 OpenPose, pose editor with presets", "ControlNet OpenPose and/or image model missing"));
     let (n, b) = crate::limits::leases();
-    Json(json!({"workflows": w, "loaded": app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend})).collect::<Vec<_>>(),
-        "vram": crate::limits::vram().map(|v| json!({"free_mib": v.free >> 20, "used_mib": v.used >> 20})), "leases": n, "leased_mib": b >> 20, "idle_unload_s": idle().as_secs()}))
+    let comps = ["sd15","sd15-inpaint","lcm","openpose","tagger","esr","isnet","rife","segformer","triposr"];
+    let components: Vec<Value> = comps.iter().map(|c| json!({"id": c, "present": crate::cabin_catalog::present(&app, c)})).collect();
+    let loaded: Vec<Value> = app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend})).collect();
+    Json(json!({
+        "workflows": w,
+        "loaded": loaded,
+        "components": components,
+        "vram": crate::limits::vram().map(|v| json!({"free_mib": v.free >> 20, "used_mib": v.used >> 20})),
+        "leases": n, "leased_mib": b >> 20, "idle_unload_s": idle().as_secs()
+    }))
+}
+
+/// `GET /api/cabin/models?task=txt2img` — cheap on-demand query for one card.
+async fn models_for_task(State(app): S, Query(q): Query<std::collections::HashMap<String, String>>) -> Response {
+    let task = q.get("task").map(|s| s.as_str()).unwrap_or("");
+    let Json(all) = workflows(State(app)).await;
+    match all["workflows"].get(task) {
+        Some(v) => Json(json!({"task": task, "workflow": v, "components": all["components"]})).into_response(),
+        None => err(StatusCode::BAD_REQUEST, format!("unknown task '{task}'")),
+    }
 }
 
 async fn styles(State(app): S) -> Response {
@@ -159,7 +181,12 @@ async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
             if std::env::var_os("PYRE_SD_LCM_LORA").is_none() && lcm.is_file() { std::env::set_var("PYRE_SD_LCM_LORA", &lcm); }
             let op = app.storage.store.root.join("cabin").join("controlnet-openpose");
             if std::env::var_os("PYRE_SD_CONTROLNET_OPENPOSE").is_none() && op.join("diffusion_pytorch_model.fp16.safetensors").is_file() { std::env::set_var("PYRE_SD_CONTROLNET_OPENPOSE", &op); }
-            ensure(&app, Kind::Image, b["model"].as_str().unwrap_or(SD15), "cuda", SD15_LEASE).await
+            {
+                let id = b["model"].as_str().map(|s| s.to_string())
+                    .or_else(|| crate::cabin_catalog::resolve_sd_id(&app))
+                    .unwrap_or_else(|| SD15.to_string());
+                ensure(&app, Kind::Image, &id, "cuda", SD15_LEASE).await
+            }
         }
         "tagger" => ensure(&app, Kind::Tagger, TAGGER, b["backend"].as_str().unwrap_or("cpu"), 1_800 << 20).await,
         w => return err(StatusCode::BAD_REQUEST, format!("unknown model kind '{w}'")),
@@ -168,6 +195,27 @@ async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
         Ok(m) => Json(json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "seconds": t.elapsed().as_secs_f64(), "vram_free_mib": crate::limits::vram().map(|v| v.free >> 20)})).into_response(),
         Err(r) => r,
     }
+}
+
+/// `POST /api/cabin/download {"id":"esr-anime"}` — SSE progress (same shape as /api/pull); writes into the HF
+/// cache or `<store>/cabin/...`. Cancel with POST /api/cabin/download/cancel {"id":...} or by closing the stream.
+async fn cabin_download(State(app): S, Json(b): Json<Value>) -> Response {
+    use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+    use std::convert::Infallible;
+    let Some(id) = b["id"].as_str().map(|s| s.to_string()) else { return err(StatusCode::BAD_REQUEST, "missing id") };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = app.clone(); let c = cancel.clone(); let id2 = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let res = crate::cabin_catalog::download(&a, &id2, &|v| { let _ = tx.send(v); }, c);
+        let _ = tx.send(match res { Ok(p) => json!({"done": true, "path": p, "id": id2}), Err(e) => json!({"error": format!("{e:#}"), "id": id2}) });
+    });
+    let s = futures::StreamExt::map(tokio_stream::wrappers::UnboundedReceiverStream::new(rx), |v| Ok::<_, Infallible>(SseEvent::default().data(v.to_string())));
+    Sse::new(s).keep_alive(KeepAlive::default()).into_response()
+}
+async fn cabin_download_cancel(Json(b): Json<Value>) -> Response {
+    let Some(id) = b["id"].as_str() else { return err(StatusCode::BAD_REQUEST, "missing id") };
+    Json(json!({"ok": crate::cabin_catalog::cancel(id), "id": id})).into_response()
 }
 
 /// `POST /api/cabin/vectorize`: raster -> SVG with vtracer (CPU).
@@ -454,8 +502,11 @@ async fn pack(Json(b): Json<Value>) -> Response {
 
 pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
     r.route("/api/cabin/workflows", get(workflows))
+        .route("/api/cabin/models", get(models_for_task))
         .route("/api/cabin/styles", get(styles))
         .route("/api/cabin/ensure", post(ensure_ep))
+        .route("/api/cabin/download", post(cabin_download))
+        .route("/api/cabin/download/cancel", post(cabin_download_cancel))
         .route("/api/cabin/upscale", post(upscale).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/esr_check", post(esr_check))
         .route("/api/cabin/rmbg", post(rmbg).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))

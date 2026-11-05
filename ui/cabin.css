@@ -34,3 +34,11 @@
 
 .glview{max-width:100%;border-radius:8px;touch-action:none;cursor:grab;display:block}
 .glwrap{margin-bottom:8px}
+
+.cdl{display:flex;flex-direction:column;gap:10px;margin-top:10px}
+.cdl-row{display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center;padding:10px;border:1px solid var(--border);border-radius:8px}
+.cdl-row b{display:block}
+.cdl-row small{display:block;color:var(--muted);font-size:11px}
+.cdl-bar{grid-column:1/-1;height:6px;background:var(--border);border-radius:4px;overflow:hidden}
+.cdl-bar>div{height:100%;background:var(--accent)}
+.cdl-msg{grid-column:1/-1;color:var(--muted);font-size:11px}

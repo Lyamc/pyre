@@ -11,6 +11,73 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error?.message || j.error || t || r.statusText);
   return j;
 }
+
+async function* cabinSse(path, body, signal) {
+  const r = await fetch(path, { method: "POST", headers: hdr({ "content-type": "application/json" }), body: JSON.stringify(body), signal });
+  if (!r.ok) { const t = await r.text(); throw new Error(t || r.statusText); }
+  const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n"); buf = parts.pop();
+    for (const block of parts) {
+      const data = block.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
+      if (!data) continue;
+      try { yield JSON.parse(data); } catch { /* keep-alive */ }
+    }
+  }
+}
+async function cabinDownload(id, onProg) {
+  const ctrl = new AbortController();
+  const cancel = () => { ctrl.abort(); fetch("/api/cabin/download/cancel", { method: "POST", headers: hdr({ "content-type": "application/json" }), body: JSON.stringify({ id }) }).catch(() => {}); };
+  try {
+    for await (const ev of cabinSse("/api/cabin/download", { id }, ctrl.signal)) {
+      if (ev.error) throw new Error(ev.error);
+      if (ev.done) return ev;
+      onProg?.(ev);
+    }
+  } catch (e) { if (e.name === "AbortError") throw new Error("download cancelled"); throw e; }
+  finally { /* stream ended */ }
+  return null;
+}
+function downloadPanel(st, onDone) {
+  const box = el("div", { class: "cdl" });
+  box.append(el("p", { class: "muted" }, st.reason || "A required model is not on disk yet."));
+  const list = st.downloads || [];
+  if (!list.length) { box.append(el("p", {}, "No downloadable options are listed for this card.")); return box; }
+  for (const d of list) {
+    const row = el("div", { class: "cdl-row" });
+    const meta = el("div", {}, el("b", {}, d.name), el("small", {}, `${d.size} · ${d.licence} · ${d.repo}`), el("small", { class: "muted" }, d.note || ""));
+    const bar = el("div", { class: "cdl-bar hidden" }, el("div", { style: "width:0%" }));
+    const msg = el("small", { class: "cdl-msg" });
+    let busy = false; let canceller = null;
+    const btn = el("button", { type: "button", class: "primary", onclick: async () => {
+      if (busy) { canceller?.(); return; }
+      busy = true; btn.textContent = "Cancel"; bar.classList.remove("hidden"); msg.textContent = "starting…";
+      const ctrl = { cancel: null };
+      try {
+        // cabinDownload uses AbortController internally; wrap with cancel button
+        const ac = new AbortController();
+        canceller = () => { ac.abort(); fetch("/api/cabin/download/cancel", { method: "POST", headers: hdr({ "content-type": "application/json" }), body: JSON.stringify({ id: d.id }) }).catch(() => {}); };
+        let done = null;
+        for await (const ev of cabinSse("/api/cabin/download", { id: d.id }, ac.signal)) {
+          if (ev.error) throw new Error(ev.error);
+          if (ev.done) { done = ev; break; }
+          const pct = ev.total ? Math.min(100, Math.round(100 * (ev.index + 1) / Math.max(ev.total, 1))) : (ev.bytes && ev.total_bytes ? Math.round(100 * ev.bytes / ev.total_bytes) : null);
+          if (pct != null) bar.firstChild.style.width = pct + "%";
+          msg.textContent = ev.file ? `${ev.file}${pct != null ? " · " + pct + "%" : ""}` : JSON.stringify(ev);
+        }
+        bar.firstChild.style.width = "100%"; msg.textContent = "done" + (done?.path ? " → " + done.path : "");
+        btn.textContent = "Downloaded"; btn.disabled = true;
+        await onDone?.();
+      } catch (e) { msg.textContent = "error: " + (e.message || e); btn.textContent = "Download"; }
+      finally { busy = false; canceller = null; }
+    } }, "Download");
+    row.append(meta, btn, bar, msg); box.append(row);
+  }
+  return box;
+}
+
 // ---------- state ----------
 let WF = {}, STYLES = [], gallery = [];   // gallery: [{url, name, from}]
 const cur = { wf: null };
@@ -507,7 +574,11 @@ function openWorkflow(id, input, prompt) {
   $$c(".ccard").forEach(c => c.classList.toggle("on", c.dataset.id === id));
   const pane = $c("#cabinPane"); pane.innerHTML = "";
   pane.append(el("h3", {}, card.icon + " " + card.title), el("p", { class: "muted" }, card.desc + (st.model ? " — " + st.model : "")));
-  if (!st.ready || !BUILD[id]) { pane.append(el("div", { class: "disabled-note" }, `${st.status || "not available"}: ${st.reason || "not implemented yet"}`)); return; }
+  if (!st.ready || !BUILD[id]) {
+    pane.append(el("div", { class: "disabled-note" }, `${st.status || "not available"}: ${st.reason || "not implemented yet"}`));
+    if (st.downloads?.length) pane.append(downloadPanel(st, async () => { await refreshStatus(); renderCards(); openWorkflow(id, input, prompt); }));
+    return;
+  }
   const form = el("div", { class: "cform" }); const res = resultBox(); const run = BUILD[id](form, res, input);
   if (prompt) { const t = form.querySelector("textarea"); if (t) t.value = prompt; }
   const go = el("button", { class: "primary", type: "button", onclick: async () => { go.disabled = true; try { await run(); } catch (e) { res.fail(e); } go.disabled = false; refreshStatus(); } }, "Run");
@@ -516,7 +587,7 @@ function openWorkflow(id, input, prompt) {
 const $$c = s => [...document.querySelectorAll(s)];
 function renderCards() {
   const g = $c("#cabinCards"); g.innerHTML = "";
-  for (const c of CARDS) { const s = WF[c.id] || {}; g.append(el("button", { class: "ccard" + (s.ready ? "" : " off"), "data-id": c.id, title: s.ready ? (s.model || "") : (s.reason || ""), onclick: () => openWorkflow(c.id) }, el("span", { class: "ci" }, c.icon), el("b", {}, c.title), el("small", {}, s.ready ? c.desc : (s.status || "unavailable")))); }
+  for (const c of CARDS) { const s = WF[c.id] || {}; const hint = s.ready ? c.desc : (s.downloads?.length ? `download · ${s.downloads[0].name}` : (s.status || "unavailable")); g.append(el("button", { class: "ccard" + (s.ready ? "" : " off"), "data-id": c.id, title: s.ready ? (s.model || "") : (s.reason || ""), onclick: () => openWorkflow(c.id) }, el("span", { class: "ci" }, c.icon), el("b", {}, c.title), el("small", {}, hint))); }
 }
 function renderGallery() { const g = $c("#cabinGallery"); if (!g) return; g.innerHTML = ""; for (const x of gallery) g.append(el("img", { src: x.url, title: `${x.from}: ${x.name}`, onclick: () => { const d = el("div", { class: "cpick", onclick: () => d.remove() }, el("img", { class: "big", src: x.url })); document.body.append(d); } })); }
 async function refreshStatus() {
