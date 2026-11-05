@@ -120,7 +120,8 @@ function refreshAvailFromStatus() {
   const sttBusy = (typeof sttJob !== "undefined") && !!sttJob;
   const kindsObj = (typeof kinds !== "undefined") ? kinds : {};
   if ($("#sttGo") && !sttBusy) {
-    if (down) setAvail($("#sttGo"), { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected — reconnecting..." });
+    if (typeof updateSttRunAvail === "function") updateSttRunAvail();
+    else if (down) setAvail($("#sttGo"), { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected" });
     else if ($("#sttGo").dataset.forceBusy !== "1") setAvail($("#sttGo"), availOk());
   }
   if ($("#imgGo")) {
@@ -482,6 +483,10 @@ function sttPrefsFromUi() {
 }
 function applySttPrefs(p) {
   if ($("#sttQuality")) $("#sttQuality").value = p.quality || "balanced";
+  // sttQualitySeg sync
+  if ($("#sttQualitySeg")) $$("#sttQualitySeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.q === ($("#sttQuality").value)));
+  if ($("#sttTaskSeg") && $("#sttTask")) $$("#sttTaskSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.task === ($("#sttTask").value)));
+
   if ($("#sttFormat")) $("#sttFormat").value = p.format || "verbose_json";
   if ($("#sttLang")) $("#sttLang").value = p.language || "";
   if ($("#sttTimestamps")) $("#sttTimestamps").checked = !!p.timestamps;
@@ -813,26 +818,204 @@ function reassignSegment(idx) {
   paintSttResult();
 }
 
+
+function micAllowed() {
+  try {
+    const h = location.hostname;
+    return !!(window.isSecureContext || h === "localhost" || h === "127.0.0.1" || h === "[::1]");
+  } catch { return false; }
+}
+function currentSttAudio() {
+  if (recBlob) return recBlob;
+  const inp = $("#sttFile");
+  return (inp && inp.files && inp.files[0]) || null;
+}
+function fmtDur(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function setSttSourceMode(mode) {
+  const file = mode !== "record";
+  if ($("#sttModeFile")) { $("#sttModeFile").classList.toggle("active", file); $("#sttModeFile").setAttribute("aria-selected", file ? "true" : "false"); }
+  if ($("#sttModeRec")) { $("#sttModeRec").classList.toggle("active", !file); $("#sttModeRec").setAttribute("aria-selected", !file ? "true" : "false"); }
+  if ($("#sttFilePane")) $("#sttFilePane").classList.toggle("hidden", !file);
+  if ($("#sttRecPane")) $("#sttRecPane").classList.toggle("hidden", file);
+  updateMicGate();
+  updateSttRunAvail();
+}
+function updateMicGate() {
+  const ok = micAllowed();
+  const hint = $("#sttMicHint");
+  if (hint) {
+    hint.classList.toggle("hidden", ok);
+    const u = $("#sttLocalUrl");
+    if (u) u.textContent = "http://127.0.0.1:" + (location.port || "8099") + "/";
+  }
+  if ($("#recBtn")) {
+    setAvail($("#recBtn"), ok
+      ? availOk()
+      : { enabled: false, reason_kind: "no_permission", message: "Microphone needs HTTPS or localhost — open 127.0.0.1 on this PC" });
+  }
+}
+function showPreview(blobOrFile) {
+  if (!blobOrFile) return;
+  const url = URL.createObjectURL(blobOrFile);
+  for (const id of ["sttPreview", "sttAudio"]) {
+    const a = $("#" + id); if (!a) continue;
+    a.src = url; a.classList.remove("hidden");
+  }
+}
+function describeFile(f) {
+  if (!f) { if ($("#sttFileMeta")) $("#sttFileMeta").textContent = "MP3, WAV, M4A, FLAC, WebM…"; return; }
+  const bits = [f.name || "audio"];
+  if (f.size) bits.push(human(f.size));
+  if ($("#sttFileMeta")) $("#sttFileMeta").textContent = bits.join(" · ");
+  const drop = $("#sttDrop"); if (drop) drop.classList.add("has-file");
+  // duration via preview metadata
+  const a = $("#sttPreview");
+  if (a) {
+    const onmeta = () => {
+      if (isFinite(a.duration)) {
+        if ($("#sttFileMeta")) $("#sttFileMeta").textContent = bits.concat([fmtDur(a.duration)]).join(" · ");
+      }
+      a.removeEventListener("loadedmetadata", onmeta);
+    };
+    a.addEventListener("loadedmetadata", onmeta);
+  }
+}
+function updateSttRunAvail() {
+  const btn = $("#sttGo"); if (!btn) return;
+  if (btn.dataset.forceBusy === "1") return;
+  const down = statusState && statusState.state === "down";
+  if (down) {
+    setAvail(btn, { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected" });
+    return;
+  }
+  const f = currentSttAudio();
+  if (!f) {
+    setAvail(btn, { enabled: false, reason_kind: "", message: "Choose or record audio first" });
+    return;
+  }
+  setAvail(btn, availOk());
+  const task = ($("#sttTask") && $("#sttTask").value) || "transcriptions";
+  btn.textContent = task === "translations" ? "Translate" : "Transcribe";
+}
+function setSttRunningUi(on) {
+  if ($("#sttGo")) $("#sttGo").classList.toggle("hidden", !!on);
+  if ($("#sttCancel")) $("#sttCancel").classList.toggle("hidden", !on);
+}
+let recTimer = null, recStarted = 0, recAnalyser = null, recRaf = 0, recStream = null;
+function stopRecMeter() {
+  if (recRaf) cancelAnimationFrame(recRaf); recRaf = 0;
+  if ($("#sttRecMeter")) $("#sttRecMeter").classList.add("hidden");
+}
+function startRecMeter(stream) {
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ac.createMediaStreamSource(stream);
+    const an = ac.createAnalyser(); an.fftSize = 256;
+    src.connect(an); recAnalyser = { ac, an };
+    const canvas = $("#sttRecMeter"); if (!canvas) return;
+    canvas.classList.remove("hidden");
+    const ctx = canvas.getContext("2d");
+    const data = new Uint8Array(an.frequencyBinCount);
+    const draw = () => {
+      recRaf = requestAnimationFrame(draw);
+      an.getByteTimeDomainData(data);
+      let peak = 0;
+      for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128));
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "rgba(127,127,127,.25)"; ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = peak > 40 ? "#2fa36b" : "#d8a017";
+      ctx.fillRect(0, 0, Math.min(w, (peak / 128) * w * 2), h);
+    };
+    draw();
+  } catch {}
+}
+function tickRecTimer() {
+  if ($("#sttRecTimer")) $("#sttRecTimer").textContent = fmtDur((Date.now() - recStarted) / 1000);
+}
+if ($("#sttModeFile")) $("#sttModeFile").onclick = () => setSttSourceMode("file");
+if ($("#sttModeRec")) $("#sttModeRec").onclick = () => setSttSourceMode("record");
+if ($("#sttDrop")) {
+  const dz = $("#sttDrop");
+  ["dragenter", "dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", e => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    const dt = new DataTransfer(); dt.items.add(f);
+    $("#sttFile").files = dt.files;
+    recBlob = null;
+    describeFile(f); showPreview(f); updateSttRunAvail();
+  });
+}
 if ($("#recBtn")) $("#recBtn").onclick = async () => {
   if (rec) { rec.stop(); return; }
+  if (!micAllowed()) { updateMicGate(); return; }
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true }); const chunks = [];
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recStream = s;
+    const chunks = [];
     rec = new MediaRecorder(s);
     rec.ondataavailable = e => chunks.push(e.data);
     rec.onstop = () => {
-      recBlob = new Blob(chunks, { type: rec.mimeType });
-      s.getTracks().forEach(t => t.stop()); rec = null;
-      $("#recBtn").textContent = "Record";
-      $("#sttAudio").src = URL.createObjectURL(recBlob);
-      $("#sttAudio").classList.remove("hidden");
+      recBlob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+      try { s.getTracks().forEach(t => t.stop()); } catch {}
+      rec = null; recStream = null;
+      if (recTimer) { clearInterval(recTimer); recTimer = null; }
+      stopRecMeter();
+      if (recAnalyser) { try { recAnalyser.ac.close(); } catch {} recAnalyser = null; }
+      $("#recBtn").textContent = "Start recording";
+      if ($("#sttRecAfter")) $("#sttRecAfter").classList.remove("hidden");
+      if ($("#sttRecMeta")) $("#sttRecMeta").textContent = "Recording ready · " + human(recBlob.size);
+      // clear file input so currentSttAudio prefers recBlob
+      if ($("#sttFile")) try { $("#sttFile").value = ""; } catch {}
+      describeFile(null);
+      showPreview(recBlob);
+      updateSttRunAvail();
     };
-    rec.start(); $("#recBtn").textContent = "Stop";
-  } catch (e) { alert("microphone: " + e.message); }
+    rec.start();
+    $("#recBtn").textContent = "Stop recording";
+    if ($("#sttRecAfter")) $("#sttRecAfter").classList.add("hidden");
+    recStarted = Date.now(); tickRecTimer();
+    recTimer = setInterval(tickRecTimer, 250);
+    startRecMeter(s);
+  } catch (e) { alert("microphone: " + e.message); updateMicGate(); }
+};
+if ($("#sttRecAgain")) $("#sttRecAgain").onclick = () => {
+  recBlob = null;
+  if ($("#sttRecAfter")) $("#sttRecAfter").classList.add("hidden");
+  if ($("#sttPreview")) { $("#sttPreview").removeAttribute("src"); $("#sttPreview").classList.add("hidden"); }
+  if ($("#sttRecTimer")) $("#sttRecTimer").textContent = "0:00";
+  updateSttRunAvail();
+  if ($("#recBtn") && !$("#recBtn").disabled) $("#recBtn").click();
 };
 if ($("#sttFile")) $("#sttFile").onchange = () => {
-  recBlob = null; const f = $("#sttFile").files[0];
-  if (f) { $("#sttAudio").src = URL.createObjectURL(f); $("#sttAudio").classList.remove("hidden"); }
+  recBlob = null;
+  const f = $("#sttFile").files[0];
+  if (f) { describeFile(f); showPreview(f); }
+  else { describeFile(null); }
+  updateSttRunAvail();
 };
+if ($("#sttQualitySeg")) $("#sttQualitySeg").onclick = (e) => {
+  const b = e.target.closest("[data-q]"); if (!b) return;
+  $$("#sttQualitySeg .seg-btn").forEach(x => x.classList.toggle("active", x === b));
+  if ($("#sttQuality")) $("#sttQuality").value = b.dataset.q;
+  if ($("#sttQuality")) $("#sttQuality").dispatchEvent(new Event("change"));
+};
+if ($("#sttTaskSeg")) $("#sttTaskSeg").onclick = (e) => {
+  const b = e.target.closest("[data-task]"); if (!b) return;
+  $$("#sttTaskSeg .seg-btn").forEach(x => x.classList.toggle("active", x === b));
+  if ($("#sttTask")) $("#sttTask").value = b.dataset.task;
+  if ($("#sttTask")) $("#sttTask").dispatchEvent(new Event("change"));
+  updateSttRunAvail();
+};
+updateMicGate();
+setSttSourceMode("file");
+updateSttRunAvail();
+if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
 if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
 if ($("#sttQuality")) $("#sttQuality").onchange = () => {
   const p = sttPrefsFromUi();
@@ -864,7 +1047,7 @@ if ($("#sttCancel")) $("#sttCancel").onclick = () => {
   setSttProg(true, null, "cancelling...");
 };
 if ($("#sttGo")) $("#sttGo").onclick = async () => {
-  const f = recBlob || ($("#sttFile") && $("#sttFile").files[0]); if (!f) return alert("choose or record audio first");
+  const f = currentSttAudio(); if (!f) return alert("Choose or record audio first");
   const pref = sttPrefsFromUi(); saveSttPrefs(pref);
   const model = effectiveSttModel(pref);
   const fd = new FormData();
@@ -886,7 +1069,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   if ($("#sttSumBox")) $("#sttSumBox").classList.add("hidden");
   $("#sttOut").textContent = "";
   setSttProg(true, 2, "uploading… · model " + model);
-  $("#sttCancel").classList.remove("hidden");
+  setSttRunningUi(true);
   if ($("#sttGo")) { $("#sttGo").dataset.forceBusy = "1"; setAvail($("#sttGo"), availBusy((statusState && statusState.headline) || "Transcribing?")); }
   const ctrl = new AbortController();
   sttJob = { id: null, ctrl };
@@ -952,8 +1135,9 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
     $("#sttOut").textContent = "error: " + msg;
     setSttProg(true, 0, "error");
   } finally {
-    if ($("#sttGo")) { delete $("#sttGo").dataset.forceBusy; setAvail($("#sttGo"), availOk()); }
-    $("#sttCancel").classList.add("hidden");
+    if ($("#sttGo")) { delete $("#sttGo").dataset.forceBusy; }
+    setSttRunningUi(false);
+    updateSttRunAvail();
     sttJob = null;
   }
 };

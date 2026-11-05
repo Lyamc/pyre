@@ -123,37 +123,151 @@
 
 <!-- AUDIO -->
 <section id="tab-audio" class="tab">
-  <div class="cards">
-    <div class="card">
+  <div class="cards audio-flow">
+    <div class="card" id="sttCard">
       <h3>Speech to text</h3>
-      <div class="disabled-note" id="sttNote">No speech-to-text model is loaded yet — pick one below to download/load.</div>
+      <p class="muted small" id="sttNote">Speech models load on demand. Pick quality below, or a specific model under Advanced.</p>
       <fieldset id="sttForm">
-        <div class="row wrap">
-          <input type="file" id="sttFile" accept="audio/*">
-          <button id="recBtn" type="button">Record</button>
-          <select id="sttQuality" title="Quality / speed">
-            <option value="fast">Fast</option>
-            <option value="balanced" selected>Balanced</option>
-            <option value="best">Best</option>
-          </select>
-          <label id="sttDiarL" title="Needs a diarization model"><input type="checkbox" id="sttDiar" disabled> Separate speakers</label>
-          <button id="sttGo" class="primary" type="button">Run</button>
-          <button id="sttCancel" type="button" class="hidden">Cancel</button>
-        </div>
-        <details id="sttAdvanced" class="prefs">
-          <summary>Advanced</summary>
-          <div class="row wrap">
-            <select id="sttModel" title="Whisper / ASR model"></select>
-            <button id="sttModelDl" type="button" class="hidden">Download model</button>
-            <select id="sttTask"><option value="transcriptions">Transcribe</option><option value="translations">Translate to English</option></select>
-            <input id="sttLang" placeholder="language (auto)" size="8">
-            <label><input type="checkbox" id="sttTimestamps" checked> Timestamps</label>
-            <label><input type="checkbox" id="sttSentences"> Sentences</label>
-            <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em"></label>
-            <label>Max tokens <input id="sttMaxTok" type="number" min="1" max="448" value="448" style="width:4.5em"></label>
+
+        <div class="astep" id="sttStepSource">
+          <div class="astep-h"><span class="astep-n">1</span> Your audio</div>
+          <div class="seg" role="tablist" aria-label="Audio source" id="sttSourceMode">
+            <button type="button" class="seg-btn active" data-mode="file" id="sttModeFile" role="tab" aria-selected="true">Upload a file</button>
+            <button type="button" class="seg-btn" data-mode="record" id="sttModeRec" role="tab" aria-selected="false">Record audio</button>
           </div>
-          <p class="muted small">Model id, language, task, decoding knobs. Output format is chosen when you download. Settings are saved in this browser.</p>
-        </details>
+
+          <div id="sttFilePane">
+            <label class="dropzone" id="sttDrop" for="sttFile">
+              <input type="file" id="sttFile" accept="audio/*" class="sr-only">
+              <span class="drop-ico" aria-hidden="true">♪</span>
+              <span class="drop-title">Drop an audio file or click to choose</span>
+              <span class="drop-meta muted small" id="sttFileMeta">MP3, WAV, M4A, FLAC, WebM…</span>
+            </label>
+          </div>
+
+          <div id="sttRecPane" class="hidden">
+            <p id="sttMicHint" class="callout hidden">Recording needs a secure context (HTTPS or localhost). On this LAN URL, open <code id="sttLocalUrl">http://127.0.0.1:8099/</code> on the machine running pyre to use the microphone.</p>
+            <div class="row wrap rec-row" id="sttRecControls">
+              <button id="recBtn" type="button" class="primary">Start recording</button>
+              <span id="sttRecTimer" class="rec-timer muted">0:00</span>
+              <canvas id="sttRecMeter" width="140" height="18" class="rec-meter hidden" title="Input level"></canvas>
+            </div>
+            <div class="row wrap hidden" id="sttRecAfter">
+              <span class="muted small" id="sttRecMeta">Recording ready</span>
+              <button id="sttRecAgain" type="button">Re-record</button>
+            </div>
+          </div>
+
+          <audio id="sttPreview" controls class="stt-preview hidden"></audio>
+        </div>
+
+        <div class="astep" id="sttStepOpts">
+          <div class="astep-h"><span class="astep-n">2</span> Options</div>
+
+          <div class="opt-block">
+            <div class="opt-label">Quality</div>
+            <div class="seg" role="radiogroup" aria-label="Quality" id="sttQualitySeg">
+              <button type="button" class="seg-btn" data-q="fast" title="Fastest — tiny model, good for quick drafts">Fast</button>
+              <button type="button" class="seg-btn active" data-q="balanced" title="Balanced — base model, solid accuracy">Balanced</button>
+              <button type="button" class="seg-btn" data-q="best" title="Best — large-v3-turbo, slower, highest quality">Best</button>
+            </div>
+            <select id="sttQuality" class="hidden" aria-hidden="true">
+              <option value="fast">Fast</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="best">Best</option>
+            </select>
+          </div>
+
+          <div class="opt-block">
+            <label class="switch-row" id="sttDiarL" title="Needs a diarization model">
+              <input type="checkbox" id="sttDiar" disabled>
+              <span class="switch-text">
+                <span class="switch-title">Separate speakers</span>
+                <span class="muted small">Label who spoke when (requires diarization model)</span>
+              </span>
+            </label>
+          </div>
+
+          <div class="opt-block">
+            <div class="opt-label">Output</div>
+            <div class="seg" role="radiogroup" aria-label="Task" id="sttTaskSeg">
+              <button type="button" class="seg-btn active" data-task="transcriptions">Transcribe</button>
+              <button type="button" class="seg-btn" data-task="translations" title="Speech in any language → English text">Translate to English</button>
+            </div>
+            <select id="sttTask" class="hidden" aria-hidden="true">
+              <option value="transcriptions" selected>Transcribe</option>
+              <option value="translations">Translate to English</option>
+            </select>
+          </div>
+
+          <details id="sttAdvanced" class="prefs">
+            <summary>Advanced</summary>
+            <div class="row wrap">
+              <select id="sttModel" title="Whisper / ASR model"></select>
+              <button id="sttModelDl" type="button" class="hidden">Download model</button>
+              <input id="sttLang" placeholder="language (auto)" size="8" title="Force language code, e.g. en">
+              <label><input type="checkbox" id="sttTimestamps" checked> Timestamps</label>
+              <label><input type="checkbox" id="sttSentences"> Sentences</label>
+              <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em"></label>
+              <label>Max tokens <input id="sttMaxTok" type="number" min="1" max="448" value="448" style="width:4.5em"></label>
+            </div>
+            <p class="muted small">Exact model id and decoding knobs. Settings are saved in this browser. Download format is chosen under Results.</p>
+          </details>
+        </div>
+
+        <div class="astep" id="sttStepRun">
+          <div class="astep-h"><span class="astep-n">3</span> Run</div>
+          <button id="sttGo" class="primary stt-run" type="button">Transcribe</button>
+          <button id="sttCancel" type="button" class="primary stt-run hidden">Cancel</button>
+          <div id="sttProg" class="aprogress hidden">
+            <div class="abar"><div id="sttBar" class="abar-fill"></div></div>
+            <div id="sttProgLabel" class="muted small"></div>
+          </div>
+        </div>
+
+        <div class="astep" id="sttStepResults">
+          <div class="astep-h"><span class="astep-n">4</span> Results</div>
+          <audio id="sttAudio" controls class="hidden"></audio>
+          <div id="sttMeta" class="muted small hidden"></div>
+          <div id="sttLegend" class="spk-legend hidden"></div>
+          <div id="sttTimeline" class="spk-timeline hidden" title="Diarization timeline"></div>
+          <div id="sttSpk" class="spk hidden"></div>
+          <pre id="sttOut" class="out"></pre>
+          <div id="sttActions" class="hidden">
+            <div class="row wrap">
+              <button id="sttSummarize" type="button" class="primary">Summarize</button>
+              <button id="sttToChat" type="button">Send transcript to chat</button>
+            </div>
+            <div class="dl-group">
+              <div class="opt-label">Download transcript</div>
+              <div class="row wrap">
+                <button id="sttDlTxt" type="button">TXT</button>
+                <button id="sttDlSrt" type="button">SRT</button>
+                <button id="sttDlVtt" type="button">VTT</button>
+                <button id="sttDlJson" type="button">JSON</button>
+                <button id="sttDlMd" type="button">Markdown</button>
+              </div>
+            </div>
+          </div>
+          <div id="sttSumBox" class="sumbox hidden">
+            <h4>Summary</h4>
+            <div id="sttSumProg" class="aprogress hidden"><div class="abar"><div id="sttSumBar" class="abar-fill"></div></div><div id="sttSumProgLabel" class="muted small"></div></div>
+            <div id="sttSumOut" class="sumout"></div>
+            <div class="row wrap">
+              <button id="sttSumCopy" type="button">Copy summary</button>
+              <button id="sttSumRegen" type="button" class="hidden">Regenerate summary</button>
+              <button id="sttSumCancel" type="button" class="hidden">Cancel</button>
+            </div>
+            <div class="dl-group" id="sttSumDlGroup">
+              <div class="opt-label">Download summary</div>
+              <div class="row wrap">
+                <button id="sttSumDlMd" type="button">Markdown</button>
+                <button id="sttSumDlTxt" type="button">TXT</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <select id="sttFormat" class="hidden" aria-hidden="true">
           <option value="verbose_json" selected>JSON (verbose)</option>
           <option value="whisburn_json">JSON (whisburn)</option>
@@ -162,53 +276,28 @@
           <option value="vtt">VTT</option>
           <option value="json">JSON</option>
         </select>
-        <div id="sttProg" class="aprogress hidden">
-          <div class="abar"><div id="sttBar" class="abar-fill"></div></div>
-          <div id="sttProgLabel" class="muted small"></div>
-        </div>
-        <audio id="sttAudio" controls class="hidden"></audio>
-        <div id="sttMeta" class="muted small hidden"></div>
-        <div id="sttLegend" class="spk-legend hidden"></div>
-        <div id="sttTimeline" class="spk-timeline hidden" title="Diarization timeline"></div>
-        <div id="sttSpk" class="spk hidden"></div>
-        <pre id="sttOut" class="out"></pre>
-        <div id="sttActions" class="row wrap hidden">
-          <button id="sttSummarize" type="button" class="primary">Summarize</button>
-          <button id="sttToChat" type="button">Send transcript to chat</button>
-          <button id="sttDlTxt" type="button">Download TXT</button>
-          <button id="sttDlSrt" type="button">Download SRT</button>
-          <button id="sttDlVtt" type="button">Download VTT</button>
-          <button id="sttDlJson" type="button">Download JSON</button>
-          <button id="sttDlMd" type="button">Download Markdown</button>
-        </div>
-        <div id="sttSumBox" class="sumbox hidden">
-          <h4>Summary</h4>
-          <div id="sttSumProg" class="aprogress hidden"><div class="abar"><div id="sttSumBar" class="abar-fill"></div></div><div id="sttSumProgLabel" class="muted small"></div></div>
-          <div id="sttSumOut" class="sumout"></div>
-          <div class="row wrap">
-            <button id="sttSumCopy" type="button">Copy summary</button>
-            <button id="sttSumDlMd" type="button">Download summary MD</button>
-            <button id="sttSumDlTxt" type="button">Download summary TXT</button>
-            <button id="sttSumRegen" type="button" class="hidden">Regenerate summary</button>
-            <button id="sttSumCancel" type="button" class="hidden">Cancel</button>
-          </div>
-        </div>
       </fieldset>
     </div>
-    <div class="card">
+
+    <div class="card tts-card" id="ttsCard">
       <h3>Text to speech</h3>
+      <p class="muted small">Separate from transcription — turns text into spoken audio.</p>
       <div class="disabled-note" id="ttsNote">No text-to-speech model is loaded (start with <code>--tts-model facebook/mms-tts-eng</code>).</div>
       <fieldset id="ttsForm" disabled>
         <textarea id="ttsText" rows="3" placeholder="Text to speak"></textarea>
-        <div class="row"><select id="ttsVoice"><option>default</option></select><label>Speed<input id="ttsSpeed" type="number" step="0.1" value="1.0"></label>
+        <div class="row wrap">
+          <select id="ttsVoice"><option>default</option></select>
+          <label>Speed <input id="ttsSpeed" type="number" step="0.1" value="1.0" style="width:4em"></label>
           <button id="ttsGo" class="primary" type="button">Speak</button>
-          <button id="ttsCancel" type="button" class="hidden">Cancel</button></div>
+          <button id="ttsCancel" type="button" class="hidden">Cancel</button>
+        </div>
         <div id="ttsProg" class="aprogress hidden"><div class="abar"><div id="ttsBar" class="abar-fill"></div></div><div id="ttsProgLabel" class="muted small"></div></div>
         <audio id="ttsAudio" controls class="hidden"></audio>
       </fieldset>
     </div>
   </div>
 </section>
+
 
 <!-- APPS -->
 <section id="tab-cabin" class="tab">
