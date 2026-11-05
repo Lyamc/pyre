@@ -107,12 +107,14 @@ impl SttModel {
     pub fn queued(&self) -> u64 { self.queued.load(Ordering::SeqCst) }
 }
 
-struct Req {
-    file: Vec<u8>, filename: String, model: Option<String>, format: String, language: Option<String>,
+pub(crate) struct Req {
+    pub file: Vec<u8>, pub filename: String, pub model: Option<String>, pub format: String, pub language: Option<String>,
     // whisburn options (pyre extensions, used by peal): decoding + whisburn-identical rendering.
-    beam_size: Option<usize>, max_tokens: Option<usize>, timestamps: Option<bool>, sentences: bool, stream: bool,
+    pub beam_size: Option<usize>, pub max_tokens: Option<usize>, pub timestamps: Option<bool>, pub sentences: bool, pub stream: bool,
     /// pyre extension: split by speaker with the loaded diarizer; `attribution` = turns (default) | midpoint
-    diarize: bool, attribution: String,
+    pub diarize: bool, pub attribution: String,
+    /// When set via jobs API: true = translations endpoint behaviour.
+    pub translate_task: bool,
 }
 
 fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
@@ -121,8 +123,8 @@ fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str()
 /// `txt` (timestamped lines when timestamps are on) and `whisburn_json` (whisburn's result JSON).
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
-async fn parse(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into() };
+pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
@@ -136,12 +138,17 @@ async fn parse(mut mp: Multipart) -> Result<Req> {
             "stream" => q.stream = parse_bool(&f.text().await?),
             "diarize" => q.diarize = parse_bool(&f.text().await?),
             "attribution" => q.attribution = f.text().await?.trim().to_ascii_lowercase(),
+            "task" => {
+                let v = f.text().await?.trim().to_ascii_lowercase();
+                q.translate_task = matches!(v.as_str(), "translate" | "translations" | "translation");
+            }
             _ => { let _ = f.bytes().await; } // prompt, temperature, timestamp_granularities: accepted, ignored
         }
     }
     if q.file.is_empty() { bail!("missing 'file' field"); }
     Ok(q)
 }
+async fn parse(mp: Multipart) -> Result<Req> { parse_multipart(mp).await }
 
 pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bool) -> Response {
     use crate::server::err;
@@ -238,6 +245,119 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     Ok((r, dur, t.elapsed().as_secs_f64(), q.format.clone()))
 }
 
+
+/// Progress-aware STT used by /api/audio/jobs. Emits JSON stages on 	x.
+#[cfg(feature = "stt")]
+pub(crate) fn run_job(
+    app: Arc<crate::registry::App>,
+    mut q: Req,
+    translate: bool,
+    cancel: Arc<AtomicBool>,
+    tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    job: &str,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let t0 = std::time::Instant::now();
+    let emit = |stage: &str, extra: serde_json::Value| {
+        let mut v = json!({"stage": stage, "job": job, "elapsed_s": t0.elapsed().as_secs_f64()});
+        if let Some(o) = extra.as_object() { for (k, val) in o { v[k] = val.clone(); } }
+        let _ = tx.send(v);
+    };
+    if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
+    let translate = translate || q.translate_task;
+    emit("resolving_model", json!({"message": "resolving speech model", "model": q.model}));
+
+    if let Some(ref name) = q.model {
+        if app.find(crate::registry::Kind::Stt, Some(name.as_str())).is_err() {
+            emit("downloading", json!({"message": format!("loading model {name} (download/convert if needed)"), "model": name}));
+            let loaded = crate::registry::load(
+                &app.storage,
+                &app.defaults,
+                crate::registry::LoadReq {
+                    kind: crate::registry::Kind::Stt,
+                    r: name,
+                    alias: None,
+                    backend: Some("cpu".into()),
+                    dtype: None,
+                    ctx_size: None,
+                },
+            )?;
+            app.insert(loaded)?;
+            emit("loading_model", json!({"message": format!("model {name} ready"), "model": name}));
+        }
+    }
+    if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
+    let m = match app.find(crate::registry::Kind::Stt, q.model.as_deref()) {
+        Ok(m) => m,
+        Err(_) => bail!("no speech-to-text model loaded; pick a model in the Audio tab"),
+    };
+    let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => bail!("registry mismatch") };
+    if !FORMATS.contains(&q.format.as_str()) { bail!("unsupported response_format '{}'", q.format); }
+    if q.diarize {
+        if crate::diar::DIAR.get().is_none() { bail!("diarize=true but no diarization model is loaded"); }
+        if q.format == "json" { q.format = "verbose_json".into(); }
+    }
+
+    emit("decoding", json!({"message": format!("decoding {}", q.filename), "bytes": q.file.len()}));
+    let cancel_h = cancel.clone();
+    let tx_h = tx.clone();
+    let job_h = job.to_string();
+    let t_chunk = std::time::Instant::now();
+    pyre_whisper_engine::job_hooks::install(pyre_whisper_engine::job_hooks::JobHooks {
+        cancel: cancel_h,
+        on_chunk: Some(std::sync::Arc::new(move |i, n| {
+            let elapsed = t_chunk.elapsed().as_secs_f64();
+            let eta = if i > 0 { elapsed * (n.saturating_sub(i)) as f64 / i as f64 } else { 0.0 };
+            let _ = tx_h.send(json!({
+                "stage": "transcribing", "job": job_h, "current": i, "total": n,
+                "elapsed_s": elapsed, "eta_s": eta, "message": format!("chunk {i}/{n}")
+            }));
+        })),
+    });
+    JOB_TX.with(|c| *c.borrow_mut() = Some((tx.clone(), job.to_string(), cancel.clone(), t0)));
+    stt.queued.fetch_add(1, Ordering::SeqCst);
+    let res = run(&stt, &q, translate);
+    JOB_TX.with(|c| *c.borrow_mut() = None);
+    pyre_whisper_engine::job_hooks::clear();
+    let (r, dur, secs, fmt) = res?;
+    if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
+    tracing::info!("stt {}: {:.2}s audio in {:.2}s ({:.1}x realtime)", m.id, dur, secs, dur / secs.max(1e-6));
+    emit("rendering", json!({"message": format!("rendering {fmt}"), "duration_s": dur, "process_s": secs}));
+    let mut body = verbose(&r, dur, translate);
+    body["response_format"] = json!(fmt);
+    body["seconds"] = json!(secs);
+    Ok(body)
+}
+
+#[cfg(not(feature = "stt"))]
+pub(crate) fn run_job(
+    _: Arc<crate::registry::App>, _: Req, _: bool, _: Arc<AtomicBool>,
+    _: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>, _: &str,
+) -> Result<serde_json::Value> { bail!("built without stt") }
+
+thread_local! {
+    static JOB_TX: std::cell::RefCell<Option<(
+        tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        String,
+        Arc<AtomicBool>,
+        std::time::Instant,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
+fn job_emit(stage: &str, extra: serde_json::Value) {
+    JOB_TX.with(|c| {
+        if let Some((tx, job, _, t0)) = c.borrow().as_ref() {
+            let mut v = serde_json::json!({"stage": stage, "job": job, "elapsed_s": t0.elapsed().as_secs_f64()});
+            if let Some(o) = extra.as_object() { for (k, val) in o { v[k] = val.clone(); } }
+            let _ = tx.send(v);
+        }
+    });
+}
+
+fn job_cancelled() -> bool {
+    JOB_TX.with(|c| c.borrow().as_ref().map(|(_, _, cancel, _)| cancel.load(Ordering::Relaxed)).unwrap_or(false))
+}
+
 /// Speaker-attributed transcript. `turns`: diarize, then run Whisper on each speaker turn (same-speaker
 /// pauses < 1.0 s merged, 0.15 s padding), so every segment has exactly one speaker and overlapped
 /// speech is transcribed once per speaker. `midpoint`: one Whisper pass, each segment goes to the
@@ -247,11 +367,16 @@ fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode
     use pyre_whisper_core::TranscriptSegment as TS;
     let d = crate::diar::DIAR.get().ok_or_else(|| anyhow!("no diarization model loaded"))?;
     let t = std::time::Instant::now();
+    job_emit("diarizing", serde_json::json!({"message": "finding speakers"}));
+    if job_cancelled() { bail!("cancelled"); }
     let turns = d.turns(&samples, if mode == "midpoint" { 0.3 } else { 1.0 });
     tracing::info!("diarize: {} turns in {:.2}s", turns.len(), t.elapsed().as_secs_f64());
+    job_emit("diarizing", serde_json::json!({"message": format!("found {} speaker turns", turns.len()), "total": turns.len()}));
     let mut out: Option<Transcript> = None;
     let mut segs: Vec<TS> = vec![];
     if mode == "midpoint" {
+        if job_cancelled() { bail!("cancelled"); }
+        job_emit("transcribing", serde_json::json!({"message": "transcribing (speaker midpoint)", "current": 1, "total": 1}));
         let mut r = tx(samples)?;
         for s in &mut r.segments {
             let ov = |a: &crate::diar::Seg| (s.end.min(a.end) - s.start.max(a.start)).max(0.0);
@@ -264,16 +389,29 @@ fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode
         out = Some(r);
     } else {
         let n = samples.len();
-        for tu in &turns {
+        let total = turns.len().max(1);
+        for (i, tu) in turns.iter().enumerate() {
+            if job_cancelled() { bail!("cancelled"); }
+            let elapsed = t.elapsed().as_secs_f64();
+            let eta = if i > 0 { elapsed * (total - i) as f64 / i as f64 } else { 0.0 };
+            job_emit("transcribing", serde_json::json!({
+                "message": format!("speaker turn {}/{}", i + 1, total),
+                "current": i + 1, "total": total, "elapsed_s": elapsed, "eta_s": eta
+            }));
             let a = (((tu.start - 0.15) * 16_000.0).max(0.0) as usize).min(n);
             let b = (((tu.end + 0.15) * 16_000.0) as usize).min(n);
             if b <= a + 4_800 { continue; } // < 0.3 s: Whisper only hallucinates on these
             let r = tx(samples[a..b].to_vec())?;
             let text = r.text.trim().to_string();
             if !text.is_empty() {
-                let mut s = TS::new(tu.start, tu.end, text);
-                s.speaker = Some(crate::diar::label(tu.speaker));
+                let spk = crate::diar::label(tu.speaker);
+                let mut s = TS::new(tu.start, tu.end, text.clone());
+                s.speaker = Some(spk.clone());
                 segs.push(s);
+                job_emit("segment", serde_json::json!({
+                    "text": text, "start": tu.start, "end": tu.end, "speaker": spk,
+                    "partial": segs.iter().map(|x| x.text.trim()).collect::<Vec<_>>().join(" ")
+                }));
             }
             if out.is_none() { out = Some(r); }
         }

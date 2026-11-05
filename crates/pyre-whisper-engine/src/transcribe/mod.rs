@@ -207,6 +207,10 @@ pub fn waveform_to_text(
     let mut accumulated_text = String::new();
 
     for (i, mel) in mel_vec.into_iter().enumerate() {
+        if crate::job_hooks::cancelled() {
+            return Err("cancelled".into());
+        }
+        crate::job_hooks::chunk(i + 1, total_chunks);
         if verbose && !quiet {
             let msg = format!("Processing chunk {}/{}...", i + 1, total_chunks);
             if let Some(ref p) = pb { p.println(msg); } else { println!("{}", msg); }

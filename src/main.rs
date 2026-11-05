@@ -7,6 +7,7 @@ mod api;
 mod logbuf;
 mod registry;
 mod stt;
+mod audio_jobs;
 mod diar;
 mod cabin;
 mod cabin_catalog;

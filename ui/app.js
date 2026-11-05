@@ -185,7 +185,8 @@ async function loadKinds() {
     sel.innerHTML = (kinds.llm || []).map(m => `<option>${esc(m.id)}</option>`).join("") || `<option value="">(no text model loaded)</option>`;
     if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
     const en = (k, form, note) => { const on = !!(kinds[k]?.length) && kinds[k].some(m => m.meta?.status !== "not-runnable"); $(form).disabled = !on; $(note).classList.toggle("hidden", on); };
-    en("image", "#imgForm", "#imgNote"); en("stt", "#sttForm", "#sttNote"); en("tts", "#ttsForm", "#ttsNote");
+    en("image", "#imgForm", "#imgNote"); /* stt form stays enabled for model download */ en("tts", "#ttsForm", "#ttsNote");
+    if (typeof refreshSttModels === "function") refreshSttModels();
   } catch (e) { console.warn(e); }
 }
 $("#modelPick").onchange = () => LS.set("model", $("#modelPick").value);
@@ -249,68 +250,253 @@ $("#imgGo").onclick = async e => {
   $("#imgGo").disabled = false; $("#imgGo").textContent = "Generate";
 };
 
-// ---------- audio ----------
+﻿// ---------- audio ----------
+const STT_PREF_KEY = "sttPrefs";
+function loadSttPrefs() {
+  const d = { model: "", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, beam: 5, maxTok: 448, task: "transcriptions" };
+  return Object.assign(d, LS.get(STT_PREF_KEY, {}));
+}
+function saveSttPrefs(p) { LS.set(STT_PREF_KEY, p); }
+function sttPrefsFromUi() {
+  return {
+    model: ($("#sttModel") && $("#sttModel").value) || "",
+    format: ($("#sttFormat") && $("#sttFormat").value) || "verbose_json",
+    language: ($("#sttLang") && $("#sttLang").value) || "",
+    timestamps: !!( $("#sttTimestamps") && $("#sttTimestamps").checked ),
+    sentences: !!( $("#sttSentences") && $("#sttSentences").checked ),
+    diarize: !!( $("#sttDiar") && $("#sttDiar").checked ),
+    beam: +(( $("#sttBeam") && $("#sttBeam").value ) || 5),
+    maxTok: +(( $("#sttMaxTok") && $("#sttMaxTok").value ) || 448),
+    task: ($("#sttTask") && $("#sttTask").value) || "transcriptions",
+  };
+}
+function applySttPrefs(p) {
+  if ($("#sttFormat")) $("#sttFormat").value = p.format || "verbose_json";
+  if ($("#sttLang")) $("#sttLang").value = p.language || "";
+  if ($("#sttTimestamps")) $("#sttTimestamps").checked = !!p.timestamps;
+  if ($("#sttSentences")) $("#sttSentences").checked = !!p.sentences;
+  if ($("#sttDiar") && !$("#sttDiar").disabled) $("#sttDiar").checked = !!p.diarize;
+  if ($("#sttBeam")) $("#sttBeam").value = p.beam || 5;
+  if ($("#sttMaxTok")) $("#sttMaxTok").value = p.maxTok || 448;
+  if ($("#sttTask")) $("#sttTask").value = p.task || "transcriptions";
+}
+let sttCatalog = { models: [], loaded: [] };
+let sttJob = null;
+async function refreshSttModels() {
+  try {
+    sttCatalog = await api("/api/audio/models");
+    const sel = $("#sttModel"); if (!sel) return;
+    const pref = loadSttPrefs();
+    const cur = pref.model || (kinds.stt && kinds.stt[0] && kinds.stt[0].id) || (sttCatalog.defaults && sttCatalog.defaults.model) || "base";
+    sel.innerHTML = "";
+    for (const m of (sttCatalog.models || [])) {
+      const o = document.createElement("option");
+      o.value = m.id;
+      o.textContent = m.id + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
+      o.dataset.present = m.present ? "1" : "0";
+      sel.append(o);
+    }
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+    updateSttDlBtn();
+    if ($("#sttForm")) $("#sttForm").removeAttribute("disabled");
+    if ((sttCatalog.loaded || []).length) $("#sttNote").classList.add("hidden");
+    else $("#sttNote").classList.remove("hidden");
+  } catch (e) { console.warn("stt models", e); }
+}
+function updateSttDlBtn() {
+  const sel = $("#sttModel"); const btn = $("#sttModelDl"); if (!sel || !btn) return;
+  const opt = sel.selectedOptions[0];
+  const need = opt && opt.dataset.present === "0";
+  btn.classList.toggle("hidden", !need);
+  btn.textContent = need ? ("Download " + sel.value) : "Download model";
+}
+function setSttProg(show, pct, label) {
+  const box = $("#sttProg"); if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (pct != null && $("#sttBar")) $("#sttBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (label != null && $("#sttProgLabel")) $("#sttProgLabel").textContent = label;
+}
+async function* audioJobSse(fd, signal) {
+  const r = await fetch("/api/audio/jobs", { method: "POST", headers: headers(), body: fd, signal });
+  if (!r.ok) { const t = await r.text(); let m = t; try { m = JSON.parse(t).error.message || t; } catch {} throw new Error(m || r.statusText); }
+  const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n"); buf = parts.pop();
+    for (const block of parts) {
+      const data = block.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
+      if (!data) continue;
+      try { yield JSON.parse(data); } catch {}
+    }
+  }
+}
+function sttStagePct(ev) {
+  const order = ["queued", "resolving_model", "downloading", "loading_model", "decoding", "diarizing", "transcribing", "rendering", "done"];
+  const i = order.indexOf(ev.stage);
+  if (ev.stage === "transcribing" && ev.total) return 15 + 75 * ((ev.current || 0) / ev.total);
+  if (i < 0) return null;
+  return (i / (order.length - 1)) * 100;
+}
 let recBlob = null, rec = null;
-$("#recBtn").onclick = async () => {
+if ($("#recBtn")) $("#recBtn").onclick = async () => {
   if (rec) { rec.stop(); return; }
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true }); const chunks = []; rec = new MediaRecorder(s);
-    rec.ondataavailable = e => chunks.push(e.data); rec.onstop = () => { recBlob = new Blob(chunks, { type: rec.mimeType }); s.getTracks().forEach(t => t.stop()); rec = null; $("#recBtn").textContent = "● Record"; $("#sttAudio").src = URL.createObjectURL(recBlob); $("#sttAudio").classList.remove("hidden"); };
-    rec.start(); $("#recBtn").textContent = "■ Stop";
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true }); const chunks = [];
+    rec = new MediaRecorder(s);
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = () => {
+      recBlob = new Blob(chunks, { type: rec.mimeType });
+      s.getTracks().forEach(t => t.stop()); rec = null;
+      $("#recBtn").textContent = "Record";
+      $("#sttAudio").src = URL.createObjectURL(recBlob);
+      $("#sttAudio").classList.remove("hidden");
+    };
+    rec.start(); $("#recBtn").textContent = "Stop";
   } catch (e) { alert("microphone: " + e.message); }
 };
-$("#sttFile").onchange = () => { recBlob = null; const f = $("#sttFile").files[0]; if (f) { $("#sttAudio").src = URL.createObjectURL(f); $("#sttAudio").classList.remove("hidden"); } };
-$("#sttGo").onclick = async () => {
-  const f = recBlob || $("#sttFile").files[0]; if (!f) return alert("choose or record audio first");
-  const fd = new FormData(); fd.append("file", f, f.name || "recording.webm"); fd.append("model", (kinds.stt?.[0]?.id) || "whisper"); fd.append("response_format", "verbose_json");
-  if ($("#sttLang").value) fd.append("language", $("#sttLang").value);
-  const diar = $("#sttDiar").checked && !$("#sttDiar").disabled && $("#sttTask").value === "transcriptions";
+if ($("#sttFile")) $("#sttFile").onchange = () => {
+  recBlob = null; const f = $("#sttFile").files[0];
+  if (f) { $("#sttAudio").src = URL.createObjectURL(f); $("#sttAudio").classList.remove("hidden"); }
+};
+if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
+["sttFormat","sttLang","sttTimestamps","sttSentences","sttDiar","sttBeam","sttMaxTok","sttTask"].forEach(id => {
+  const el = document.getElementById(id); if (el) el.addEventListener("change", () => saveSttPrefs(sttPrefsFromUi()));
+});
+if ($("#sttModelDl")) $("#sttModelDl").onclick = async () => {
+  const id = $("#sttModel").value; if (!id) return;
+  $("#sttModelDl").disabled = true; setSttProg(true, 5, "Downloading/loading " + id + "...");
+  try {
+    await api("/api/models/load", { model: id, kind: "stt", backend: "cpu" });
+    await refreshSttModels();
+    if (typeof refreshAll === "function") await refreshAll();
+    setSttProg(true, 100, id + " ready");
+  } catch (e) { setSttProg(true, 0, "error: " + e.message); }
+  finally { $("#sttModelDl").disabled = false; }
+};
+if ($("#sttCancel")) $("#sttCancel").onclick = () => {
+  if (!sttJob) return;
+  sttJob.ctrl.abort();
+  fetch("/api/audio/jobs/cancel", { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ id: sttJob.id }) }).catch(() => {});
+  $("#sttCancel").classList.add("hidden");
+  setSttProg(true, null, "cancelling...");
+};
+if ($("#sttGo")) $("#sttGo").onclick = async () => {
+  const f = recBlob || ($("#sttFile") && $("#sttFile").files[0]); if (!f) return alert("choose or record audio first");
+  const pref = sttPrefsFromUi(); saveSttPrefs(pref);
+  const fd = new FormData();
+  fd.append("file", f, f.name || "recording.webm");
+  fd.append("model", pref.model || (kinds.stt && kinds.stt[0] && kinds.stt[0].id) || "base");
+  fd.append("response_format", pref.format || "verbose_json");
+  fd.append("task", pref.task === "translations" ? "translations" : "transcriptions");
+  if (pref.language) fd.append("language", pref.language);
+  fd.append("timestamps", pref.timestamps ? "true" : "false");
+  fd.append("sentences", pref.sentences ? "true" : "false");
+  fd.append("beam_size", String(pref.beam || 5));
+  fd.append("max_tokens", String(pref.maxTok || 448));
+  const diar = pref.diarize && $("#sttDiar") && !$("#sttDiar").disabled && pref.task === "transcriptions";
   if (diar) fd.append("diarize", "true");
   $("#sttSpk").classList.add("hidden"); $("#sttSpk").innerHTML = "";
-  $("#sttOut").textContent = "…"; const t0 = performance.now();
+  if ($("#sttDownload")) $("#sttDownload").classList.add("hidden");
+  $("#sttOut").textContent = "";
+  setSttProg(true, 2, "uploading...");
+  $("#sttCancel").classList.remove("hidden");
+  $("#sttGo").disabled = true;
+  const ctrl = new AbortController();
+  sttJob = { id: null, ctrl };
+  const t0 = performance.now();
+  let partial = "";
   try {
-    const r = await fetch("/v1/audio/" + $("#sttTask").value, { method: "POST", headers: headers(), body: fd });
-    const raw = await r.text();
-    let j; try { j = JSON.parse(raw); } catch { j = null; }
-    if (!r.ok) {
-      const msg = (j && j.error && j.error.message) || raw || r.statusText || ("HTTP " + r.status);
-      throw new Error(msg);
+    for await (const ev of audioJobSse(fd, ctrl.signal)) {
+      if (ev.job) sttJob.id = ev.job;
+      if (ev.stage === "error" || ev.stage === "cancelled") throw new Error(ev.message || ev.stage);
+      const pct = sttStagePct(ev);
+      let label = ev.message || ev.stage;
+      if (ev.stage === "transcribing" && ev.total) {
+        label = (ev.message || "transcribing") + " · " + ev.current + "/" + ev.total +
+          (ev.eta_s != null ? (" · ETA " + Math.max(0, ev.eta_s).toFixed(0) + "s") : "") +
+          (ev.elapsed_s != null ? (" · " + ev.elapsed_s.toFixed(1) + "s") : "");
+      }
+      setSttProg(true, pct, label);
+      if (ev.stage === "segment") {
+        if (ev.partial) partial = ev.partial;
+        else if (ev.text) partial = (partial ? partial + " " : "") + ev.text;
+        $("#sttOut").textContent = partial + "\n\n(...still working)";
+      }
+      if (ev.stage === "done") {
+        const j = ev.result || {};
+        sttText = j.text || j.rendered || "";
+        $("#sttToChat").classList.toggle("hidden", !sttText.trim());
+        if (diar && Array.isArray(j.segments)) {
+          renderSpeakers(j.segments);
+          $("#sttOut").textContent = sttText + "\n\n(" + ((performance.now() - t0) / 1000).toFixed(2) + " s, " +
+            (new Set(j.segments.map(s => s.speaker)).size) + " speakers" + (j.language ? ", language " + j.language : "") + ")";
+        } else {
+          $("#sttOut").textContent = sttText + "\n\n(" + ((performance.now() - t0) / 1000).toFixed(2) + " s" +
+            (j.language ? ", language " + j.language : "") + ")";
+        }
+        const body = j.rendered || sttText;
+        if (body && $("#sttDownload")) {
+          const ext = ({ srt: "srt", vtt: "vtt", txt: "txt", text: "txt" })[pref.format] || "json";
+          const blob = new Blob([pref.format.indexOf("json") >= 0 ? JSON.stringify(j, null, 2) : body], { type: "text/plain" });
+          const a = $("#sttDownload"); a.href = URL.createObjectURL(blob); a.download = "transcript." + ext; a.classList.remove("hidden");
+        }
+        setSttProg(true, 100, "done in " + ((performance.now() - t0) / 1000).toFixed(2) + "s");
+      }
     }
-    if (!j) throw new Error(raw || "empty response");
-    sttText = j.text || ""; $("#sttToChat").classList.toggle("hidden", !sttText.trim());
-    if (diar && Array.isArray(j.segments)) { renderSpeakers(j.segments); $("#sttOut").textContent = `(${((performance.now() - t0) / 1000).toFixed(2)} s, ${new Set(j.segments.map(s => s.speaker)).size} speakers${j.language ? ", language " + j.language : ""})`; return; }
-    $("#sttOut").textContent = `${j.text}\n\n(${((performance.now() - t0) / 1000).toFixed(2)} s${j.language ? ", language " + j.language : ""})`;
   } catch (e) {
     let msg = e && e.message ? e.message : String(e);
+    if (e.name === "AbortError") msg = "cancelled";
     if (/NetworkError|Failed to fetch|network error|Load failed/i.test(msg)) {
       msg += " (no usable response — server may have closed the connection, rejected a too-large upload, or crashed; check pyre logs)";
     }
     $("#sttOut").textContent = "error: " + msg;
+    setSttProg(true, 0, "error");
+  } finally {
+    $("#sttGo").disabled = false;
+    $("#sttCancel").classList.add("hidden");
+    sttJob = null;
   }
 };
 let sttText = "";
 const SPK_COLORS = ["#2f7ed8", "#d8572f", "#2fa36b", "#9b4fd8", "#c9a227", "#d82f8a", "#2fb5c9", "#7a7a7a"];
-const fmtT = s => { const m = Math.floor(s / 60); return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`; };
+const fmtT = s => { const m = Math.floor(s / 60); return m + ":" + (s - m * 60).toFixed(1).padStart(4, "0"); };
 function renderSpeakers(segs) {
   const box = $("#sttSpk"); box.innerHTML = ""; const ids = [];
   for (const s of segs) {
     const sp = s.speaker || "?"; if (!ids.includes(sp)) ids.push(sp);
     const c = SPK_COLORS[ids.indexOf(sp) % SPK_COLORS.length];
     const row = document.createElement("div"); row.className = "spk-row"; row.style.borderLeftColor = c;
-    const h = document.createElement("span"); h.className = "spk-who"; h.style.color = c; h.textContent = `${sp.replace("SPEAKER_", "Speaker ")} · ${fmtT(s.start)}–${fmtT(s.end)}`;
-    const t = document.createElement("span"); t.className = "spk-text"; t.textContent = (s.text || "").trim();
-    row.append(h, t); box.append(row);
+    const h = document.createElement("span"); h.className = "spk-who"; h.style.color = c;
+    h.textContent = sp.replace("SPEAKER_", "Speaker ") + " · " + fmtT(s.start) + "–" + fmtT(s.end);
+    const tt = document.createElement("span"); tt.className = "spk-text"; tt.textContent = (s.text || "").trim();
+    row.append(h, tt); box.append(row);
   }
   box.classList.remove("hidden");
 }
-fetch("/api/diarizer", { headers: headers() }).then(r => r.json()).then(j => { const ok = !!j.loaded; $("#sttDiar").disabled = !ok; $("#sttDiarL").title = ok ? `Who spoke when: ${j.info.model} on ${j.info.backend}` : "No diarization model loaded (start with --load diar=nvidia/Nemotron-3-Diarization)"; }).catch(() => {});
-$("#sttToChat").onclick = () => { const i = $("#input"); i.value = (i.value ? i.value + " " : "") + sttText.trim(); document.querySelector('#tabs [data-tab="chat"]')?.click(); i.focus(); };
-$("#ttsGo").onclick = async () => {
+fetch("/api/diarizer", { headers: headers() }).then(r => r.json()).then(j => {
+  const ok = !!j.loaded; if ($("#sttDiar")) $("#sttDiar").disabled = !ok;
+  if ($("#sttDiarL")) $("#sttDiarL").title = ok ? ("Who spoke when: " + j.info.model + " on " + j.info.backend) : "No diarization model loaded (start with --load diar=nvidia/Nemotron-3-Diarization)";
+  applySttPrefs(loadSttPrefs());
+}).catch(() => {});
+refreshSttModels();
+applySttPrefs(loadSttPrefs());
+if ($("#sttToChat")) $("#sttToChat").onclick = () => {
+  const i = $("#input"); i.value = (i.value ? i.value + " " : "") + sttText.trim();
+  const tab = document.querySelector('#tabs [data-tab="chat"]'); if (tab) tab.click(); i.focus();
+};
+if ($("#ttsGo")) $("#ttsGo").onclick = async () => {
+  if ($("#ttsProg")) $("#ttsProg").classList.remove("hidden");
+  if ($("#ttsBar")) $("#ttsBar").style.width = "30%";
+  if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "synthesizing...";
   try {
-    const r = await fetch("/v1/audio/speech", { method: "POST", headers: headers({ "Content-Type": "application/json" }), body: JSON.stringify({ model: kinds.tts?.[0]?.id, input: $("#ttsText").value, voice: $("#ttsVoice").value, speed: +$("#ttsSpeed").value, response_format: "wav" }) });
-    if (!r.ok) throw new Error((await r.json()).error?.message);
+    const r = await fetch("/v1/audio/speech", { method: "POST", headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ model: kinds.tts && kinds.tts[0] && kinds.tts[0].id, input: $("#ttsText").value, voice: $("#ttsVoice").value, speed: +$("#ttsSpeed").value, response_format: "wav" }) });
+    if (!r.ok) throw new Error((await r.json()).error.message);
+    if ($("#ttsBar")) $("#ttsBar").style.width = "100%";
+    if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "done";
     $("#ttsAudio").src = URL.createObjectURL(await r.blob()); $("#ttsAudio").classList.remove("hidden"); $("#ttsAudio").play();
-  } catch (e) { alert(e.message); }
+  } catch (e) { alert(e.message); if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "error: " + e.message; }
 };
 
 // ---------- apps ----------

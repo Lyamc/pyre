@@ -39,6 +39,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/diarizer", get(crate::diar::status))
         .route("/v1/images/tags", post(tags).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .merge(crate::cabin::routes(Router::new()))
+        .merge(crate::audio_jobs::routes(Router::new()))
         .merge(crate::ui::routes())
 }
 

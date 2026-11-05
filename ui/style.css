@@ -82,3 +82,11 @@ table.mdt{border-collapse:collapse;margin:6px 0;font-size:13px}table.mdt td,tabl
 .spk-text { white-space: pre-wrap; }
 #sttDiarL { display: inline-flex; align-items: center; gap: 4px; }
 
+
+/* Audio progress + prefs */
+.aprogress { margin: 0.6rem 0; }
+.abar { height: 8px; background: #2a2a2a; border-radius: 4px; overflow: hidden; }
+.abar-fill { height: 100%; width: 0%; background: #2f7ed8; transition: width 0.2s ease; }
+.prefs { margin: 0.5rem 0; }
+.prefs summary { cursor: pointer; color: #9aa; }
+.row.wrap { flex-wrap: wrap; gap: 0.4rem 0.6rem; }
