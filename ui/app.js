@@ -31,6 +31,27 @@ async function* sse(path, body, signal) {
 }
 function askKey() { const k = prompt("API key for this pyre server (stored in this browser):", LS.get("apikey", "")); if (k !== null) { LS.set("apikey", k.trim()); refreshAll(); } }
 
+function showToast(msg, ms = 8000) {
+  let box = $("#pyreToasts");
+  if (!box) {
+    box = document.createElement("div"); box.id = "pyreToasts"; box.className = "pyre-toasts";
+    document.body.appendChild(box);
+  }
+  const el = document.createElement("div"); el.className = "pyre-toast"; el.textContent = String(msg);
+  box.appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+window.addEventListener("error", (e) => {
+  const m = (e && e.message) || "script error";
+  console.error(e);
+  try { showToast("UI error: " + m); } catch {}
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const r = e && e.reason; const m = (r && r.message) || String(r || "unhandled rejection");
+  console.error(e);
+  try { showToast("UI error: " + m); } catch {}
+});
+
 // ---------- availability (generic disabled-reason) ----------
 // reason_kind: busy | loading | missing_model | no_permission | offline | ""
 function setAvail(el, { enabled, reason_kind = "", message = "" } = {}) {
@@ -50,8 +71,8 @@ function setAvail(el, { enabled, reason_kind = "", message = "" } = {}) {
 }
 function reasonMessage(kind) {
   return ({
-    busy: "Busy — wait for the current job to finish",
-    loading: "Loading…",
+    busy: "Busy - wait for the current job to finish",
+    loading: "Loading...",
     missing_model: "Required model is not loaded or not downloaded",
     no_permission: "You do not have permission for this action",
     offline: "Server unreachable",
@@ -62,7 +83,7 @@ function availMissing(message) { return { enabled: false, reason_kind: "missing_
 function availOk() { return { enabled: true, reason_kind: "", message: "" }; }
 
 // ---------- global status pill (one shared SSE; avoids HTTP/1.1 6-conn starvation) ----------
-let statusState = { state: "down", headline: "Connecting…", jobs: [], vram: {}, chat_active: [] };
+let statusState = { state: "down", headline: "Connecting...", jobs: [], vram: {}, chat_active: [] };
 let statusCtrl = null;
 function renderStatusPill() {
   const pill = $("#statusPill"); const text = $("#statusPillText"); const pop = $("#statusPopJobs"); const vram = $("#statusPopVram");
@@ -94,21 +115,24 @@ function renderStatusPill() {
   refreshAvailFromStatus();
 }
 function refreshAvailFromStatus() {
+  // NEVER disable tab navigation — tabs must work offline / while Connecting.
   const down = statusState.state === "down";
-  $$("#tabs button").forEach(b => setAvail(b, availOk()));
-  if ($("#sttGo") && !sttJob) {
-    if (down) setAvail($("#sttGo"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
+  const sttBusy = (typeof sttJob !== "undefined") && !!sttJob;
+  const kindsObj = (typeof kinds !== "undefined") ? kinds : {};
+  if ($("#sttGo") && !sttBusy) {
+    if (down) setAvail($("#sttGo"), { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected — reconnecting..." });
     else if ($("#sttGo").dataset.forceBusy !== "1") setAvail($("#sttGo"), availOk());
   }
   if ($("#imgGo")) {
-    const hasImg = !!(kinds.image && kinds.image.length);
-    if (down) setAvail($("#imgGo"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
+    const hasImg = !!(kindsObj.image && kindsObj.image.length);
+    if (down) setAvail($("#imgGo"), { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected — reconnecting..." });
     else if (!hasImg) setAvail($("#imgGo"), availMissing("No image model loaded — open Models or run a Cabin card (loads on demand)"));
     else setAvail($("#imgGo"), availOk());
   }
   if ($("#sendBtn")) {
-    if (down) setAvail($("#sendBtn"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
-    else if (typeof ctrl !== "undefined" && ctrl) setAvail($("#sendBtn"), availBusy("Chat is generating — stop it first or wait"));
+    const chatBusy = (typeof ctrl !== "undefined") && !!ctrl;
+    if (down) setAvail($("#sendBtn"), { enabled: false, reason_kind: "offline", message: statusState.headline || "Server disconnected — reconnecting..." });
+    else if (chatBusy) setAvail($("#sendBtn"), availBusy("Chat is generating — stop it first or wait"));
     else setAvail($("#sendBtn"), availOk());
   }
 }
@@ -116,12 +140,25 @@ async function connectStatusStream() {
   if (statusCtrl) statusCtrl.abort();
   statusCtrl = new AbortController();
   const signal = statusCtrl.signal;
-  const backoff = () => new Promise(r => setTimeout(r, 1500));
+  let gotEvent = false;
+  const CONNECT_MS = 5000;
+  const timer = setTimeout(() => {
+    if (gotEvent || signal.aborted) return;
+    statusState.state = "down";
+    statusState.headline = "Can't reach pyre - retrying (no status yet)";
+    renderStatusPill();
+  }, CONNECT_MS);
+  const backoff = (ms) => new Promise(r => setTimeout(r, ms));
+  let delay = 1000;
   while (!signal.aborted) {
     try {
+      statusState.headline = statusState.headline || "Connecting...";
+      renderStatusPill();
       const r = await fetch("/api/status/stream", { headers: headers(), signal });
-      if (!r.ok) throw new Error("status " + r.status);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      if (!r.body) throw new Error("empty body");
       const rd = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+      delay = 1000;
       for (;;) {
         const { value, done } = await rd.read(); if (done) break;
         buf += dec.decode(value, { stream: true });
@@ -130,20 +167,28 @@ async function connectStatusStream() {
           for (const line of block.split("\n")) if (line.startsWith("data:")) {
             try {
               const j = JSON.parse(line.slice(5).trim());
+              gotEvent = true; clearTimeout(timer);
               statusState = Object.assign({}, statusState, j);
               if (!j.state) statusState.state = ((statusState.jobs || []).length || (statusState.chat_active || []).length) ? "busy" : "idle";
               renderStatusPill();
-            } catch {}
+            } catch (parseErr) { console.warn("status parse", parseErr); }
           }
         }
       }
-      statusState.state = "down"; statusState.headline = "Disconnected — reconnecting…"; renderStatusPill();
+      throw new Error("stream closed");
     } catch (e) {
       if (signal.aborted) break;
-      statusState.state = "down"; statusState.headline = "Disconnected — reconnecting…"; renderStatusPill();
-      await backoff();
+      clearTimeout(timer);
+      const reason = (e && e.name === "AbortError") ? "aborted" : ((e && e.message) || String(e));
+      statusState.state = "down";
+      statusState.headline = "Can't reach pyre - retrying (" + reason + ")";
+      statusState.jobs = []; statusState.chat_active = [];
+      renderStatusPill();
+      await backoff(delay);
+      delay = Math.min(delay * 1.5, 8000);
     }
   }
+  clearTimeout(timer);
 }
 if (typeof document !== "undefined") {
   document.addEventListener("DOMContentLoaded", () => {});
@@ -1134,5 +1179,7 @@ $("#logRefresh").onclick = loadStatus;
 
 function refreshAll() { loadKinds(); const t = location.hash.slice(1); if (t) onTab(t); }
 renderConvs(); renderMsgs(); loadKinds();
+// Status pill: paint immediately, then connect (tabs already bound above — never wait on this).
+try { renderStatusPill(); connectStatusStream(); } catch (e) { console.error(e); showToast("Status pill failed: " + (e.message || e)); }
 const h = location.hash.slice(1); if (h) $(`#tabs button[data-tab="${h}"]`)?.click();
 setInterval(() => { if ($("#tab-status").classList.contains("active")) loadStatus(); }, 5000);
