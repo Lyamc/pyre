@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Result};
 use axum::{extract::Multipart, http::StatusCode, response::{IntoResponse, Response}, Json};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -92,7 +93,7 @@ impl SttModel {
         {
             let me = self.clone();
             let _ = std::thread::Builder::new().name("stt-warmup".into()).spawn(move || {
-                let rt = me.rt.lock().unwrap();
+                let rt = me.rt.lock().unwrap_or_else(|p| p.into_inner());
                 let t = std::time::Instant::now();
                 let o = pyre_whisper_core::TaskOptions::default();
                 match rt.transcribe_waveform(&me.name, vec![0.0f32; 16_000], 16_000, &o) {
@@ -184,7 +185,7 @@ type Transcript = pyre_whisper_core::TranscriptResult;
 
 #[cfg(feature = "stt")]
 fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64, String)> {
-    let rt = stt.rt.lock().unwrap();
+    let rt = stt.rt.lock().unwrap_or_else(|p| p.into_inner());
     stt.queued.fetch_sub(1, Ordering::SeqCst);
     stt.busy.store(true, Ordering::SeqCst);
     struct Clear<'a>(&'a AtomicBool);
@@ -193,6 +194,13 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     let ext = Path::new(&q.filename).extension().and_then(|e| e.to_str()).unwrap_or("wav").to_ascii_lowercase();
     let wav = pyre_whisper_audio::decode_bytes_to_mono_pcm(&q.file, &ext).map_err(|e| anyhow!("could not decode audio ({ext}): {e}"))?;
     let wav = wav.ensure_sample_rate(16_000).map_err(|e| anyhow!("resample: {e}"))?;
+    // Whisper STFT needs >= n_fft (400) samples; pad tiny clips instead of asserting in the engine.
+    let mut wav = wav;
+    const MIN_SAMPLES: usize = 400;
+    if wav.samples.len() < MIN_SAMPLES {
+        if wav.samples.is_empty() { bail!("decoded audio is empty ({ext})"); }
+        wav.samples.resize(MIN_SAMPLES, 0.0);
+    }
     let dur = wav.duration_secs();
     let mut o = pyre_whisper_core::TaskOptions::default();
     o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
@@ -204,10 +212,29 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
     o.group_into_sentences = q.sentences;
     let t = std::time::Instant::now();
-    let r = if q.diarize {
-        let tx = |s: Vec<f32>| rt.transcribe_waveform(&stt.name, s, 16_000, &o).map_err(|e| anyhow!("whisburn: {e}"));
-        diarized(&tx, wav.samples, &q.attribution)?
-    } else { rt.transcribe_waveform(&stt.name, wav.samples, wav.sample_rate, &o).map_err(|e| anyhow!("whisburn: {e}"))? };
+    let name = stt.name.clone();
+    let samples = wav.samples.clone();
+    let sr = wav.sample_rate;
+    let diarize = q.diarize;
+    let attribution = q.attribution.clone();
+    let r = catch_unwind(AssertUnwindSafe(|| -> Result<Transcript> {
+        if diarize {
+            let tx = |s: Vec<f32>| rt.transcribe_waveform(&name, s, 16_000, &o).map_err(|e| anyhow!("whisburn: {e}"));
+            diarized(&tx, samples, &attribution)
+        } else {
+            rt.transcribe_waveform(&name, samples, sr, &o).map_err(|e| anyhow!("whisburn: {e}"))
+        }
+    }));
+    let r = match r {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() { (*s).to_string() }
+                else if let Some(s) = panic.downcast_ref::<String>() { s.clone() }
+                else { "whisburn panicked".into() };
+            bail!("stt engine panic: {msg}");
+        }
+    };
     Ok((r, dur, t.elapsed().as_secs_f64(), q.format.clone()))
 }
 

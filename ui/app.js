@@ -269,12 +269,24 @@ $("#sttGo").onclick = async () => {
   $("#sttSpk").classList.add("hidden"); $("#sttSpk").innerHTML = "";
   $("#sttOut").textContent = "…"; const t0 = performance.now();
   try {
-    const r = await fetch("/v1/audio/" + $("#sttTask").value, { method: "POST", headers: headers(), body: fd }); const j = await r.json();
-    if (!r.ok) throw new Error(j.error?.message || r.statusText);
+    const r = await fetch("/v1/audio/" + $("#sttTask").value, { method: "POST", headers: headers(), body: fd });
+    const raw = await r.text();
+    let j; try { j = JSON.parse(raw); } catch { j = null; }
+    if (!r.ok) {
+      const msg = (j && j.error && j.error.message) || raw || r.statusText || ("HTTP " + r.status);
+      throw new Error(msg);
+    }
+    if (!j) throw new Error(raw || "empty response");
     sttText = j.text || ""; $("#sttToChat").classList.toggle("hidden", !sttText.trim());
     if (diar && Array.isArray(j.segments)) { renderSpeakers(j.segments); $("#sttOut").textContent = `(${((performance.now() - t0) / 1000).toFixed(2)} s, ${new Set(j.segments.map(s => s.speaker)).size} speakers${j.language ? ", language " + j.language : ""})`; return; }
     $("#sttOut").textContent = `${j.text}\n\n(${((performance.now() - t0) / 1000).toFixed(2)} s${j.language ? ", language " + j.language : ""})`;
-  } catch (e) { $("#sttOut").textContent = "error: " + e.message; }
+  } catch (e) {
+    let msg = e && e.message ? e.message : String(e);
+    if (/NetworkError|Failed to fetch|network error|Load failed/i.test(msg)) {
+      msg += " (no usable response — server may have closed the connection, rejected a too-large upload, or crashed; check pyre logs)";
+    }
+    $("#sttOut").textContent = "error: " + msg;
+  }
 };
 let sttText = "";
 const SPK_COLORS = ["#2f7ed8", "#d8572f", "#2fa36b", "#9b4fd8", "#c9a227", "#d82f8a", "#2fb5c9", "#7a7a7a"];

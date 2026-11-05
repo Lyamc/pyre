@@ -41,10 +41,12 @@ pub fn waveform_to_mel_tensor(
         let start = i * shift;
         let end = (start + n_samples_per_tensor).min(waveform.len());
 
-        let slice = &waveform[start..end];
+        let mut chunk = waveform[start..end].to_vec();
+        // Whisper STFT reflection pad needs >= n_fft (400) samples.
+        if chunk.len() < 400 { chunk.resize(400, 0.0); }
 
         let waveform_tensor = Tensor::<1>::from_floats(
-            slice,
+            chunk.as_slice(),
             &device_clone,
         );
 

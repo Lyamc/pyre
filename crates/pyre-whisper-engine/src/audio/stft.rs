@@ -55,8 +55,15 @@ pub fn stfft(
     hop_length: usize,
     window: Tensor<1>,
 ) -> (Tensor<3>, Tensor<3>) {
+    let [n_batch, orig_input_size] = input.dims();
+    // Short clips (or a short final mel chunk) used to assert and poison the STT mutex.
+    let input = if orig_input_size < n_fft {
+        let pad_right = Tensor::zeros([n_batch, n_fft - orig_input_size], &input.device());
+        Tensor::cat(vec![input, pad_right], 1)
+    } else {
+        input
+    };
     let [_, orig_input_size] = input.dims();
-    assert!(orig_input_size >= n_fft);
 
     let pad = n_fft / 2;
     let left_pad = reverse(input.clone().slice([0..input.dims()[0], 1..(pad + 1)]), 1);
