@@ -56,6 +56,18 @@ impl SttModel {
 
     #[cfg(feature = "stt")]
     pub fn load(r: &str, backend: &str, store_root: &Path, offline: bool) -> Result<Self> {
+        Self::load_with_progress(r, backend, store_root, offline, None)
+    }
+
+    /// Like [`load`], with optional whisburn prep progress (download/convert/load fractions).
+    #[cfg(feature = "stt")]
+    pub fn load_with_progress(
+        r: &str,
+        backend: &str,
+        store_root: &Path,
+        offline: bool,
+        progress: Option<pyre_whisper_models::PrepProgressFn>,
+    ) -> Result<Self> {
         let (name, explicit) = map_ref(r)?;
         // whisburn reads WHISBURN_MODELS_DIR on every lookup; it is process-global, so all
         // loaded STT models share one bundle directory (documented in the README).
@@ -71,7 +83,9 @@ impl SttModel {
         if !has_bundle {
             if offline || explicit.is_some() { bail!("no whisburn bundle for '{name}' in {} (offline or explicit path)", dir.display()); }
             tracing::info!("whisburn: downloading + converting '{name}' into {}", models_dir.display());
-            pyre_whisper_models::download_model(&name, &pyre_whisper_models::DownloadOptions::default())
+            let mut opts = pyre_whisper_models::DownloadOptions::default();
+            opts.progress = progress;
+            pyre_whisper_models::download_model(&name, &opts)
                 .map_err(|e| anyhow!("whisburn download/convert failed: {e:#}"))?;
         }
         // Same Burn as the LLM path, so Whisper runs on any pyre backend (cuda, wgpu, vulkan, cpu).
@@ -150,10 +164,35 @@ pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
 }
 async fn parse(mp: Multipart) -> Result<Req> { parse_multipart(mp).await }
 
+
+/// Resolve an STT model for the OpenAI-compatible endpoints.
+/// Known whisburn ASR ids must match exactly (no silent fallback to another loaded model);
+/// placeholder names like `whisper-1` still fall back to the first loaded STT.
+fn resolve_stt(app: &crate::registry::App, name: Option<&str>) -> Result<std::sync::Arc<crate::registry::Loaded>, Response> {
+    use crate::server::err;
+    if let Some(n) = name {
+        if let Some(m) = app.find_exact(crate::registry::Kind::Stt, n) {
+            return Ok(m);
+        }
+        #[cfg(feature = "stt")]
+        {
+            if map_ref(n).is_ok() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "speech model '{n}' is not loaded; load it via POST /api/models/load                          or use POST /api/audio/jobs (downloads/converts on demand)"
+                    ),
+                ));
+            }
+        }
+    }
+    app.find(crate::registry::Kind::Stt, name)
+}
+
 pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bool) -> Response {
     use crate::server::err;
     let mut q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
-    let m = match app.find(crate::registry::Kind::Stt, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
+    let m = match resolve_stt(&app, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch") };
     if !FORMATS.contains(&q.format.as_str()) {
         return err(StatusCode::BAD_REQUEST, format!("unsupported response_format '{}'", q.format));
@@ -262,14 +301,49 @@ pub(crate) fn run_job(
         let mut v = json!({"stage": stage, "job": job, "elapsed_s": t0.elapsed().as_secs_f64()});
         if let Some(o) = extra.as_object() { for (k, val) in o { v[k] = val.clone(); } }
         let _ = tx.send(v);
+        let stage_s = stage.to_string();
+        let job_s = job.to_string();
+        let msg = extra.get("message").and_then(|x| x.as_str()).unwrap_or(stage).to_string();
+        let cur = extra.get("current").and_then(|x| x.as_u64());
+        let tot = extra.get("total").and_then(|x| x.as_u64());
+        let frac = extra.get("fraction").and_then(|x| x.as_f64());
+        let eta = extra.get("eta_s").and_then(|x| x.as_f64());
+        let bytes = extra.get("bytes").and_then(|x| x.as_u64());
+        let bytes_total = extra.get("bytes_total").and_then(|x| x.as_u64());
+        crate::activity::patch(&job_s, |j| {
+            j.stage = stage_s.clone();
+            j.label = msg.clone();
+            j.current = cur; j.total = tot; j.fraction = frac; j.eta_s = eta;
+            j.bytes = bytes; j.bytes_total = bytes_total;
+            j.cancelable = true;
+        });
     };
     if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     let translate = translate || q.translate_task;
     emit("resolving_model", json!({"message": "resolving speech model", "model": q.model}));
 
-    if let Some(ref name) = q.model {
-        if app.find(crate::registry::Kind::Stt, Some(name.as_str())).is_err() {
+    // Exact match only — never silently fall back to another loaded STT (e.g. tiny → base).
+    let m = if let Some(ref name) = q.model {
+        if let Some(m) = app.find_exact(crate::registry::Kind::Stt, name) {
+            m
+        } else {
             emit("downloading", json!({"message": format!("loading model {name} (download/convert if needed)"), "model": name}));
+            let tx_p = tx.clone();
+            let job_p = job.to_string();
+            let name_p = name.clone();
+            let progress: pyre_whisper_models::PrepProgressFn = std::sync::Arc::new(move |p: pyre_whisper_models::PrepProgress| {
+                let stage = match p.stage {
+                    "download" | "convert" => "downloading",
+                    _ => "loading_model",
+                };
+                let mut v = json!({
+                    "stage": stage, "job": job_p, "model": name_p,
+                    "message": p.label, "fraction": p.fraction, "prep_stage": p.stage,
+                });
+                if let Some(b) = p.bytes_done { v["bytes"] = json!(b); }
+                if let Some(b) = p.bytes_total { v["bytes_total"] = json!(b); }
+                let _ = tx_p.send(v);
+            });
             let loaded = crate::registry::load(
                 &app.storage,
                 &app.defaults,
@@ -280,17 +354,22 @@ pub(crate) fn run_job(
                     backend: Some("cpu".into()),
                     dtype: None,
                     ctx_size: None,
+                    stt_progress: Some(progress),
                 },
             )?;
+            let id = loaded.id.clone();
             app.insert(loaded)?;
-            emit("loading_model", json!({"message": format!("model {name} ready"), "model": name}));
+            emit("loading_model", json!({"message": format!("model {id} ready"), "model": id}));
+            app.find_exact(crate::registry::Kind::Stt, name)
+                .ok_or_else(|| anyhow!("model '{name}' failed to register after load"))?
         }
-    }
-    if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
-    let m = match app.find(crate::registry::Kind::Stt, q.model.as_deref()) {
-        Ok(m) => m,
-        Err(_) => bail!("no speech-to-text model loaded; pick a model in the Audio tab"),
+    } else {
+        match app.find(crate::registry::Kind::Stt, None) {
+            Ok(m) => m,
+            Err(_) => bail!("no speech-to-text model loaded; pick a model in the Audio tab"),
+        }
     };
+    if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => bail!("registry mismatch") };
     if !FORMATS.contains(&q.format.as_str()) { bail!("unsupported response_format '{}'", q.format); }
     if q.diarize {
@@ -312,6 +391,12 @@ pub(crate) fn run_job(
                 "stage": "transcribing", "job": job_h, "current": i, "total": n,
                 "elapsed_s": elapsed, "eta_s": eta, "message": format!("chunk {i}/{n}")
             }));
+            crate::activity::patch(&job_h, |j| {
+                j.stage = "transcribing".into();
+                j.label = format!("Transcribing {i}/{n}");
+                j.current = Some(i as u64); j.total = Some(n as u64); j.eta_s = Some(eta);
+                j.cancelable = true;
+            });
         })),
     });
     JOB_TX.with(|c| *c.borrow_mut() = Some((tx.clone(), job.to_string(), cancel.clone(), t0)));
@@ -326,6 +411,7 @@ pub(crate) fn run_job(
     let mut body = verbose(&r, dur, translate);
     body["response_format"] = json!(fmt);
     body["seconds"] = json!(secs);
+    body["model"] = json!(m.id);
     Ok(body)
 }
 

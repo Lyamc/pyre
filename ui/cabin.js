@@ -198,6 +198,16 @@ async function sd(body, res, label = "generating") {
   const tm = j.timings?.[0] || {}; return { url: "data:image/png;base64," + j.data[0].b64_json, seed: tm.seed, secs: (performance.now() - t0) / 1000, gen: tm.seconds };
 }
 const seedBox = () => { const s = num(-1, -1, 4294967295); const lock = el("input", { type: "checkbox" }); const w = el("span", { class: "rng" }, s, el("label", { class: "inl" }, lock, "lock")); w.get = () => +s.value; w.after = v => { if (!lock.checked) s.value = -1; else s.value = v; w.last = v; }; w.lockTo = v => { lock.checked = true; s.value = v; }; return w; };
+const advanced = (...kids) => {
+  const open = localStorage.getItem("cabin.advanced") === "1";
+  const d = el("details", { class: "cadv" }); d.open = open;
+  d.append(el("summary", {}, "Advanced"));
+  const body = el("div", { class: "cadv-body" });
+  for (const k of kids) if (k) body.append(k);
+  d.append(body);
+  d.addEventListener("toggle", () => localStorage.setItem("cabin.advanced", d.open ? "1" : "0"));
+  return d;
+};
 // ---------- workflow definitions ----------
 const TAKES_IMAGE = ["img2img", "restyle", "inpaint", "outpaint", "tagger", "svg", "upscale", "denoise", "rmbg", "layers", "to3d", "clothes", "pose", "animate"];
 const CARDS = [
@@ -224,7 +234,7 @@ BUILD.txt2img = (f, res) => {
   const p = el("textarea", { rows: 3, placeholder: "a cozy cabin in a snowy forest at dusk" }); const n = el("input", { placeholder: "negative (optional)" });
   const st = stylePicker("none"); const size = sel([["512x512", "512×512"], ["512x768", "512×768 portrait"], ["768x512", "768×512 landscape"], ["640x640", "640×640"], ["768x768", "768×768"]], "512x512");
   const steps = num(25, 1, 60), cfg = num(7, 1, 20, 0.5), seed = seedBox();
-  f.append(field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Size", size), field("Steps", steps), field("CFG", cfg), field("Seed", seed)), field("Negative", n));
+  f.append(field("Prompt", p), field("Style", st), field("Size", size), field("Negative", n), advanced(el("div", { class: "row" }, field("Steps", steps), field("CFG", cfg), field("Seed", seed))));
   return async () => { const s = styled(p.value, n.value, st.value); const r = await sd({ prompt: s.prompt, negative_prompt: s.negative, size: size.value, steps: +steps.value, guidance_scale: +cfg.value, seed: seed.get() }, res); seed.after(r.seed); res.show(r.url, `txt2img_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s (${(r.gen || 0).toFixed(1)} s on GPU)` }); };
 };
 // --- image + text (upload or sketch)
@@ -232,7 +242,7 @@ BUILD.img2img = (f, res, input) => {
   const src = imageSource({ sketch: true }); if (input) src.set(input);
   const p = el("textarea", { rows: 2, placeholder: "what it should become" }); const st = stylePicker("none"); const s = range(0.65, 0.1, 1, 0.05);
   const steps = num(30, 1, 60), seed = seedBox();
-  f.append(field("Input image (upload, pick a result, or draw)", src), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Strength", s, "low = keep more of the input"), field("Steps", steps), field("Seed", seed)));
+  f.append(field("Input image (upload, pick a result, or draw)", src), field("Prompt", p), field("Style", st), advanced(el("div", { class: "row" }, field("Strength", s, "low = keep more of the input"), field("Steps", steps), field("Seed", seed))));
   return async () => { if (!src.url) throw new Error("choose, pick or draw an input image"); const sp = styled(p.value, "", st.value); const r = await sd({ image: await prep(src.url), prompt: sp.prompt, negative_prompt: sp.negative, strength: +s.input.value, steps: +steps.value, seed: seed.get() }, res); seed.after(r.seed); res.show(r.url, `img2img_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` }); };
 };
 // --- restyle
@@ -241,7 +251,7 @@ BUILD.restyle = (f, res, input) => {
   const st = stylePicker("ghibli"); const p = el("input", { placeholder: "describe the picture (optional; 'Describe' fills it from the tagger)" });
   const s = range(0.55, 0.2, 0.9, 0.05); const seed = seedBox();
   const desc = el("button", { type: "button", onclick: async () => { if (!src.url) return; desc.disabled = true; try { p.value = await describe(src.url); } catch (e) { alert(e.message); } desc.disabled = false; } }, "Describe");
-  f.append(field("Image", src), field("Target style", st), field("Content", el("div", { class: "row" }, p, desc)), el("div", { class: "row" }, field("Strength", s, "how far to move toward the style"), field("Seed", seed)));
+  f.append(field("Image", src), field("Target style", st), field("Content", el("div", { class: "row" }, p, desc)), advanced(el("div", { class: "row" }, field("Strength", s, "how far to move toward the style"), field("Seed", seed))));
   return async () => { if (!src.url) throw new Error("choose an image"); const sp = styled(p.value || "the same scene", "", st.value); const r = await sd({ image: await prep(src.url), prompt: sp.prompt, negative_prompt: sp.negative, strength: +s.input.value, steps: 30, seed: seed.get() }, res, "restyling"); seed.after(r.seed); res.show(r.url, `restyle_${st.value}_${r.seed}.png`, { info: `${st.value} · seed ${r.seed} · ${r.secs.toFixed(1)} s` }); };
 };
 async function describe(url) {
@@ -255,7 +265,7 @@ BUILD.inpaint = (f, res, input) => {
   const src = imageSource(); const me = maskEditor(); src.onchange = async u => { if (u) me.setImage(await prep(u)); }; if (input) src.set(input);
   const p = el("textarea", { rows: 2, placeholder: "what to paint in the masked area" }); const st = stylePicker("none");
   const s = range(1, 0.3, 1, 0.05), blur = range(8, 0, 32, 1), steps = num(30, 1, 60), seed = seedBox();
-  f.append(field("Image", src), field("Mask (paint the area to change)", me), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Strength", s, "1 = fully new content"), field("Feather px", blur), field("Steps", steps), field("Seed", seed)));
+  f.append(field("Image", src), field("Mask (paint the area to change)", me), field("Prompt", p), field("Style", st), advanced(el("div", { class: "row" }, field("Strength", s, "1 = fully new content"), field("Feather px", blur), field("Steps", steps), field("Seed", seed))));
   const ipm = el("input", { type: "checkbox", checked: true }); f.append(el("label", { class: "inl" }, ipm, " use the SD 1.5 inpainting model (better blending; off = base model + latent blending)"));
   return async () => { if (!src.url) throw new Error("choose an image"); const m = me.mask(); if (!m) throw new Error("paint a mask first"); const sp = styled(p.value, "", st.value); const r = await sd({ image: await prep(src.url), mask: m, mask_blur: +blur.input.value, prompt: sp.prompt, negative_prompt: sp.negative, strength: +s.input.value, steps: +steps.value, seed: seed.get(), inpaint_model: ipm.checked }, res, "inpainting"); seed.after(r.seed); res.show(r.url, `inpaint_${r.seed}.png`, { info: `seed ${r.seed} · ${r.secs.toFixed(1)} s` }); };
 };
@@ -266,7 +276,7 @@ BUILD.outpaint = (f, res, input) => {
   const ar = sel([["", "custom"], ["1:1", "1:1"], ["4:3", "4:3"], ["3:4", "3:4"], ["16:9", "16:9"], ["9:16", "9:16"]], "");
   ar.onchange = async () => { if (!ar.value || !src.url) return; const i = await loadImg(await prep(src.url)); const [a, b] = ar.value.split(":").map(Number); let w = i.naturalWidth, h = i.naturalHeight; if (w / h < a / b) { const nw = Math.round(h * a / b / 8) * 8; L.value = R.value = Math.round((nw - w) / 16) * 8; T.value = B.value = 0; } else { const nh = Math.round(w * b / a / 8) * 8; T.value = B.value = Math.round((nh - h) / 16) * 8; L.value = R.value = 0; } };
   const p = el("textarea", { rows: 2, placeholder: "describe the whole extended scene" }); const st = stylePicker("none"); const seed = seedBox();
-  f.append(field("Image", src), el("div", { class: "row" }, field("Left", L), field("Right", R), field("Top", T), field("Bottom", B), field("Aspect", ar)), field("Prompt", p), field("Style", st), field("Seed", seed));
+  f.append(field("Image", src), el("div", { class: "row" }, field("Left", L), field("Right", R), field("Top", T), field("Bottom", B), field("Aspect", ar)), field("Prompt", p), field("Style", st), advanced(field("Seed", seed)));
   return async () => {
     if (!src.url) throw new Error("choose an image"); const i = await loadImg(await prep(src.url, 640));
     let [l, r, t, b] = [L, R, T, B].map(x => Math.round(+x.value / 8) * 8); const w = i.naturalWidth + l + r, h = i.naturalHeight + t + b;
@@ -306,7 +316,7 @@ function esrBuilder(def) {
   return (f, res, input) => {
     const src = imageSource(); if (input) src.set(input);
     const scale = sel([["2", "2x"], ["4", "4x"], ["1", "1x (restore only)"]], def.scale), model = sel([["general", "General / photo"], ["anime", "Anime / illustration"]], "general"), dn = range(def.dn, 0, 1, 0.05, v => (+v).toFixed(2));
-    f.append(field("Image", src), el("div", { class: "row" }, field("Scale", scale), field("Model", model), field("Denoise strength", dn, "general model only: 0 keeps fine texture/grain, 1 removes the most noise")));
+    f.append(field("Image", src), el("div", { class: "row" }, field("Scale", scale), field("Model", model)), advanced(field("Denoise strength", dn, "general model only: 0 keeps fine texture/grain, 1 removes the most noise")));
     return async () => {
       if (!src.url) throw new Error("choose an image"); res.busy("upscaling on the GPU…"); const t0 = performance.now();
       const j = await api("/api/cabin/upscale", { image: await prep(src.url, 1536, 16), scale: +scale.value, model: model.value, denoise: +dn.input.value });
@@ -362,7 +372,7 @@ BUILD.pose = (f, res, input) => {
   const pe = poseEditor(); const src = imageSource(); if (input) src.set(input);
   const p = el("textarea", { rows: 2, placeholder: "who / what, e.g. young woman adventurer, red hair, leather jacket" }); const st = stylePicker("anime");
   const scale = range(1, 0.3, 1.5, 0.05), keep = range(1, 0.5, 1, 0.05), steps = num(25, 1, 60), seed = seedBox();
-  f.append(el("div", { class: "row" }, field("Pose", pe), field("Character image (optional: keeps colours/look)", src)), field("Prompt", p), field("Style", st), el("div", { class: "row" }, field("Pose strength", scale), field("Change amount", keep, "1 = follow the pose (look from the prompt); lower keeps more of the character image but the pose follows less"), field("Steps", steps), field("Seed", seed)));
+  f.append(el("div", { class: "row" }, field("Pose", pe), field("Character image (optional: keeps colours/look)", src)), field("Prompt", p), field("Style", st), advanced(el("div", { class: "row" }, field("Pose strength", scale), field("Change amount", keep, "1 = follow the pose (look from the prompt); lower keeps more of the character image but the pose follows less"), field("Steps", steps), field("Seed", seed))));
   return async () => {
     if (!p.value.trim()) throw new Error("describe the character"); const sp = styled(p.value + ", full body", "lowres, bad anatomy, extra limbs, deformed", st.value);
     const body = { prompt: sp.prompt, negative_prompt: sp.negative, size: "512x768", steps: +steps.value, seed: seed.get(), control_image: pe.image(), control_scale: +scale.input.value, fast: false };
@@ -402,7 +412,7 @@ BUILD.clothes = (f, res, input) => {
   const part = sel([["top", "Top / shirt / jacket"], ["sleeves", "Top incl. sleeves (arms)"], ["bottom", "Bottom (pants / skirt)"], ["dress", "Whole outfit / dress"], ["shoes", "Shoes"], ["hair", "Hair"], ["hat", "Hat"], ["acc", "Accessories / bag / scarf"]], "top");
   const p = el("textarea", { rows: 2, placeholder: "the new garment, e.g. a red hoodie" }); const st = stylePicker("none");
   const grow = range(14, 0, 48, 1), steps = num(30, 1, 60), seed = seedBox();
-  f.append(field("Image", src), field("Change", part), field("New look", p), field("Style", st), el("div", { class: "row" }, field("Grow mask px", grow, "room for a different shape"), field("Steps", steps), field("Seed", seed)));
+  f.append(field("Image", src), field("Change", part), field("New look", p), field("Style", st), advanced(el("div", { class: "row" }, field("Grow mask px", grow, "room for a different shape"), field("Steps", steps), field("Seed", seed))));
   return async () => {
     if (!src.url) throw new Error("choose an image"); if (!p.value.trim()) throw new Error("describe the new look");
     res.busy("segmenting clothes…"); const img = await prep(src.url);
@@ -477,7 +487,7 @@ BUILD.character = (f, res) => {
     el("button", { type: "button", onclick: () => { if (ch.history.length > 1) { ch.history.pop(); save(); drawHist(); const h = ch.history.at(-1); res.show(h.url, "character.png", { info: "undo → v" + ch.history.length }); me.setImage(h.url); } } }, "Undo"),
     el("button", { type: "button", onclick: () => { const h = ch.history; if (h.length < 2) return; res.innerHTML = ""; res.append(el("div", { class: "side" }, el("figure", {}, el("img", { src: h.at(-2).url }), el("figcaption", {}, "previous")), el("figure", {}, el("img", { src: h.at(-1).url }), el("figcaption", {}, "current")))); } }, "Compare"),
     el("button", { type: "button", onclick: () => { if (confirm("Start a new character (history is cleared)?")) { localStorage.removeItem("cabin.char"); openWorkflow("character"); } } }, "New")),
-    grid, field("Style", st), el("div", { class: "row" }, field("Seed (locked)", seed), field("Steps", steps), field("Edit method", how)), field("Optional mask (for 'Inpaint my painted mask')", me), field("Versions", hist));
+    grid, field("Style", st), field("Edit method", how), advanced(el("div", { class: "row" }, field("Seed (locked)", seed), field("Steps", steps))), field("Optional mask (for 'Inpaint my painted mask')", me), field("Versions", hist));
   drawHist(); if (ch.history.length) me.setImage(ch.history.at(-1).url);
   return async () => {
     const sp = styled(prompt(), "lowres, bad anatomy, extra limbs, deformed", st.value); const last = ch.history.at(-1); const changed = [...dirty]; let r, change;
@@ -581,13 +591,30 @@ function openWorkflow(id, input, prompt) {
   }
   const form = el("div", { class: "cform" }); const res = resultBox(); const run = BUILD[id](form, res, input);
   if (prompt) { const t = form.querySelector("textarea"); if (t) t.value = prompt; }
-  const go = el("button", { class: "primary", type: "button", onclick: async () => { go.disabled = true; try { await run(); } catch (e) { res.fail(e); } go.disabled = false; refreshStatus(); } }, "Run");
+  const go = el("button", { class: "primary", type: "button", onclick: async () => {
+    if (typeof setAvail === "function") setAvail(go, { enabled: false, reason_kind: "busy", message: (typeof statusState !== "undefined" && statusState.headline) || "Cabin job running…" });
+    else go.disabled = true;
+    try { await run(); } catch (e) { res.fail(e); }
+    if (typeof setAvail === "function") setAvail(go, { enabled: true }); else go.disabled = false;
+    refreshStatus();
+  } }, "Run");
   pane.append(form, el("div", { class: "row" }, go), res);
 }
 const $$c = s => [...document.querySelectorAll(s)];
 function renderCards() {
   const g = $c("#cabinCards"); g.innerHTML = "";
-  for (const c of CARDS) { const s = WF[c.id] || {}; const hint = s.ready ? c.desc : (s.downloads?.length ? `download · ${s.downloads[0].name}` : (s.status || "unavailable")); g.append(el("button", { class: "ccard" + (s.ready ? "" : " off"), "data-id": c.id, title: s.ready ? (s.model || "") : (s.reason || ""), onclick: () => openWorkflow(c.id) }, el("span", { class: "ci" }, c.icon), el("b", {}, c.title), el("small", {}, hint))); }
+  for (const c of CARDS) {
+    const s = WF[c.id] || {};
+    const hint = s.ready ? c.desc : (s.downloads?.length ? `download · ${s.downloads[0].name}` : (s.status || "unavailable"));
+    const why = s.ready ? (s.model || c.desc) : (s.reason || (s.downloads?.length ? `Model not downloaded — ${s.downloads[0].name}` : (s.status || "unavailable")));
+    const btn = el("button", { class: "ccard" + (s.ready ? "" : " off"), "data-id": c.id, title: why, onclick: () => openWorkflow(c.id) }, el("span", { class: "ci" }, c.icon), el("b", {}, c.title), el("small", {}, hint));
+    if (typeof setAvail === "function") {
+      if (s.ready) setAvail(btn, { enabled: true });
+      else setAvail(btn, { enabled: true, reason_kind: s.downloads?.length ? "missing_model" : "busy", message: why }); // still clickable to open download panel
+      btn.title = why;
+    }
+    g.append(btn);
+  }
 }
 function renderGallery() { const g = $c("#cabinGallery"); if (!g) return; g.innerHTML = ""; for (const x of gallery) g.append(el("img", { src: x.url, title: `${x.from}: ${x.name}`, onclick: () => { const d = el("div", { class: "cpick", onclick: () => d.remove() }, el("img", { class: "big", src: x.url })); document.body.append(d); } })); }
 async function refreshStatus() {

@@ -90,3 +90,36 @@ table.mdt{border-collapse:collapse;margin:6px 0;font-size:13px}table.mdt td,tabl
 .prefs { margin: 0.5rem 0; }
 .prefs summary { cursor: pointer; color: #9aa; }
 .row.wrap { flex-wrap: wrap; gap: 0.4rem 0.6rem; }
+
+/* Speaker edit / legend / timeline / summary */
+.spk-legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.spk-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: rgba(127,127,127,.12); border: 1px solid var(--border, #333); cursor: pointer; font-size: 12px; }
+.spk-chip .dot { width: 10px; height: 10px; border-radius: 50%; }
+.spk-chip button { font-size: 11px; padding: 0 6px; }
+.spk-timeline { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: #222; margin: 6px 0 10px; }
+.spk-timeline span { display: block; height: 100%; min-width: 1px; }
+.spk-who { cursor: pointer; text-decoration: underline dotted; }
+.spk-who:hover { opacity: 0.85; }
+.spk-seg-acts { float: right; font-size: 11px; opacity: 0.7; }
+.spk-seg-acts button { font-size: 11px; padding: 0 4px; }
+.sumbox { margin-top: 12px; padding: 10px; border: 1px solid var(--border, #333); border-radius: 8px; background: rgba(127,127,127,.06); }
+.sumbox h4 { margin: 0 0 8px; }
+.sumout { white-space: pre-wrap; max-height: 420px; overflow: auto; line-height: 1.45; }
+#sttMeta { margin: 6px 0; }
+
+/* Global status pill */
+.spill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border, #333); background: rgba(127,127,127,.12); font-size: 12px; cursor: pointer; max-width: 280px; }
+.spill .spill-dot { width: 8px; height: 8px; border-radius: 50%; background: #888; flex: 0 0 auto; }
+.spill.idle .spill-dot { background: #2fa36b; }
+.spill.busy .spill-dot { background: #d8a017; animation: spillpulse 1.2s infinite; }
+.spill.down .spill-dot { background: #d8572f; }
+.spill #statusPillText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@keyframes spillpulse { 50% { opacity: .45; } }
+.right { position: relative; display: flex; align-items: center; gap: 8px; }
+.spop { position: absolute; right: 0; top: calc(100% + 6px); width: 320px; max-height: 360px; overflow: auto; z-index: 50; background: var(--panel, #1a1a1a); border: 1px solid var(--border, #333); border-radius: 10px; padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.spop-h { font-weight: 600; margin-bottom: 6px; }
+.spop-jobs { display: flex; flex-direction: column; gap: 6px; }
+.spop-job { display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; background: rgba(127,127,127,.08); font-size: 12px; }
+.spop-job button { font-size: 11px; }
+[data-avail="0"] { opacity: .55; cursor: not-allowed !important; }
+button[data-avail="0"]:hover, [data-avail="0"]:hover { /* title carries reason */ }

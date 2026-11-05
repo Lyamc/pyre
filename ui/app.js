@@ -31,6 +31,145 @@ async function* sse(path, body, signal) {
 }
 function askKey() { const k = prompt("API key for this pyre server (stored in this browser):", LS.get("apikey", "")); if (k !== null) { LS.set("apikey", k.trim()); refreshAll(); } }
 
+// ---------- availability (generic disabled-reason) ----------
+// reason_kind: busy | loading | missing_model | no_permission | offline | ""
+function setAvail(el, { enabled, reason_kind = "", message = "" } = {}) {
+  if (!el) return;
+  const on = !!enabled;
+  if ("disabled" in el) el.disabled = !on;
+  el.dataset.avail = on ? "1" : "0";
+  el.dataset.reasonKind = on ? "" : (reason_kind || "");
+  if (on) {
+    if (el.dataset._reasonTitle === "1") { el.title = el.dataset.availBaseTitle || ""; delete el.dataset._reasonTitle; }
+  } else {
+    if (!el.dataset.availBaseTitle) el.dataset.availBaseTitle = el.title || "";
+    el.title = message || reasonMessage(reason_kind) || el.dataset.availBaseTitle || "Unavailable";
+    el.dataset._reasonTitle = "1";
+  }
+  el.setAttribute("aria-disabled", on ? "false" : "true");
+}
+function reasonMessage(kind) {
+  return ({
+    busy: "Busy — wait for the current job to finish",
+    loading: "Loading…",
+    missing_model: "Required model is not loaded or not downloaded",
+    no_permission: "You do not have permission for this action",
+    offline: "Server unreachable",
+  })[kind] || "";
+}
+function availBusy(message) { return { enabled: false, reason_kind: "busy", message }; }
+function availMissing(message) { return { enabled: false, reason_kind: "missing_model", message }; }
+function availOk() { return { enabled: true, reason_kind: "", message: "" }; }
+
+// ---------- global status pill (one shared SSE; avoids HTTP/1.1 6-conn starvation) ----------
+let statusState = { state: "down", headline: "Connecting…", jobs: [], vram: {}, chat_active: [] };
+let statusCtrl = null;
+function renderStatusPill() {
+  const pill = $("#statusPill"); const text = $("#statusPillText"); const pop = $("#statusPopJobs"); const vram = $("#statusPopVram");
+  if (!pill || !text) return;
+  pill.classList.remove("idle", "busy", "down");
+  pill.classList.add(statusState.state === "busy" ? "busy" : statusState.state === "idle" ? "idle" : "down");
+  text.textContent = statusState.headline || (statusState.state === "idle" ? "Idle" : "…");
+  pill.title = statusState.headline || "Server status";
+  if (pop) {
+    const jobs = statusState.jobs || [];
+    const chat = statusState.chat_active || [];
+    if (!jobs.length && !chat.length) pop.innerHTML = `<div class="muted">Idle</div>`;
+    else {
+      pop.innerHTML = jobs.map(j => {
+        const eta = j.eta_s != null ? ` · ${Math.max(0, Math.floor(j.eta_s / 60))}:${String(Math.max(0, Math.floor(j.eta_s % 60))).padStart(2, "0")} left` : (j.fraction != null ? ` · ${Math.round(j.fraction * 100)}%` : "");
+        const prog = (j.current != null && j.total) ? ` ${j.current}/${j.total}` : "";
+        return `<div class="spop-job"><span>${esc(j.label || j.kind)}${prog}${eta}</span>${j.cancelable ? `<button type="button" data-acancel="${esc(j.id)}">Cancel</button>` : ""}</div>`;
+      }).join("") + chat.map(c => `<div class="spop-job"><span>Chat ${esc(c.phase || "generating")} · ${esc(String(c.model || "").split("/").pop())}</span></div>`).join("");
+    }
+  }
+  if (vram) {
+    const v = statusState.vram || {};
+    const bits = [];
+    if (v.used_mib != null && v.total_mib != null) bits.push(`VRAM ${v.used_mib}/${v.total_mib} MiB`);
+    else if (v.free_mib != null) bits.push(`VRAM free ${v.free_mib} MiB`);
+    if (v.util_pct != null) bits.push(`GPU ${v.util_pct}%`);
+    vram.textContent = bits.join(" · ");
+  }
+  refreshAvailFromStatus();
+}
+function refreshAvailFromStatus() {
+  const down = statusState.state === "down";
+  $$("#tabs button").forEach(b => setAvail(b, availOk()));
+  if ($("#sttGo") && !sttJob) {
+    if (down) setAvail($("#sttGo"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
+    else if ($("#sttGo").dataset.forceBusy !== "1") setAvail($("#sttGo"), availOk());
+  }
+  if ($("#imgGo")) {
+    const hasImg = !!(kinds.image && kinds.image.length);
+    if (down) setAvail($("#imgGo"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
+    else if (!hasImg) setAvail($("#imgGo"), availMissing("No image model loaded — open Models or run a Cabin card (loads on demand)"));
+    else setAvail($("#imgGo"), availOk());
+  }
+  if ($("#sendBtn")) {
+    if (down) setAvail($("#sendBtn"), { enabled: false, reason_kind: "offline", message: "Server disconnected — reconnecting…" });
+    else if (typeof ctrl !== "undefined" && ctrl) setAvail($("#sendBtn"), availBusy("Chat is generating — stop it first or wait"));
+    else setAvail($("#sendBtn"), availOk());
+  }
+}
+async function connectStatusStream() {
+  if (statusCtrl) statusCtrl.abort();
+  statusCtrl = new AbortController();
+  const signal = statusCtrl.signal;
+  const backoff = () => new Promise(r => setTimeout(r, 1500));
+  while (!signal.aborted) {
+    try {
+      const r = await fetch("/api/status/stream", { headers: headers(), signal });
+      if (!r.ok) throw new Error("status " + r.status);
+      const rd = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { value, done } = await rd.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i; while ((i = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, i); buf = buf.slice(i + 2);
+          for (const line of block.split("\n")) if (line.startsWith("data:")) {
+            try {
+              const j = JSON.parse(line.slice(5).trim());
+              statusState = Object.assign({}, statusState, j);
+              if (!j.state) statusState.state = ((statusState.jobs || []).length || (statusState.chat_active || []).length) ? "busy" : "idle";
+              renderStatusPill();
+            } catch {}
+          }
+        }
+      }
+      statusState.state = "down"; statusState.headline = "Disconnected — reconnecting…"; renderStatusPill();
+    } catch (e) {
+      if (signal.aborted) break;
+      statusState.state = "down"; statusState.headline = "Disconnected — reconnecting…"; renderStatusPill();
+      await backoff();
+    }
+  }
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", () => {});
+  const bootPill = () => {
+    if ($("#statusPill")) {
+      $("#statusPill").onclick = (e) => {
+        e.stopPropagation();
+        const pop = $("#statusPop"); if (!pop) return;
+        const closing = !pop.classList.contains("hidden");
+        pop.classList.toggle("hidden", closing);
+        pop.hidden = closing;
+      };
+      document.addEventListener("click", (e) => {
+        const pop = $("#statusPop"); if (!pop || pop.classList.contains("hidden")) return;
+        if (!e.target.closest("#statusPop") && !e.target.closest("#statusPill")) { pop.classList.add("hidden"); pop.hidden = true; }
+      });
+      $("#statusPop") && $("#statusPop").addEventListener("click", async (e) => {
+        const id = e.target.dataset && e.target.dataset.acancel; if (!id) return;
+        try { await api("/api/activity/cancel", { id }); } catch (err) { console.warn(err); }
+      });
+    }
+  };
+  bootPill();
+}
+
+
 // ---------- tiny markdown ----------
 function md(src) {
   const parts = src.split(/```/); let html = "";
@@ -81,7 +220,8 @@ document.addEventListener("click", e => { if (e.target.classList.contains("copy"
 
 // ---------- tabs / theme ----------
 $$("#tabs button").forEach(b => b.onclick = () => { $$("#tabs button").forEach(x => x.classList.toggle("active", x === b)); $$(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + b.dataset.tab)); location.hash = b.dataset.tab; onTab(b.dataset.tab); });
-function onTab(t) { if (t === "models") loadModels(); if (t === "status") loadStatus(); if (t === "images" || t === "audio") loadKinds(); if (t === "apps") loadApps(); }
+function onTab(t) { /* never await ? tab switch must stay instant even when backend is busy */
+  if (t === "models") loadModels(); if (t === "status") loadStatus(); if (t === "images" || t === "audio") loadKinds(); if (t === "apps") loadApps(); if (t === "cabin" && window.cabin && cabin.refreshStatus) cabin.refreshStatus(); }
 document.documentElement.dataset.theme = LS.get("theme", matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
 $("#themeBtn").onclick = () => { const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = t; LS.set("theme", t); };
 $("#keyBtn").onclick = askKey;
@@ -250,16 +390,40 @@ $("#imgGo").onclick = async e => {
   $("#imgGo").disabled = false; $("#imgGo").textContent = "Generate";
 };
 
-﻿// ---------- audio ----------
+﻿﻿// ---------- audio ----------
 const STT_PREF_KEY = "sttPrefs";
+const STT_TX_KEY = "sttTranscript";
+const QUALITY_MODELS = { fast: "tiny", balanced: "base", best: "large-v3-turbo" };
+const SPK_COLORS = ["#2f7ed8", "#d8572f", "#2fa36b", "#9b4fd8", "#c9a227", "#d82f8a", "#2fb5c9", "#7a7a7a"];
+const fmtT = s => { const m = Math.floor(s / 60); const sec = (s - m * 60); return m + ":" + sec.toFixed(1).padStart(4, "0"); };
+const fmtTs = s => {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const ss = String(Math.floor(sec)).padStart(2, "0") + "," + String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + ss;
+};
+const fmtVtt = s => {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const ss = String(Math.floor(sec)).padStart(2, "0") + "." + String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + ss;
+};
+
+/** @type {{ sourceName: string, model: string, language: string, duration: number, segments: Array, names: Record<string,string>, text: string, summary: string, summaryStale: boolean }} */
+let sttState = null;
+let sttText = "";
+let sttJob = null;
+let sttSumCtrl = null;
+let sttCatalog = { models: [], loaded: [] };
+let recBlob = null, rec = null;
+
 function loadSttPrefs() {
-  const d = { model: "", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, beam: 5, maxTok: 448, task: "transcriptions" };
+  const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
   return Object.assign(d, LS.get(STT_PREF_KEY, {}));
 }
 function saveSttPrefs(p) { LS.set(STT_PREF_KEY, p); }
 function sttPrefsFromUi() {
   return {
     model: ($("#sttModel") && $("#sttModel").value) || "",
+    quality: ($("#sttQuality") && $("#sttQuality").value) || "balanced",
     format: ($("#sttFormat") && $("#sttFormat").value) || "verbose_json",
     language: ($("#sttLang") && $("#sttLang").value) || "",
     timestamps: !!( $("#sttTimestamps") && $("#sttTimestamps").checked ),
@@ -268,9 +432,11 @@ function sttPrefsFromUi() {
     beam: +(( $("#sttBeam") && $("#sttBeam").value ) || 5),
     maxTok: +(( $("#sttMaxTok") && $("#sttMaxTok").value ) || 448),
     task: ($("#sttTask") && $("#sttTask").value) || "transcriptions",
+    advancedOpen: !!( $("#sttAdvanced") && $("#sttAdvanced").open ),
   };
 }
 function applySttPrefs(p) {
+  if ($("#sttQuality")) $("#sttQuality").value = p.quality || "balanced";
   if ($("#sttFormat")) $("#sttFormat").value = p.format || "verbose_json";
   if ($("#sttLang")) $("#sttLang").value = p.language || "";
   if ($("#sttTimestamps")) $("#sttTimestamps").checked = !!p.timestamps;
@@ -279,9 +445,127 @@ function applySttPrefs(p) {
   if ($("#sttBeam")) $("#sttBeam").value = p.beam || 5;
   if ($("#sttMaxTok")) $("#sttMaxTok").value = p.maxTok || 448;
   if ($("#sttTask")) $("#sttTask").value = p.task || "transcriptions";
+  if ($("#sttAdvanced")) $("#sttAdvanced").open = !!p.advancedOpen;
+  if ($("#sttModel") && p.model) {
+    if ([...($("#sttModel").options || [])].some(o => o.value === p.model)) $("#sttModel").value = p.model;
+  }
 }
-let sttCatalog = { models: [], loaded: [] };
-let sttJob = null;
+function effectiveSttModel(pref) {
+  const adv = $("#sttAdvanced") && $("#sttAdvanced").open;
+  if (adv && pref.model) return pref.model;
+  return QUALITY_MODELS[pref.quality] || QUALITY_MODELS.balanced;
+}
+function persistSttState() {
+  if (!sttState) { try { localStorage.removeItem("pyre." + STT_TX_KEY); } catch {} return; }
+  try { LS.set(STT_TX_KEY, sttState); } catch (e) { console.warn("stt persist", e); }
+}
+function restoreSttState() {
+  const s = LS.get(STT_TX_KEY, null);
+  if (!s || !Array.isArray(s.segments)) return;
+  sttState = s;
+  paintSttResult({ restored: true });
+}
+function displayName(id) {
+  if (!sttState) return id || "?";
+  const n = sttState.names && sttState.names[id];
+  return n || String(id || "?").replace(/^SPEAKER_/, "Speaker ");
+}
+function speakerIds() {
+  if (!sttState) return [];
+  const ids = [];
+  for (const s of sttState.segments) {
+    const sp = s.speaker || "?";
+    if (!ids.includes(sp)) ids.push(sp);
+  }
+  return ids;
+}
+function colorFor(id) {
+  const ids = speakerIds();
+  const i = Math.max(0, ids.indexOf(id));
+  return SPK_COLORS[i % SPK_COLORS.length];
+}
+function labelledText() {
+  if (!sttState) return sttText || "";
+  if (!sttState.segments.length) return sttState.text || "";
+  return sttState.segments.map(s => {
+    const who = displayName(s.speaker);
+    const hasSpk = !!(s.speaker || (sttState.names && Object.keys(sttState.names).length));
+    const line = (s.text || "").trim();
+    if (!hasSpk && speakerIds().length <= 1 && !(s.speaker)) return line;
+    return who + ": " + line;
+  }).filter(Boolean).join("\n");
+}
+function buildTxt() {
+  if (!sttState) return sttText || "";
+  const ts = loadSttPrefs().timestamps;
+  return sttState.segments.map(s => {
+    const who = displayName(s.speaker);
+    const head = ts ? "[" + fmtT(s.start) + " → " + fmtT(s.end) + "] " : "";
+    return head + who + ": " + (s.text || "").trim();
+  }).join("\n");
+}
+function buildSrt() {
+  if (!sttState) return "";
+  return sttState.segments.map((s, i) => {
+    const who = displayName(s.speaker);
+    return (i + 1) + "\n" + fmtTs(s.start) + " --> " + fmtTs(s.end) + "\n" + who + ": " + (s.text || "").trim() + "\n";
+  }).join("\n");
+}
+function buildVtt() {
+  if (!sttState) return "WEBVTT\n\n";
+  return "WEBVTT\n\n" + sttState.segments.map(s => {
+    const who = displayName(s.speaker);
+    return fmtVtt(s.start) + " --> " + fmtVtt(s.end) + "\n" + who + ": " + (s.text || "").trim() + "\n";
+  }).join("\n");
+}
+function buildJson() {
+  if (!sttState) return "{}";
+  const segs = sttState.segments.map((s, i) => ({
+    id: i, start: s.start, end: s.end, text: (s.text || "").trim(),
+    speaker: s.speaker || null, speaker_label: displayName(s.speaker),
+  }));
+  return JSON.stringify({
+    model: sttState.model, language: sttState.language, duration: sttState.duration,
+    source: sttState.sourceName, names: sttState.names || {},
+    text: labelledText(), segments: segs,
+  }, null, 2);
+}
+function buildMd() {
+  if (!sttState) return sttText || "";
+  let md = "# Transcript";
+  if (sttState.sourceName) md += " — " + sttState.sourceName;
+  md += "\n\n";
+  if (sttState.model) md += "_Model: `" + sttState.model + "`";
+  if (sttState.language) md += " · Language: " + sttState.language;
+  md += "_\n\n";
+  for (const s of sttState.segments) {
+    md += "**" + displayName(s.speaker) + "** [" + fmtT(s.start) + "–" + fmtT(s.end) + "]\n\n" + (s.text || "").trim() + "\n\n";
+  }
+  return md;
+}
+function sttBaseName() {
+  const n = (sttState && sttState.sourceName) || "transcript";
+  return n.replace(/\.[^.]+$/, "").replace(/[^\w\-]+/g, "_").slice(0, 80) || "transcript";
+}
+function downloadBlob(name, text, mime) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: mime || "text/plain" }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function setSttProg(show, pct, label) {
+  const box = $("#sttProg"); if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (pct != null && $("#sttBar")) $("#sttBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (label != null && $("#sttProgLabel")) $("#sttProgLabel").textContent = label;
+}
+function setSumProg(show, pct, label) {
+  const box = $("#sttSumProg"); if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (pct != null && $("#sttSumBar")) $("#sttSumBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (label != null && $("#sttSumProgLabel")) $("#sttSumProgLabel").textContent = label;
+}
 async function refreshSttModels() {
   try {
     sttCatalog = await api("/api/audio/models");
@@ -310,12 +594,6 @@ function updateSttDlBtn() {
   btn.classList.toggle("hidden", !need);
   btn.textContent = need ? ("Download " + sel.value) : "Download model";
 }
-function setSttProg(show, pct, label) {
-  const box = $("#sttProg"); if (!box) return;
-  box.classList.toggle("hidden", !show);
-  if (pct != null && $("#sttBar")) $("#sttBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
-  if (label != null && $("#sttProgLabel")) $("#sttProgLabel").textContent = label;
-}
 async function* audioJobSse(fd, signal) {
   const r = await fetch("/api/audio/jobs", { method: "POST", headers: headers(), body: fd, signal });
   if (!r.ok) { const t = await r.text(); let m = t; try { m = JSON.parse(t).error.message || t; } catch {} throw new Error(m || r.statusText); }
@@ -334,11 +612,162 @@ async function* audioJobSse(fd, signal) {
 function sttStagePct(ev) {
   const order = ["queued", "resolving_model", "downloading", "loading_model", "decoding", "diarizing", "transcribing", "rendering", "done"];
   const i = order.indexOf(ev.stage);
-  if (ev.stage === "transcribing" && ev.total) return 15 + 75 * ((ev.current || 0) / ev.total);
+  if (ev.stage === "downloading" && ev.fraction != null) return 5 + 20 * ev.fraction;
+  if (ev.stage === "transcribing" && ev.total) return 30 + 60 * ((ev.current || 0) / ev.total);
   if (i < 0) return null;
   return (i / (order.length - 1)) * 100;
 }
-let recBlob = null, rec = null;
+function paintSttResult(opts) {
+  opts = opts || {};
+  if (!sttState) return;
+  sttText = labelledText();
+  const meta = $("#sttMeta");
+  if (meta) {
+    meta.classList.remove("hidden");
+    const bits = [];
+    if (sttState.model) bits.push("model " + sttState.model);
+    if (sttState.language) bits.push("language " + sttState.language);
+    if (sttState.duration) bits.push(sttState.duration.toFixed(1) + "s audio");
+    if (opts.elapsed) bits.push(opts.elapsed.toFixed(2) + "s wall");
+    if (opts.restored) bits.push("restored");
+    if (sttState.summaryStale) bits.push("summary outdated — regenerate");
+    meta.textContent = bits.join(" · ");
+  }
+  renderSpeakerChrome();
+  $("#sttOut").textContent = sttText + (opts.footer ? "\n\n(" + opts.footer + ")" : "");
+  if ($("#sttActions")) $("#sttActions").classList.toggle("hidden", !sttText.trim());
+  if ($("#sttSumBox")) {
+    if (sttState.summary) {
+      $("#sttSumBox").classList.remove("hidden");
+      $("#sttSumOut").innerHTML = md(sttState.summary);
+      if ($("#sttSumRegen")) $("#sttSumRegen").classList.toggle("hidden", !sttState.summaryStale);
+    }
+  }
+}
+function renderSpeakerChrome() {
+  const box = $("#sttSpk"); const legend = $("#sttLegend"); const tl = $("#sttTimeline");
+  if (!box || !sttState) return;
+  const ids = speakerIds();
+  const hasSpk = ids.some(id => id && id !== "?") || (sttState.segments.some(s => s.speaker));
+  box.innerHTML = "";
+  if (legend) legend.innerHTML = "";
+  if (tl) tl.innerHTML = "";
+  if (!hasSpk) {
+    box.classList.add("hidden");
+    if (legend) legend.classList.add("hidden");
+    if (tl) tl.classList.add("hidden");
+    return;
+  }
+  if (legend) {
+    legend.classList.remove("hidden");
+    for (const id of ids) {
+      const chip = document.createElement("span"); chip.className = "spk-chip";
+      const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = colorFor(id);
+      const lab = document.createElement("span"); lab.textContent = displayName(id);
+      const ren = document.createElement("button"); ren.type = "button"; ren.textContent = "rename";
+      ren.onclick = () => renameSpeaker(id);
+      const mer = document.createElement("button"); mer.type = "button"; mer.textContent = "merge…";
+      mer.onclick = () => mergeSpeaker(id);
+      chip.append(dot, lab, ren, mer);
+      legend.append(chip);
+    }
+  }
+  if (tl && sttState.duration > 0) {
+    tl.classList.remove("hidden");
+    for (const s of sttState.segments) {
+      const w = Math.max(0.2, 100 * ((s.end - s.start) / sttState.duration));
+      const span = document.createElement("span");
+      span.style.width = w + "%";
+      span.style.background = colorFor(s.speaker || "?");
+      span.title = displayName(s.speaker) + " " + fmtT(s.start) + "–" + fmtT(s.end);
+      tl.append(span);
+    }
+  }
+  for (let i = 0; i < sttState.segments.length; i++) {
+    const s = sttState.segments[i];
+    const sp = s.speaker || "?";
+    const c = colorFor(sp);
+    const row = document.createElement("div"); row.className = "spk-row"; row.style.borderLeftColor = c;
+    const h = document.createElement("span"); h.className = "spk-who"; h.style.color = c;
+    h.textContent = displayName(sp) + " · " + fmtT(s.start) + "–" + fmtT(s.end);
+    h.title = "Click to rename speaker";
+    h.onclick = () => renameSpeaker(sp);
+    const acts = document.createElement("span"); acts.className = "spk-seg-acts";
+    const reas = document.createElement("button"); reas.type = "button"; reas.textContent = "reassign";
+    reas.onclick = (e) => { e.stopPropagation(); reassignSegment(i); };
+    acts.append(reas);
+    const tt = document.createElement("span"); tt.className = "spk-text"; tt.textContent = (s.text || "").trim();
+    row.append(h, acts, tt); box.append(row);
+  }
+  box.classList.remove("hidden");
+}
+function markSummaryStale() {
+  if (sttState && sttState.summary) {
+    sttState.summaryStale = true;
+    if ($("#sttSumRegen")) $("#sttSumRegen").classList.remove("hidden");
+    if ($("#sttMeta") && !$("#sttMeta").classList.contains("hidden")) {
+      paintSttResult();
+    }
+  }
+}
+function renameSpeaker(id) {
+  if (!sttState) return;
+  const cur = displayName(id);
+  const n = prompt("Rename speaker", cur);
+  if (n == null) return;
+  const name = n.trim();
+  if (!name) return;
+  sttState.names = sttState.names || {};
+  sttState.names[id] = name;
+  markSummaryStale();
+  persistSttState();
+  paintSttResult();
+}
+function mergeSpeaker(fromId) {
+  if (!sttState) return;
+  const ids = speakerIds().filter(x => x !== fromId);
+  if (!ids.length) return alert("No other speakers to merge into");
+  const choices = ids.map(id => displayName(id) + " (" + id + ")").join("\n");
+  const to = prompt("Merge " + displayName(fromId) + " into which speaker id?\n\n" + choices, ids[0]);
+  if (to == null) return;
+  const toId = to.trim();
+  if (!ids.includes(toId) && !ids.some(id => displayName(id) === toId)) {
+    // allow typing display name
+    const hit = ids.find(id => id === toId || displayName(id) === toId);
+    if (!hit) return alert("Unknown speaker");
+    return mergeSpeakerInto(fromId, hit);
+  }
+  const hit = ids.includes(toId) ? toId : ids.find(id => displayName(id) === toId);
+  mergeSpeakerInto(fromId, hit);
+}
+function mergeSpeakerInto(fromId, toId) {
+  for (const s of sttState.segments) {
+    if ((s.speaker || "?") === fromId) s.speaker = toId;
+  }
+  if (sttState.names) delete sttState.names[fromId];
+  markSummaryStale();
+  persistSttState();
+  paintSttResult();
+}
+function reassignSegment(idx) {
+  if (!sttState) return;
+  const ids = speakerIds();
+  const choices = ids.map(id => displayName(id) + " [" + id + "]").join("\n");
+  const cur = sttState.segments[idx].speaker || "?";
+  const to = prompt("Reassign this segment to speaker id:\n\n" + choices, cur);
+  if (to == null) return;
+  let hit = ids.find(id => id === to.trim() || displayName(id) === to.trim());
+  if (!hit) {
+    // create new speaker id
+    hit = to.trim();
+    if (!hit) return;
+  }
+  sttState.segments[idx].speaker = hit;
+  markSummaryStale();
+  persistSttState();
+  paintSttResult();
+}
+
 if ($("#recBtn")) $("#recBtn").onclick = async () => {
   if (rec) { rec.stop(); return; }
   try {
@@ -360,9 +789,17 @@ if ($("#sttFile")) $("#sttFile").onchange = () => {
   if (f) { $("#sttAudio").src = URL.createObjectURL(f); $("#sttAudio").classList.remove("hidden"); }
 };
 if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
+if ($("#sttQuality")) $("#sttQuality").onchange = () => {
+  const p = sttPrefsFromUi();
+  // sync advanced model select to the quality mapping when quality changes
+  const m = QUALITY_MODELS[p.quality];
+  if (m && $("#sttModel") && [...$("#sttModel").options].some(o => o.value === m)) $("#sttModel").value = m;
+  saveSttPrefs(sttPrefsFromUi());
+};
 ["sttFormat","sttLang","sttTimestamps","sttSentences","sttDiar","sttBeam","sttMaxTok","sttTask"].forEach(id => {
   const el = document.getElementById(id); if (el) el.addEventListener("change", () => saveSttPrefs(sttPrefsFromUi()));
 });
+if ($("#sttAdvanced")) $("#sttAdvanced").addEventListener("toggle", () => saveSttPrefs(sttPrefsFromUi()));
 if ($("#sttModelDl")) $("#sttModelDl").onclick = async () => {
   const id = $("#sttModel").value; if (!id) return;
   $("#sttModelDl").disabled = true; setSttProg(true, 5, "Downloading/loading " + id + "...");
@@ -384,10 +821,11 @@ if ($("#sttCancel")) $("#sttCancel").onclick = () => {
 if ($("#sttGo")) $("#sttGo").onclick = async () => {
   const f = recBlob || ($("#sttFile") && $("#sttFile").files[0]); if (!f) return alert("choose or record audio first");
   const pref = sttPrefsFromUi(); saveSttPrefs(pref);
+  const model = effectiveSttModel(pref);
   const fd = new FormData();
   fd.append("file", f, f.name || "recording.webm");
-  fd.append("model", pref.model || (kinds.stt && kinds.stt[0] && kinds.stt[0].id) || "base");
-  fd.append("response_format", pref.format || "verbose_json");
+  fd.append("model", model);
+  fd.append("response_format", "verbose_json");
   fd.append("task", pref.task === "translations" ? "translations" : "transcriptions");
   if (pref.language) fd.append("language", pref.language);
   fd.append("timestamps", pref.timestamps ? "true" : "false");
@@ -397,11 +835,14 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   const diar = pref.diarize && $("#sttDiar") && !$("#sttDiar").disabled && pref.task === "transcriptions";
   if (diar) fd.append("diarize", "true");
   $("#sttSpk").classList.add("hidden"); $("#sttSpk").innerHTML = "";
-  if ($("#sttDownload")) $("#sttDownload").classList.add("hidden");
+  if ($("#sttLegend")) { $("#sttLegend").classList.add("hidden"); $("#sttLegend").innerHTML = ""; }
+  if ($("#sttTimeline")) { $("#sttTimeline").classList.add("hidden"); $("#sttTimeline").innerHTML = ""; }
+  if ($("#sttActions")) $("#sttActions").classList.add("hidden");
+  if ($("#sttSumBox")) $("#sttSumBox").classList.add("hidden");
   $("#sttOut").textContent = "";
-  setSttProg(true, 2, "uploading...");
+  setSttProg(true, 2, "uploading… · model " + model);
   $("#sttCancel").classList.remove("hidden");
-  $("#sttGo").disabled = true;
+  if ($("#sttGo")) { $("#sttGo").dataset.forceBusy = "1"; setAvail($("#sttGo"), availBusy((statusState && statusState.headline) || "Transcribing?")); }
   const ctrl = new AbortController();
   sttJob = { id: null, ctrl };
   const t0 = performance.now();
@@ -412,6 +853,11 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
       if (ev.stage === "error" || ev.stage === "cancelled") throw new Error(ev.message || ev.stage);
       const pct = sttStagePct(ev);
       let label = ev.message || ev.stage;
+      if (ev.model) label += " · " + ev.model;
+      if (ev.stage === "downloading") {
+        if (ev.bytes != null && ev.bytes_total) label = (ev.message || "downloading") + " · " + human(ev.bytes) + " / " + human(ev.bytes_total);
+        else if (ev.fraction != null) label = (ev.message || "downloading") + " · " + Math.round(ev.fraction * 100) + "%";
+      }
       if (ev.stage === "transcribing" && ev.total) {
         label = (ev.message || "transcribing") + " · " + ev.current + "/" + ev.total +
           (ev.eta_s != null ? (" · ETA " + Math.max(0, ev.eta_s).toFixed(0) + "s") : "") +
@@ -425,23 +871,31 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
       }
       if (ev.stage === "done") {
         const j = ev.result || {};
-        sttText = j.text || j.rendered || "";
-        $("#sttToChat").classList.toggle("hidden", !sttText.trim());
-        if (diar && Array.isArray(j.segments)) {
-          renderSpeakers(j.segments);
-          $("#sttOut").textContent = sttText + "\n\n(" + ((performance.now() - t0) / 1000).toFixed(2) + " s, " +
-            (new Set(j.segments.map(s => s.speaker)).size) + " speakers" + (j.language ? ", language " + j.language : "") + ")";
-        } else {
-          $("#sttOut").textContent = sttText + "\n\n(" + ((performance.now() - t0) / 1000).toFixed(2) + " s" +
-            (j.language ? ", language " + j.language : "") + ")";
-        }
-        const body = j.rendered || sttText;
-        if (body && $("#sttDownload")) {
-          const ext = ({ srt: "srt", vtt: "vtt", txt: "txt", text: "txt" })[pref.format] || "json";
-          const blob = new Blob([pref.format.indexOf("json") >= 0 ? JSON.stringify(j, null, 2) : body], { type: "text/plain" });
-          const a = $("#sttDownload"); a.href = URL.createObjectURL(blob); a.download = "transcript." + ext; a.classList.remove("hidden");
-        }
-        setSttProg(true, 100, "done in " + ((performance.now() - t0) / 1000).toFixed(2) + "s");
+        const segs = Array.isArray(j.segments) ? j.segments.map(s => ({
+          start: s.start || 0, end: s.end || 0, text: s.text || "", speaker: s.speaker || null,
+        })) : [{ start: 0, end: j.duration || 0, text: j.text || j.rendered || "", speaker: null }];
+        const names = {};
+        for (const s of segs) if (s.speaker) names[s.speaker] = String(s.speaker).replace(/^SPEAKER_/, "Speaker ");
+        sttState = {
+          sourceName: f.name || "recording.webm",
+          model: j.model || model,
+          language: j.language || "",
+          duration: j.duration || 0,
+          segments: segs,
+          names,
+          text: j.text || "",
+          summary: "",
+          summaryStale: false,
+        };
+        persistSttState();
+        const elapsed = (performance.now() - t0) / 1000;
+        paintSttResult({
+          elapsed,
+          footer: elapsed.toFixed(2) + " s" + (j.model ? ", model " + j.model : "") +
+            (segs.some(s => s.speaker) ? ", " + speakerIds().length + " speakers" : "") +
+            (j.language ? ", language " + j.language : ""),
+        });
+        setSttProg(true, 100, "done in " + elapsed.toFixed(2) + "s · model " + (j.model || model));
       }
     }
   } catch (e) {
@@ -453,27 +907,140 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
     $("#sttOut").textContent = "error: " + msg;
     setSttProg(true, 0, "error");
   } finally {
-    $("#sttGo").disabled = false;
+    if ($("#sttGo")) { delete $("#sttGo").dataset.forceBusy; setAvail($("#sttGo"), availOk()); }
     $("#sttCancel").classList.add("hidden");
     sttJob = null;
   }
 };
-let sttText = "";
-const SPK_COLORS = ["#2f7ed8", "#d8572f", "#2fa36b", "#9b4fd8", "#c9a227", "#d82f8a", "#2fb5c9", "#7a7a7a"];
-const fmtT = s => { const m = Math.floor(s / 60); return m + ":" + (s - m * 60).toFixed(1).padStart(4, "0"); };
-function renderSpeakers(segs) {
-  const box = $("#sttSpk"); box.innerHTML = ""; const ids = [];
-  for (const s of segs) {
-    const sp = s.speaker || "?"; if (!ids.includes(sp)) ids.push(sp);
-    const c = SPK_COLORS[ids.indexOf(sp) % SPK_COLORS.length];
-    const row = document.createElement("div"); row.className = "spk-row"; row.style.borderLeftColor = c;
-    const h = document.createElement("span"); h.className = "spk-who"; h.style.color = c;
-    h.textContent = sp.replace("SPEAKER_", "Speaker ") + " · " + fmtT(s.start) + "–" + fmtT(s.end);
-    const tt = document.createElement("span"); tt.className = "spk-text"; tt.textContent = (s.text || "").trim();
-    row.append(h, tt); box.append(row);
-  }
-  box.classList.remove("hidden");
+
+function wireDl(id, kind) {
+  const el = document.getElementById(id); if (!el) return;
+  el.onclick = () => {
+    if (!sttState) return alert("run a transcription first");
+    const base = sttBaseName();
+    if (kind === "txt") downloadBlob(base + ".txt", buildTxt(), "text/plain");
+    else if (kind === "srt") downloadBlob(base + ".srt", buildSrt(), "application/x-subrip");
+    else if (kind === "vtt") downloadBlob(base + ".vtt", buildVtt(), "text/vtt");
+    else if (kind === "json") downloadBlob(base + ".json", buildJson(), "application/json");
+    else if (kind === "md") downloadBlob(base + ".md", buildMd(), "text/markdown");
+  };
 }
+// fix vtt mime
+if ($("#sttDlVtt")) $("#sttDlVtt").onclick = () => {
+  if (!sttState) return alert("run a transcription first");
+  downloadBlob(sttBaseName() + ".vtt", buildVtt(), "text/vtt");
+};
+wireDl("sttDlTxt", "txt");
+wireDl("sttDlSrt", "srt");
+wireDl("sttDlJson", "json");
+wireDl("sttDlMd", "md");
+
+if ($("#sttToChat")) $("#sttToChat").onclick = () => {
+  const i = $("#input"); i.value = (i.value ? i.value + " " : "") + labelledText().trim();
+  const tab = document.querySelector('#tabs [data-tab="chat"]'); if (tab) tab.click(); i.focus();
+};
+
+async function summarizeTranscript() {
+  if (!sttState) return alert("run a transcription first");
+  const model = $("#modelPick") && $("#modelPick").value;
+  if (!model) return alert("No text model is loaded. Load Qwen (or another LLM) on the Models page.");
+  const transcript = labelledText().trim();
+  if (!transcript) return alert("empty transcript");
+  $("#sttSumBox").classList.remove("hidden");
+  $("#sttSumOut").textContent = "";
+  if ($("#sttSumRegen")) $("#sttSumRegen").classList.add("hidden");
+  if ($("#sttSumCancel")) $("#sttSumCancel").classList.remove("hidden");
+  setSumProg(true, 5, "summarizing…");
+  sttSumCtrl = new AbortController();
+  const effort = (localStorage.getItem("pyre.effort") || "medium");
+  // ~6k chars per chunk keeps plenty of headroom even for smaller ctx; n_ctx here is 131k so we can go larger
+  const CHUNK = 24000;
+  const parts = [];
+  if (transcript.length <= CHUNK) parts.push(transcript);
+  else {
+    let i = 0;
+    while (i < transcript.length) {
+      let end = Math.min(transcript.length, i + CHUNK);
+      if (end < transcript.length) {
+        const nl = transcript.lastIndexOf("\n", end);
+        if (nl > i + CHUNK * 0.5) end = nl;
+      }
+      parts.push(transcript.slice(i, end));
+      i = end;
+    }
+  }
+  const sys = "You are a precise meeting analyst. Summarize the transcript with: (1) Key points, (2) Decisions, (3) Action items (owner + due if stated), (4) Per-speaker notes when speakers are labelled. Use the speaker names exactly as given. Be concise; use markdown headings and bullets.";
+  try {
+    let combined = "";
+    if (parts.length === 1) {
+      setSumProg(true, 20, "streaming summary…");
+      combined = await streamChatSummary(model, sys, "Summarize this transcript:\n\n" + parts[0], effort, sttSumCtrl.signal, (t) => {
+        $("#sttSumOut").innerHTML = md(t);
+        setSumProg(true, 20 + Math.min(70, t.length / 40), "streaming…");
+      });
+    } else {
+      const partials = [];
+      for (let i = 0; i < parts.length; i++) {
+        setSumProg(true, 10 + 60 * (i / parts.length), "chunk " + (i + 1) + "/" + parts.length);
+        const p = await streamChatSummary(model, sys,
+          "This is part " + (i + 1) + " of " + parts.length + " of a longer transcript. Extract key points, decisions, action items, and per-speaker notes. Speaker names must be preserved.\n\n" + parts[i],
+          effort, sttSumCtrl.signal, (t) => { $("#sttSumOut").innerHTML = md("_Chunk " + (i + 1) + "/" + parts.length + "_\n\n" + t); });
+        partials.push(p);
+      }
+      setSumProg(true, 80, "merging chunks…");
+      combined = await streamChatSummary(model, sys,
+        "Merge these partial summaries of one meeting into a single clean summary with Key points, Decisions, Action items, and Per-speaker notes. Deduplicate. Keep speaker names.\n\n" +
+        partials.map((p, i) => "### Part " + (i + 1) + "\n" + p).join("\n\n"),
+        effort, sttSumCtrl.signal, (t) => { $("#sttSumOut").innerHTML = md(t); });
+    }
+    sttState.summary = combined;
+    sttState.summaryStale = false;
+    persistSttState();
+    $("#sttSumOut").innerHTML = md(combined);
+    setSumProg(true, 100, "done");
+  } catch (e) {
+    if (e.name === "AbortError") setSumProg(true, 0, "cancelled");
+    else { setSumProg(true, 0, "error"); $("#sttSumOut").textContent = "error: " + (e.message || e); }
+  } finally {
+    sttSumCtrl = null;
+    if ($("#sttSumCancel")) $("#sttSumCancel").classList.add("hidden");
+  }
+}
+async function streamChatSummary(model, system, user, effort, signal, onDelta) {
+  let out = "";
+  const body = {
+    model, stream: true, reasoning_effort: effort || "medium",
+    temperature: 0.3, max_tokens: 4096,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  for await (const ch of sse("/v1/chat/completions", body, signal)) {
+    if (ch.error) throw new Error(ch.error.message || "chat error");
+    const d = ch.choices?.[0]?.delta?.content;
+    if (d) { out += d; if (onDelta) onDelta(out); }
+  }
+  return plainAnswer({ content: out }) || out;
+}
+if ($("#sttSummarize")) $("#sttSummarize").onclick = () => summarizeTranscript();
+if ($("#sttSumRegen")) $("#sttSumRegen").onclick = () => summarizeTranscript();
+if ($("#sttSumCancel")) $("#sttSumCancel").onclick = () => { if (sttSumCtrl) sttSumCtrl.abort(); };
+if ($("#sttSumCopy")) $("#sttSumCopy").onclick = async () => {
+  const t = sttState && sttState.summary; if (!t) return;
+  try { await navigator.clipboard.writeText(t); } catch { prompt("Copy summary:", t); }
+};
+if ($("#sttSumDlMd")) $("#sttSumDlMd").onclick = () => {
+  if (!sttState || !sttState.summary) return;
+  downloadBlob(sttBaseName() + "_summary.md", "# Summary — " + (sttState.sourceName || "") + "\n\n" + sttState.summary, "text/markdown");
+};
+if ($("#sttSumDlTxt")) $("#sttSumDlTxt").onclick = () => {
+  if (!sttState || !sttState.summary) return;
+  // strip light markdown for txt
+  const t = sttState.summary.replace(/^#+\s+/gm, "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1");
+  downloadBlob(sttBaseName() + "_summary.txt", t, "text/plain");
+};
+
 fetch("/api/diarizer", { headers: headers() }).then(r => r.json()).then(j => {
   const ok = !!j.loaded; if ($("#sttDiar")) $("#sttDiar").disabled = !ok;
   if ($("#sttDiarL")) $("#sttDiarL").title = ok ? ("Who spoke when: " + j.info.model + " on " + j.info.backend) : "No diarization model loaded (start with --load diar=nvidia/Nemotron-3-Diarization)";
@@ -481,10 +1048,8 @@ fetch("/api/diarizer", { headers: headers() }).then(r => r.json()).then(j => {
 }).catch(() => {});
 refreshSttModels();
 applySttPrefs(loadSttPrefs());
-if ($("#sttToChat")) $("#sttToChat").onclick = () => {
-  const i = $("#input"); i.value = (i.value ? i.value + " " : "") + sttText.trim();
-  const tab = document.querySelector('#tabs [data-tab="chat"]'); if (tab) tab.click(); i.focus();
-};
+restoreSttState();
+
 if ($("#ttsGo")) $("#ttsGo").onclick = async () => {
   if ($("#ttsProg")) $("#ttsProg").classList.remove("hidden");
   if ($("#ttsBar")) $("#ttsBar").style.width = "30%";

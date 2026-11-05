@@ -42,3 +42,7 @@
 .cdl-bar{grid-column:1/-1;height:6px;background:var(--border);border-radius:4px;overflow:hidden}
 .cdl-bar>div{height:100%;background:var(--accent)}
 .cdl-msg{grid-column:1/-1;color:var(--muted);font-size:11px}
+
+.cadv { margin: 8px 0; padding: 6px 10px; border: 1px solid var(--border, #333); border-radius: 8px; background: rgba(127,127,127,.05); }
+.cadv > summary { cursor: pointer; color: #9aa; font-size: 13px; }
+.cadv-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }

@@ -42,7 +42,7 @@ pub async fn ensure(app: &Arc<App>, kind: Kind, r: &str, backend: &str, lease: u
         let v0 = crate::limits::vram().map(|v| v.free >> 20);
         if lease > 0 { crate::limits::lease(lease, &format!("loading {r2}"))?; }
         let t = Instant::now();
-        let m = match crate::registry::load(&app2.storage, &app2.defaults, LoadReq { kind, r: &r2, alias: None, backend: Some(b2.clone()), dtype: None, ctx_size: None }) {
+        let m = match crate::registry::load(&app2.storage, &app2.defaults, LoadReq { kind, r: &r2, alias: None, backend: Some(b2.clone()), dtype: None, ctx_size: None, stt_progress: None, }) {
             Ok(m) => m,
             Err(e) => { if gpu { cleanup(); } if lease > 0 { crate::limits::lease_end(lease); } return Err(e); }
         };

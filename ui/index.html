@@ -21,8 +21,17 @@
     <button data-tab="status">Server</button>
   </nav>
   <div class="right">
-    <button id="keyBtn" class="ghost" title="API key">🔑</button>
-    <button id="themeBtn" class="ghost" title="Toggle theme">◐</button>
+    <div id="statusPill" class="spill idle" title="Server status">
+      <span class="spill-dot"></span>
+      <span id="statusPillText">Connecting…</span>
+    </div>
+    <div id="statusPop" class="spop hidden" hidden>
+      <div class="spop-h">Activity</div>
+      <div id="statusPopJobs" class="spop-jobs muted">Idle</div>
+      <div id="statusPopVram" class="spop-vram muted small"></div>
+    </div>
+    <button id="keyBtn" class="ghost" title="API key">key</button>
+    <button id="themeBtn" class="ghost" title="Toggle theme">theme</button>
   </div>
 </header>
 
@@ -122,91 +131,70 @@
         <div class="row wrap">
           <input type="file" id="sttFile" accept="audio/*">
           <button id="recBtn" type="button">Record</button>
-          <select id="sttModel" title="Whisper / ASR model"></select>
-          <button id="sttModelDl" type="button" class="hidden">Download model</button>
-          <select id="sttTask"><option value="transcriptions">Transcribe</option><option value="translations">Translate to English</option></select>
-          <input id="sttLang" placeholder="language (auto)" size="8">
-          <select id="sttFormat" title="Output format">
-            <option value="verbose_json">JSON (verbose)</option>
-            <option value="whisburn_json">JSON (whisburn)</option>
-            <option value="txt">TXT</option>
-            <option value="srt">SRT</option>
-            <option value="vtt">VTT</option>
-            <option value="json">JSON</option>
+          <select id="sttQuality" title="Quality / speed">
+            <option value="fast">Fast</option>
+            <option value="balanced" selected>Balanced</option>
+            <option value="best">Best</option>
           </select>
-        </div>
-        <details id="sttPrefs" class="prefs"><summary>Preferences</summary>
-          <div class="row wrap">
-            <label><input type="checkbox" id="sttTimestamps" checked> Timestamps</label>
-            <label><input type="checkbox" id="sttSentences"> Sentences</label>
-            <label id="sttDiarL" title="Needs a diarization model"><input type="checkbox" id="sttDiar" disabled> Separate speakers</label>
-            <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em"></label>
-            <label>Max tokens <input id="sttMaxTok" type="number" min="1" max="448" value="448" style="width:4.5em"></label>
-          </div>
-          <p class="muted small">Defaults match peal/whisburn. Settings are saved in this browser.</p>
-        </details>
-        <div class="row">
+          <label id="sttDiarL" title="Needs a diarization model"><input type="checkbox" id="sttDiar" disabled> Separate speakers</label>
           <button id="sttGo" class="primary" type="button">Run</button>
           <button id="sttCancel" type="button" class="hidden">Cancel</button>
         </div>
+        <details id="sttAdvanced" class="prefs">
+          <summary>Advanced</summary>
+          <div class="row wrap">
+            <select id="sttModel" title="Whisper / ASR model"></select>
+            <button id="sttModelDl" type="button" class="hidden">Download model</button>
+            <select id="sttTask"><option value="transcriptions">Transcribe</option><option value="translations">Translate to English</option></select>
+            <input id="sttLang" placeholder="language (auto)" size="8">
+            <label><input type="checkbox" id="sttTimestamps" checked> Timestamps</label>
+            <label><input type="checkbox" id="sttSentences"> Sentences</label>
+            <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em"></label>
+            <label>Max tokens <input id="sttMaxTok" type="number" min="1" max="448" value="448" style="width:4.5em"></label>
+          </div>
+          <p class="muted small">Model id, language, task, decoding knobs. Output format is chosen when you download. Settings are saved in this browser.</p>
+        </details>
+        <!-- hidden legacy format select kept for prefs restore; downloads own the format -->
+        <select id="sttFormat" class="hidden" aria-hidden="true">
+          <option value="verbose_json" selected>JSON (verbose)</option>
+          <option value="whisburn_json">JSON (whisburn)</option>
+          <option value="txt">TXT</option>
+          <option value="srt">SRT</option>
+          <option value="vtt">VTT</option>
+          <option value="json">JSON</option>
+        </select>
         <div id="sttProg" class="aprogress hidden">
           <div class="abar"><div id="sttBar" class="abar-fill"></div></div>
-          <div id="sttProgLabel" class="muted small">…</div>
+          <div id="sttProgLabel" class="muted small"></div>
         </div>
         <audio id="sttAudio" controls class="hidden"></audio>
+        <div id="sttMeta" class="muted small hidden"></div>
+        <div id="sttLegend" class="spk-legend hidden"></div>
+        <div id="sttTimeline" class="spk-timeline hidden" title="Diarization timeline"></div>
         <div id="sttSpk" class="spk hidden"></div>
         <pre id="sttOut" class="out"></pre>
-        <div class="row"><button id="sttToChat" type="button" class="hidden">Send transcript to chat</button>
-          <a id="sttDownload" class="btnlink hidden" download="transcript.txt">Download</a></div>
+        <div id="sttActions" class="row wrap hidden">
+          <button id="sttSummarize" type="button" class="primary">Summarize</button>
+          <button id="sttToChat" type="button">Send transcript to chat</button>
+          <button id="sttDlTxt" type="button">Download TXT</button>
+          <button id="sttDlSrt" type="button">Download SRT</button>
+          <button id="sttDlVtt" type="button">Download VTT</button>
+          <button id="sttDlJson" type="button">Download JSON</button>
+          <button id="sttDlMd" type="button">Download Markdown</button>
+        </div>
+        <div id="sttSumBox" class="sumbox hidden">
+          <h4>Summary</h4>
+          <div id="sttSumProg" class="aprogress hidden"><div class="abar"><div id="sttSumBar" class="abar-fill"></div></div><div id="sttSumProgLabel" class="muted small"></div></div>
+          <div id="sttSumOut" class="sumout"></div>
+          <div class="row wrap">
+            <button id="sttSumCopy" type="button">Copy summary</button>
+            <button id="sttSumDlMd" type="button">Download summary MD</button>
+            <button id="sttSumDlTxt" type="button">Download summary TXT</button>
+            <button id="sttSumRegen" type="button" class="hidden">Regenerate summary</button>
+            <button id="sttSumCancel" type="button" class="hidden">Cancel</button>
+          </div>
+        </div>
       </fieldset>
     </div>
     <div class="card">
-      <h3>Text to speech</h3>
-      <div class="disabled-note" id="ttsNote">No text-to-speech model is loaded (start with <code>--tts-model facebook/mms-tts-eng</code>).</div>
-      <fieldset id="ttsForm" disabled>
-        <textarea id="ttsText" rows="3" placeholder="Text to speak"></textarea>
-        <div class="row"><select id="ttsVoice"><option>default</option></select><label>Speed<input id="ttsSpeed" type="number" step="0.1" value="1.0"></label>
-          <button id="ttsGo" class="primary" type="button">Speak</button>
-          <button id="ttsCancel" type="button" class="hidden">Cancel</button></div>
-        <div id="ttsProg" class="aprogress hidden"><div class="abar"><div id="ttsBar" class="abar-fill"></div></div><div id="ttsProgLabel" class="muted small"></div></div>
-        <audio id="ttsAudio" controls class="hidden"></audio>
-      </fieldset>
-    </div>
-  </div>
-</section>
-
-<!-- APPS -->
-<section id="tab-cabin" class="tab">
-  <div class="cside">
-    <div id="cabinCards"></div>
-    <div id="cabinStatus"></div>
-    <b>Results</b>
-    <div id="cabinGallery"></div>
-  </div>
-  <div id="cabinPane"><h3>Cabin workflows</h3><p class="muted">Pick a workflow on the left. Models load on demand (GPU models borrow VRAM from the LLM's expert cache and are unloaded after a couple of idle minutes).</p></div>
-</section>
-<section id="tab-apps" class="tab">
-  <div class="card"><h3>Apps <span class="muted small" id="appsInfo"></span></h3>
-    <p class="muted small">Companion programs that use this pyre server. Install builds the app into pyre's apps folder and configures it with this server's URL. "Run" starts it on the machine pyre runs on.</p>
-    <div id="appsList" class="apps"></div>
-    <div class="row"><input id="appSrc" placeholder="folder with pyre-app.toml, or manifest path"><button id="appAdd">Install from path</button></div>
-    <pre id="appLog" class="out logs hidden"></pre>
-  </div>
-</section>
-
-<!-- STATUS -->
-<section id="tab-status" class="tab">
-  <div class="cards">
-    <div class="card"><h3>Server</h3><div id="statusBox" class="kv"></div></div>
-    <div class="card"><h3>Slots / queues</h3><table id="slotsTbl"><thead><tr><th>Model</th><th>Kind</th><th>Busy</th><th>Queued</th></tr></thead><tbody></tbody></table></div>
-  </div>
-  <div class="card"><h3>API usage</h3><pre id="apiSnippet" class="out code"></pre></div>
-  <div class="card"><h3>Logs <button id="logRefresh" class="ghost small">refresh</button></h3><pre id="logs" class="out logs"></pre></div>
-</section>
-</main>
-
-<dialog id="dlg"><form method="dialog"><p id="dlgText"></p><div id="dlgExtra"></div><menu><button value="cancel">Cancel</button><button value="ok" class="primary" id="dlgOk">OK</button></menu></form></dialog>
-<script src="/ui/app.js"></script>
-<script src="/ui/cabin.js"></script>
-</body>
-</html>
+      <h3>Text to speech

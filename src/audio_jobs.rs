@@ -56,9 +56,13 @@ async fn list_models(State(app): S) -> Response {
     { err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
 }
 
+
+pub fn cancel_id(id: &str) -> bool {
+    jobs().lock().unwrap().get(id).map(|j| { j.cancel.store(true, Ordering::SeqCst); true }).unwrap_or(false)
+}
 async fn cancel_job(Json(b): Json<Value>) -> Response {
     let id = b["id"].as_str().unwrap_or("");
-    let ok = jobs().lock().unwrap().get(id).map(|j| { j.cancel.store(true, Ordering::SeqCst); true }).unwrap_or(false);
+    let ok = cancel_id(id);
     Json(json!({"ok": ok, "id": id})).into_response()
 }
 
@@ -72,9 +76,14 @@ async fn start_job_async(State(app): S, mp: Multipart) -> Response {
         jobs().lock().unwrap().insert(id.clone(), Job { cancel: cancel.clone() });
         let (tx, rx) = mpsc::unbounded_channel::<Value>();
         emit(&tx, json!({"stage":"queued","job":id,"message":"job accepted"}));
+        {
+            let mut j = crate::activity::Job::new(&id, "audio", "Transcribing");
+            j.cancelable = true;
+            crate::activity::upsert(j);
+        }
         let parsed = match crate::stt::parse_multipart(mp).await {
             Ok(q) => q,
-            Err(e) => { jobs().lock().unwrap().remove(&id); return err(StatusCode::BAD_REQUEST, format!("{e:#}")); }
+            Err(e) => { jobs().lock().unwrap().remove(&id); crate::activity::remove(&id); return err(StatusCode::BAD_REQUEST, format!("{e:#}")); }
         };
         let translate = parsed.translate_task;
         let app2 = app.clone();
@@ -91,6 +100,7 @@ async fn start_job_async(State(app): S, mp: Multipart) -> Response {
                     emit(&tx2, json!({"stage":stage,"job":id2,"message":msg}));
                 }
             }
+            crate::activity::remove(&id2);
             jobs().lock().unwrap().remove(&id2);
             #[cfg(feature = "stt")]
             pyre_whisper_engine::job_hooks::clear();

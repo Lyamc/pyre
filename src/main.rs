@@ -8,6 +8,7 @@ mod logbuf;
 mod registry;
 mod stt;
 mod audio_jobs;
+mod activity;
 mod diar;
 mod cabin;
 mod cabin_catalog;
@@ -345,7 +346,7 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
     let app = Arc::new(registry::App { models: Default::default(), storage: sctx, defaults: defaults.clone(), api_key: args.api_key.clone(), started: std::time::Instant::now() });
     for (i, (kind, r, be)) in want.iter().enumerate() {
         let alias = if i == 0 && *kind == Kind::Llm { args.alias.clone() } else { None };
-        let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: be.clone(), dtype: None, ctx_size: None })?;
+        let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: be.clone(), dtype: None, ctx_size: None, stt_progress: None, })?;
         tracing::info!("loaded {} model '{}' on {}", kind.as_str(), m.id, m.backend);
         app.insert(m)?;
     }

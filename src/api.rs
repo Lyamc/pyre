@@ -25,6 +25,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/models/rm", post(rm))
         .route("/api/pull", post(pull))
         .route("/api/status", get(status))
+        .route("/api/status/stream", get(status_stream))
+        .route("/api/activity/cancel", post(activity_cancel))
         .route("/api/metrics", get(metrics))
         .route("/api/logs", get(logs))
         .route("/metrics", get(prom))
@@ -59,12 +61,20 @@ struct LoadBody { model: String, kind: Option<String>, alias: Option<String>, ba
 async fn load(State(app): S, Json(b): Json<LoadBody>) -> Response {
     let kind = match b.kind.as_deref() { Some(k) => match Kind::parse(k) { Some(k) => k, None => return err(StatusCode::BAD_REQUEST, format!("unknown kind {k}")) }, None => Kind::Llm };
     let a = app.clone();
+    let act_id = format!("load-{}", b.model);
+    {
+        let mut j = crate::activity::Job::new(&act_id, "model", format!("Loading {}", b.model));
+        j.stage = "loading".into();
+        crate::activity::upsert(j);
+    }
+    let act_id2 = act_id.clone();
     let r = tokio::task::spawn_blocking(move || {
-        let m = crate::registry::load(&a.storage, &a.defaults, LoadReq { kind, r: &b.model, alias: b.alias, backend: b.backend, dtype: b.dtype, ctx_size: b.ctx_size })?;
+        let m = crate::registry::load(&a.storage, &a.defaults, LoadReq { kind, r: &b.model, alias: b.alias, backend: b.backend, dtype: b.dtype, ctx_size: b.ctx_size, stt_progress: None, })?;
         let id = m.id.clone();
         a.insert(m)?;
         anyhow::Ok(id)
     }).await;
+    crate::activity::remove(&act_id2);
     match r {
         Ok(Ok(id)) => Json(json!({"ok": true, "id": id})).into_response(),
         Ok(Err(e)) => bad(e),
@@ -171,13 +181,59 @@ fn nvidia() -> Value {
     }
 }
 
+
+async fn status_stream(State(app): S) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let _ = app; // app reserved for future auth/context
+    let mut rx = crate::activity::subscribe();
+    // Push current snapshot immediately, then on change + 1s heartbeat.
+    let (tx, rx_out) = tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+    let _ = tx.send(Ok(Event::default().data(crate::activity::snapshot().to_string())));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if tx.send(Ok(Event::default().data(crate::activity::snapshot().to_string()))).is_err() { break; }
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(v) => { if tx.send(Ok(Event::default().data(v.to_string()))).is_err() { break; } }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if tx.send(Ok(Event::default().data(crate::activity::snapshot().to_string()))).is_err() { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    });
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx_out);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn activity_cancel(Json(b): Json<Value>) -> Response {
+    let id = b["id"].as_str().unwrap_or("");
+    crate::activity::cancel(id);
+    let cancelled = crate::audio_jobs::cancel_id(id);
+    Json(json!({"ok": cancelled, "id": id})).into_response()
+}
+
 async fn status(State(app): S) -> Json<Value> {
-    let gpus = tokio::task::spawn_blocking(nvidia).await.unwrap_or(json!([]));
+    // Fast path: reuse metrics GPU sampler (no nvidia-smi spawn). Activity snapshot is lock-cheap.
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let pid = sysinfo::get_current_pid().ok();
     if let Some(p) = pid { sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true); }
     let rss = pid.and_then(|p| sys.process(p)).map(|p| p.memory()).unwrap_or(0);
+    let m = crate::metrics::snapshot();
+    let g = &m["gpu"];
+    let gpus = json!([{
+        "name": "GPU0",
+        "memory_used_mib": g["vram_used_bytes"].as_u64().map(|b| b >> 20),
+        "memory_total_mib": g["vram_total_bytes"].as_u64().map(|b| b >> 20),
+        "utilization_pct": g["util_pct"],
+    }]);
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"), "burn": "0.22", "uptime_s": app.started.elapsed().as_secs(),
         "default_backend": app.defaults.backend, "backends_compiled": crate::backend::enabled(),
@@ -186,7 +242,8 @@ async fn status(State(app): S) -> Json<Value> {
         "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>(),
         "store_root": app.storage.store.root, "hf_cache": app.storage.hf_cache,
         "limits": crate::limits::status(),
-        "metrics": crate::metrics::snapshot(),
+        "metrics": m,
+        "activity": crate::activity::snapshot(),
         "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
         "speculative": crate::spec::status()["speculative"], "route_prior": crate::spec::status()["route_prior"], "fast": crate::spec::fast(), "context": crate::spec::status()["context"],
     }))

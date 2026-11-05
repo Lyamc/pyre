@@ -86,6 +86,11 @@ impl App {
         })
     }
 
+    /// Exact id match of the right kind; no OpenAI-style fallback to the first loaded model.
+    pub fn find_exact(&self, kind: Kind, name: &str) -> Option<Arc<Loaded>> {
+        self.loaded().into_iter().find(|m| m.kind == kind && m.id == name)
+    }
+
     pub fn llm(&self, name: Option<&str>) -> Result<Arc<Llm>, Response> {
         let m = self.find(Kind::Llm, name)?;
         match &m.inner { Inner::Llm(l) => Ok(l.clone()), _ => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch")) }
@@ -107,7 +112,17 @@ impl App {
     }
 }
 
-pub struct LoadReq<'a> { pub kind: Kind, pub r: &'a str, pub alias: Option<String>, pub backend: Option<String>, pub dtype: Option<String>, pub ctx_size: Option<usize> }
+#[cfg(feature = "stt")]
+pub type SttPrepProgress = pyre_whisper_models::PrepProgressFn;
+#[cfg(not(feature = "stt"))]
+pub type SttPrepProgress = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+pub struct LoadReq<'a> {
+    pub kind: Kind, pub r: &'a str, pub alias: Option<String>, pub backend: Option<String>,
+    pub dtype: Option<String>, pub ctx_size: Option<usize>,
+    /// Optional whisburn prep progress (STT download/convert only).
+    pub stt_progress: Option<SttPrepProgress>,
+}
 
 /// Resolve + load a model (blocking; run on a blocking thread from async code). Refuses loads that
 /// would breach the VRAM reserve (estimate from the weight files first, then the measured result).
@@ -145,6 +160,9 @@ fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
         // STT bundles are whisburn-format (converted .bpk), resolved by the whisburn adapter. Runs on the
         // requested backend (cuda/wgpu/vulkan), so it shares the LLM's device and kernel caches.
         let backend = if matches!(backend.as_str(), "cpu" | "flex" | "ndarray") { "cpu".to_string() } else { backend };
+        #[cfg(feature = "stt")]
+        let s = crate::stt::SttModel::load_with_progress(q.r, &backend, &storage.store.root, storage.offline, q.stt_progress.clone()).context("loading speech-to-text model")?;
+        #[cfg(not(feature = "stt"))]
         let s = crate::stt::SttModel::load(q.r, &backend, &storage.store.root, storage.offline).context("loading speech-to-text model")?;
         let s = Arc::new(s);
         s.warm_in_background();
