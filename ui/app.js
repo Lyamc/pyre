@@ -541,6 +541,7 @@ let sttJob = null;
 let sttSumCtrl = null;
 let sttCatalog = { models: [], loaded: [] };
 let recBlob = null, rec = null;
+let stsRecBlob = null, stsRec = null, stsCtrl = null, stsReplyBlob = null, stsRecTimer = null, stsRecStarted = 0;
 
 function loadSttPrefs() {
   const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
@@ -938,11 +939,11 @@ function updateMicGate() {
 }
 function showPreview(blobOrFile) {
   if (!blobOrFile) return;
-  const url = URL.createObjectURL(blobOrFile);
-  for (const id of ["sttPreview", "sttAudio"]) {
-    const a = $("#" + id); if (!a) continue;
-    a.src = url; a.classList.remove("hidden");
-  }
+  // Source step only. Results must not repeat this file (STS/TTS reply players are separate).
+  const a = $("#sttPreview");
+  if (!a) return;
+  a.src = URL.createObjectURL(blobOrFile);
+  a.classList.remove("hidden");
 }
 function describeFile(f) {
   if (!f) { if ($("#sttFileMeta")) $("#sttFileMeta").textContent = "MP3, WAV, M4A, FLAC, WebM…"; return; }
@@ -1459,7 +1460,7 @@ if ($("#sttCloneVoice")) $("#sttCloneVoice").onclick = async () => {
   await saveVoiceFromBlob(name.trim(), a, "stt");
 };
 if ($("#stsCloneVoice")) $("#stsCloneVoice").onclick = async () => {
-  const f = ($("#stsFile") && $("#stsFile").files && $("#stsFile").files[0]) || window._stsRecBlob;
+  const f = (typeof currentStsAudio === "function") && currentStsAudio();
   if (!f) { showToast("Provide STS audio first"); return; }
   const name = prompt("Name for this voice:");
   if (!name) return;
