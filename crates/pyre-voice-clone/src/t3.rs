@@ -1,4 +1,5 @@
-//! T3-Nano layout. This does not run the model and does not emit audio.
+//! T3-Nano layout and decode constants. The forward pass lives in [`crate::t3_model`].
+//! Speech-token ids are not a waveform, so cloned speech stays unavailable.
 //!
 //! Nano is built in `ChatterboxTurboTTS.from_local(nano=True)` as a GPT-2 small
 //! backbone with separate text and speech embeddings. `input_pos_emb` is `None`,

@@ -87,7 +87,7 @@ async fn voices_list() -> Response {
                         "licence": "MIT",
                         "status": "porting",
                         "text_to_cloned_speech_ready": clone_ready,
-                        "message": "Burn speaker encoder and GPT-2 text tokenizer are in-tree. text_to_cloned_speech_ready stays false until T3, S3, and HiFT emit audio. Bracket tags on the built-in voice are MMS silence/rate approximations, not Nano token ids. voice_id!=mms synthesis is not ready yet."
+                        "message": "Burn speaker encoder, GPT-2 tokenizer, and T3 speech-token sampler are in-tree. text_to_cloned_speech_ready stays false until S3 and HiFT emit a waveform. Bracket tags on the built-in voice are MMS silence/rate approximations, not Nano token ids. voice_id!=mms synthesis is not ready yet."
                     },
                     "directions": "/v1/audio/directions"
                 })).into_response()

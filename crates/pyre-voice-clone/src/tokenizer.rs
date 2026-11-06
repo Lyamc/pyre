@@ -218,7 +218,7 @@ pub fn dir_has_tokenizer(dir: &Path) -> bool {
     dir.is_dir() && REQUIRED.iter().all(|name| safe_file(dir, name).is_ok())
 }
 
-fn safe_file(dir: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn safe_file(dir: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
         bail!("refusing tokenizer path {name}");
     }

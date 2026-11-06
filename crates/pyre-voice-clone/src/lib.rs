@@ -24,14 +24,16 @@
 //!
 //! What runs here: the voice encoder on real `ve.safetensors`, clone cosine, the
 //! inline-tag parser, and the GPT-2 BPE tokenizer (vocab 50276, tags as one id).
-//! T3-Nano's tensor contract is described in [`t3`] and can be checked against a
-//! checkpoint header. What does not: text to a waveform. See [`plan`].
+//! T3-Nano's GPT-2 forward ([`t3_model`]) turns text plus a speaker vector and
+//! optional prompt-speech ids into speech-token ids. What does not: text to a
+//! waveform. See [`plan`].
 
 pub mod directions;
 pub mod encoder;
 pub mod mel;
 pub mod plan;
 pub mod t3;
+pub mod t3_model;
 pub mod tokenizer;
 pub mod verify;
 
@@ -39,5 +41,6 @@ pub use directions::{parse_script, Direction, DirectionKind, Script};
 pub use encoder::VoiceEncoder;
 pub use plan::{stages, text_to_cloned_speech_ready, Stage, StageState};
 pub use t3::{check_checkpoint, TurboDecode};
+pub use t3_model::{discover_t3, T3Nano};
 pub use tokenizer::{discover_tokenizer_dir, NanoTokenizer};
 pub use verify::{match_speakers, SpeakerMatch, CLONE_COSINE_FLOOR};
