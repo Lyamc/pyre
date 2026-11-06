@@ -211,7 +211,7 @@ button[data-avail="0"]:hover, [data-avail="0"]:hover { /* title carries reason *
 .switch-text { display: flex; flex-direction: column; gap: 2px; }
 .switch-title { font-weight: 600; }
 .stt-run { width: 100%; padding: 12px 16px; font-size: 15px; font-weight: 600; }
-.stt-preview, #sttAudio, #ttsAudio, #stsAudio { width: 100%; margin: 8px 0; }
+.stt-preview, #ttsAudio, #stsAudio { width: 100%; margin: 8px 0; }
 .rec-timer { font-variant-numeric: tabular-nums; min-width: 3em; }
 .rec-meter { border-radius: 4px; background: rgba(127,127,127,.15); vertical-align: middle; }
 .callout { padding: 8px 12px; border-radius: 8px; border: 1px solid #d8a01755; background: #d8a01718; margin: 0 0 10px; }
