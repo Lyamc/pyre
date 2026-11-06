@@ -1,0 +1,15 @@
+[package]
+name = "pyre-voice-clone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Burn port of the Chatterbox-Nano voice-cloning front end (speaker encoder and inline vocal directions)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+burn = { workspace = true, features = ["flex"] }
+safetensors = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
