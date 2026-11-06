@@ -3,14 +3,15 @@ use crate::convert::dtype::transpose_linear_weight;
 pub fn layout_tensor(rel: &str, data: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>) {
     let is_conformer_ff = rel.contains("/ff1/") || rel.contains("/ff2/");
     let is_linear_weight = rel.ends_with("/weight.npy")
-        && !is_conformer_ff
         && !rel.contains("/decoder/embedding/")
         && !rel.contains("/decoder/lstm/")
         && (rel.contains("/attn/")
             || rel.contains("pre_encode_out")
             || rel.contains("final_proj")
             || rel.contains("decoder/projector")
-            || rel.contains("ctc_linear"));
+            || rel.contains("ctc_linear")
+            // Conformer FF weights are nn.Linear [out, in] like the rest; Burn wants [in, out].
+            || is_conformer_ff);
 
     // HF CTC head is Conv1d(k=1): [vocab, hidden, 1] → Burn Linear [hidden, vocab].
     if rel.contains("ctc_linear") && shape.len() == 3 && shape[2] == 1 {

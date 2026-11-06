@@ -51,7 +51,8 @@ fn model_dir_has_assets(dir: &Path) -> bool {
         return false;
     }
     let has_tokenizer = dir.join("tokenizer.json").is_file()
-        || (dir.join("vocab.json").is_file() && dir.join("merges.txt").is_file());
+        || (dir.join("vocab.json").is_file() && dir.join("merges.txt").is_file())
+        || (dir.join("vocab.txt").is_file() && dir.join("parakeet_decode.json").is_file());
     let has_weights = dir.join("model.bpk").is_file()
         || dir.join("model.bpk").is_file()
         || dir.join("model.safetensors").is_file()

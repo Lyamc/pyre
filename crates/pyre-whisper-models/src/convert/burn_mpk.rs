@@ -26,7 +26,8 @@ pub fn save_model_from_npy(name: &str, options: &DownloadOptions) -> anyhow::Res
         tracing::info!("converting npy dump to burn mpk for '{name}'");
     }
 
-    let device = burn::tensor::Device::default();
+    // Convert on CPU: Device::default() picks CUDA and would take VRAM from a running LLM server.
+    let device = burn::tensor::Device::flex();
     let dump_str = dump_dir
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("invalid model path"))?;

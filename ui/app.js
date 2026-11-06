@@ -1265,9 +1265,13 @@ async function summarizeTranscript() {
   if ($("#sttSumCancel")) $("#sttSumCancel").classList.remove("hidden");
   setSumProg(true, 5, "summarizing…");
   sttSumCtrl = new AbortController();
-  const effort = (localStorage.getItem("pyre.effort") || "medium");
+  // Summaries run with reasoning off: measured on a ~45 min (9.4k-token) transcript, medium effort spent
+  // ~1.4k reasoning tokens (~85 s) without improving the summary. Override with localStorage pyre.sumEffort.
+  const effort = (localStorage.getItem("pyre.sumEffort") || "none");
   // ~6k chars per chunk keeps plenty of headroom even for smaller ctx; n_ctx here is 131k so we can go larger
-  const CHUNK = 24000;
+  // Prefill dominates (~50 tok/s), so a single pass beats map-reduce (209 s vs 340 s for 36k chars):
+  // only split very long transcripts (~>20k tokens) to keep KV growth well under the VRAM floor.
+  const CHUNK = 80000;
   const parts = [];
   if (transcript.length <= CHUNK) parts.push(transcript);
   else {
