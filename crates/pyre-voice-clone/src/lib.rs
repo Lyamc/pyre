@@ -26,11 +26,14 @@
 //! inline-tag parser, and the GPT-2 BPE tokenizer (vocab 50276, tags as one id).
 //! T3-Nano's GPT-2 forward ([`t3_model`]) turns text plus a speaker vector and
 //! optional prompt-speech ids into speech-token ids. [`s3`] turns a 16 kHz
-//! reference into those prompt ids (25 Hz, at most 375). What does not: text
-//! to a waveform. See [`plan`].
+//! reference into those prompt ids (25 Hz, at most 375). [`hift`] turns an
+//! 80-bin 24 kHz mel into samples. Mean-flow, which would make that mel from
+//! the tokens, is not implemented, so this is still not text to a waveform.
+//! See [`plan`].
 
 pub mod directions;
 pub mod encoder;
+pub mod hift;
 pub mod mel;
 pub mod plan;
 pub mod s3;
@@ -41,6 +44,7 @@ pub mod verify;
 
 pub use directions::{parse_script, Direction, DirectionKind, Script};
 pub use encoder::VoiceEncoder;
+pub use hift::Hift;
 pub use plan::{stages, text_to_cloned_speech_ready, Stage, StageState};
 pub use s3::{discover_s3, S3Tokenizer, MAX_PROMPT_TOKENS};
 pub use t3::{check_checkpoint, TurboDecode};
