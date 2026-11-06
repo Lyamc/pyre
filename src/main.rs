@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+﻿#![recursion_limit = "512"]
 mod backend;
 mod ctx;
 mod effort;
@@ -20,6 +20,9 @@ mod rife;
 mod triposr;
 mod mc_tables;
 mod tts;
+mod tts_markup;
+mod voices;
+mod voices_api;
 mod image;
 mod tagger;
 mod ui;
