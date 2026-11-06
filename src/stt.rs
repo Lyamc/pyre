@@ -379,31 +379,43 @@ pub(crate) fn run_job(
 
     emit("decoding", json!({"message": format!("decoding {}", q.filename), "bytes": q.file.len()}));
     let cancel_h = cancel.clone();
-    let tx_h = tx.clone();
-    let job_h = job.to_string();
-    let t_chunk = std::time::Instant::now();
+    PROG.with(|p| {
+        *p.borrow_mut() = Some(JobProg {
+            ledger: pyre_whisper_core::ProgressLedger::new(),
+            tx: tx.clone(),
+            job: job.to_string(),
+            job_at: t0,
+            transcribe_at: None,
+        });
+    });
     pyre_whisper_engine::job_hooks::install(pyre_whisper_engine::job_hooks::JobHooks {
         cancel: cancel_h,
-        on_chunk: Some(std::sync::Arc::new(move |i, n| {
-            let elapsed = t_chunk.elapsed().as_secs_f64();
-            let eta = if i > 0 { elapsed * (n.saturating_sub(i)) as f64 / i as f64 } else { 0.0 };
-            let _ = tx_h.send(json!({
-                "stage": "transcribing", "job": job_h, "current": i, "total": n,
-                "elapsed_s": elapsed, "eta_s": eta, "message": format!("chunk {i}/{n}")
-            }));
-            crate::activity::patch(&job_h, |j| {
-                j.stage = "transcribing".into();
-                j.label = format!("Transcribing {i}/{n}");
-                j.current = Some(i as u64); j.total = Some(n as u64); j.eta_s = Some(eta);
-                j.cancelable = true;
+        on_chunk: Some(std::sync::Arc::new(|report| {
+            PROG.with(|p| {
+                let mut slot = p.borrow_mut();
+                let Some(prog) = slot.as_mut() else { return };
+                if prog.transcribe_at.is_none() {
+                    prog.transcribe_at = Some(std::time::Instant::now());
+                }
+                if prog.diarizing() {
+                    prog.ledger.set_phase("transcribing", "transcribing");
+                }
+                prog.ledger.observe_chunks(
+                    report.chunks_done as u64,
+                    report.chunks_total as u64,
+                    report.samples_done as u64,
+                    report.samples_total as u64,
+                );
             });
+            prog_publish();
         })),
     });
+    let _prog_guard = ProgGuard;
     JOB_TX.with(|c| *c.borrow_mut() = Some((tx.clone(), job.to_string(), cancel.clone(), t0)));
     stt.queued.fetch_add(1, Ordering::SeqCst);
     let res = run(&stt, &q, translate);
     JOB_TX.with(|c| *c.borrow_mut() = None);
-    pyre_whisper_engine::job_hooks::clear();
+    drop(_prog_guard);
     let (r, dur, secs, fmt) = res?;
     if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     tracing::info!("stt {}: {:.2}s audio in {:.2}s ({:.1}x realtime)", m.id, dur, secs, dur / secs.max(1e-6));
@@ -444,6 +456,99 @@ fn job_cancelled() -> bool {
     JOB_TX.with(|c| c.borrow().as_ref().map(|(_, _, cancel, _)| cancel.load(Ordering::Relaxed)).unwrap_or(false))
 }
 
+#[cfg(feature = "stt")]
+struct JobProg {
+    ledger: pyre_whisper_core::ProgressLedger,
+    tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    job: String,
+    job_at: std::time::Instant,
+    transcribe_at: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "stt")]
+impl JobProg {
+    fn diarizing(&self) -> bool {
+        self.ledger.view(0.0).phase == "diarizing"
+    }
+}
+
+#[cfg(feature = "stt")]
+thread_local! {
+    static PROG: std::cell::RefCell<Option<JobProg>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "stt")]
+struct ProgGuard;
+
+#[cfg(feature = "stt")]
+impl Drop for ProgGuard {
+    fn drop(&mut self) {
+        PROG.with(|p| *p.borrow_mut() = None);
+        pyre_whisper_engine::job_hooks::clear();
+    }
+}
+
+#[cfg(feature = "stt")]
+fn prog_publish() {
+    let published = PROG.with(|p| {
+        let slot = p.borrow();
+        let prog = slot.as_ref()?;
+        let elapsed_stt = prog.transcribe_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let view = prog.ledger.view(elapsed_stt);
+        let mut v = serde_json::json!({
+            "stage": view.phase,
+            "phase": view.phase,
+            "job": prog.job,
+            "elapsed_s": prog.job_at.elapsed().as_secs_f64(),
+            "message": view.message,
+        });
+        if view.total.is_some() || view.completed > 0 {
+            v["current"] = serde_json::json!(view.completed);
+            v["completed"] = serde_json::json!(view.completed);
+        }
+        if let Some(t) = view.total { v["total"] = serde_json::json!(t); }
+        if let Some(f) = view.fraction { v["fraction"] = serde_json::json!(f); }
+        if let Some(e) = view.eta_s { v["eta_s"] = serde_json::json!(e); }
+        let _ = prog.tx.send(v);
+        Some((prog.job.clone(), view))
+    });
+    if let Some((job, view)) = published {
+        crate::activity::patch(&job, |j| {
+            j.stage = view.phase.to_string();
+            j.label = view.message.clone();
+            j.current = if view.total.is_some() || view.completed > 0 { Some(view.completed) } else { None };
+            j.total = view.total;
+            j.fraction = view.fraction;
+            j.eta_s = view.eta_s;
+            j.cancelable = true;
+        });
+    }
+}
+
+#[cfg(feature = "stt")]
+fn prog_set_phase(phase: &'static str, message: impl Into<String>) {
+    let message = message.into();
+    PROG.with(|p| {
+        if let Some(prog) = p.borrow_mut().as_mut() {
+            prog.ledger.set_phase(phase, message);
+        }
+    });
+    prog_publish();
+}
+
+#[cfg(feature = "stt")]
+fn prog_mark_transcribe() {
+    PROG.with(|p| {
+        if let Some(prog) = p.borrow_mut().as_mut() {
+            if prog.transcribe_at.is_none() {
+                prog.transcribe_at = Some(std::time::Instant::now());
+            }
+            prog.ledger.set_phase("transcribing", "transcribing");
+        }
+    });
+    prog_publish();
+}
+
 /// Speaker-attributed transcript. `turns`: diarize, then run Whisper on each speaker turn (same-speaker
 /// pauses < 1.0 s merged, 0.15 s padding), so every segment has exactly one speaker and overlapped
 /// speech is transcribed once per speaker. `midpoint`: one Whisper pass, each segment goes to the
@@ -453,16 +558,16 @@ fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode
     use pyre_whisper_core::TranscriptSegment as TS;
     let d = crate::diar::DIAR.get().ok_or_else(|| anyhow!("no diarization model loaded"))?;
     let t = std::time::Instant::now();
-    job_emit("diarizing", serde_json::json!({"message": "finding speakers"}));
+    prog_set_phase("diarizing", "finding speakers");
     if job_cancelled() { bail!("cancelled"); }
     let turns = d.turns(&samples, if mode == "midpoint" { 0.3 } else { 1.0 });
     tracing::info!("diarize: {} turns in {:.2}s", turns.len(), t.elapsed().as_secs_f64());
-    job_emit("diarizing", serde_json::json!({"message": format!("found {} speaker turns", turns.len()), "total": turns.len()}));
+    prog_set_phase("diarizing", format!("found {} speaker turns", turns.len()));
     let mut out: Option<Transcript> = None;
     let mut segs: Vec<TS> = vec![];
     if mode == "midpoint" {
         if job_cancelled() { bail!("cancelled"); }
-        job_emit("transcribing", serde_json::json!({"message": "transcribing (speaker midpoint)", "current": 1, "total": 1}));
+        prog_mark_transcribe();
         let mut r = tx(samples)?;
         for s in &mut r.segments {
             let ov = |a: &crate::diar::Seg| (s.end.min(a.end) - s.start.max(a.start)).max(0.0);
@@ -475,19 +580,35 @@ fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode
         out = Some(r);
     } else {
         let n = samples.len();
-        let total = turns.len().max(1);
-        for (i, tu) in turns.iter().enumerate() {
-            if job_cancelled() { bail!("cancelled"); }
-            let elapsed = t.elapsed().as_secs_f64();
-            let eta = if i > 0 { elapsed * (total - i) as f64 / i as f64 } else { 0.0 };
-            job_emit("transcribing", serde_json::json!({
-                "message": format!("speaker turn {}/{}", i + 1, total),
-                "current": i + 1, "total": total, "elapsed_s": elapsed, "eta_s": eta
-            }));
+        let mut work: Vec<(usize, usize, &crate::diar::Seg)> = Vec::new();
+        for tu in &turns {
             let a = (((tu.start - 0.15) * 16_000.0).max(0.0) as usize).min(n);
             let b = (((tu.end + 0.15) * 16_000.0) as usize).min(n);
             if b <= a + 4_800 { continue; } // < 0.3 s: Whisper only hallucinates on these
+            work.push((a, b, tu));
+        }
+        let budget: u64 = work.iter().map(|(a, b, _)| (*b - *a) as u64).sum();
+        PROG.with(|p| {
+            if let Some(prog) = p.borrow_mut().as_mut() {
+                prog.transcribe_at = Some(std::time::Instant::now());
+                prog.ledger.begin_turns(work.len() as u64, budget);
+            }
+        });
+        prog_publish();
+        for (a, b, tu) in work {
+            if job_cancelled() { bail!("cancelled"); }
+            PROG.with(|p| {
+                if let Some(prog) = p.borrow_mut().as_mut() {
+                    prog.ledger.begin_slice((b - a) as u64);
+                }
+            });
             let r = tx(samples[a..b].to_vec())?;
+            PROG.with(|p| {
+                if let Some(prog) = p.borrow_mut().as_mut() {
+                    prog.ledger.finish_slice();
+                }
+            });
+            prog_publish();
             let text = r.text.trim().to_string();
             if !text.is_empty() {
                 let spk = crate::diar::label(tu.speaker);

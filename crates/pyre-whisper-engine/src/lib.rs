@@ -12,6 +12,8 @@ pub mod job_hooks;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod speed_stt;
+#[cfg(test)]
 pub mod benchmarks;
 #[cfg(test)]
 pub mod test_shape;

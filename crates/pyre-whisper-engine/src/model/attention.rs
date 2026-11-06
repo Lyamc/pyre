@@ -46,6 +46,28 @@ impl MultiHeadAttention {
         let v = self.value.forward(x);
         qkv_attention(q, k, v, mask, self.n_head, &self.out)
     }
+
+    /// Self-attention over `x_ln` (new positions only). `past` is K/V for the
+    /// tokens already decoded; both are returned covering past + new.
+    pub fn forward_self_step(
+        &self,
+        x_ln: Tensor<3>,
+        past: Option<(Tensor<3>, Tensor<3>)>,
+        mask: Option<Tensor<2>>,
+    ) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
+        let q = self.query.forward(x_ln.clone());
+        let k_new = self.key.forward(x_ln.clone());
+        let v_new = self.value.forward(x_ln);
+        let (k, v) = match past {
+            Some((pk, pv)) => (
+                Tensor::cat(vec![pk, k_new], 1),
+                Tensor::cat(vec![pv, v_new], 1),
+            ),
+            None => (k_new, v_new),
+        };
+        let y = qkv_attention(q, k.clone(), v.clone(), mask, self.n_head, &self.out);
+        (y, k, v)
+    }
 }
 
 // --- Relative Positional Attention (Parakeet, FastConformer) ---
@@ -204,6 +226,22 @@ impl MultiHeadCrossAttention {
         let k = self.key.forward(xa.clone());
         let v = self.value.forward(xa);
         qkv_attention(q, k, v, None, self.n_head, &self.out)
+    }
+
+    /// Cross-attention. Encoder K/V are projected once and reused for every token.
+    pub fn forward_cross_step(
+        &self,
+        x_ln: Tensor<3>,
+        xa: &Tensor<3>,
+        past: Option<(Tensor<3>, Tensor<3>)>,
+    ) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
+        let (k, v) = match past {
+            Some(kv) => kv,
+            None => (self.key.forward(xa.clone()), self.value.forward(xa.clone())),
+        };
+        let q = self.query.forward(x_ln);
+        let y = qkv_attention(q, k.clone(), v.clone(), None, self.n_head, &self.out);
+        (y, k, v)
     }
 }
 

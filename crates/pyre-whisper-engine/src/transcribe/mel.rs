@@ -1,9 +1,26 @@
 use burn::tensor::{Tensor};
 use crate::audio::AudioProcessor;
-use std::ops::Div;
 use std::sync::Arc;
 
 use crate::model::load::helpers::load_tensor;
+use pyre_whisper_core::plan_windows;
+
+pub fn slice_to_mel(
+    waveform: &[f32],
+    start: usize,
+    end: usize,
+    processor: &AudioProcessor,
+    device: &burn::tensor::Device,
+) -> Tensor<3> {
+    let end = end.min(waveform.len()).max(start);
+    let mut chunk = waveform[start..end].to_vec();
+    // Whisper STFT reflection pad needs >= n_fft (400) samples.
+    if chunk.len() < 400 {
+        chunk.resize(400, 0.0);
+    }
+    let waveform_tensor = Tensor::<1>::from_floats(chunk.as_slice(), device);
+    processor.prep_audio(waveform_tensor.unsqueeze())
+}
 
 pub fn waveform_to_mel_tensor(
     waveform: Vec<f32>,
@@ -14,10 +31,9 @@ pub fn waveform_to_mel_tensor(
     is_nemo: bool,
     model_name: &str,
 ) -> impl Iterator<Item = Tensor<3>> {
-    let chunk_overlap = sample_rate * 3;
-    let n_samples_per_tensor = window_length_samples;
-    let shift = n_samples_per_tensor.saturating_sub(chunk_overlap).max(1);
-    let iter_len = waveform.len().saturating_sub(1).div(shift) + 1;
+    let plan = plan_windows(waveform.len(), window_length_samples, sample_rate.saturating_mul(3));
+    let starts = plan.starts;
+    let window = plan.window;
     let device_clone = device.clone();
 
     let mut processor = AudioProcessor::new(&device_clone, sample_rate as f64, n_mels, is_nemo, model_name);
@@ -36,22 +52,10 @@ pub fn waveform_to_mel_tensor(
 
     let processor_arc = Arc::new(processor);
 
-    (0..iter_len).into_iter().map(move |i| {
+    (0..starts.len()).map(move |i| {
         let processor = processor_arc.clone();
-        let start = i * shift;
-        let end = (start + n_samples_per_tensor).min(waveform.len());
-
-        let mut chunk = waveform[start..end].to_vec();
-        // Whisper STFT reflection pad needs >= n_fft (400) samples.
-        if chunk.len() < 400 { chunk.resize(400, 0.0); }
-
-        let waveform_tensor = Tensor::<1>::from_floats(
-            chunk.as_slice(),
-            &device_clone,
-        );
-
-        let mels = processor.prep_audio(waveform_tensor.unsqueeze());
-
-        mels
+        let start = starts[i];
+        let end = (start + window).min(waveform.len());
+        slice_to_mel(&waveform, start, end, &processor, &device_clone)
     })
 }

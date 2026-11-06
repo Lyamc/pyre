@@ -55,6 +55,15 @@ impl Whisper {
         self.decoder.forward(tokens, encoder_output)
     }
 
+    pub fn forward_decoder_cached(
+        &self,
+        tokens: Tensor<2, Int>,
+        encoder_output: Tensor<3>,
+        past: Option<crate::model::decoder::DecoderKv>,
+    ) -> (Tensor<3>, crate::model::decoder::DecoderKv) {
+        self.decoder.forward_cached(tokens, encoder_output, past)
+    }
+
     pub fn encoder_ctx_size(&self) -> usize {
         self.encoder.ctx_size()
     }

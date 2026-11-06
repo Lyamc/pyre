@@ -12,7 +12,7 @@ pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, Trans
 use crate::audio::max_waveform_samples;
 use crate::model::{get_model_stats, Model};
 use crate::token::{self, *};
-use self::mel::waveform_to_mel_tensor;
+use self::mel::slice_to_mel;
 use self::decode::*;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -169,19 +169,33 @@ pub fn waveform_to_text(
         println!("DEBUG: Waveform samples: {}, model: {}", waveform.len(), model_name);
     }
 
-    let mel_iter = waveform_to_mel_tensor(waveform, sample_rate, n_waveform_samples_per_window, &device, n_mels, is_nemo, model_name);
-    
-    // Apply Global Normalization if stats exist
-    let (mean, std) = get_model_stats(model_name, &device);
-    
-    let mel_vec: Vec<_> = if let (Some(m), Some(s)) = (mean, std) {
-        mel_iter.map(|mel| (mel - m.clone().unsqueeze()) / s.clone().unsqueeze()).collect()
-    } else {
-        mel_iter.collect()
-    };
+    let overlap = sample_rate.saturating_mul(3);
+    let plan = pyre_whisper_core::plan_windows(waveform.len(), n_waveform_samples_per_window, overlap);
+    let mut processor = crate::audio::AudioProcessor::new(&device, sample_rate as f64, n_mels, is_nemo, model_name);
+    if is_nemo {
+        let dir = pyre_whisper_core::resolve_model_dir(model_name);
+        let mean_path = dir.join("mean.npy");
+        let std_path = dir.join("std.npy");
+        if mean_path.exists() && std_path.exists() {
+            let dir_str = dir.to_string_lossy();
+            let mean = crate::model::load::helpers::load_tensor::<2>("mean", dir_str.as_ref(), &device).unwrap();
+            let std = crate::model::load::helpers::load_tensor::<2>("std", dir_str.as_ref(), &device).unwrap();
+            processor = processor.with_stats(mean, std);
+        }
+    }
 
-    let total_chunks = mel_vec.len();
+    let (mean, std) = get_model_stats(model_name, &device);
+    let total_chunks = plan.starts.len();
+    let samples_total = waveform.len();
     if debug { println!("DEBUG WAVEFORM_TO_TEXT: total_chunks: {}", total_chunks); }
+    if total_chunks > 0 {
+        crate::job_hooks::report(crate::job_hooks::ChunkReport {
+            chunks_done: 0,
+            chunks_total: total_chunks,
+            samples_done: 0,
+            samples_total,
+        });
+    }
     
     let pb = if !streaming_mode && !quiet {
         let pb = ProgressBar::new(total_chunks as u64);
@@ -206,11 +220,15 @@ pub fn waveform_to_text(
     let mut segments: Vec<TranscriptSegment> = Vec::new();
     let mut accumulated_text = String::new();
 
-    for (i, mel) in mel_vec.into_iter().enumerate() {
+    for (i, &start) in plan.starts.iter().enumerate() {
         if crate::job_hooks::cancelled() {
             return Err("cancelled".into());
         }
-        crate::job_hooks::chunk(i + 1, total_chunks);
+        let end = (start + plan.window).min(samples_total);
+        let mut mel = slice_to_mel(&waveform, start, end, &processor, &device);
+        if let (Some(m), Some(s)) = (&mean, &std) {
+            mel = (mel - m.clone().unsqueeze()) / s.clone().unsqueeze();
+        }
         if verbose && !quiet {
             let msg = format!("Processing chunk {}/{}...", i + 1, total_chunks);
             if let Some(ref p) = pb { p.println(msg); } else { println!("{}", msg); }
@@ -309,6 +327,17 @@ pub fn waveform_to_text(
         }
 
         if let Some(ref p) = pb { p.inc(1); }
+        let samples_done = if i + 1 == total_chunks {
+            samples_total
+        } else {
+            (start + plan.shift).min(samples_total)
+        };
+        crate::job_hooks::report(crate::job_hooks::ChunkReport {
+            chunks_done: i + 1,
+            chunks_total: total_chunks,
+            samples_done,
+            samples_total,
+        });
     }
 
     if let Some(p) = pb { p.finish_with_message("Transcription complete."); }
