@@ -38,10 +38,10 @@ const STAGES: &[Stage] = &[
     },
     Stage {
         id: "t3-nano",
-        state: StageState::NotStarted,
+        state: StageState::Running,
         weights: "t3_nano_v1.safetensors (~870 MB). GPT-2 small (`llama_config_name = GPT2_small`), text vocab 50276, speech vocab 6563, speech_cond_prompt_len 375, no perceiver, emotion_adv off.",
-        reuses: "Qwen and Whisper already have causal self-attention, RMS/LayerNorm, and a sampler. The graph is not theirs: a GPT-2 backbone with a speech-token head and Turbo decoding (temperature 0.8, top-k 1000, top-p 0.95, repetition penalty 1.2, cfg 0).",
-        missing: "The GPT-2 forward (12 layers, gelu_new, Conv1D QKV [768, 2304], wpe added to inputs_embeds, wte ignored). Config, tensor contract, and a header check live in t3.rs. Still missing: conditioning concat, KV cache, and the Turbo sample loop. Output would be speech-token ids, not audio.",
+        reuses: "Burn matmul, softmax, and layer-norm on the flex CPU device. Qwen and Whisper attention are a different graph (RoPE, GQA, SiLU), so the GPT-2 block is its own.",
+        missing: "Nothing for speech-token ids. `gelu_new`, absolute `wpe` on the concatenated cond/text/speech embeds, KV cache, and the Turbo logit warpers run. Output is speech-token ids, not audio. S3 and HiFT are still required before a waveform.",
     },
     Stage {
         id: "s3-tokenizer",
@@ -80,7 +80,7 @@ pub fn stages() -> &'static [Stage] {
 /// Cloned speech is a Burn waveform from text plus a reference clip.
 ///
 /// This stays `false` until that path exists. It is not derived from [`stages`]:
-/// a running tokenizer, a checked T3 header, or the MMS bracket approximations
+/// a running tokenizer, T3 speech-token ids, or the MMS bracket approximations
 /// in `src/tts_markup.rs` do not make it true. Those approximations insert
 /// silence or change rate; they are not Nano GPT-2 token ids and they are not
 /// a cloned voice.
@@ -100,7 +100,10 @@ mod tests {
         assert!(stages()
             .iter()
             .any(|s| s.id == "inline-directions" && s.state == StageState::Running));
-        // Tokenizer and encoder stages running still do not mean cloned audio.
+        assert!(stages()
+            .iter()
+            .any(|s| s.id == "t3-nano" && s.state == StageState::Running));
+        // Tokenizer, encoder, and T3 speech ids still do not mean cloned audio.
         assert!(!text_to_cloned_speech_ready());
         assert!(stages()
             .iter()
