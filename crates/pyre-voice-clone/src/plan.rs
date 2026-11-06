@@ -1,7 +1,7 @@
 //! What this crate runs today, and the stages still required before
-//! text becomes cloned speech. HiFT can turn a mel into samples.
-//! [`text_to_cloned_speech_ready`] stays false until mean-flow feeds that mel
-//! from S3 and T3 tokens and the result is a real clone, not a reconstruction.
+//! text becomes cloned speech. Mean-flow feeds HiFT from S3 and T3 tokens.
+//! [`text_to_cloned_speech_ready`] stays false until that waveform has been
+//! auditioned. A passing numeric test is not that audition.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageState {
@@ -43,7 +43,7 @@ const STAGES: &[Stage] = &[
         state: StageState::Running,
         weights: "t3_nano_v1.safetensors (~870 MB). GPT-2 small (`llama_config_name = GPT2_small`), text vocab 50276, speech vocab 6563, speech_cond_prompt_len 375, no perceiver, emotion_adv off.",
         reuses: "Burn matmul, softmax, and layer-norm on the flex CPU device. Qwen and Whisper attention are a different graph (RoPE, GQA, SiLU), so the GPT-2 block is its own.",
-        missing: "Nothing for speech-token ids. `gelu_new`, absolute `wpe` on the concatenated cond/text/speech embeds, KV cache, and the Turbo logit warpers run. Output is speech-token ids, not audio. S3 and HiFT are still required before a waveform.",
+        missing: "Nothing for speech-token ids. `gelu_new`, absolute `wpe` on the concatenated cond/text/speech embeds, KV cache, and the Turbo logit warpers run. `generate_seeded` draws one categorical sample after those warpers. Greedy argmax on a short clip can ignore the script even when the logits move.",
     },
     Stage {
         id: "s3-tokenizer",
@@ -57,14 +57,14 @@ const STAGES: &[Stage] = &[
         state: StageState::Running,
         weights: "mel2wav.* inside s3gen_meanflow.safetensors. HiFTGenerator: upsample [8, 5, 3], iSTFT n_fft 16 hop 4, 24 kHz, 8 harmonics.",
         reuses: "Burn is not required for the 16-point FFT. Conv, Snake, and iSTFT are local. The VITS HiFi-GAN in src/tts.rs is a different vocoder and is not loaded.",
-        missing: "Nothing for mel-to-wave given an excitation. The harmonic source is seeded here (SplitMix64); it is not torch's RNG. Mean-flow still has to produce the mel from S3 and T3 tokens. A reconstruction of a reference mel is not a cloned voice.",
+        missing: "Nothing for mel-to-wave given an excitation. The harmonic source is seeded here (SplitMix64); it is not torch's RNG. A reconstruction of a reference mel is not a cloned voice.",
     },
     Stage {
         id: "meanflow",
-        state: StageState::NotStarted,
+        state: StageState::Running,
         weights: "flow.* and speaker_encoder.* (CAMPPlus, 192-d) in the same file. S3Gen(meanflow=True), n_cfm_timesteps=2, no CFG. Prompt mel is 24 kHz, 80 bins, hop 480, two frames per S3 token.",
-        reuses: "HiFT consumes the mel. T3 and S3 already emit the token ids that are concatenated with the prompt tokens (drop ids >= 6561, then three silence tokens 4299).",
-        missing: "UpsampleConformerEncoder (6 blocks, relative position), token embedding 6561x512, speaker affine 192 to 80, CausalConditionalCFM basic_euler over t and r with the diagonal time mixer, ConditionalDecoder UNet1D (channels 256, 4 transformer blocks down, 12 mid, 4 up, causal conv). Until this runs, HiFT is fed a mel, not speech tokens.",
+        reuses: "HiFT consumes the generated mel tail. T3 and S3 emit the token ids. The voice encoder's 256-d vector is only for T3. CAMPPlus is a separate 192-d embedding from a Kaldi fbank (dither 0).",
+        missing: "Nothing for the two-step Euler mel on a batch-1 clip. Prompt and speech noise are separate normals; a seed replays them and does not zero them. Audio longer than the 30 s S3 window is not implemented. The server resamples with linear interpolation; the numeric test uses a librosa kaiser pair.",
     },
     Stage {
         id: "watermark",
@@ -75,10 +75,10 @@ const STAGES: &[Stage] = &[
     },
     Stage {
         id: "server-wireup",
-        state: StageState::NotStarted,
-        weights: "A directory of the Nano files above, pointed at by a future store entry. Do not replace the MMS `TtsModel` until text produces samples.",
-        reuses: "The registry already has a Tts kind. Leave facebook/mms-tts on that path.",
-        missing: "A clone request shape: reference audio plus script. CPU residency so the 12 GB 3060 stays with Qwen-Next. Full Nano weights are about 1.9 GB and the project quotes about 3× realtime on 8 CPU cores once every stage exists.",
+        state: StageState::Running,
+        weights: "Discovered the same way as the crate: PYRE_CHATTERBOX_S3, PYRE_CHATTERBOX_T3, PYRE_CHATTERBOX_VE, PYRE_CHATTERBOX_TOKENIZER, then PYRE_CHATTERBOX_NANO, then the HF hub cache. Nothing is downloaded.",
+        reuses: "POST /v1/audio/speech. voice_id mms is still the MMS VITS path, including SSML breaks. A saved voice_id loads reference.wav and runs NanoStack, cached after the first call.",
+        missing: "text_to_cloned_speech_ready stays false. The list endpoint still marks cloned voices as not synthesizable so the picker does not advertise them. Watermark is not applied. The first request loads about 1.9 GB on CPU.",
     },
 ];
 
@@ -88,11 +88,11 @@ pub fn stages() -> &'static [Stage] {
 
 /// Cloned speech is a Burn waveform from text plus a reference clip.
 ///
-/// This stays `false` until that path exists. It is not derived from [`stages`]:
-/// a running tokenizer, T3 or S3 speech-token ids, or the MMS bracket approximations
-/// in `src/tts_markup.rs` do not make it true. Those approximations insert
-/// silence or change rate; they are not Nano GPT-2 token ids and they are not
-/// a cloned voice. A HiFT reconstruction of a reference mel is not one either.
+/// This stays `false` until a person has listened to a waveform from this
+/// path and accepted it. It is not derived from [`stages`]. A HiFT
+/// reconstruction of a reference mel is not a cloned voice, and neither is
+/// `testdata/clone_hello.wav` until that audition. MMS bracket markup is still
+/// a silence/rate approximation, not these token ids.
 pub fn text_to_cloned_speech_ready() -> bool {
     false
 }
@@ -122,6 +122,9 @@ mod tests {
             .any(|s| s.id == "hift" && s.state == StageState::Running));
         assert!(stages()
             .iter()
-            .any(|s| s.id == "meanflow" && s.state == StageState::NotStarted));
+            .any(|s| s.id == "meanflow" && s.state == StageState::Running));
+        assert!(stages()
+            .iter()
+            .any(|s| s.id == "server-wireup" && s.state == StageState::Running));
     }
 }

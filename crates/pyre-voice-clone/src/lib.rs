@@ -26,17 +26,22 @@
 //! inline-tag parser, and the GPT-2 BPE tokenizer (vocab 50276, tags as one id).
 //! T3-Nano's GPT-2 forward ([`t3_model`]) turns text plus a speaker vector and
 //! optional prompt-speech ids into speech-token ids. [`s3`] turns a 16 kHz
-//! reference into those prompt ids (25 Hz, at most 375). [`hift`] turns an
-//! 80-bin 24 kHz mel into samples. Mean-flow, which would make that mel from
-//! the tokens, is not implemented, so this is still not text to a waveform.
+//! reference into those prompt ids (25 Hz, at most 375). [`flow`] turns the
+//! tokens plus a CAMPPlus embedding and a 24 kHz prompt mel into a mel.
+//! [`hift`] turns that mel into samples. [`synth`] chains them.
+//! [`text_to_cloned_speech_ready`] stays false until the waveform is auditioned.
 //! See [`plan`].
 
+pub mod camp;
 pub mod directions;
 pub mod encoder;
+pub mod flow;
+pub mod frontend;
 pub mod hift;
 pub mod mel;
 pub mod plan;
 pub mod s3;
+pub mod synth;
 pub mod t3;
 pub mod t3_model;
 pub mod tokenizer;
@@ -44,9 +49,11 @@ pub mod verify;
 
 pub use directions::{parse_script, Direction, DirectionKind, Script};
 pub use encoder::VoiceEncoder;
+pub use flow::{Flow, S3GEN_SIL};
 pub use hift::Hift;
 pub use plan::{stages, text_to_cloned_speech_ready, Stage, StageState};
 pub use s3::{discover_s3, S3Tokenizer, MAX_PROMPT_TOKENS};
+pub use synth::{with_stack, CloneWave, NanoStack};
 pub use t3::{check_checkpoint, TurboDecode};
 pub use t3_model::{discover_t3, T3Nano};
 pub use tokenizer::{discover_tokenizer_dir, NanoTokenizer};
