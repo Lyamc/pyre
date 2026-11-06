@@ -1,0 +1,10 @@
+{
+  "sample_rate": 24000,
+  "mel_frames": 50,
+  "mel_bins": 80,
+  "f0_len": 50,
+  "source_len": 24000,
+  "wav_len": 24000,
+  "note": "HiFT reconstruction of the first 1s of LDC93S1 at 24 kHz. Not a voice clone. Source excitation includes torch.manual_seed(0) phase and noise; decode(mel, source) is the deterministic check.",
+  "reference": "LDC93S1 DeepSpeech smoke test, first 1.0s, librosa resample to 24 kHz"
+}
