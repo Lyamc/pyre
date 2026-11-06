@@ -8,4 +8,4 @@
 
 **Portable timing (pyre):** SSML `<break time="…"/>` and `<prosody rate="…">` applied on every engine, including built-in MMS.
 
-**Status:** Speaker encoder + direction parser + GPT-2 BPE (`encode_script`) run in Burn (`crates/pyre-voice-clone`). Server `/v1/audio/speech/preview` exposes Nano single-token ids when the tokenizer is in the HF cache (or cabin catalog `chatterbox-nano-tok`). `text_to_cloned_speech_ready()` stays false until T3-Nano -> S3Gen -> HiFT emit audio. MMS still owns production TTS; SSML breaks/prosody and event-tag silence approximations apply there. Do not claim cloned output or delivery-tag synthesis.
+**Status:** Speaker encoder + direction parser + GPT-2 BPE (`encode_script`) + T3-Nano GPT-2 forward (speech-token ids, flex CPU) run in Burn (`crates/pyre-voice-clone`). Server `/v1/audio/speech/preview` exposes Nano single-token ids when the tokenizer is discoverable. `text_to_cloned_speech_ready()` stays false until S3Gen + mean-flow HiFT emit a waveform. MMS still owns production TTS; SSML breaks/prosody and event-tag silence approximations apply there. Do not claim cloned waveform output.
