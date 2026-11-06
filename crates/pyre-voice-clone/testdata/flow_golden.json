@@ -1,0 +1,7 @@
+{
+  "tokens": 6,
+  "prompt_mel_frames": 8,
+  "mel_bins": 80,
+  "gen_frames": 4,
+  "note": "Fixed generator seed 0. Not a voice. Two Euler steps, no CFG. mu is [1,80,12] before the prompt crop."
+}

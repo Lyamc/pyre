@@ -196,6 +196,18 @@ impl T3Nano {
         self.generate(ctx, decode, max_gen_len, NextId::Greedy)
     }
 
+    /// Same warpers as [`generate_greedy`](Self::generate_greedy), then one
+    /// categorical draw. The seed fixes the draw. It does not skip it.
+    pub fn generate_seeded(
+        &self,
+        ctx: &T3Context,
+        decode: &TurboDecode,
+        max_gen_len: usize,
+        seed: u64,
+    ) -> Result<Vec<u32>> {
+        self.generate(ctx, decode, max_gen_len, NextId::Seeded(seed))
+    }
+
     fn generate(
         &self,
         ctx: &T3Context,
@@ -203,6 +215,10 @@ impl T3Nano {
         max_gen_len: usize,
         next: NextId,
     ) -> Result<Vec<u32>> {
+        let mut rng = match next {
+            NextId::Seeded(seed) => Some(SampleRng::new(seed)),
+            NextId::Greedy => None,
+        };
         let mut speech = vec![self.start_speech];
         let mut generated: Vec<u32> = Vec::new();
         let mut cache: Option<Vec<Kv>> = None;
@@ -236,6 +252,7 @@ impl T3Nano {
             }
             let id = match next {
                 NextId::Greedy => argmax(&processed),
+                NextId::Seeded(_) => sample_logits(&processed, rng.as_mut().unwrap()),
             };
             generated.push(id);
             speech.push(id);
@@ -319,6 +336,59 @@ impl T3Nano {
 
 enum NextId {
     Greedy,
+    Seeded(u64),
+}
+
+struct SampleRng {
+    state: u64,
+}
+
+impl SampleRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed | 1 }
+    }
+
+    fn unit(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn sample_logits(scores: &[f32], rng: &mut SampleRng) -> u32 {
+    let max = scores
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(scores);
+    }
+    let mut sum = 0.0f64;
+    let mut weights = Vec::with_capacity(scores.len());
+    for s in scores {
+        let w = if s.is_finite() {
+            (*s as f64 - max as f64).exp()
+        } else {
+            0.0
+        };
+        weights.push(w);
+        sum += w;
+    }
+    if sum == 0.0 {
+        return argmax(scores);
+    }
+    let mut pick = rng.unit() * sum;
+    for (i, w) in weights.iter().enumerate() {
+        pick -= *w;
+        if pick <= 0.0 {
+            return i as u32;
+        }
+    }
+    weights.len().saturating_sub(1) as u32
 }
 
 impl Block {
