@@ -23,5 +23,9 @@ tokenizers = { workspace = true }
 safetensors = { workspace = true }
 half = { workspace = true }
 
+[features]
+cpu = ["burn/flex", "pyre-whisper-engine/cpu"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
+hound = { workspace = true }

@@ -740,16 +740,11 @@ async function* audioJobSse(fd, signal) {
     }
   }
 }
+let sttBarFloor = null;
+function resetSttBar() { sttBarFloor = null; }
 function sttStagePct(ev) {
-  const order = ["queued", "resolving_model", "downloading", "loading_model", "decoding", "diarizing", "transcribing", "rendering", "done"];
-  const i = order.indexOf(ev.stage);
-  if (ev.stage === "downloading" && ev.fraction != null) return 5 + 20 * ev.fraction;
-  if (ev.stage === "transcribing") {
-    const f = ev.fraction != null ? ev.fraction : (ev.total ? (ev.current || 0) / ev.total : null);
-    if (f != null) return 30 + 60 * Math.max(0, Math.min(1, f));
-  }
-  if (i < 0) return null;
-  return (i / (order.length - 1)) * 100;
+  sttBarFloor = advanceSttBar(sttBarFloor, ev);
+  return sttBarFloor;
 }
 function paintSttResult(opts) {
   opts = opts || {};
@@ -1152,7 +1147,8 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   if ($("#sttActions")) $("#sttActions").classList.add("hidden");
   if ($("#sttSumBox")) $("#sttSumBox").classList.add("hidden");
   $("#sttOut").textContent = "";
-  setSttProg(true, 2, "uploading… · model " + model);
+  resetSttBar();
+  setSttProg(true, 0, "uploading… · model " + model);
   setSttRunningUi(true);
   if ($("#sttGo")) { $("#sttGo").dataset.forceBusy = "1"; setAvail($("#sttGo"), availBusy((statusState && statusState.headline) || "Transcribing?")); }
   const ctrl = new AbortController();
@@ -1659,7 +1655,8 @@ if ($("#stsGo")) $("#stsGo").onclick = async () => {
   $("#stsGo").classList.add("hidden");
   $("#stsCancel").classList.remove("hidden");
   try {
-    setStsProg(true, 5, "Transcribing…");
+    resetSttBar();
+    setStsProg(true, 0, "Transcribing…");
     const fd = new FormData();
     fd.append("file", f, f.name || "recording.webm");
     fd.append("model", model);
