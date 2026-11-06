@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [".", "crates/*"]
-exclude = ["third_party/hf-hub", "gui"]
+exclude = ["third_party/hf-hub", "gui", "tools/pyre-resume"]
 
 [workspace.dependencies]
 # ONE Burn for the whole workspace: Lyamc's fork, pinned (main @ 2026-10-26).
@@ -102,6 +102,8 @@ pyre-whisper-core = { path = "crates/pyre-whisper-core", optional = true }
 pyre-whisper-audio = { path = "crates/pyre-whisper-audio", optional = true }
 pyre-whisper-engine = { path = "crates/pyre-whisper-engine", optional = true }
 pyre-whisper-models = { path = "crates/pyre-whisper-models", optional = true }
+# Journal, SSE terminal contract, and resume planning. No Burn dependency.
+pyre-resume = { path = "tools/pyre-resume" }
 
 [dev-dependencies]
 tempfile = "3"

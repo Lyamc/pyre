@@ -40,6 +40,8 @@ pub fn router(st: Arc<App>) -> Router {
         .route("/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/chat/completions", post(chat))
+        .route("/v1/generations/{id}", get(generation))
+        .route("/v1/generations/{id}/resume", post(resume_alias))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/embeddings", post(embeddings))
@@ -74,7 +76,9 @@ async fn auth(State(st): S, req: Request, next: Next) -> Response {
         return r;
     }
     let mut r = auth_inner(st, req, next).await;
-    r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    let h = r.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("x-request-id, x-resume-token, x-pyre-status"));
     r
 }
 
@@ -181,7 +185,7 @@ fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize
         let mut done = false;
         while let Some(e) = rx_in.recv().await {
             match &e {
-                Event::Token(_) => crate::metrics::token(mid),
+                Event::Token { .. } => crate::metrics::token(mid),
                 Event::Done { timings, finish_reason, .. } => { crate::metrics::finish_ex(mid, "ok", Some(timings), Some(finish_reason), None); done = true; }
                 Event::Error(e) => { crate::metrics::finish_ex(mid, "error", None, None, Some(e)); done = true; }
                 _ => {}
@@ -220,7 +224,44 @@ fn sse(s: impl Stream<Item = Value> + Send + 'static, done: bool) -> SseStream {
     let s: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> = if done {
         Box::pin(s.chain(stream::once(async { Ok(SseEvent::default().data("[DONE]")) })))
     } else { Box::pin(s) };
-    Sse::new(s).keep_alive(KeepAlive::default())
+    Sse::new(s).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(pyre_resume::ping_secs())).text("pyre-ping"))
+}
+
+/// `x-request-id` / `x-resume-token` go out with the headers, before the first token,
+/// so a client whose socket dies during prefill still knows which journal to resume.
+fn stamp(mut res: Response, id: &str, status: &str) -> Response {
+    use axum::http::{header::HeaderName, HeaderValue};
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(id) {
+        h.insert(HeaderName::from_static("x-request-id"), v.clone());
+        h.insert(HeaderName::from_static("x-resume-token"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(status) {
+        h.insert(HeaderName::from_static("x-pyre-status"), v);
+    }
+    h.insert(HeaderName::from_static("cache-control"), HeaderValue::from_static("no-cache"));
+    h.insert(HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"));
+    res
+}
+
+fn frame_is_terminal(v: &Value) -> bool {
+    v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()).is_some() || v.get("stop").and_then(|s| s.as_bool()) == Some(true)
+}
+
+/// If the body ends without a finish_reason / native `stop: true`, append an explicit abort.
+/// `sse(..., true)` still writes the `[DONE]` sentinel.
+fn ensure_terminal(s: impl Stream<Item = Value> + Send + 'static, abort: impl Fn() -> Vec<Value> + Send + 'static) -> impl Stream<Item = Value> + Send {
+    let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw2 = saw.clone();
+    let marked = s.inspect(move |v| { if frame_is_terminal(v) { saw2.store(true, std::sync::atomic::Ordering::Relaxed); } });
+    let tail = stream::once(async move {
+        if saw.load(std::sync::atomic::Ordering::Relaxed) { Vec::new() } else { abort() }
+    }).flat_map(stream::iter);
+    marked.chain(tail)
+}
+
+fn frames_to_values(frames: Vec<pyre_resume::Frame>) -> Vec<Value> {
+    frames.into_iter().filter(|f| !f.is_done()).filter_map(|f| serde_json::from_str(&f.data).ok()).collect()
 }
 
 /// Generation with a thinking budget (effort.rs). Budget None/0 = plain `start` (0 is handled by the prefilled empty
@@ -250,7 +291,7 @@ fn start_eff(st: &Arc<Llm>, ids: Vec<u32>, g: &Gen, budget: Option<usize>, auto:
             let close = if closed { String::new() } else if auto_none { "\n</think>\n\n".to_string() } else { crate::effort::close_text() };
             let cids = st.tok.encode(close.as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
             if !auto_none { tracing::info!("reasoning: think budget {:?} reached ({} tokens), force-closing and continuing", tb.or(info.lock().unwrap().pointer("/auto/budget").and_then(|b| b.as_u64()).map(|b| b as usize)), tokens.len()); }
-            if tx.send(Event::Token(close.clone())).is_err() { return; }
+            if tx.send(Event::Token { text: close.clone(), ids: cids.clone() }).is_err() { return; }
             let mut ids2 = ids; ids2.extend_from_slice(&tokens); ids2.extend_from_slice(&cids);
             let rest = max.saturating_sub(tokens.len() + cids.len());
             let mut all = tokens; all.extend_from_slice(&cids);
@@ -407,6 +448,8 @@ fn reqlog(v: Value) -> bool {
 // ---------- OpenAI chat ----------
 #[derive(Deserialize)]
 struct ChatReq {
+    /// Omitted on resume calls (`resume` identifies the generation).
+    #[serde(default)]
     messages: Vec<Value>,
     model: Option<String>,
     tools: Option<Value>,
@@ -415,6 +458,17 @@ struct ChatReq {
     reasoning: Option<Value>,
     chat_template_kwargs: Option<Value>,
     thinking_token_budget: Option<Value>,
+    /// Continue or replay a generation recorded in the journal (`chatcmpl-...`).
+    resume: Option<String>,
+    /// Send the tokens already generated before any continuation. Default true.
+    #[serde(default)]
+    replay: Option<bool>,
+    /// Generate the remainder of an aborted generation. Default: true only when it was aborted.
+    #[serde(rename = "continue", default)]
+    cont: Option<bool>,
+    /// Byte offset into the raw generated text the client already has. Replay starts after it.
+    #[serde(default)]
+    replay_from: Option<usize>,
     #[serde(flatten)]
     g: Gen,
 }
@@ -436,6 +490,7 @@ fn norm_messages(m: &[Value]) -> Vec<Value> {
 }
 
 async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
+    if req.resume.is_some() { return resume_chat(app, req).await; }
     let st = match app.llm(req.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let mut msgs = norm_messages(&req.messages);
     let prompt = match st.template.render(&msgs, true, req.tools.as_ref()) {
@@ -489,56 +544,403 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let rlog = reqlog(json!({"req": &id, "stream": req.g.stream, "messages": &req.messages, "ntools": req.tools.as_ref().and_then(|t| t.as_array()).map(|a| a.len()),
         "effort": plan.effort.name(), "effort_explicit": plan.explicit, "budget": budget, "auto_bias": auto}));
     let has_tools = req.tools.as_ref().and_then(|t| t.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let prompt_ids = ids.clone();
+    let max_tokens = req.g.max(&st, prompt_ids.len());
     let rx = start_eff(&st, ids, &req.g, budget, auto, has_tools, forced.clone(), info.clone());
+    let mut session = open_journal(&app, &id, &model, created, &prompt_ids, max_tokens, &req.g, Value::Array(msgs), req.tools.clone(), json!({"prompt_open_think": thinking, "think_budget": budget, "effort": plan.effort.name()}));
+    let env = pyre_resume::Envelope::new(id.clone(), created, model.clone());
     if !req.g.stream {
-        return match collect(rx).await {
+        return match drive_until_done(rx, &mut session).await {
             Ok((text, fin, t, _)) => {
                 let (mut r, mut c) = think.push(&text); let (r2, c2) = think.finish(); r.push_str(&r2); c.push_str(&c2);
                 let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
                 let fin = if calls.is_empty() { fin } else { "tool_calls" };
                 let mut msg = json!({"role": "assistant", "content": if calls.is_empty() || !c.trim().is_empty() { json!(c) } else { Value::Null }});
-                if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
+                if !calls.is_empty() { msg["tool_calls"] = json!(calls.clone()); }
                 let tt = ntok(&r); crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
                 let fc = forced.load(std::sync::atomic::Ordering::Relaxed);
                 let ai = info.lock().unwrap().get("auto").cloned();
                 if rlog { reqlog(json!({"resp": &id, "finish": fin, "message": &msg, "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
-                if !r.is_empty() { msg["reasoning_content"] = json!(r); }
+                if !r.is_empty() { msg["reasoning_content"] = json!(r.clone()); }
+                if let Some(sess) = session.as_mut() {
+                    let _ = sess.close_finished(fin, &c, &r, calls, prompt_ids.len(), t.predicted_n, json!({}));
+                }
                 let mut u = usage(&t); u["completion_tokens_details"] = json!({"reasoning_tokens": tt});
-                Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
+                stamp(Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": fin, "logprobs": null}],
-                "usage": u, "timings": t, "reasoning": {"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai}})).into_response() }
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+                "usage": u, "timings": t, "reasoning": {"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai},
+                "pyre": {"resume_token": id, "status": "finished"}})).into_response(), &id, "finished") }
+            Err(e) => err_resume(StatusCode::INTERNAL_SERVER_ERROR, e, &id),
         };
     }
     let inc = req.g.include_usage();
-    let chunk = move |delta: Value, fin: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": fin, "logprobs": null}]});
-    let first = stream::once({ let c = chunk.clone(); async move { c(json!({"role": "assistant", "content": ""}), Value::Null) } });
-    let (mut acc_r, mut acc_c) = (String::new(), String::new());
-    let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
-        let v: Vec<Value> = match e {
-            Event::Token(s) => { let (r, c) = think.push(&s); let c = tools.push(&c); acc_r.push_str(&r); if rlog { acc_c.push_str(&c); } think_delta(r, c).map(|d| chunk(d, Value::Null)).into_iter().collect() }
-            Event::Done { finish_reason, timings, .. } => {
-                let (r, c) = think.finish(); let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
-                let mut v: Vec<Value> = think_delta(r.clone(), c.clone()).map(|d| chunk(d, Value::Null)).into_iter().collect();
-                acc_r.push_str(&r); let tt = ntok(&acc_r); crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
-                let fc = forced.load(std::sync::atomic::Ordering::Relaxed); let ai = info.lock().unwrap().get("auto").cloned();
-                if rlog { reqlog(json!({"resp": "stream", "finish": finish_reason, "reasoning": &acc_r, "content": format!("{acc_c}{c}"), "tool_calls": &calls,
-                    "effort": plan.effort.name(), "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
-                if !calls.is_empty() { v.push(chunk(json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), Value::Null)); }
-                let mut f = chunk(json!({}), json!(if calls.is_empty() { finish_reason } else { "tool_calls" }));
-                f["timings"] = json!(timings);
-                f["reasoning"] = json!({"effort": plan.effort.name(), "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai});
-                v.push(f);
-                if inc { let mut u = chunk(json!({}), Value::Null); u["choices"] = json!([]); u["usage"] = usage(&timings); u["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": tt}); v.push(u); }
-                v
-            }
-            Event::Error(m) => vec![json!({"error": {"message": m}})],
-            _ => vec![],
-        };
-        stream::iter(v)
+    let (tx, rx_sse) = unbounded_channel();
+    let (shut, guard) = pyre_resume::drain().track();
+    let effort = plan.effort.name();
+    tokio::spawn(async move {
+        let _ = tx.send(serde_json::from_str(&pyre_resume::role_frame(&env).data).unwrap_or(Value::Null));
+        pump_chat(rx, shut, tx, env, session, think, tools, ntok, forced, info, rlog, inc, effort, budget, String::new(), String::new()).await;
     });
-    sse(first.chain(body), true).into_response()
+    let body = UnboundedReceiverStream::new(rx_sse);
+    let guarded = HoldGuard { inner: body, _guard: guard };
+    let abort_env = pyre_resume::Envelope::new(id.clone(), created, model.clone());
+    let body = ensure_terminal(guarded, move || frames_to_values(pyre_resume::frames_failed(&abort_env, pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted")));
+    stamp(sse(body, true).into_response(), &id, "running")
+}
+
+/// Read engine events until a terminal one, recording each piece in the journal.
+async fn drive_until_done(mut rx: UnboundedReceiver<Event>, session: &mut Option<pyre_resume::Session>) -> Result<(String, &'static str, Timings, String), String> {
+    let (mut shut, _guard) = pyre_resume::drain().track();
+    loop {
+        tokio::select! {
+            biased;
+            s = shut.recv() => {
+                match s {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(sess) = session.as_mut() { let _ = sess.close_failed(pyre_resume::Status::Aborted, "server shutting down", "server_shutdown"); }
+                        return Err("server shutting down".into());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => { std::future::pending::<()>().await; }
+                }
+            }
+            ev = rx.recv() => match ev {
+                Some(Event::Token { text, ids }) => { if let Some(sess) = session.as_mut() { let _ = sess.note_token(&text, &ids); } }
+                Some(Event::Done { finish_reason, text, timings, stopping_word, .. }) => {
+                    if finish_reason == "abort" {
+                        if let Some(sess) = session.as_mut() { let _ = sess.close_failed(pyre_resume::Status::Aborted, "client disconnected", "generation_aborted"); }
+                        return Err("client disconnected".into());
+                    }
+                    return Ok((text, finish_reason, timings, stopping_word));
+                }
+                Some(Event::Error(m)) => {
+                    if let Some(sess) = session.as_mut() { let _ = sess.close_failed(pyre_resume::Status::Error, &m, "generation_error"); }
+                    return Err(m);
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(sess) = session.as_mut() { let _ = sess.close_failed(pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted"); }
+                    return Err("generation interrupted before a terminal event".into());
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_chat(
+    mut rx: UnboundedReceiver<Event>, mut shut: tokio::sync::broadcast::Receiver<()>, tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    env: pyre_resume::Envelope, mut session: Option<pyre_resume::Session>, mut think: Think, mut tools: Tools,
+    ntok: impl Fn(&str) -> usize, forced: Arc<std::sync::atomic::AtomicBool>, info: Arc<std::sync::Mutex<Value>>,
+    rlog: bool, inc: bool, effort: &'static str, budget: Option<usize>, mut acc_r: String, mut acc_c: String,
+) {
+    let send = |tx: &tokio::sync::mpsc::UnboundedSender<Value>, v: Vec<Value>| -> bool {
+        v.into_iter().all(|item| tx.send(item).is_ok())
+    };
+    loop {
+        let ev = tokio::select! {
+            biased;
+            s = shut.recv() => {
+                match s {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let frames = fail_session(&env, &mut session, pyre_resume::Status::Aborted, "server shutting down", "server_shutdown");
+                        let _ = send(&tx, frames);
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => { std::future::pending::<()>().await; continue; }
+                }
+            }
+            ev = rx.recv() => ev,
+        };
+        match ev {
+            Some(Event::Token { text, ids }) => {
+                if let Some(sess) = session.as_mut() { let _ = sess.note_token(&text, &ids); }
+                let (r, c) = think.push(&text);
+                let c = tools.push(&c);
+                acc_r.push_str(&r);
+                acc_c.push_str(&c);
+                if let Some(d) = think_delta(r, c) {
+                    if tx.send(delta_value(&env, d, false)).is_err() { return; }
+                }
+            }
+            Some(Event::Done { finish_reason, text, timings, tokens, .. }) => {
+                note_tail(&mut session, &text, &tokens);
+                if finish_reason == "abort" {
+                    let _ = send(&tx, fail_session(&env, &mut session, pyre_resume::Status::Aborted, "client disconnected", "generation_aborted"));
+                    return;
+                }
+                let (r, c) = think.finish();
+                let mut c = tools.push(&c);
+                let (c3, calls) = tools.finish();
+                c.push_str(&c3);
+                let mut v = Vec::new();
+                if let Some(d) = think_delta(r.clone(), c.clone()) { v.push(delta_value(&env, d, false)); }
+                acc_r.push_str(&r);
+                let tt = ntok(&acc_r);
+                crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
+                let fc = forced.load(std::sync::atomic::Ordering::Relaxed);
+                let ai = info.lock().unwrap().get("auto").cloned();
+                let fin = if calls.is_empty() { finish_reason } else { "tool_calls" };
+                if rlog { reqlog(json!({"resp": "stream", "finish": fin, "reasoning": &acc_r, "content": format!("{acc_c}{c}"), "tool_calls": &calls,
+                    "effort": effort, "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
+                if !calls.is_empty() {
+                    v.push(delta_value(&env, json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), false));
+                }
+                let extra = json!({"timings": timings, "reasoning": {"effort": effort, "budget": budget, "thinking_tokens": tt, "forced_close": fc, "auto": ai}});
+                let prompt_n = session.as_ref().map(|s| s.meta.prompt_ids.len()).unwrap_or(0);
+                let full_c = format!("{acc_c}{c}");
+                let mut frames = if let Some(sess) = session.as_mut() {
+                    match sess.close_finished(fin, &full_c, &acc_r, calls, prompt_n, timings.predicted_n, extra.clone()) {
+                        Ok(f) => f,
+                        Err(_) => pyre_resume::frames_finished(&env, fin, extra),
+                    }
+                } else {
+                    pyre_resume::frames_finished(&env, fin, extra)
+                };
+                if inc {
+                    let mut u = env.chunk(json!({}), None, pyre_resume::Status::Finished, false, None);
+                    u["choices"] = json!([]);
+                    u["usage"] = usage(&timings);
+                    u["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": tt});
+                    let done = frames.pop();
+                    frames.push(pyre_resume::Frame::json(&u));
+                    if let Some(d) = done { frames.push(d); }
+                }
+                if !send(&tx, v) { return; }
+                let _ = send(&tx, frames_to_values(frames));
+                return;
+            }
+            Some(Event::Error(m)) => {
+                let _ = send(&tx, fail_session(&env, &mut session, pyre_resume::Status::Error, &m, "generation_error"));
+                return;
+            }
+            Some(_) => {}
+            None => {
+                let _ = send(&tx, fail_session(&env, &mut session, pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted"));
+                return;
+            }
+        }
+    }
+}
+
+fn open_journal(app: &App, id: &str, model: &str, created: u64, prompt_ids: &[u32], max_tokens: usize, g: &Gen, messages: Value, tools: Option<Value>, extra: Value) -> Option<pyre_resume::Session> {
+    if !pyre_resume::enabled() { return None; }
+    let meta = pyre_resume::OpenMeta {
+        id: id.to_string(), resume_token: id.to_string(), model: model.to_string(), created, endpoint: "chat".into(),
+        prompt_ids: prompt_ids.to_vec(), max_tokens, stop: g.stops(), sampling: sampling_json(&g.params()), messages, tools, extra,
+    };
+    match pyre_resume::Session::create(&app.generations, meta) {
+        Ok(s) => Some(s),
+        Err(e) => { tracing::warn!("resume journal not opened for {id}: {e}"); None }
+    }
+}
+
+fn sampling_json(p: &SamplingParams) -> Value {
+    json!({"temperature": p.temperature, "top_p": p.top_p, "top_k": p.top_k, "min_p": p.min_p,
+        "repeat_penalty": p.repeat_penalty, "repeat_last_n": p.repeat_last_n,
+        "presence_penalty": p.presence_penalty, "frequency_penalty": p.frequency_penalty, "seed": p.seed, "spec": p.spec})
+}
+
+fn gen_from_saved(v: &Value, max_tokens: usize, stop: &[String]) -> Gen {
+    let d = SamplingParams::default();
+    let f = |k: &str, d: f32| v.get(k).and_then(|x| x.as_f64()).map(|n| n as f32).unwrap_or(d);
+    let u = |k: &str, d: usize| v.get(k).and_then(|x| x.as_u64()).map(|n| n as usize).unwrap_or(d);
+    Gen {
+        temperature: Some(f("temperature", d.temperature)), top_p: Some(f("top_p", d.top_p)), top_k: Some(u("top_k", d.top_k)),
+        min_p: Some(f("min_p", d.min_p)), repeat_penalty: Some(f("repeat_penalty", d.repeat_penalty)),
+        repeat_last_n: Some(u("repeat_last_n", d.repeat_last_n)), presence_penalty: Some(f("presence_penalty", d.presence_penalty)),
+        frequency_penalty: Some(f("frequency_penalty", d.frequency_penalty)), seed: v.get("seed").and_then(|x| x.as_u64()),
+        spec: v.get("spec").and_then(|x| if x.is_null() { None } else { x.as_u64().map(|n| n as usize) }),
+        max_tokens: Some(max_tokens), stop: Some(Value::Array(stop.iter().cloned().map(Value::String).collect())), stream: true,
+        ..Default::default()
+    }
+}
+
+fn err_resume(code: StatusCode, msg: impl Into<String>, id: &str) -> Response {
+    let m = msg.into();
+    stamp((code, Json(json!({"error": {"message": m, "type": "server_error", "code": code.as_u16(), "resume_token": id}}))).into_response(), id, "error")
+}
+
+fn delta_value(env: &pyre_resume::Envelope, delta: Value, replay: bool) -> Value {
+    serde_json::from_str(&pyre_resume::data_frame(env, delta, replay).data).unwrap_or(Value::Null)
+}
+
+fn fail_session(env: &pyre_resume::Envelope, session: &mut Option<pyre_resume::Session>, status: pyre_resume::Status, message: &str, code: &str) -> Vec<Value> {
+    if let Some(sess) = session.as_mut() {
+        if let Ok(frames) = sess.close_failed(status, message, code) { return frames_to_values(frames); }
+    }
+    frames_to_values(pyre_resume::frames_failed(env, status, message, code))
+}
+
+fn note_tail(session: &mut Option<pyre_resume::Session>, full: &str, tokens: &[u32]) {
+    let Some(sess) = session.as_mut() else { return };
+    let have = sess.text().len();
+    if full.len() > have && full.is_char_boundary(have) && full.starts_with(sess.text()) {
+        let suf = full[have..].to_string();
+        let n = sess.ids().len();
+        let ids = if tokens.len() > n { tokens[n..].to_vec() } else { Vec::new() };
+        let _ = sess.note_token(&suf, &ids);
+    }
+}
+
+fn llm_exact(app: &App, name: &str) -> Result<Arc<Llm>, Response> {
+    match app.find_exact(crate::registry::Kind::Llm, name) {
+        Some(m) => match &m.inner {
+            crate::registry::Inner::Llm(l) => Ok(l.clone()),
+            _ => Err(err(StatusCode::CONFLICT, format!("model '{name}' is not a text model"))),
+        },
+        None => Err(err(StatusCode::CONFLICT, format!("model '{name}' is not loaded; the partial generation is still in the journal and can be resumed once it is loaded"))),
+    }
+}
+
+struct HoldGuard<S> { inner: S, _guard: pyre_resume::TrackGuard }
+impl<S: Stream + Unpin> Stream for HoldGuard<S> {
+    type Item = S::Item;
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+async fn generation(State(app): S, axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+    match app.generations.snapshot(&id) {
+        Ok(s) => { let name = s.status.as_str(); stamp(Json(s).into_response(), &id, name) }
+        Err(pyre_resume::PlanError::NotFound) => err(StatusCode::NOT_FOUND, "generation not found"),
+        Err(pyre_resume::PlanError::BadId) => err(StatusCode::BAD_REQUEST, "invalid generation id"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn resume_alias(State(app): S, axum::extract::Path(id): axum::extract::Path<String>, Json(mut req): Json<ChatReq>) -> Response {
+    req.resume = Some(id);
+    req.g.stream = true;
+    chat(State(app), Json(req)).await
+}
+
+fn char_floor(s: &str, mut i: usize) -> usize {
+    if i > s.len() { i = s.len(); }
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
+}
+
+/// Feed `text` through the think/tool splitters. `emitted` is what a resume should put on the wire.
+fn prime_split(text: &str, open_think: bool, tools_schema: Option<&Value>, replay: bool, replay_from: Option<usize>) -> (Think, Tools, Vec<Value>, String, String) {
+    let mut think = Think::new(if open_think { "<think>" } else { "x" });
+    let mut tools = Tools::new(tools_schema);
+    let from = if replay { char_floor(text, replay_from.unwrap_or(0)) } else { text.len() };
+    let (pre, suf) = text.split_at(from);
+    let (r0, c0) = think.push(pre);
+    let c0 = tools.push(&c0);
+    let (r1, c1) = think.push(suf);
+    let c1 = tools.push(&c1);
+    let mut acc_r = r0;
+    acc_r.push_str(&r1);
+    let mut acc_c = c0;
+    acc_c.push_str(&c1);
+    let mut emitted = Vec::new();
+    if replay {
+        if let Some(d) = think_delta(r1, c1) { emitted.push(d); }
+    }
+    (think, tools, emitted, acc_r, acc_c)
+}
+
+async fn resume_chat(app: Arc<App>, req: ChatReq) -> Response {
+    let id = match req.resume.clone() { Some(id) => id, None => return err(StatusCode::BAD_REQUEST, "resume id required") };
+    let replay = req.replay.unwrap_or(true);
+    let plan = match app.generations.plan(&id, replay, req.cont) {
+        Ok(p) => p,
+        Err(pyre_resume::PlanError::NotFound) => return err(StatusCode::NOT_FOUND, "generation not found"),
+        Err(pyre_resume::PlanError::BadId) => return err(StatusCode::BAD_REQUEST, "invalid generation id"),
+        Err(pyre_resume::PlanError::Busy) => {
+            let snap = app.generations.snapshot(&id).ok();
+            return stamp((StatusCode::CONFLICT, Json(json!({"error": {"message": "generation is still running on its original stream", "type": "server_error", "code": "generation_busy", "resume_token": id}, "pyre": snap}))).into_response(), &id, "running");
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let rec = plan.record;
+    let env = rec.meta.envelope();
+    let open_think = rec.meta.extra.get("prompt_open_think").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (mut think, mut tools, replay_deltas, acc_r, acc_c) = prime_split(&rec.text, open_think, rec.meta.tools.as_ref(), plan.replay, req.replay_from);
+    if plan.cont.is_none() {
+        let mut frames = vec![serde_json::from_str(&pyre_resume::role_frame(&env).data).unwrap_or(Value::Null)];
+        for d in replay_deltas { frames.push(delta_value(&env, d, true)); }
+        let (r, c) = think.finish();
+        let mut c = tools.push(&c);
+        let (c3, calls) = tools.finish();
+        c.push_str(&c3);
+        if let Some(d) = think_delta(r, c) { frames.push(delta_value(&env, d, true)); }
+        if !calls.is_empty() {
+            frames.push(delta_value(&env, json!({"tool_calls": calls.iter().enumerate().map(|(i, c)| { let mut c = c.clone(); c["index"] = json!(i); c }).collect::<Vec<_>>()}), true));
+        }
+        let term = match rec.status {
+            pyre_resume::Status::Finished => pyre_resume::frames_finished(&env, rec.finish_reason.as_deref().unwrap_or("stop"), json!({})),
+            pyre_resume::Status::Error => pyre_resume::frames_failed(&env, pyre_resume::Status::Error, rec.message.as_deref().unwrap_or("generation failed"), "generation_error"),
+            _ => pyre_resume::frames_failed(&env, pyre_resume::Status::Aborted, rec.message.as_deref().unwrap_or("generation aborted"), "generation_aborted"),
+        };
+        frames.extend(frames_to_values(term));
+        let status = rec.status.as_str();
+        if !req.g.stream {
+            let content: String = frames.iter().filter_map(|v| v.pointer("/choices/0/delta/content").and_then(|c| c.as_str())).collect();
+            let finish = frames.iter().rev().find_map(|v| v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str())).unwrap_or("error");
+            return stamp(Json(json!({"id": id, "object": "chat.completion", "created": rec.meta.created, "model": rec.meta.model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
+                "pyre": {"resume_token": id, "status": status}})).into_response(), &id, status);
+        }
+        let body = stream::iter(frames);
+        let abort_env = env.clone();
+        let body = ensure_terminal(body, move || frames_to_values(pyre_resume::frames_failed(&abort_env, pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted")));
+        return stamp(sse(body, true).into_response(), &id, status);
+    }
+    let st = match llm_exact(&app, &rec.meta.model) {
+        Ok(s) => s,
+        Err(_) => {
+            let snap = rec.snapshot();
+            let message = format!("model '{}' is not loaded; the partial generation is still in the journal", rec.meta.model);
+            return stamp((StatusCode::CONFLICT, Json(json!({"error": {"message": message, "type": "server_error", "code": "model_not_loaded", "resume_token": id}, "pyre": snap}))).into_response(), &id, snap.status.as_str());
+        }
+    };
+    let (session, _) = match pyre_resume::Session::resume_append(&app.generations, &id) {
+        Ok(s) => s,
+        Err(pyre_resume::PlanError::Busy) => {
+            let snap = app.generations.snapshot(&id).ok();
+            return stamp((StatusCode::CONFLICT, Json(json!({"error": {"message": "generation is still running on its original stream", "type": "server_error", "code": "generation_busy", "resume_token": id}, "pyre": snap}))).into_response(), &id, "running");
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let cont = plan.cont.expect("cont");
+    let g = gen_from_saved(&cont.sampling, cont.max_tokens, &cont.stop);
+    let rx = start(&st, cont.prompt_ids, &g);
+    let forced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let info = Arc::new(std::sync::Mutex::new(Value::Null));
+    let tokc = st.tok.clone();
+    let ntok = move |r: &str| -> usize { if r.is_empty() { 0 } else { tokc.encode(r, false).map(|e| e.len()).unwrap_or(0) } };
+    let (tx, rx_sse) = unbounded_channel();
+    let (shut, guard) = pyre_resume::drain().track();
+    let inc = req.g.include_usage();
+    let env2 = env.clone();
+    tokio::spawn(async move {
+        if tx.send(serde_json::from_str(&pyre_resume::role_frame(&env2).data).unwrap_or(Value::Null)).is_err() { return; }
+        for d in replay_deltas {
+            if tx.send(delta_value(&env2, d, true)).is_err() { return; }
+        }
+        pump_chat(rx, shut, tx, env2, Some(session), think, tools, ntok, forced, info, false, inc, "resume", None, acc_r, acc_c).await;
+    });
+    let body = UnboundedReceiverStream::new(rx_sse);
+    let guarded = HoldGuard { inner: body, _guard: guard };
+    let abort_env = env.clone();
+    let body = ensure_terminal(guarded, move || frames_to_values(pyre_resume::frames_failed(&abort_env, pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted")));
+    if req.g.stream {
+        stamp(sse(body, true).into_response(), &id, "running")
+    } else {
+        // Non-streaming resume: collect the same frames the stream would have sent.
+        let mut frames = Vec::new();
+        let mut body = std::pin::pin!(body);
+        while let Some(v) = futures::StreamExt::next(&mut body).await { frames.push(v); }
+        let content: String = frames.iter().filter_map(|v| v.pointer("/choices/0/delta/content").and_then(|c| c.as_str())).collect();
+        let finish = frames.iter().rev().find_map(|v| v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str())).unwrap_or("error");
+        let status = if pyre_resume::is_success_finish(finish) { "finished" } else { "aborted" };
+        stamp(Json(json!({"id": id, "object": "chat.completion", "created": rec.meta.created, "model": rec.meta.model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
+            "pyre": {"resume_token": id, "status": status}})).into_response(), &id, status)
+    }
 }
 
 // ---------- OpenAI legacy completions ----------
@@ -563,28 +965,31 @@ async fn completions(State(app): S, Json(req): Json<CompReq>) -> Response {
     let rx = start(&st, ids, &req.g);
     if !req.g.stream {
         return match collect(rx).await {
-            Ok((text, fin, t, _)) => Json(json!({"id": id, "object": "text_completion", "created": created, "model": model,
-                "choices": [{"index": 0, "text": text, "finish_reason": fin, "logprobs": null}], "usage": usage(&t)})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Ok((text, fin, t, _)) => stamp(Json(json!({"id": &id, "object": "text_completion", "created": created, "model": model,
+                "choices": [{"index": 0, "text": text, "finish_reason": fin, "logprobs": null}], "usage": usage(&t)})).into_response(), &id, "finished"),
+            Err(e) => err_resume(StatusCode::INTERNAL_SERVER_ERROR, e, &id),
         };
     }
     let inc = req.g.include_usage();
+    let env = pyre_resume::Envelope::new(id.clone(), created, model.clone());
     let body = UnboundedReceiverStream::new(rx).flat_map(move |e| {
         let mk = |text: &str, fin: Value| json!({"id": id, "object": "text_completion", "created": created, "model": model,
             "choices": [{"index": 0, "text": text, "finish_reason": fin, "logprobs": null}]});
         let v = match e {
-            Event::Token(s) => vec![mk(&s, Value::Null)],
+            Event::Token { text, .. } => vec![mk(&text, Value::Null)],
             Event::Done { finish_reason, timings, .. } => {
                 let mut f = mk("", json!(finish_reason));
                 if inc { f["usage"] = usage(&timings); }
                 vec![f]
             }
-            Event::Error(m) => vec![json!({"error": {"message": m}})],
+            Event::Error(m) => frames_to_values(pyre_resume::frames_failed(&pyre_resume::Envelope::new(id.clone(), created, model.clone()), pyre_resume::Status::Error, &m, "generation_error")),
             _ => vec![],
         };
         stream::iter(v)
     });
-    sse(body, true).into_response()
+    let env2 = env.clone();
+    let body = ensure_terminal(body, move || frames_to_values(pyre_resume::frames_failed(&env2, pyre_resume::Status::Aborted, "generation interrupted before a terminal event", "generation_aborted")));
+    stamp(sse(body, true).into_response(), &env.id, "running")
 }
 
 // ---------- embeddings ----------
@@ -634,14 +1039,15 @@ async fn completion(State(app): S, Json(req): Json<NativeReq>) -> Response {
     let body = UnboundedReceiverStream::new(rx).filter_map(move |e| {
         let model = model.clone();
         async move { match e {
-            Event::Token(s) => Some(json!({"content": s, "stop": false, "id_slot": 0})),
+            Event::Token { text, .. } => Some(json!({"content": text, "stop": false, "id_slot": 0})),
             Event::Done { finish_reason, timings, stopping_word, .. } => Some(json!({"content": "", "stop": true, "model": model,
                 "tokens_predicted": timings.predicted_n, "tokens_evaluated": n_eval, "stopped_limit": finish_reason == "length",
                 "stopping_word": stopping_word, "timings": timings, "id_slot": 0})),
-            Event::Error(m) => Some(json!({"error": {"message": m}})),
+            Event::Error(m) => Some(json!({"content": "", "stop": true, "error": {"message": m, "type": "server_error", "code": "generation_error"}})),
             _ => None,
         }}
     });
+    let body = ensure_terminal(body, || vec![json!({"content": "", "stop": true, "error": {"message": "generation interrupted before a terminal event", "type": "server_error", "code": "generation_aborted"}})]);
     sse(body, false).into_response()
 }
 

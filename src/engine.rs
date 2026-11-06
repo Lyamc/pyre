@@ -37,7 +37,10 @@ pub struct Timings {
 
 #[derive(Debug)]
 pub enum Event {
-    Token(String),
+    /// `text` is the decoded piece safe to show; `ids` are the newly committed token ids
+    /// (possibly more than one when a speculative window or a held UTF-8 sequence flushes).
+    /// Persisted together so a resume can continue the exact token sequence.
+    Token { text: String, ids: Vec<u32> },
     /// `tokens`: the generated ids (lets the server continue the exact sequence after a forced think close)
     Done { finish_reason: &'static str, text: String, timings: Timings, stopping_word: String, tokens: Vec<u32> },
     Embedding(Vec<f32>, usize),
@@ -74,6 +77,8 @@ struct Seq {
     max_stop: usize,
     max_tokens: usize,
     emitted: usize,
+    /// How many entries of `out` have been attached to a Token event.
+    sent_ids: usize,
     text: String,
     finish: &'static str,
     stop_word: String,
@@ -217,7 +222,7 @@ fn start(model: &Llama, eos: &[u32], mut cache: KvCache, r: GenRequest) -> Optio
     let max_stop = r.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     Some(Seq {
         tx: r.tx, cache, sampler: Sampler::new(r.params), history: prompt, out: vec![], stop: r.stop, max_stop,
-        max_tokens: r.max_tokens, emitted: 0, text: String::new(), finish: "length", stop_word: String::new(),
+        max_tokens: r.max_tokens, emitted: 0, sent_ids: 0, text: String::new(), finish: "length", stop_word: String::new(),
         tm, t1: Instant::now(), logits, done: r.max_tokens == 0, think_budget: r.think_budget,
     })
 }
@@ -235,8 +240,13 @@ fn step_sample(s: &mut Seq, tok: &Tokenizer, eos: &[u32], ctx: usize) {
         s.stop_word = w;
         s.text.truncate(p);
         s.finish = "stop";
-        if s.text.len() > s.emitted { let _ = s.tx.send(Event::Token(s.text[s.emitted..].to_string())); }
-        s.emitted = s.text.len();
+        if s.text.len() > s.emitted {
+            let ids = s.out[s.sent_ids..].to_vec();
+            s.sent_ids = s.out.len();
+            let piece = s.text[s.emitted..].to_string();
+            s.emitted = s.text.len();
+            if s.tx.send(Event::Token { text: piece, ids }).is_err() { s.finish = "abort"; }
+        }
         s.done = true;
         return;
     }
@@ -245,7 +255,10 @@ fn step_sample(s: &mut Seq, tok: &Tokenizer, eos: &[u32], ctx: usize) {
     if s.max_stop > 0 { safe = safe.min(s.text.len().saturating_sub(s.max_stop - 1)); }
     while safe > s.emitted && !s.text.is_char_boundary(safe) { safe -= 1; }
     if safe > s.emitted {
-        if s.tx.send(Event::Token(s.text[s.emitted..safe].to_string())).is_err() { s.finish = "abort"; s.done = true; return; }
+        let ids = s.out[s.sent_ids..].to_vec();
+        s.sent_ids = s.out.len();
+        let piece = s.text[s.emitted..safe].to_string();
+        if s.tx.send(Event::Token { text: piece, ids }).is_err() { s.finish = "abort"; s.done = true; return; }
         s.emitted = safe;
     }
     if crate::effort::over_budget(s.think_budget, s.out.len(), &s.text) { s.finish = "think_budget"; s.done = true; return; }
@@ -253,7 +266,10 @@ fn step_sample(s: &mut Seq, tok: &Tokenizer, eos: &[u32], ctx: usize) {
 }
 
 fn finish(mut s: Seq) -> KvCache {
-    if s.text.len() > s.emitted && s.finish != "abort" { let _ = s.tx.send(Event::Token(s.text[s.emitted..].to_string())); }
+    if s.text.len() > s.emitted && s.finish != "abort" {
+        let ids = s.out[s.sent_ids..].to_vec();
+        let _ = s.tx.send(Event::Token { text: s.text[s.emitted..].to_string(), ids });
+    }
     let tm = &mut s.tm;
     tm.predicted_n = s.out.len();
     tm.predicted_ms = s.t1.elapsed().as_secs_f64() * 1e3;
