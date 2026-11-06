@@ -1,9 +1,12 @@
 pub mod mel;
 pub mod mels_to_text;
+pub mod pass;
 pub mod utils;
 pub mod decode;
 pub mod task;
 pub mod whisper_config;
+
+pub use pass::{with_whisper_pass, DecoderKind, MelTail, WhisperPass, Windowing};
 
 pub use task::DecodeTask;
 
@@ -170,7 +173,12 @@ pub fn waveform_to_text(
     }
 
     let overlap = sample_rate.saturating_mul(3);
-    let plan = pyre_whisper_core::plan_windows(waveform.len(), n_waveform_samples_per_window, overlap);
+    let (starts, shift) = window_starts(
+        waveform.len(),
+        n_waveform_samples_per_window,
+        overlap,
+        pass::current().windows,
+    );
     let mut processor = crate::audio::AudioProcessor::new(&device, sample_rate as f64, n_mels, is_nemo, model_name);
     if is_nemo {
         let dir = pyre_whisper_core::resolve_model_dir(model_name);
@@ -185,7 +193,7 @@ pub fn waveform_to_text(
     }
 
     let (mean, std) = get_model_stats(model_name, &device);
-    let total_chunks = plan.starts.len();
+    let total_chunks = starts.len();
     let samples_total = waveform.len();
     if debug { println!("DEBUG WAVEFORM_TO_TEXT: total_chunks: {}", total_chunks); }
     if total_chunks > 0 {
@@ -220,11 +228,11 @@ pub fn waveform_to_text(
     let mut segments: Vec<TranscriptSegment> = Vec::new();
     let mut accumulated_text = String::new();
 
-    for (i, &start) in plan.starts.iter().enumerate() {
+    for (i, &start) in starts.iter().enumerate() {
         if crate::job_hooks::cancelled() {
             return Err("cancelled".into());
         }
-        let end = (start + plan.window).min(samples_total);
+        let end = (start + n_waveform_samples_per_window).min(samples_total);
         let mut mel = slice_to_mel(&waveform, start, end, &processor, &device);
         if let (Some(m), Some(s)) = (&mean, &std) {
             mel = (mel - m.clone().unsqueeze()) / s.clone().unsqueeze();
@@ -330,7 +338,7 @@ pub fn waveform_to_text(
         let samples_done = if i + 1 == total_chunks {
             samples_total
         } else {
-            (start + plan.shift).min(samples_total)
+            (start + shift).min(samples_total)
         };
         crate::job_hooks::report(crate::job_hooks::ChunkReport {
             chunks_done: i + 1,
@@ -347,15 +355,40 @@ pub fn waveform_to_text(
     } else {
         trim_trailing_hallucination(&accumulated_text)
     };
+    let audio_end = samples_total as f64 / sample_rate.max(1) as f64;
     if segments.is_empty() {
         segments.push(TranscriptSegment {
             start: 0.0,
-            end: (total_chunks as f64 * shift_duration) + chunk_overlap,
+            end: audio_end,
             text: final_text.clone(),
             diarization: None,
             location: None,
         });
     }
+    for segment in &mut segments {
+        segment.start = segment.start.clamp(0.0, audio_end);
+        segment.end = segment.end.clamp(segment.start, audio_end);
+    }
 
     Ok((final_text, segments))
+}
+
+fn window_starts(len: usize, window: usize, overlap: usize, mode: pass::Windowing) -> (Vec<usize>, usize) {
+    let window = window.max(1);
+    let overlap = overlap.min(window.saturating_sub(1));
+    let shift = (window - overlap).max(1);
+    let starts = match mode {
+        pass::Windowing::Covering => {
+            pyre_whisper_core::plan_windows(len, window, overlap).starts
+        }
+        pass::Windowing::Legacy => {
+            if len == 0 {
+                Vec::new()
+            } else {
+                let n = (len - 1) / shift + 1;
+                (0..n).map(|i| i * shift).filter(|start| *start < len).collect()
+            }
+        }
+    };
+    (starts, shift)
 }

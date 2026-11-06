@@ -1,7 +1,7 @@
 mod heuristics;
 mod prompt;
 
-use crate::beam::get_top_elements;
+use crate::beam::{beam_search, get_top_elements, BeamNode};
 use crate::model::decoder::DecoderKv;
 use crate::model::*;
 use crate::token::{self, *};
@@ -9,14 +9,20 @@ use burn::tensor::{
     activation::log_softmax,
     ElementConversion, Int, Tensor, TensorData,
 };
+use std::iter;
 
 pub use prompt::is_whisper_english_only;
 
-/// Mel frames actually passed to the Whisper encoder.
-/// Longer than one context window is clipped. Shorter audio is not padded to 30 s.
-pub(crate) fn whisper_encoder_mel_frames(actual_frames: usize, n_audio_ctx: usize) -> usize {
-    let max_frames = n_audio_ctx.saturating_mul(2);
-    actual_frames.min(max_frames)
+use super::pass::{DecoderKind, MelTail};
+
+/// Mel frames the encoder should see for this tail policy.
+/// `ZeroPad` is the historical path (always `n_audio_ctx * 2`, clipped if longer).
+pub(crate) fn encoder_mel_len(actual_frames: usize, n_audio_ctx: usize, tail: MelTail) -> usize {
+    let max_frames = n_audio_ctx.saturating_mul(2).max(1);
+    match tail {
+        MelTail::ZeroPad => max_frames.min(actual_frames.max(max_frames)),
+        MelTail::Truncate => actual_frames.min(max_frames).max(1),
+    }
 }
 
 use super::DecodeTask;
@@ -46,7 +52,8 @@ pub fn mels_to_text(
     let device = mels.device();
     let n_ctx_max_encoder_frames = whisper.encoder_ctx_size() * 2;
     let [_, n_mel, n_ctx] = mels.dims();
-    let used_frames = whisper_encoder_mel_frames(n_ctx, whisper.encoder_ctx_size());
+    let tail = super::pass::current().tail;
+    let target = encoder_mel_len(n_ctx, whisper.encoder_ctx_size(), tail);
 
     if n_ctx > n_ctx_max_encoder_frames {
         println!(
@@ -55,10 +62,23 @@ pub fn mels_to_text(
         );
     }
 
-    // Do not pad short turns out to 30 s. Tiny's encoder attention is quadratic in
-    // mel frames; a measured CPU forward was ~30× slower at 3000 frames than at 200.
-    // Positional embeddings are already sliced to the real length.
-    let mels = mels.slice([0..1, 0..n_mel, 0..used_frames]);
+    // Historical Whisper: pad with zeros in log-mel space up to one context (3000
+    // frames on tiny/base). Those frames still receive absolute positional
+    // embeddings inside the encoder, so dropping them changes the transcript.
+    // A key mask is not a substitute: it would stop real frames from attending
+    // to that positional tail.
+    let mels = if n_ctx >= target {
+        mels.slice([0..1, 0..n_mel, 0..target])
+    } else {
+        let padding_needed = target - n_ctx;
+        Tensor::cat(
+            vec![
+                mels.slice([0..1, 0..n_mel, 0..n_ctx]),
+                Tensor::zeros([1, n_mel, padding_needed], &device),
+            ],
+            2,
+        )
+    };
 
     let encoder_output = whisper.forward_encoder(mels);
     let end_token = end_token(bpe);
@@ -76,20 +96,35 @@ pub fn mels_to_text(
 
     let max_depth = max_depth.min(whisper.decoder_ctx_size() - initial_seq.len());
     let finished = |toks: &[BeamSearchToken]| beamsearch_is_finished(toks, end_token);
-    let tokens = beam_decode(
-        whisper,
-        &encoder_output,
-        &device,
-        initial_seq,
-        prompt_len,
-        vocab_size,
-        &special_tokens_maskout,
-        &decode_cfg,
-        end_token,
-        &finished,
+    let tokens = match super::pass::current().decoder {
+        DecoderKind::Eager => eager_beam(
+            whisper,
+            &encoder_output,
+            &device,
+            initial_seq,
+            prompt_len,
+            vocab_size,
+            &special_tokens_maskout,
+            &decode_cfg,
+            end_token,
         beam_size,
         max_depth,
-    );
+    ),
+        DecoderKind::Cached => beam_decode(
+            whisper,
+            &encoder_output,
+            &device,
+            initial_seq,
+            prompt_len,
+            vocab_size,
+            &special_tokens_maskout,
+            &decode_cfg,
+            end_token,
+            &finished,
+            beam_size,
+            max_depth,
+        ),
+    };
 
     let text_tokens: Vec<usize> = tokens
         .get(prompt_len..)
@@ -111,6 +146,89 @@ pub fn mels_to_text(
     }
 
     Ok((final_text, out_tokens))
+}
+
+fn eager_beam(
+    whisper: &Whisper,
+    encoder_output: &Tensor<3>,
+    device: &burn::tensor::Device,
+    initial_seq: Vec<BeamSearchToken>,
+    prompt_len: usize,
+    vocab_size: usize,
+    special_tokens_maskout: &[f32],
+    decode_cfg: &super::whisper_config::WhisperDecodeConfig,
+    end_token: usize,
+    beam_size: usize,
+    max_depth: usize,
+) -> Vec<usize> {
+    let initial = BeamNode { seq: initial_seq, log_prob: 0.0 };
+    let next = |beams: &[BeamNode<BeamSearchToken>]| {
+        let max_seq_len = beams.iter().map(|beam| beam.seq.len()).max().unwrap_or(0);
+        let flattened_tokens: Vec<i64> = beams
+            .iter()
+            .flat_map(|beam| {
+                let additional_tokens = max_seq_len - beam.seq.len();
+                beam.seq
+                    .iter()
+                    .map(|btok| btok.token as i64)
+                    .chain(iter::once(0).cycle().take(additional_tokens))
+            })
+            .collect();
+        let token_tensor = Tensor::<2, Int>::from_ints(
+            TensorData::new(flattened_tokens, [beams.len(), max_seq_len]),
+            device,
+        );
+        let logits = whisper.forward_decoder(
+            token_tensor,
+            encoder_output.clone().repeat(&[beams.len(), 1, 1]),
+        );
+        let logits = if max_seq_len >= prompt_len {
+            let mask_vec = build_logit_mask(
+                vocab_size,
+                special_tokens_maskout,
+                decode_cfg,
+                at_generation_start(max_seq_len, prompt_len),
+                end_token,
+            );
+            let mask = Tensor::<1>::from_floats(mask_vec.as_slice(), device);
+            logits + mask.unsqueeze::<3>()
+        } else {
+            logits
+        };
+        let log_probs = log_softmax(logits, 2);
+        beams
+            .iter()
+            .enumerate()
+            .map(|(i, beam)| {
+                let token_index = beam.seq.len() - 1;
+                log_probs
+                    .clone()
+                    .slice([i..i + 1, token_index..token_index + 1])
+                    .flatten::<1>(0, 2)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            })
+            .zip(beams)
+            .map(|(row, beam)| {
+                row.into_iter()
+                    .map(|log_prob| log_prob.elem::<f64>())
+                    .enumerate()
+                    .map(|(token_id, log_prob)| {
+                        (
+                            BeamSearchToken { token: token_id, log_prob },
+                            beam.log_prob + log_prob,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let is_finished = |toks: &[BeamSearchToken]| beamsearch_is_finished(toks, end_token);
+    beam_search(vec![initial], next, is_finished, beam_size, max_depth)
+        .into_iter()
+        .map(|tok| tok.token)
+        .collect()
 }
 
 #[derive(Clone)]

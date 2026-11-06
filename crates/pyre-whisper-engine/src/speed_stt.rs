@@ -8,7 +8,8 @@ use burn::tensor::{Int, Tensor, TensorData};
 
 use crate::audio::stft::{gather_frames, gather_frames_collect};
 use crate::model::{AudioEncoderConfig, TextDecoder, TextDecoderConfig};
-use crate::transcribe::mels_to_text::whisper_encoder_mel_frames;
+use crate::transcribe::mels_to_text::encoder_mel_len;
+use crate::transcribe::MelTail;
 
 fn cpu() -> burn::tensor::Device {
     crate::cli::get_device(&Some("cpu".into()))
@@ -171,10 +172,11 @@ fn tiny_encoder_cost_grows_with_padded_mel_frames() {
 }
 
 #[test]
-fn short_clips_are_not_padded_to_thirty_seconds() {
-    assert_eq!(whisper_encoder_mel_frames(200, 1500), 200);
-    assert_eq!(whisper_encoder_mel_frames(3000, 1500), 3000);
-    assert_eq!(whisper_encoder_mel_frames(4000, 1500), 3000);
+fn short_clips_stay_padded_to_one_encoder_context() {
+    assert_eq!(encoder_mel_len(200, 1500, MelTail::ZeroPad), 3000);
+    assert_eq!(encoder_mel_len(3000, 1500, MelTail::ZeroPad), 3000);
+    assert_eq!(encoder_mel_len(4000, 1500, MelTail::ZeroPad), 3000);
+    assert_eq!(encoder_mel_len(200, 1500, MelTail::Truncate), 200);
 }
 
 fn wave(n: usize, device: &burn::tensor::Device) -> Tensor<2> {

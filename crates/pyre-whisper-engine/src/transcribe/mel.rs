@@ -1,9 +1,9 @@
 use burn::tensor::{Tensor};
 use crate::audio::AudioProcessor;
+use std::ops::Div;
 use std::sync::Arc;
 
 use crate::model::load::helpers::load_tensor;
-use pyre_whisper_core::plan_windows;
 
 pub fn slice_to_mel(
     waveform: &[f32],
@@ -31,9 +31,14 @@ pub fn waveform_to_mel_tensor(
     is_nemo: bool,
     model_name: &str,
 ) -> impl Iterator<Item = Tensor<3>> {
-    let plan = plan_windows(waveform.len(), window_length_samples, sample_rate.saturating_mul(3));
-    let starts = plan.starts;
-    let window = plan.window;
+    let chunk_overlap = sample_rate * 3;
+    let n_samples_per_tensor = window_length_samples.max(1);
+    let shift = n_samples_per_tensor.saturating_sub(chunk_overlap).max(1);
+    let iter_len = if waveform.is_empty() {
+        0
+    } else {
+        waveform.len().saturating_sub(1).div(shift) + 1
+    };
     let device_clone = device.clone();
 
     let mut processor = AudioProcessor::new(&device_clone, sample_rate as f64, n_mels, is_nemo, model_name);
@@ -52,10 +57,10 @@ pub fn waveform_to_mel_tensor(
 
     let processor_arc = Arc::new(processor);
 
-    (0..starts.len()).map(move |i| {
+    (0..iter_len).map(move |i| {
         let processor = processor_arc.clone();
-        let start = starts[i];
-        let end = (start + window).min(waveform.len());
+        let start = i * shift;
+        let end = (start + n_samples_per_tensor).min(waveform.len());
         slice_to_mel(&waveform, start, end, &processor, &device_clone)
     })
 }

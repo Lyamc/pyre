@@ -5,7 +5,7 @@ use axum::routing::get;
 use axum::Router;
 
 const INDEX: &str = include_str!("../ui/index.html");
-const APP_JS: &str = include_str!("../ui/app.js");
+const APP_JS: &str = concat!(include_str!("../ui/stt_progress.js"), "\n", include_str!("../ui/app.js"));
 const STYLE: &str = include_str!("../ui/style.css");
 const ICON: &str = include_str!("../ui/favicon.svg");
 const CABIN_JS: &str = include_str!("../ui/cabin.js");

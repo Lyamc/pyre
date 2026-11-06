@@ -6669,6 +6669,7 @@ dependencies = [
  "flate2",
  "half",
  "hf-hub 0.5.0",
+ "hound",
  "indicatif",
  "pyre-whisper-core",
  "pyre-whisper-engine",
