@@ -1,12 +1,12 @@
-﻿//! Persistent voice identity library for cloning-capable TTS.
+//! Persistent voice identity library for cloning-capable TTS.
 //!
 //! Voices live on disk under `{models_root}/audio_voices/` (override with
 //! `PYRE_AUDIO_VOICES_DIR` or `C:\Temp\qnx\audio_voices` when set via env).
 //! Each voice is a folder: `meta.json` + `reference.wav` (mono, typically 16–24 kHz).
 //!
-//! Synthesis with a cloned voice requires the Burn Pocket TTS engine (in progress).
-//! Until that engine is loaded, creating/listing/deleting voices works; speaking with
-//! `voice_id` other than the built-in MMS voice returns a clear error.
+//! `voice_id` `mms` is the built-in VITS voice. Any other id is a saved
+//! reference clip. Speaking as that clip runs the native Nano stack when the
+//! checkpoints are on disk. The ready flag stays false until an audition.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,9 @@ pub struct VoiceMeta {
     pub engine: String,
 }
 
-fn default_engine() -> String { "chatterbox-nano".into() }
+fn default_engine() -> String {
+    "chatterbox-nano".into()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceInfo {
@@ -49,21 +51,30 @@ pub struct VoiceLib {
 
 impl VoiceLib {
     pub fn open(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&root).with_context(|| format!("create voice lib {}", root.display()))?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create voice lib {}", root.display()))?;
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     pub fn list(&self, synthesizable: bool) -> Result<Vec<VoiceInfo>> {
         let mut out = Vec::new();
-        if !self.root.exists() { return Ok(out); }
+        if !self.root.exists() {
+            return Ok(out);
+        }
         let mut dirs: Vec<_> = fs::read_dir(&self.root)?.filter_map(|e| e.ok()).collect();
         dirs.sort_by_key(|e| e.file_name());
         for e in dirs {
-            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
             let id = e.file_name().to_string_lossy().into_owned();
-            if let Ok(info) = self.info(&id, synthesizable) { out.push(info); }
+            if let Ok(info) = self.info(&id, synthesizable) {
+                out.push(info);
+            }
         }
         Ok(out)
     }
@@ -83,14 +94,26 @@ impl VoiceLib {
 
     pub fn reference_path(&self, id: &str) -> Result<PathBuf> {
         let p = self.dir(id)?.join("reference.wav");
-        if !p.is_file() { bail!("voice '{id}' has no reference.wav"); }
+        if !p.is_file() {
+            bail!("voice '{id}' has no reference.wav");
+        }
         Ok(p)
     }
 
-    pub fn create(&self, name: &str, wav_bytes: &[u8], source: &str, notes: &str) -> Result<VoiceInfo> {
+    pub fn create(
+        &self,
+        name: &str,
+        wav_bytes: &[u8],
+        source: &str,
+        notes: &str,
+    ) -> Result<VoiceInfo> {
         let name = name.trim();
-        if name.is_empty() { bail!("voice name is required"); }
-        if wav_bytes.len() < 44 { bail!("audio too short"); }
+        if name.is_empty() {
+            bail!("voice name is required");
+        }
+        if wav_bytes.len() < 44 {
+            bail!("audio too short");
+        }
         // Basic WAV header check; full decode happens at clone/synth time.
         if &wav_bytes[..4] != b"RIFF" || &wav_bytes[8..12] != b"WAVE" {
             bail!("reference audio must be WAV (convert uploads server-side before create)");
@@ -101,7 +124,9 @@ impl VoiceLib {
         }
         let id = slug(name);
         let dir = self.root.join(&id);
-        if dir.exists() { bail!("a voice named '{name}' (id '{id}') already exists"); }
+        if dir.exists() {
+            bail!("a voice named '{name}' (id '{id}') already exists");
+        }
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("reference.wav"), wav_bytes)?;
         let meta = VoiceMeta {
@@ -140,26 +165,46 @@ impl VoiceLib {
             bail!("invalid voice id");
         }
         let dir = self.root.join(id);
-        if !dir.is_dir() { bail!("voice '{id}' not found"); }
+        if !dir.is_dir() {
+            bail!("voice '{id}' not found");
+        }
         Ok(dir)
     }
 }
 
 fn slug(name: &str) -> String {
-    let mut s: String = name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
-    while s.contains("--") { s = s.replace("--", "-"); }
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { format!("voice-{}", now_ms()) } else { s }
+    if s.is_empty() {
+        format!("voice-{}", now_ms())
+    } else {
+        s
+    }
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn wav_rate_duration(bytes: &[u8]) -> Result<(u32, f64)> {
-    if bytes.len() < 44 { bail!("wav too short"); }
+    if bytes.len() < 44 {
+        bail!("wav too short");
+    }
     let channels = u16::from_le_bytes([bytes[22], bytes[23]]) as u32;
     let sr = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
     let bits = u16::from_le_bytes([bytes[34], bytes[35]]) as u32;
@@ -167,17 +212,117 @@ fn wav_rate_duration(bytes: &[u8]) -> Result<(u32, f64)> {
     let mut i = 12usize;
     let mut data_len = 0u32;
     while i + 8 <= bytes.len() {
-        let id = &bytes[i..i+4];
-        let sz = u32::from_le_bytes([bytes[i+4], bytes[i+5], bytes[i+6], bytes[i+7]]);
-        if id == b"data" { data_len = sz; break; }
+        let id = &bytes[i..i + 4];
+        let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]);
+        if id == b"data" {
+            data_len = sz;
+            break;
+        }
         i += 8 + sz as usize;
-        if sz % 2 == 1 { i += 1; }
+        if sz % 2 == 1 {
+            i += 1;
+        }
     }
-    if sr == 0 || channels == 0 || bits == 0 { bail!("bad wav header"); }
+    if sr == 0 || channels == 0 || bits == 0 {
+        bail!("bad wav header");
+    }
     let bytes_per_sec = sr.saturating_mul(channels).saturating_mul(bits / 8);
-    if bytes_per_sec == 0 { bail!("bad wav format"); }
+    if bytes_per_sec == 0 {
+        bail!("bad wav format");
+    }
     let dur = data_len as f64 / bytes_per_sec as f64;
     Ok((sr, dur))
+}
+
+/// Mono f32 samples and the file's sample rate. PCM16 and IEEE float are
+/// accepted. Extra channels are averaged.
+pub fn wav_mono_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("reference audio must be a WAV");
+    }
+    let mut i = 12usize;
+    let mut audio_format = 0u16;
+    let mut channels = 0u16;
+    let mut rate = 0u32;
+    let mut bits = 0u16;
+    let mut data: Option<&[u8]> = None;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let sz =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        let start = i + 8;
+        let end = start.saturating_add(sz).min(bytes.len());
+        if id == b"fmt " && end - start >= 16 {
+            audio_format = u16::from_le_bytes([bytes[start], bytes[start + 1]]);
+            channels = u16::from_le_bytes([bytes[start + 2], bytes[start + 3]]);
+            rate = u32::from_le_bytes([
+                bytes[start + 4],
+                bytes[start + 5],
+                bytes[start + 6],
+                bytes[start + 7],
+            ]);
+            bits = u16::from_le_bytes([bytes[start + 14], bytes[start + 15]]);
+        } else if id == b"data" {
+            data = Some(&bytes[start..end]);
+        }
+        i = end + (sz % 2);
+    }
+    let data = data.context("wav has no data chunk")?;
+    if rate == 0 || channels == 0 {
+        bail!("bad wav header");
+    }
+    let ch = channels as usize;
+    let samples = match (audio_format, bits) {
+        (1, 16) => {
+            let n = data.len() / 2 / ch;
+            let mut out = vec![0f32; n];
+            for i in 0..n {
+                let mut acc = 0f32;
+                for c in 0..ch {
+                    let o = (i * ch + c) * 2;
+                    let s = i16::from_le_bytes([data[o], data[o + 1]]);
+                    acc += s as f32 / 32768.0;
+                }
+                out[i] = acc / ch as f32;
+            }
+            out
+        }
+        (3, 32) => {
+            let n = data.len() / 4 / ch;
+            let mut out = vec![0f32; n];
+            for i in 0..n {
+                let mut acc = 0f32;
+                for c in 0..ch {
+                    let o = (i * ch + c) * 4;
+                    acc += f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                }
+                out[i] = acc / ch as f32;
+            }
+            out
+        }
+        _ => bail!("wav must be pcm16 or float32 (format {audio_format}, {bits} bits)"),
+    };
+    Ok((samples, rate))
+}
+
+/// Linear resample. The numeric clone test uses a librosa kaiser pair instead.
+pub fn resample_linear(wav: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if wav.is_empty() || from == 0 || to == 0 || from == to {
+        return wav.to_vec();
+    }
+    let n = ((wav.len() as f64) * to as f64 / from as f64)
+        .round()
+        .max(1.0) as usize;
+    let mut out = vec![0f32; n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let x = i as f64 * from as f64 / to as f64;
+        let j = x.floor() as usize;
+        let frac = (x - j as f64) as f32;
+        let a = wav[j.min(wav.len() - 1)];
+        let b = wav[(j + 1).min(wav.len() - 1)];
+        *slot = a + (b - a) * frac;
+    }
+    out
 }
 
 /// Process-wide library, opened lazily from env / default path.
@@ -195,7 +340,8 @@ pub fn global() -> Result<std::sync::MutexGuard<'static, VoiceLib>> {
             });
         Mutex::new(VoiceLib::open(root).expect("open voice library"))
     });
-    Ok(m.lock().map_err(|_| anyhow::anyhow!("voice library lock poisoned"))?)
+    Ok(m.lock()
+        .map_err(|_| anyhow::anyhow!("voice library lock poisoned"))?)
 }
 
 fn dirs_fallback() -> PathBuf {
@@ -217,4 +363,3 @@ pub fn builtin_mms() -> serde_json::Value {
         "notes": "facebook/mms-tts-eng Burn VITS. No cloning; supports SSML breaks/prosody."
     })
 }
-
