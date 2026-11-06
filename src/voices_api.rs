@@ -339,6 +339,12 @@ fn strip_ssml_for_nano(input: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Upstream `T3.inference_turbo` default `max_gen_len=1000` (25 speech tokens/s,
+/// about 40 s). Generation normally ends at the stop token well before this.
+const NANO_MAX_GEN_DEFAULT: u64 = 1000;
+/// Upstream `prepare_conditionals` asserts the reference is longer than 5 s.
+const NANO_MIN_REF_SECS: f64 = 5.0;
+
 async fn nano_speech(voice_id: &str, b: &Value) -> Response {
     let exists = crate::voices::global()
         .ok()
@@ -373,8 +379,8 @@ async fn nano_speech(voice_id: &str, b: &Value) -> Response {
     let max_gen = b
         .get("max_new_tokens")
         .and_then(|v| v.as_u64())
-        .unwrap_or(16)
-        .clamp(1, 64) as usize;
+        .unwrap_or(NANO_MAX_GEN_DEFAULT)
+        .clamp(1, NANO_MAX_GEN_DEFAULT) as usize;
     let voice_id = voice_id.to_string();
     let text = strip_ssml_for_nano(&input);
     let joined =
@@ -385,6 +391,12 @@ async fn nano_speech(voice_id: &str, b: &Value) -> Response {
                 std::fs::read(&path)?
             };
             let (wav, rate) = crate::voices::wav_mono_f32(&bytes)?;
+            let secs = wav.len() as f64 / rate.max(1) as f64;
+            if secs <= NANO_MIN_REF_SECS {
+                anyhow::bail!(
+                    "reference clip is {secs:.2}s; Chatterbox needs more than {NANO_MIN_REF_SECS}s (upstream asserts this; shorter clips stop T3 after a few tokens)"
+                );
+            }
             let wav16 = crate::voices::resample_linear(&wav, rate, 16_000);
             let wav24 = crate::voices::resample_linear(&wav, rate, 24_000);
             pyre_voice_clone::with_stack(|stack| {
@@ -406,6 +418,8 @@ async fn nano_speech(voice_id: &str, b: &Value) -> Response {
                 "audio/wav"
             };
             headers.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
+            headers.insert("x-pyre-clone-speech-tokens", wave.speech_tokens.len().into());
+            headers.insert("x-pyre-clone-prompt-tokens", wave.prompt_tokens.len().into());
             let body = if fmt == "pcm" {
                 let mut v = Vec::with_capacity(wave.samples.len() * 2);
                 for x in &wave.samples {
@@ -420,7 +434,9 @@ async fn nano_speech(voice_id: &str, b: &Value) -> Response {
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
             let missing = msg.contains("not found") || msg.contains("safetensors");
-            let code = if missing {
+            let code = if msg.contains("reference clip is") {
+                StatusCode::BAD_REQUEST
+            } else if missing {
                 StatusCode::NOT_IMPLEMENTED
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR

@@ -127,8 +127,20 @@ impl NanoStack {
         if text.is_empty() {
             bail!("text tokens are empty");
         }
-        let mut prompt = self.s3.encode_prompt(wav_16k, MAX_PROMPT_TOKENS)?;
-        let mel = prompt_mel_24k(wav_24k);
+        // Upstream crops: T3 prompt tokens from the first 15 s at 16 kHz
+        // (ENC_COND_LEN); S3Gen's ref dict (prompt tokens, prompt mel,
+        // CAMPPlus) from the first 10 s at 24 kHz (DEC_COND_LEN). The voice
+        // encoder sees the whole clip.
+        let enc16 = &wav_16k[..wav_16k.len().min(15 * 16_000)];
+        let dec24 = &wav_24k[..wav_24k.len().min(10 * CLONE_SR as usize)];
+        let dec16 = &wav_16k[..wav_16k.len().min(10 * 16_000)];
+        let t3_prompt = self.s3.encode_prompt(enc16, MAX_PROMPT_TOKENS)?;
+        let mut prompt = if dec16.len() == enc16.len() {
+            t3_prompt.clone()
+        } else {
+            self.s3.encode_prompt(dec16, MAX_PROMPT_TOKENS)?
+        };
+        let mel = prompt_mel_24k(dec24);
         let frames = mel.len() / 80;
         let n = prompt.len().min(frames / 2);
         if n == 0 {
@@ -137,11 +149,11 @@ impl NanoStack {
         prompt.truncate(n);
         let prompt_mel = &mel[..n * 2 * 80];
         let speaker_t3 = self.ve.embed_wav(wav_16k, 16_000)?;
-        let speaker_flow = self.camp.embed(wav_16k)?;
+        let speaker_flow = self.camp.embed(dec16)?;
         let generated = self.t3.generate_seeded(
             &T3Context {
                 speaker: speaker_t3,
-                prompt_speech: prompt.clone(),
+                prompt_speech: t3_prompt,
                 text: text.to_vec(),
             },
             &TurboDecode {
