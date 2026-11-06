@@ -179,6 +179,13 @@ pub fn discover_tokenizer_dir() -> Option<PathBuf> {
             }
         }
     }
+    // Cabin catalog install path: <PYRE_STORE>/cabin/chatterbox-nano (HfFiles offer).
+    if let Some(store) = std::env::var_os("PYRE_STORE") {
+        let cabin = PathBuf::from(store).join("cabin").join("chatterbox-nano");
+        if dir_has_tokenizer(&cabin) {
+            return Some(cabin);
+        }
+    }
     find_in_hf_cache(&hf_cache_dir())
 }
 
