@@ -213,15 +213,14 @@ mod tests {
 
     #[test]
     fn f32_forward_matches_matmul() {
-        use burn::backend::ndarray::{NdArray, NdArrayDevice};
         use burn::tensor::Tensor;
-        let device = NdArrayDevice::Cpu;
+        let device = burn::tensor::Device::default();
         let d_in = 3;
         let d_out = 4;
         // Burn layout [d_in, d_out]
         let w: Vec<f32> = (0..d_in * d_out).map(|i| i as f32 * 0.5).collect();
-        let layer = super::QuantLinear::<NdArray>::from_f32(w.clone(), None, d_in, d_out, &device);
-        let x = Tensor::<NdArray, 1>::from_floats([1.0f32, 0.0, 2.0].as_slice(), &device).reshape([1, 1, d_in]);
+        let layer = super::QuantLinear::from_f32(w.clone(), None, d_in, d_out, &device);
+        let x = Tensor::<1>::from_floats([1.0f32, 0.0, 2.0].as_slice(), &device).reshape([1, 1, d_in]);
         let y = layer.forward(x).into_data().to_vec::<f32>().unwrap();
         // y[j] = x0*w[0,j] + x2*w[2,j]
         let mut expect = vec![0f32; d_out];

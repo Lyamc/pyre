@@ -1,4 +1,4 @@
-use burn::tensor::{Tensor};
+use burn::tensor::{Tensor, TensorData};
 use crate::helper::*;
 
 pub fn hann_window(window_length: usize, device: &burn::tensor::Device) -> Tensor<1> {
@@ -78,13 +78,49 @@ pub fn stfft(
     stfft_frames(input, n_fft, hop_length, window)
 }
 
+/// One host gather of every STFT frame. The previous path cloned and sliced the
+/// waveform once per frame, then concatenated that command list.
+pub(crate) fn gather_frames(input: &Tensor<2>, n_fft: usize, hop_length: usize, n_frame: usize) -> Tensor<3> {
+    let [n_batch, input_size] = input.dims();
+    let device = input.device();
+    let values = input.clone().into_data().to_vec::<f32>().expect("stft samples");
+    let mut windows = vec![0f32; n_batch * n_fft * n_frame];
+    for b in 0..n_batch {
+        let row = b * input_size;
+        for frame in 0..n_frame {
+            let start = frame * hop_length;
+            for k in 0..n_fft {
+                windows[(b * n_fft + k) * n_frame + frame] = values[row + start + k];
+            }
+        }
+    }
+    Tensor::<3>::from_data(TensorData::new(windows, [n_batch, n_fft, n_frame]), &device)
+}
+
+#[cfg(test)]
+pub(crate) fn gather_frames_collect(input: &Tensor<2>, n_fft: usize, hop_length: usize, n_frame: usize) -> Tensor<3> {
+    let [n_batch, _] = input.dims();
+    let mut windows_vec = Vec::with_capacity(n_frame);
+    for i in 0..n_frame {
+        let start = i * hop_length;
+        let end = start + n_fft;
+        windows_vec.push(
+            input
+                .clone()
+                .slice([0..n_batch, start..end])
+                .reshape([n_batch, n_fft, 1]),
+        );
+    }
+    Tensor::cat(windows_vec, 2)
+}
+
 fn stfft_frames(
     input: Tensor<2>,
     n_fft: usize,
     hop_length: usize,
     window: Tensor<1>,
 ) -> (Tensor<3>, Tensor<3>) {
-    let [n_batch, input_size] = input.dims();
+    let [_, input_size] = input.dims();
     let device = input.device();
 
     let [orig_window_length] = window.dims();
@@ -105,14 +141,7 @@ fn stfft_frames(
 
     let n_frame = (input_size - n_fft) / hop_length + 1;
     let n_freq = n_fft / 2 + 1;
-
-    let mut windows_vec = Vec::with_capacity(n_frame);
-    for i in 0..n_frame {
-        let start = i * hop_length;
-        let end = start + n_fft;
-        windows_vec.push(input.clone().slice([0..n_batch, start..end]).reshape([n_batch, n_fft, 1]));
-    }
-    let input_windows = Tensor::cat(windows_vec, 2);
+    let input_windows = gather_frames(&input, n_fft, hop_length, n_frame);
 
     let coe = std::f64::consts::PI * 2.0 / n_fft as f64;
     let b = Tensor::arange(0..n_freq as i64, &device)

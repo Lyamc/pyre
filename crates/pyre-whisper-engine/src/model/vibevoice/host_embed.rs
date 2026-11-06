@@ -86,16 +86,15 @@ impl HostEmbedding {
 #[cfg(test)]
 mod tests {
     use super::HostEmbedding;
-    use burn::backend::ndarray::{NdArray, NdArrayDevice};
-    use burn::tensor::{Int, Tensor};
+    use burn::tensor::{Int, Tensor, TensorData};
 
     #[test]
     fn gathers_requested_rows() {
-        let device = NdArrayDevice::Cpu;
+        let device = burn::tensor::Device::default();
         // 3 tokens, hidden 2: rows [0,1], [2,3], [4,5]
         let table = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        let emb = HostEmbedding::<NdArray>::from_weight(table, 3, 2, &device);
-        let ids = Tensor::<NdArray, 1, Int>::from_ints([2i32, 0], &device).reshape([1, 2]);
+        let emb = HostEmbedding::from_weight(table, 3, 2, &device);
+        let ids = Tensor::<2, Int>::from_ints(TensorData::new(vec![2i64, 0], [1, 2]), &device);
         let out = emb.forward(ids).into_data().to_vec::<f32>().unwrap();
         assert_eq!(out, vec![4.0, 5.0, 0.0, 1.0]);
     }

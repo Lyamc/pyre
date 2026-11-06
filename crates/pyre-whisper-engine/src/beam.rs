@@ -115,7 +115,7 @@ where
         .collect()
 }
 
-fn get_top_elements<T>(elems: &[T], score: impl Fn(&T) -> f64, num: usize) -> Vec<&T> {
+pub(crate) fn get_top_elements<T>(elems: &[T], score: impl Fn(&T) -> f64, num: usize) -> Vec<&T> {
     let mut top_elems = Vec::with_capacity(num);
     let mut scores = Vec::with_capacity(num);
 

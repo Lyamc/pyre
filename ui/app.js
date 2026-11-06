@@ -98,7 +98,7 @@ function renderStatusPill() {
     if (!jobs.length && !chat.length) pop.innerHTML = `<div class="muted">Idle</div>`;
     else {
       pop.innerHTML = jobs.map(j => {
-        const eta = j.eta_s != null ? ` · ${Math.max(0, Math.floor(j.eta_s / 60))}:${String(Math.max(0, Math.floor(j.eta_s % 60))).padStart(2, "0")} left` : (j.fraction != null ? ` · ${Math.round(j.fraction * 100)}%` : "");
+        const eta = (j.eta_s != null && j.eta_s >= 0.5) ? ` · ${Math.max(0, Math.floor(j.eta_s / 60))}:${String(Math.max(0, Math.floor(j.eta_s % 60))).padStart(2, "0")} left` : (j.eta_s != null && j.fraction != null && j.fraction >= 0.98) ? ` · 0:00 left` : (j.fraction != null ? ` · ${Math.round(j.fraction * 100)}%` : "");
         const prog = (j.current != null && j.total) ? ` ${j.current}/${j.total}` : "";
         return `<div class="spop-job"><span>${esc(j.label || j.kind)}${prog}${eta}</span>${j.cancelable ? `<button type="button" data-acancel="${esc(j.id)}">Cancel</button>` : ""}</div>`;
       }).join("") + chat.map(c => `<div class="spop-job"><span>Chat ${esc(c.phase || "generating")} · ${esc(String(c.model || "").split("/").pop())}</span></div>`).join("");
@@ -744,7 +744,10 @@ function sttStagePct(ev) {
   const order = ["queued", "resolving_model", "downloading", "loading_model", "decoding", "diarizing", "transcribing", "rendering", "done"];
   const i = order.indexOf(ev.stage);
   if (ev.stage === "downloading" && ev.fraction != null) return 5 + 20 * ev.fraction;
-  if (ev.stage === "transcribing" && ev.total) return 30 + 60 * ((ev.current || 0) / ev.total);
+  if (ev.stage === "transcribing") {
+    const f = ev.fraction != null ? ev.fraction : (ev.total ? (ev.current || 0) / ev.total : null);
+    if (f != null) return 30 + 60 * Math.max(0, Math.min(1, f));
+  }
   if (i < 0) return null;
   return (i / (order.length - 1)) * 100;
 }
@@ -1167,12 +1170,15 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
         if (ev.bytes != null && ev.bytes_total) label = (ev.message || "downloading") + " · " + human(ev.bytes) + " / " + human(ev.bytes_total);
         else if (ev.fraction != null) label = (ev.message || "downloading") + " · " + Math.round(ev.fraction * 100) + "%";
       }
-      if (ev.stage === "transcribing" && ev.total) {
-        label = (ev.message || "transcribing") + " · " + ev.current + "/" + ev.total +
-          (ev.eta_s != null ? (" · ETA " + Math.max(0, ev.eta_s).toFixed(0) + "s") : "") +
+      if (ev.stage === "transcribing" && (ev.total || ev.fraction != null)) {
+        const prog = ev.total ? (ev.current + "/" + ev.total) : "";
+        const eta = (ev.eta_s != null && (ev.eta_s >= 0.5 || (ev.fraction != null && ev.fraction >= 0.98)))
+          ? (" · ETA " + Math.max(0, ev.eta_s).toFixed(0) + "s")
+          : (ev.fraction != null ? (" · " + Math.round(ev.fraction * 100) + "%") : "");
+        label = (ev.message || "transcribing") + (prog ? (" · " + prog) : "") + eta +
           (ev.elapsed_s != null ? (" · " + ev.elapsed_s.toFixed(1) + "s") : "");
       }
-      setSttProg(true, pct, label);
+      if (ev.stage !== "segment") setSttProg(true, pct, label);
       if (ev.stage === "segment") {
         if (ev.partial) partial = ev.partial;
         else if (ev.text) partial = (partial ? partial + " " : "") + ev.text;

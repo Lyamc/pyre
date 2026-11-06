@@ -33,9 +33,13 @@ impl Job {
     fn to_json(&self) -> Value {
         let mut v = json!({
             "id": self.id, "kind": self.kind, "label": self.label, "stage": self.stage,
+            "phase": self.stage,
             "cancelable": self.cancelable, "elapsed_s": self.started.elapsed().as_secs_f64(),
         });
-        if let Some(x) = self.current { v["current"] = json!(x); }
+        if let Some(x) = self.current {
+            v["current"] = json!(x);
+            v["completed"] = json!(x);
+        }
         if let Some(x) = self.total { v["total"] = json!(x); }
         if let Some(x) = self.fraction { v["fraction"] = json!(x); }
         if let Some(x) = self.eta_s { v["eta_s"] = json!(x); }
