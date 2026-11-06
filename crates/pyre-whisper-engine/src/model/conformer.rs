@@ -134,8 +134,9 @@ impl FeedForwardModule {
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.ln.forward(x);
         
+        // Burn Linear weights are [in, out] (the converter transposes nn.Linear [out, in]).
         // Manual lin1
-        let x = x.matmul(self.lin1.weight.val().transpose().unsqueeze::<3>());
+        let x = x.matmul(self.lin1.weight.val().unsqueeze::<3>());
         let x = if let Some(bias) = &self.lin1.bias {
             x + bias.val().unsqueeze::<3>()
         } else {
@@ -145,7 +146,7 @@ impl FeedForwardModule {
         let x = burn::tensor::activation::silu(x);
         
         // Manual lin2
-        let x = x.matmul(self.lin2.weight.val().transpose().unsqueeze::<3>());
+        let x = x.matmul(self.lin2.weight.val().unsqueeze::<3>());
         if let Some(bias) = &self.lin2.bias {
             x + bias.val().unsqueeze::<3>()
         } else {

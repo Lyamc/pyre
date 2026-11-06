@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """One-time weight lift: NeMo Parakeet-TDT .nemo archive -> HF-layout model.safetensors + config.json.
 
 This only re-keys checkpoint tensors so pyre's Rust converter (convert/parakeet) can turn them into a
@@ -55,6 +55,12 @@ def main():
         if k.startswith("preprocessor.") or k.endswith("num_batches_tracked"):
             continue
         out[rename(k)] = v.detach().to(torch.float32).contiguous()
+    # NeMo conformer layers are bias-free; pyre's Burn module (HF layout) has bias slots, so give them zeros.
+    for k in list(out):
+        if re.search(r"\.(self_attn\.(q|k|v|o)_proj|feed_forward[12]\.linear[12]|conv\.(pointwise_conv[12]|depthwise_conv))\.weight$", k):
+            b = k[: -len("weight")] + "bias"
+            if b not in out:
+                out[b] = torch.zeros(out[k].shape[0], dtype=torch.float32)
     vocab = int(scalar(yaml, "vocab_size")) + 1  # + blank
     m = re.search(r"durations:\s*\n((?:\s*-\s*\d+\s*\n)+)", yaml)
     durations = [int(x) for x in re.findall(r"\d+", m.group(1))] if m else [0, 1, 2, 3, 4]
@@ -78,7 +84,14 @@ def main():
     save_file(out, os.path.join(a.out, "model.safetensors"))
     with open(os.path.join(a.out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"wrote {len(out)} tensors, config {cfg}", flush=True)
+    # Token table for pyre's tokenizer loader: the SentencePiece pieces in id order, as a WordLevel tokenizer.json.
+    vname = next(n for n in members if n.endswith("tokenizer.vocab"))
+    pieces = [l.split("\t")[0] for l in tar.extractfile(members[vname]).read().decode("utf-8").splitlines() if l]
+    tok = {"version": "1.0", "truncation": None, "padding": None, "added_tokens": [], "normalizer": None,
+           "pre_tokenizer": None, "post_processor": None, "decoder": None,
+           "model": {"type": "WordLevel", "vocab": {p: i for i, p in enumerate(pieces)}, "unk_token": pieces[0]}}
+    with open(os.path.join(a.out, "tokenizer.json"), "w", encoding="utf-8") as f:
+        json.dump(tok, f, ensure_ascii=False)    print(f"wrote {len(out)} tensors, config {cfg}", flush=True)
 
 
 if __name__ == "__main__":
