@@ -45,10 +45,10 @@ const STAGES: &[Stage] = &[
     },
     Stage {
         id: "s3-tokenizer",
-        state: StageState::NotStarted,
-        weights: "Inside s3gen_meanflow.safetensors. 16 kHz reference audio, first 15 s, becomes up to 375 prompt tokens at 25 Hz.",
-        reuses: "Not the Whisper encoder and not the VibeVoice acoustic encoder. S3Tokenizer is the CosyVoice speech tokenizer (convolutional encoder, vector quantizer). Sharing the Whisper graph would not load these weights.",
-        missing: "The tokenizer module, the 6561-code vocabulary (ids below 6561 are kept; 6561 is silence padding), and the prompt-token length crop.",
+        state: StageState::Running,
+        weights: "tokenizer.* inside s3gen_meanflow.safetensors. 16 kHz reference, first 15 s, at most 375 tokens at 25 Hz. The file also holds HiFT; this stage loads only the tokenizer tensors.",
+        reuses: "The voice-encoder mel uses the same periodic Hann and Slaney scale, but 40 bins. S3 is 128 bins plus Whisper-style log compression, then a 6-layer FSMN encoder. It is not the Whisper encoder.",
+        missing: "Nothing for prompt-token ids. Finite scalar quantization (3^8 = 6561). A speaker-encoder cosine on a synthetic harmonic is not evidence these ids are a voice.",
     },
     Stage {
         id: "meanflow-hift",
@@ -80,7 +80,7 @@ pub fn stages() -> &'static [Stage] {
 /// Cloned speech is a Burn waveform from text plus a reference clip.
 ///
 /// This stays `false` until that path exists. It is not derived from [`stages`]:
-/// a running tokenizer, T3 speech-token ids, or the MMS bracket approximations
+/// a running tokenizer, T3 or S3 speech-token ids, or the MMS bracket approximations
 /// in `src/tts_markup.rs` do not make it true. Those approximations insert
 /// silence or change rate; they are not Nano GPT-2 token ids and they are not
 /// a cloned voice.
@@ -103,7 +103,10 @@ mod tests {
         assert!(stages()
             .iter()
             .any(|s| s.id == "t3-nano" && s.state == StageState::Running));
-        // Tokenizer, encoder, and T3 speech ids still do not mean cloned audio.
+        assert!(stages()
+            .iter()
+            .any(|s| s.id == "s3-tokenizer" && s.state == StageState::Running));
+        // Tokenizer, T3, and S3 ids still do not mean cloned audio.
         assert!(!text_to_cloned_speech_ready());
         assert!(stages()
             .iter()
