@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [".", "crates/*"]
-exclude = ["third_party/hf-hub", "gui"]
+exclude = ["third_party/hf-hub", "gui", "vendor/**"]
 
 [workspace.dependencies]
-# ONE Burn for the whole workspace: Lyamc's fork, pinned (main @ 2026-10-26).
-burn = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std"] }
-burn-store = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std", "safetensors"] }
+# ONE Burn for the whole workspace: Lyamc/burn @ pyre-fused-quant (matches vendor/burn-pyre submodule).
+burn = { git = "https://github.com/Lyamc/burn", rev = "4b9af57ff044b0e3157b985361a4c6f2004f3ae7", default-features = false, features = ["std"] }
+burn-store = { git = "https://github.com/Lyamc/burn", rev = "4b9af57ff044b0e3157b985361a4c6f2004f3ae7", default-features = false, features = ["std", "safetensors"] }
 pyre-whisper-core = { path = "crates/pyre-whisper-core" }
 pyre-whisper-audio = { path = "crates/pyre-whisper-audio" }
 pyre-whisper-engine = { path = "crates/pyre-whisper-engine", default-features = false }
@@ -58,7 +58,7 @@ flex = ["burn/flex", "burn/rayon"]
 
 [dependencies]
 # cubecl-env-direct: StreamId for the expert copy stream (same crate as the [patch] below)
-cubecl-environment = { path = "../cubecl-pipe/crates/cubecl-environment" }
+cubecl-environment = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
 burn = { workspace = true, default-features = false, features = ["std", "fusion", "autotune", "persistence"] }
 safetensors = "0.8"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
@@ -80,7 +80,7 @@ memmap2 = "0.9"
 rayon = "1"
 half = "2"
 # GGUF (Q8_0 kept packed as Burn Q8F blocks; K-quants dequantized). Local port of Lyamc/burn-gguf to the burn fork.
-burn-gguf = { path = "../burn-gguf", default-features = false, features = ["std", "memmap"] }
+burn-gguf = { path = "vendor/burn-gguf", default-features = false, features = ["std", "memmap"] }
 toml = "0.9"
 sha2 = "0.10"
 same-file = "1"
@@ -95,7 +95,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 vtracer = { version = "0.6", default-features = false }
 visioncortex = "0.8"
 # Image tagger: reads PyTorch .pt checkpoints in place (same Burn fork, no torch).
-pytorch-reader = { path = "../burn-pyre/crates/pytorch-reader" }
+pytorch-reader = { git = "https://github.com/Lyamc/burn", rev = "4b9af57ff044b0e3157b985361a4c6f2004f3ae7" }
 base64 = "0.22"
 # Speech-to-text: Whisper (and friends) vendored from the user's whisburn @ d27f1fc, now owned by pyre.
 pyre-whisper-core = { path = "crates/pyre-whisper-core", optional = true }
@@ -115,63 +115,35 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Local fix (not pushed): cubecl's Turso kernel cache requests multiprocess WAL, unsupported on Windows.
-# Local branch of the burn fork (not pushed): fused dequant+matmul for block-quantized weights.
-[patch."https://github.com/Lyamc/burn"]
-burn-cubecl = { path = "../burn-pyre/crates/burn-cubecl" }
-burn-cubecl-fusion = { path = "../burn-pyre/crates/burn-cubecl-fusion" }
-burn = { path = "../burn-pyre/crates/burn" }
-burn-autodiff = { path = "../burn-pyre/crates/burn-autodiff" }
-burn-backend = { path = "../burn-pyre/crates/burn-backend" }
-burn-backend-extension = { path = "../burn-pyre/crates/burn-backend-extension" }
-burn-core = { path = "../burn-pyre/crates/burn-core" }
-burn-cpu = { path = "../burn-pyre/crates/burn-cpu" }
-burn-cuda = { path = "../burn-pyre/crates/burn-cuda" }
-burn-derive = { path = "../burn-pyre/crates/burn-derive" }
-burn-dispatch = { path = "../burn-pyre/crates/burn-dispatch" }
-burn-einsum = { path = "../burn-pyre/crates/burn-einsum" }
-burn-flex = { path = "../burn-pyre/crates/burn-flex" }
-burn-fusion = { path = "../burn-pyre/crates/burn-fusion" }
-burn-instrument = { path = "../burn-pyre/crates/burn-instrument" }
-burn-instrument-macros = { path = "../burn-pyre/crates/burn-instrument-macros" }
-burn-ir = { path = "../burn-pyre/crates/burn-ir" }
-burn-linalg = { path = "../burn-pyre/crates/burn-linalg" }
-burn-nn = { path = "../burn-pyre/crates/burn-nn" }
-burn-optim = { path = "../burn-pyre/crates/burn-optim" }
-burn-pack = { path = "../burn-pyre/crates/burn-pack" }
-burn-remote = { path = "../burn-pyre/crates/burn-remote" }
-burn-rocm = { path = "../burn-pyre/crates/burn-rocm" }
-burn-router = { path = "../burn-pyre/crates/burn-router" }
-burn-signal = { path = "../burn-pyre/crates/burn-signal" }
-burn-std = { path = "../burn-pyre/crates/burn-std" }
-burn-store = { path = "../burn-pyre/crates/burn-store" }
-burn-tensor = { path = "../burn-pyre/crates/burn-tensor" }
-burn-vision = { path = "../burn-pyre/crates/burn-vision" }
-burn-wgpu = { path = "../burn-pyre/crates/burn-wgpu" }
+# Vendored forks are git submodules under vendor/ (same commits as these revs).
+# Burn is pinned via workspace.dependencies git rev (matches vendor/burn-pyre).
+# CubeCL is [patch]ed from tracel-ai/cubecl -> Lyamc/cubecl-pipe (different URL; matches vendor/cubecl-pipe).
+# burn-gguf is a single crate: path = vendor/burn-gguf (its Burn deps use the same rev).
 
+# Vendored CubeCL: Lyamc/cubecl-pipe @ pyre-hostmem (Windows WAL / host-mem extensions).
 [patch."https://github.com/tracel-ai/cubecl"]
-cubecl-environment = { path = "../cubecl-pipe/crates/cubecl-environment" }
-cubecl = { path = "../cubecl-pipe/crates/cubecl" }
-cubecl-common = { path = "../cubecl-pipe/crates/cubecl-common" }
-cubecl-core = { path = "../cubecl-pipe/crates/cubecl-core" }
-cubecl-cpp = { path = "../cubecl-pipe/crates/cubecl-cpp" }
-cubecl-cpu = { path = "../cubecl-pipe/crates/cubecl-cpu" }
-cubecl-cuda = { path = "../cubecl-pipe/crates/cubecl-cuda" }
-cubecl-hip = { path = "../cubecl-pipe/crates/cubecl-hip" }
-cubecl-ir = { path = "../cubecl-pipe/crates/cubecl-ir" }
-cubecl-llvm = { path = "../cubecl-pipe/crates/cubecl-llvm" }
-cubecl-macros = { path = "../cubecl-pipe/crates/cubecl-macros" }
-cubecl-macros-internal = { path = "../cubecl-pipe/crates/cubecl-macros-internal" }
-cubecl-metal = { path = "../cubecl-pipe/crates/cubecl-metal" }
-cubecl-monitoring = { path = "../cubecl-pipe/crates/cubecl-monitoring" }
-cubecl-opt = { path = "../cubecl-pipe/crates/cubecl-opt" }
-cubecl-runtime = { path = "../cubecl-pipe/crates/cubecl-runtime" }
-cubecl-server = { path = "../cubecl-pipe/crates/cubecl-server" }
-cubecl-spirv = { path = "../cubecl-pipe/crates/cubecl-spirv" }
-cubecl-std = { path = "../cubecl-pipe/crates/cubecl-std" }
-cubecl-tile = { path = "../cubecl-pipe/crates/cubecl-tile" }
-cubecl-wgpu = { path = "../cubecl-pipe/crates/cubecl-wgpu" }
-cubecl-zspace = { path = "../cubecl-pipe/crates/cubecl-zspace" }
+cubecl-environment = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-common = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-core = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-cpp = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-cpu = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-cuda = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-hip = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-ir = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-llvm = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-macros = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-macros-internal = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-metal = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-monitoring = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-opt = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-runtime = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-server = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-spirv = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-std = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-tile = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-wgpu = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
+cubecl-zspace = { git = "https://github.com/Lyamc/cubecl-pipe", rev = "29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd" }
 
 
 [target.'cfg(windows)'.dependencies]

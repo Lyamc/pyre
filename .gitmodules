@@ -1,0 +1,12 @@
+[submodule "vendor/burn-pyre"]
+	path = vendor/burn-pyre
+	url = https://github.com/Lyamc/burn.git
+	branch = pyre-fused-quant
+[submodule "vendor/burn-gguf"]
+	path = vendor/burn-gguf
+	url = https://github.com/Lyamc/burn-gguf.git
+	branch = pyre-burn-fork
+[submodule "vendor/cubecl-pipe"]
+	path = vendor/cubecl-pipe
+	url = https://github.com/Lyamc/cubecl-pipe.git
+	branch = pyre-hostmem

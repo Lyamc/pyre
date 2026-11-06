@@ -4,6 +4,24 @@ A llama.cpp `llama-server`-style inference server written in Rust where **[Burn]
 
 ## Build
 
+Clone with vendored dependency submodules:
+
+```powershell
+git clone --recurse-submodules https://github.com/Lyamc/pyre.git
+cd pyre
+git checkout qwen-int
+# already cloned without submodules?
+git submodule update --init --recursive
+```
+
+| submodule | GitHub | branch / pinned commit |
+|---|---|---|
+| `vendor/burn-pyre` | [Lyamc/burn](https://github.com/Lyamc/burn) | `pyre-fused-quant` |
+| `vendor/burn-gguf` | [Lyamc/burn-gguf](https://github.com/Lyamc/burn-gguf) | `pyre-burn-fork` |
+| `vendor/cubecl-pipe` | [Lyamc/cubecl-pipe](https://github.com/Lyamc/cubecl-pipe) | `pyre-hostmem` |
+
+`burn-gguf` is a single crate and is used as a `path = "vendor/burn-gguf"` dependency. Burn and CubeCL are full Cargo workspaces; Cargo cannot path-depend on nested workspaces that live *inside* this repo, so those two are pinned in `Cargo.toml` with **git revs that match the submodule commits** (`[patch]` + direct deps). After `git submodule update`, the trees under `vendor/` are the same commits Cargo builds.
+
 ```powershell
 cargo build --release            # cuda + wgpu + cpu(flex) + ndarray
 cargo build --release --no-default-features --features wgpu   # smaller build
@@ -42,7 +60,7 @@ pyre **reuses the standard Hugging Face hub cache in place**, so a model you alr
 * **pyre store** (`--models-dir` > `PYRE_MODELS_DIR` > `models_dir` in the config file `%APPDATA%\pyre\config.toml` / `~/.config/pyre/config.toml` > `%LOCALAPPDATA%\pyre\models` / `~/.local/share/pyre/models`). The layout is `<kind>/<org>/<name>/<rev>/` plus `pyre-model.toml` (source repo/revision, kind, architecture, dtype, files with sizes and sha256, import mode, optional alias).
   * `import --link` (default) hardlinks the files, so they take **no extra space**. If hardlinks fail (different volume) it falls back to symlinks, then to copying, and it tells you which it used.
   * `--copy` copies the files. `--move` takes them out of the cache. `--register` records a local folder in place and copies nothing.
-* Search order for `-m`: explicit path ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ store alias/name ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ HF cache ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ download (unless offline). Change it with `--search-order path,store,hf,download` or `search_order = [...]` in the config file.
+* Search order for `-m`: explicit path ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ store alias/name ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ HF cache ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ download (unless offline). Change it with `--search-order path,store,hf,download` or `search_order = [...]` in the config file.
 
 ```text
 pyre models list [--json]
@@ -171,7 +189,7 @@ not pushed; its 168 tests pass). Weights stay **packed on the GPU** (`src/model/
 - Q5_0 -> Q8F block 32, exact.
 - Q6_K -> Q8F block 16 with f32 scales, exact.
 - Q4_K -> Q4F block 32 with the exact f32 sub-block scale and q-8, plus a per-block offset matrix C
-  (`[out, in/32]`). The linear becomes `xÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·W'ÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂµÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ + blocksum32(x)ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·CÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂµÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬`.
+  (`[out, in/32]`). The linear becomes `xÃÆÃâÃÂ¢Ã¢âÂ¬ÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂ·W'ÃÆÃâÃâÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂµÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ + blocksum32(x)ÃÆÃâÃÂ¢Ã¢âÂ¬ÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂ·CÃÆÃâÃâÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂµÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬`.
 
 `PYRE_GGUF_KQUANT=0` dequantizes the K/Q5 types at load; `PYRE_GGUF_DEQUANT=1` dequantizes everything.
 Burn's quantized matmul dequantizes each weight inside the op (no hand-written fused int4 kernel), so
@@ -182,7 +200,7 @@ RTX 3060, CUDA, util cap off (`scripts/gguf_bench.ps1`; extra VRAM after load + 
 | model | packed | dequantized | Q8_0 | bf16 safetensors |
 |---|---|---|---|---|
 | Qwen2.5-0.5B Q4_K_M | +991 MiB, 43.4 tok/s | +1376 MiB, 46.4 tok/s | +1040 MiB, 48.9 tok/s | +1376 MiB, 45.8 tok/s |
-| Qwen2.5-1.5B Q4_K_M | +2863 MiB, 28.2 tok/s | +3759 MiB, 28.5 tok/s | +2760 MiB, 38.4 tok/s | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
+| Qwen2.5-1.5B Q4_K_M | +2863 MiB, 28.2 tok/s | +3759 MiB, 28.5 tok/s | +2760 MiB, 38.4 tok/s | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ |
 
 All outputs are coherent text. In the 0.5B Q4_K_M file most tensors are Q5_0 (896 is not a multiple of 256).
 In the 1.5B file, packing saves ~0.9 GB. It still doesn't beat Q8_0, because Burn's memory pool keeps
@@ -198,33 +216,33 @@ fork (based on 9db7598). The changes live in `burn-cubecl/src/kernel/matmul/fuse
   PackedU32`, Q4_K/Q5_0, block 32; `Q8F/Q8S Native`, Q8_0/Q6_K, block 32/16). It reads the
   packed words and the f32 block scales straight from the weight's own buffers, so it never
   creates a dequantized copy. It handles row-pitched buffers and broadcast leading dims.
-- **Decode, m ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¤ 8 (the default).** A GEMV: one 32-lane plane per output column, 8 columns per
+- **Decode, m ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ°ÃÆÃ¢â¬Å¡ÃâÃÂ¤ 8 (the default).** A GEMV: one 32-lane plane per output column, 8 columns per
   cube, and `plane_sum` to reduce.
-- **Prefill.** A 64ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â64 shared-memory tiled GEMM exists, but it is opt-in (`BURN_FQ_GEMM=1`)
-  because it is 6ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ11ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â slower than dequantize + cubek's matmul (q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536, m=300: 6.6 ms vs
+- **Prefill.** A 64ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ64 shared-memory tiled GEMM exists, but it is opt-in (`BURN_FQ_GEMM=1`)
+  because it is 6ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬Ãâ¦Ã¢â¬Å11ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ slower than dequantize + cubek's matmul (q4 8960ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ1536, m=300: 6.6 ms vs
   0.64 ms). Prefill therefore still dequantizes, and only temporarily, one layer at a time.
 - **Switches.** `BURN_FUSED_QMATMUL=0` turns the whole thing off, which also stops
   burn-cubecl-fusion from capturing the matmul. `BURN_FQ_GEMV_MAX=<m>` lowers the GEMV cutoff.
 - **Exactness.** `cargo test --release --features cuda,wgpu,stt,image fused_qmatmul -- --ignored
   --nocapture` (`PYRE_TEST_BACKEND=wgpu` for wgpu) compares against bf16 dequant + matmul and
-  checks that the fused kernel really was launched. Max relative error is 3.5e-3ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ6.9e-3 on CUDA
-  bf16, the same as the unfused path, and 4e-4ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ9e-4 on wgpu f16. m=1,4,8 run fused; m=37,300
+  checks that the fused kernel really was launched. Max relative error is 3.5e-3ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬Ãâ¦Ã¢â¬Å6.9e-3 on CUDA
+  bf16, the same as the unfused path, and 4e-4ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬Ãâ¦Ã¢â¬Å9e-4 on wgpu f16. m=1,4,8 run fused; m=37,300
   run unfused.
 - **Portability.** The kernel runs on wgpu (Vulkan, f16) as well as CUDA. On wgpu, Q8 Native
   (i8 storage) does not compile even for plain dequantize, so only Q4 is tested there.
 
-Kernel microbenchmarks (m=1, ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âµs):
+Kernel microbenchmarks (m=1, ÃÆÃâÃÂ¢Ã¢âÂ¬ÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂµs):
 
 | shape | CUDA fused | CUDA unfused | CUDA bf16 | wgpu fused | wgpu unfused | wgpu f16 |
 |---|---|---|---|---|---|---|
-| q4 896ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â896 | 9.8 | 40.4 | 13.6 | 8.9 | 104.8 | 21.3 |
-| q8 4864ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â896 | 20.2 | 22.5 | 30.1 | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
-| q8/b16 1536ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â8960 | 85.2 | 68.4 | 98.6 | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
-| q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536 | 427 | 492 | 97 | 47 | 283 | 150 |
+| q4 896ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ896 | 9.8 | 40.4 | 13.6 | 8.9 | 104.8 | 21.3 |
+| q8 4864ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ896 | 20.2 | 22.5 | 30.1 | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ |
+| q8/b16 1536ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ8960 | 85.2 | 68.4 | 98.6 | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ | ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ |
+| q4 8960ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ1536 | 427 | 492 | 97 | 47 | 283 | 150 |
 
 End to end on CUDA (`scripts/fq_bench.ps1`): decode tok/s over 3 runs of 256 tokens, with
 `PYRE_GPU_UTIL_MAX=100 PYRE_LOW_PRIORITY=0`, and VRAM above the idle baseline. The desktop was
-in use during these runs (all of them are well below this README's earlier ~41ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ48 tok/s), so
+in use during these runs (all of them are well below this README's earlier ~41ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬Ãâ¦Ã¢â¬Å48 tok/s), so
 compare rows with each other, not with the older table.
 
 | model | fused | unfused (`BURN_FUSED_QMATMUL=0`) |
@@ -237,14 +255,14 @@ compare rows with each other, not with the older table.
 
 Results against the goal:
 
-- The fused kernel speeds up decode by 10ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ18%.
+- The fused kernel speeds up decode by 10ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢âÂ¬ÃÂ¡ÃâÃÂ¬ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬Ãâ¦Ã¢â¬Å18%.
 - On 1.5B Q4_K_M it removes the temporary dequant memory: 856 MiB less VRAM than unfused, and
   less than Q8_0.
 - **Q4_K_M is still not faster than Q8_0 at decode.** Two reasons:
   - At these sizes decode is bound by launch and host overhead, not by weight bandwidth. bf16
     runs at the same speed.
   - pyre's Q4_K layout adds an offset matmul per projection.
-  - The q4 8960ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â1536 shape (the MLP down-projection) is also slower than bf16 in the GEMV on
+  - The q4 8960ÃÆÃâÃâ Ã¢â¬â¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢âÂ¬ÃÂ1536 shape (the MLP down-projection) is also slower than bf16 in the GEMV on
     CUDA. That shape is the next thing to tune.
 - 1.5B bf16 was not measured, because it is not downloaded locally.
 ## Decode launch overhead
@@ -266,7 +284,7 @@ scheme to carry a per-block offset; not done.
 
 The engine (`src/engine.rs`) runs up to `PYRE_PARALLEL` (default 8) sequences per decode step,
 with a KV-cache pool reused by longest common prefix. Aggregate tok/s, Qwen2.5-0.5B on CUDA, 128 tokens
-(`scripts/bench_concurrency.py`): 1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 26.9, 4 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 80.6, 8 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 129.0 (bf16); in f32, 27.2 / 70.4 / 127.4,
+(`scripts/bench_concurrency.py`): 1 ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ 26.9, 4 ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ 80.6, 8 ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ 129.0 (bf16); in f32, 27.2 / 70.4 / 127.4,
 and batched output is identical to solo output.
 
 ## Gemma 2/3 and Qwen3-MoE
@@ -326,11 +344,11 @@ pyre leaves room for the desktop and other apps:
   - Image generation at a new, larger size is checked first.
 - `--gpu-util-max 90` / `PYRE_GPU_UTIL_MAX`: duty-cycle cap; `100` or `0` disables.
   - After each decode step, prefill chunk and diffusion step, the worker syncs the device and sleeps
-    `busyÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â·(100-u)/u`.
+    `busyÃÆÃâÃÂ¢Ã¢âÂ¬ÃÂ¡ÃÆÃ¢â¬Å¡ÃâÃÂ·(100-u)/u`.
   - Prefill runs in 512-token chunks (`PYRE_PREFILL_CHUNK`), so no submission runs long. This is gentler
     on the driver watchdog.
   - The process runs at below-normal priority (`PYRE_LOW_PRIORITY=0` turns that off).
-- Current limits and usage are in `/api/status` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ `limits`, on the web UI Status page and on the GPUI Status page.
+- Current limits and usage are in `/api/status` ÃÆÃâÃâÃÂ¢ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃâÃÂ ÃÆÃÂ¢ÃÂ¢Ã¢â¬Å¡ÃÂ¬ÃÂ¢Ã¢â¬Å¾ÃÂ¢ `limits`, on the web UI Status page and on the GPUI Status page.
 
 Cost of the defaults (RTX 3060):
 
@@ -720,11 +738,11 @@ C++/CUDA is linked or vendored.
     subset (`PYRE_MTP_DRAFT_VOCAB=en` default | `cjk` | `full` | file, Strata's lists).
   * `PYRE_MTP_MIN_P` stops a chain below a draft probability (Strata's `--spec-min-p`, default 0).
   * About 7 ms per draft step.
-  * Acceptance of greedy drafts: 68�77% on story and code (Strata reports 0.85�0.89 with its GPU drafter).
+  * Acceptance of greedy drafts: 6877% on story and code (Strata reports 0.850.89 with its GPU drafter).
 * **Greedy identity.** With `--spec 2/3/4` the output matches plain decode token for token on every run
   (96 tokens story, the full code answer). Wave mode and tail skip match too.
 * **Verify GEMV** (`k_gemv4r`, default; `PYRE_QN_GEMV4R=0` gives the old kernel). Nsight showed the multi-token
-  verify's 4-column GEMV costing 3.6� a single GEMV, limited by activation loads, not by weights. Each warp now
+  verify's 4-column GEMV costing 3.6× a single GEMV, limited by activation loads, not by weights. Each warp now
   takes 4 rows, so each activation value is loaded once for 4 rows, with every (row, column) summed in exactly
   `k_gemv`'s order.
   * GEMV time per T=4 verify: 43 ? 27 ms.
@@ -738,20 +756,20 @@ Measurements: quiet GPU, graphs on, 96 tokens, steady tok/s. VRAM is unchanged, 
 
 | | story (pA) | code (pB) | output |
 |---|---|---|---|
-| plain decode | 18.6�20.8 | 16.7�19.0 | reference |
-| `--spec 2` (MTP) | 18.1�19.3 (77% accepted) | 17.4 (75%) | identical |
-| `--spec 3` (MTP) | 18.4�18.7 (69%) | 15.8 (75%) | identical |
-| `--spec 4` (MTP) | 16.3 (66%) | � | identical |
+| plain decode | 18.620.8 | 16.719.0 | reference |
+| `--spec 2` (MTP) | 18.119.3 (77% accepted) | 17.4 (75%) | identical |
+| `--spec 3` (MTP) | 18.418.7 (69%) | 15.8 (75%) | identical |
+| `--spec 4` (MTP) | 16.3 (66%) |  | identical |
 | `PYRE_QN_TAIL_SKIP=7` | 23.0 | 20.7 | story same 96 tokens; code differs from token 4 |
-| tail skip 7 + `--spec 2` | 21.7 (80%) | � | identical to tail skip alone |
-| `PYRE_ROUTE_PRIOR=1.5` | 23.3 | � | differs from token 40 |
+| tail skip 7 + `--spec 2` | 21.7 (80%) |  | identical to tail skip alone |
+| `PYRE_ROUTE_PRIOR=1.5` | 23.3 |  | differs from token 40 |
 
 So MTP speculation is correct but **not faster here**, and it stays opt-in (`--spec`, default 0). The reason is
 how verify scales on this machine. A window of T tokens costs about T plain steps:
-* the CPU experts scale with the distinct experts in the window (~3.3� for T=4);
+* the CPU experts scale with the distinct experts in the window (~3.3× for T=4);
 * DeltaNet and the per-token kernels run T times.
 
-A round with 2.5�2.9 accepted tokens therefore costs about as much as the tokens it saves. Strata gets its MTP
+A round with 2.52.9 accepted tokens therefore costs about as much as the tokens it saves. Strata gets its MTP
 speedup with a larger share of the experts on the GPU and the whole drafter on the GPU.
 
 `PYRE_QN_TAIL_SKIP=R` (opt-in, changes outputs, default off) is new. It skips an expert that missed the GPU cache
