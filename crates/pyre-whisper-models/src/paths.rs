@@ -113,5 +113,7 @@ pub fn has_burn_bundle(dir: &Path, name: &str) -> bool {
 
     mpk_candidates.iter().any(|p| p.exists())
         && cfg_candidates.iter().any(|p| p.exists())
-        && tokenizer.exists()
+        && (tokenizer.exists()
+            // NeMo Parakeet ships a SentencePiece vocab.txt, not tokenizer.json.
+            || (crate::convert::is_parakeet_model(name) && dir.join("vocab.txt").exists()))
 }
