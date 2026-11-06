@@ -31,7 +31,7 @@ pub struct VoiceMeta {
     pub engine: String,
 }
 
-fn default_engine() -> String { "pocket-tts".into() }
+fn default_engine() -> String { "chatterbox-nano".into() }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceInfo {
@@ -217,3 +217,4 @@ pub fn builtin_mms() -> serde_json::Value {
         "notes": "facebook/mms-tts-eng Burn VITS. No cloning; supports SSML breaks/prosody."
     })
 }
+

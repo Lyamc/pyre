@@ -6532,6 +6532,7 @@ dependencies = [
  "nvml-wrapper",
  "pyre-resume",
  "pyre-sd",
+ "pyre-voice-clone",
  "pyre-whisper-audio",
  "pyre-whisper-core",
  "pyre-whisper-engine",

@@ -253,6 +253,7 @@
             <div class="row wrap">
               <button id="sttSummarize" type="button" class="primary">Summarize</button>
               <button id="sttToChat" type="button">Send transcript to chat</button>
+              <button id="sttCloneVoice" type="button" title="Save the current audio as a named voice identity">Clone a voice</button>
             </div>
             <div class="dl-group">
               <div class="opt-label">Download transcript</div>
@@ -344,9 +345,11 @@
             <div class="opt-block">
               <div class="opt-label">Reply voice</div>
               <div class="row wrap">
-                <select id="stsVoice"><option>default</option></select>
+                <select id="stsVoice"><option value="mms">MMS English (built-in)</option></select>
                 <label>Speed <input id="stsSpeed" type="number" step="0.1" value="1.0" style="width:4em"></label>
+                <button id="stsCloneVoice" type="button" title="Save the STS input audio as a voice">Clone a voice</button>
               </div>
+              <p class="muted small">Same voice library as TTS. Cloned synthesis waits on Chatterbox-Nano Burn stages.</p>
             </div>
             <details id="stsAdvanced" class="prefs">
               <summary>Advanced</summary>
@@ -384,15 +387,35 @@
         <p class="muted small">Separate from transcription — turns text into spoken audio.</p>
       <div class="disabled-note" id="ttsNote">No text-to-speech model is loaded (start with <code>--tts-model facebook/mms-tts-eng</code>).</div>
       <fieldset id="ttsForm" disabled>
-        <textarea id="ttsText" rows="3" placeholder="Text to speak"></textarea>
-        <div class="row wrap">
-          <select id="ttsVoice"><option>default</option></select>
-          <label>Speed <input id="ttsSpeed" type="number" step="0.1" value="1.0" style="width:4em"></label>
-          <button id="ttsGo" class="primary" type="button">Speak</button>
-          <button id="ttsCancel" type="button" class="hidden">Cancel</button>
+        <div class="row wrap" style="justify-content:space-between;align-items:center">
+          <label class="opt-label" for="ttsText">Script</label>
+          <button id="ttsDirHelp" type="button" class="ghost small" title="Direction syntax help">Directions help</button>
         </div>
+        <textarea id="ttsText" rows="4" placeholder="Hi there [chuckle], have you got one minute?&#10;Or with a pause: Hello. &lt;break time=&quot;500ms&quot;/&gt; Take your time."></textarea>
+        <div id="ttsDirIgnored" class="callout hidden muted small"></div>
+        <div class="opt-block">
+          <div class="opt-label">Voice</div>
+          <div class="row wrap">
+            <select id="ttsVoice"><option value="mms">MMS English (built-in)</option></select>
+            <label>Speed <input id="ttsSpeed" type="number" step="0.1" value="1.0" style="width:4em"></label>
+            <button id="ttsGo" class="primary" type="button">Speak</button>
+            <button id="ttsCancel" type="button" class="hidden">Cancel</button>
+          </div>
+          <p class="muted small" id="ttsVoiceNote">Cloned voices can be saved now; speaking with them waits on the Burn Chatterbox-Nano port (speaker encoder is in, T3/HiFT still coming).</p>
+        </div>
+        <details id="ttsVoicesLib" class="prefs">
+          <summary>Voice library</summary>
+          <div id="ttsVoicesList" class="muted small">Loading…</div>
+          <div class="row wrap" style="margin-top:.5rem">
+            <input id="ttsCloneName" placeholder="New voice name" style="min-width:10em">
+            <input id="ttsCloneFile" type="file" accept="audio/*">
+            <button id="ttsCloneSave" type="button">Save from file</button>
+          </div>
+          <p class="muted small">Reference: about 5–30 s of clean speech. Stored on the server under the audio_voices library.</p>
+        </details>
         <div id="ttsProg" class="aprogress hidden"><div class="abar"><div id="ttsBar" class="abar-fill"></div></div><div id="ttsProgLabel" class="muted small"></div></div>
         <audio id="ttsAudio" controls class="hidden"></audio>
+        <dialog id="ttsDirDlg"><form method="dialog"><h3>Speech directions</h3><div id="ttsDirBody" class="sumout" style="max-height:50vh;overflow:auto"></div><menu><button value="ok" class="primary">Close</button></menu></form></dialog>
       </fieldset>
       </div>
     </div>

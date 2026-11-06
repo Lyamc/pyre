@@ -7,7 +7,7 @@
 //! - `<break/>` — default 500 ms pause
 //! - `<prosody rate="slow|medium|fast|x-slow|x-fast|N%">...</prosody>`
 //!
-//! **VoxCPM nonverbal tags** (official OpenBMB tags; on MMS these become short silences
+//! **Chatterbox-Nano event tags** (and a few aliases) (official OpenBMB tags; on MMS these become short silences
 //! because the built-in VITS cannot emit non-speech sounds — not spoken aloud):
 //! - `[breath]`, `[laughing]` / `[laughs]`, `[sigh]` / `[sighs]`, `[Uhm]`, `[Shh]`
 //!
@@ -136,12 +136,14 @@ fn rate_to_speed(rate: &str) -> Option<f64> {
 
 /// Nonverbal VoxCPM tags → silence seconds on engines that cannot emit them.
 fn nonverbal_silence(tag: &str) -> Option<f64> {
+    // Chatterbox-Nano event tags (approx as silence on MMS) + a few aliases.
     match tag.trim().to_ascii_lowercase().as_str() {
-        "breath" => Some(0.35),
-        "laughing" | "laughs" | "laughter" => Some(0.45),
+        "breath" | "clear throat" => Some(0.35),
+        "laughing" | "laughs" | "laughter" | "laugh" | "chuckle" => Some(0.45),
         "sigh" | "sighs" | "sighing" => Some(0.4),
         "uhm" | "uh" | "um" => Some(0.25),
-        "shh" | "shhh" => Some(0.3),
+        "shh" | "shhh" | "shush" => Some(0.3),
+        "cough" | "groan" | "sniff" | "gasp" => Some(0.35),
         "pause" => Some(0.5),
         _ => None,
     }
@@ -149,11 +151,13 @@ fn nonverbal_silence(tag: &str) -> Option<f64> {
 
 /// Map a bracket emotion to (speed, noise) when MMS can approximate it; None = ignore.
 fn emotion_map(tag: &str) -> Option<(f64, f64)> {
+    // Chatterbox delivery tags + a few aliases. Mapped to MMS rate/noise only.
     match tag.trim().to_ascii_lowercase().as_str() {
-        "slow" | "calm" | "sad" | "tired" | "whisper" | "whispers" => Some((0.75, 0.8)),
-        "fast" | "excited" | "angry" | "frustrated" | "hurried" => Some((1.25, 1.15)),
-        "confused" | "hesitant" => Some((0.9, 1.05)),
-        "happy" | "cheerful" => Some((1.1, 1.0)),
+        "slow" | "calm" | "sad" | "tired" | "whisper" | "whispers" | "whispering"
+        | "crying" | "fear" => Some((0.75, 0.8)),
+        "fast" | "excited" | "angry" | "frustrated" | "hurried" | "dramatic" => Some((1.25, 1.15)),
+        "confused" | "hesitant" | "surprised" => Some((0.9, 1.05)),
+        "happy" | "cheerful" | "sarcastic" | "advertisement" | "narration" => Some((1.1, 1.0)),
         _ => None,
     }
 }

@@ -22,20 +22,51 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
 }
 
 async fn directions_help() -> Response {
+    let chatterbox_events = [
+        "[clear throat]", "[sigh]", "[shush]", "[cough]", "[groan]",
+        "[sniff]", "[gasp]", "[chuckle]", "[laugh]",
+    ];
+    let chatterbox_delivery = [
+        "[angry]", "[fear]", "[surprised]", "[whispering]", "[advertisement]",
+        "[dramatic]", "[narration]", "[crying]", "[happy]", "[sarcastic]",
+    ];
+    let stages: Vec<Value> = pyre_voice_clone::stages().iter().map(|s| json!({
+        "id": s.id,
+        "state": format!("{:?}", s.state).to_ascii_lowercase(),
+        "weights": s.weights,
+        "missing": s.missing,
+    })).collect();
     Json(json!({
-        "supported": crate::tts_markup::supported_tags(),
-        "example": "Hello. <break time=\"500ms\"/> <prosody rate=\"slow\">Take your time.</prosody> [breath] That is all.",
-        "notes": [
-            "Prefer SSML <break> and <prosody rate> for portable timing/rate control.",
-            "VoxCPM nonverbal tags ([breath], [laughing], [sigh], …) become short silences on built-in MMS so they are never spoken as words.",
-            "Leading (style instruct) is the VoxCPM controllable-clone convention; MMS lists it as ignored.",
-            "Cloned voices require the Burn Pocket TTS engine (native port in progress). Built-in voice id is \"mms\"."
-        ]
+        "engine": {
+            "id": "chatterbox-nano",
+            "licence": "MIT (ResembleAI/chatterbox-nano)",
+            "status": if pyre_voice_clone::text_to_cloned_speech_ready() { "ready" } else { "porting" },
+            "text_to_cloned_speech_ready": pyre_voice_clone::text_to_cloned_speech_ready(),
+            "stages": stages,
+        },
+        "native_syntax": {
+            "family": "Chatterbox-Nano / Turbo bracket tokens (GPT-2 added tokens 50257-50275)",
+            "example": "Hi there [chuckle], have you got one minute?",
+            "event_tags": chatterbox_events,
+            "delivery_tags": chatterbox_delivery,
+            "notes": [
+                "Official Nano UI / added_tokens.json tags. Unknown brackets are reported, never silently remapped.",
+                "Nano generate() ignores exaggeration and cfg_weight.",
+                "Until Burn T3+HiFT land, MMS approximates event tags as silences and maps some delivery tags to rate/noise; the rest are stripped so they are not spoken."
+            ]
+        },
+        "portable_timing": {
+            "family": "SSML-compatible (applied by pyre on every engine, including MMS)",
+            "example": "Hello. <break time=\"500ms\"/> <prosody rate=\"slow\">Take your time.</prosody>",
+            "tags": crate::tts_markup::supported_tags(),
+        },
+        "builtin_voice": "mms"
     })).into_response()
 }
 
 async fn voices_list() -> Response {
     let synth = false;
+    let clone_ready = pyre_voice_clone::text_to_cloned_speech_ready();
     match crate::voices::global() {
         Ok(lib) => match lib.list(synth) {
             Ok(v) => {
@@ -52,8 +83,11 @@ async fn voices_list() -> Response {
                 Json(json!({
                     "voices": voices,
                     "clone_engine": {
-                        "id": "pocket-tts", "status": "porting",
-                        "message": "Native Burn Pocket TTS voice cloning is in progress. Save identities now; synthesis with voice_id!=mms waits for the port."
+                        "id": "chatterbox-nano",
+                        "licence": "MIT",
+                        "status": "porting",
+                        "text_to_cloned_speech_ready": clone_ready,
+                        "message": "Burn Chatterbox-Nano speaker encoder is in-tree; text-to-cloned-speech waits on T3/S3/HiFT. Save identities now; voice_id!=mms synthesis is not ready yet."
                     },
                     "directions": "/v1/audio/directions"
                 })).into_response()
@@ -135,7 +169,7 @@ async fn voices_create(mp: Multipart) -> Response {
         match crate::voices::global().and_then(|lib| lib.create(&name, &wav_bytes, &source, &notes)) {
             Ok(info) => Json(json!({
                 "ok": true, "voice": info, "synthesizable": false,
-                "message": "Voice identity saved. Cloned synthesis waits on the native Burn Pocket TTS port; TTS/STS still use built-in MMS until then."
+                "message": "Voice identity saved. Cloned synthesis waits on the native Burn Chatterbox-Nano port; TTS/STS still use built-in MMS until then."
             })).into_response(),
             Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
         }
@@ -163,7 +197,7 @@ async fn speech(State(app): S, body: Option<Json<Value>>) -> Response {
     if voice_id != "mms" {
         let exists = crate::voices::global().ok().and_then(|lib| lib.info(voice_id, false).ok()).is_some();
         let msg = if exists {
-            format!("voice '{voice_id}' is saved, but native Burn Pocket TTS cloning is not ready yet; use voice_id=mms (built-in) for now")
+            format!("voice '{voice_id}' is saved, but native Burn Chatterbox-Nano cloning is not ready yet; use voice_id=mms (built-in) for now")
         } else {
             format!("unknown voice_id '{voice_id}' (built-in: mms; create cloned voices via POST /v1/audio/voices)")
         };

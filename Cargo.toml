@@ -105,6 +105,7 @@ pyre-whisper-engine = { path = "crates/pyre-whisper-engine", optional = true }
 pyre-whisper-models = { path = "crates/pyre-whisper-models", optional = true }
 # Journal, SSE terminal contract, and resume planning. No Burn dependency.
 pyre-resume = { path = "crates/pyre-resume" }
+pyre-voice-clone = { path = "crates/pyre-voice-clone" }
 
 [dev-dependencies]
 tempfile = "3"

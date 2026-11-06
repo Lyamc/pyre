@@ -517,7 +517,7 @@ $("#imgGo").onclick = async e => {
   $("#imgGo").disabled = false; $("#imgGo").textContent = "Generate";
 };
 
-﻿﻿// ---------- audio ----------
+// ---------- audio ----------
 const STT_PREF_KEY = "sttPrefs";
 const STT_TX_KEY = "sttTranscript";
 const QUALITY_MODELS = { fast: "tiny", balanced: "base", best: "large-v3-turbo" };
@@ -1360,22 +1360,147 @@ refreshSttModels();
 applySttPrefs(loadSttPrefs());
 restoreSttState();
 
-if ($("#ttsGo")) $("#ttsGo").onclick = async () => {
-  if ($("#ttsProg")) $("#ttsProg").classList.remove("hidden");
-  if ($("#ttsBar")) $("#ttsBar").style.width = "30%";
-  if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "synthesizing...";
+async function refreshVoicePicker() {
   try {
-    const r = await fetch("/v1/audio/speech", { method: "POST", headers: headers({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ model: kinds.tts && kinds.tts[0] && kinds.tts[0].id, input: $("#ttsText").value, voice: $("#ttsVoice").value, speed: +$("#ttsSpeed").value, response_format: "wav" }) });
-    if (!r.ok) throw new Error((await r.json()).error.message);
-    if ($("#ttsBar")) $("#ttsBar").style.width = "100%";
-    if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "done";
-    $("#ttsAudio").src = URL.createObjectURL(await r.blob()); $("#ttsAudio").classList.remove("hidden"); $("#ttsAudio").play();
-  } catch (e) { alert(e.message); if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "error: " + e.message; }
+    const j = await api("/v1/audio/voices");
+    const voices = (j && j.voices) || [];
+    const fill = (sel) => {
+      if (!sel) return;
+      const cur = sel.value;
+      sel.innerHTML = "";
+      voices.forEach(v => {
+        const o = document.createElement("option");
+        o.value = v.id;
+        o.textContent = v.name + (v.builtin ? "" : (v.synthesizable ? "" : " (saved — synth pending)"));
+        o.disabled = !v.builtin && !v.synthesizable;
+        sel.appendChild(o);
+      });
+      try { sel.value = cur; } catch {}
+      if (!sel.value && voices[0]) sel.value = voices[0].id;
+    };
+    fill($("#ttsVoice"));
+    fill($("#stsVoice"));
+    const box = $("#ttsVoicesList");
+    if (box) {
+      if (!voices.length) box.textContent = "No voices yet.";
+      else {
+        box.innerHTML = voices.map(v => {
+          const pending = !v.builtin && !v.synthesizable ? " <span class=\"muted\">(synth pending)</span>" : "";
+          const del = v.builtin ? "" : (" <button type=\"button\" data-voice-del=\"" + v.id + "\" class=\"ghost small\">Delete</button>");
+          const prev = v.has_reference ? (" <a href=\"/v1/audio/voices/" + encodeURIComponent(v.id) + "/reference\" target=\"_blank\" rel=\"noopener\">preview</a>") : "";
+          return "<div><b>" + v.name + "</b> <code>" + v.id + "</code>" + pending + prev + del + "</div>";
+        }).join("");
+        box.querySelectorAll("[data-voice-del]").forEach(btn => {
+          btn.onclick = async () => {
+            const id = btn.getAttribute("data-voice-del");
+            if (!confirm("Delete voice " + id + "?")) return;
+            const r = await fetch("/v1/audio/voices/" + encodeURIComponent(id), { method: "DELETE", headers: headers() });
+            if (!r.ok) { showToast(await r.text()); return; }
+            refreshVoicePicker();
+          };
+        });
+      }
+      const note = $("#ttsVoiceNote");
+      if (note && j.clone_engine) note.textContent = j.clone_engine.message || note.textContent;
+    }
+  } catch (e) { console.warn("voices", e); }
+}
+
+async function saveVoiceFromBlob(name, blob, source) {
+  if (!name || !blob) { showToast("Name and audio are required"); return null; }
+  const fd = new FormData();
+  fd.append("name", name);
+  fd.append("source", source || "ui");
+  fd.append("file", blob, (blob.name || "reference.webm"));
+  const r = await fetch("/v1/audio/voices", { method: "POST", headers: headers(), body: fd });
+  const txt = await r.text();
+  let j = null; try { j = JSON.parse(txt); } catch {}
+  if (!r.ok) { showToast((j && j.error && j.error.message) || txt); return null; }
+  showToast((j && j.message) || "Voice saved");
+  await refreshVoicePicker();
+  return j;
+}
+
+async function showDirectionsHelp() {
+  const dlg = $("#ttsDirDlg"); const body = $("#ttsDirBody");
+  if (!dlg || !body) return;
+  body.textContent = "Loading…";
+  dlg.showModal();
+  try {
+    const j = await api("/v1/audio/directions");
+    const ev = (j.native_syntax && j.native_syntax.event_tags) || [];
+    const del = (j.native_syntax && j.native_syntax.delivery_tags) || [];
+    const stages = (j.engine && j.engine.stages) || [];
+    body.innerHTML =
+      "<p><b>Engine:</b> " + (j.engine && j.engine.id || "?") + " (" + (j.engine && j.engine.licence || "") + ") — " + (j.engine && j.engine.status || "") + "</p>" +
+      "<p><b>Native example:</b> <code>" + (j.native_syntax && j.native_syntax.example || "") + "</code></p>" +
+      "<p><b>Event tags:</b> " + ev.map(t => "<code>" + t + "</code>").join(" ") + "</p>" +
+      "<p><b>Delivery tags:</b> " + del.map(t => "<code>" + t + "</code>").join(" ") + "</p>" +
+      "<p><b>Portable timing:</b> <code>" + (j.portable_timing && j.portable_timing.example || "") + "</code></p>" +
+      "<p class=\"muted small\">" + ((j.native_syntax && j.native_syntax.notes) || []).join(" ") + "</p>" +
+      "<h4>Port stages</h4><ul>" + stages.map(s => "<li><code>" + s.id + "</code> — " + s.state + "</li>").join("") + "</ul>";
+  } catch (e) { body.textContent = String(e); }
+}
+
+if ($("#ttsDirHelp")) $("#ttsDirHelp").onclick = () => showDirectionsHelp();
+if ($("#ttsCloneSave")) $("#ttsCloneSave").onclick = async () => {
+  const name = ($("#ttsCloneName") && $("#ttsCloneName").value || "").trim();
+  const f = $("#ttsCloneFile") && $("#ttsCloneFile").files && $("#ttsCloneFile").files[0];
+  if (!f) { showToast("Pick a reference audio file"); return; }
+  await saveVoiceFromBlob(name, f, "tts-upload");
+};
+if ($("#sttCloneVoice")) $("#sttCloneVoice").onclick = async () => {
+  const a = (typeof currentSttAudio === "function") && currentSttAudio();
+  if (!a) { showToast("Transcribe or load audio first"); return; }
+  const name = prompt("Name for this voice:");
+  if (!name) return;
+  await saveVoiceFromBlob(name.trim(), a, "stt");
+};
+if ($("#stsCloneVoice")) $("#stsCloneVoice").onclick = async () => {
+  const f = ($("#stsFile") && $("#stsFile").files && $("#stsFile").files[0]) || window._stsRecBlob;
+  if (!f) { showToast("Provide STS audio first"); return; }
+  const name = prompt("Name for this voice:");
+  if (!name) return;
+  await saveVoiceFromBlob(name.trim(), f, "sts");
 };
 
-// ---------- Speech to Speech (STS) ----------
-let stsRec = null, stsRecBlob = null, stsRecTimer = null, stsRecStarted = 0, stsCtrl = null, stsReplyBlob = null;
+if ($("#ttsGo")) $("#ttsGo").onclick = async () => {
+  const input = $("#ttsText").value || "";
+  if (!input.trim()) { showToast("Enter text to speak"); return; }
+  const voice = ($("#ttsVoice") && $("#ttsVoice").value) || "mms";
+  const speed = parseFloat(($("#ttsSpeed") && $("#ttsSpeed").value) || "1") || 1;
+  $("#ttsProg").classList.remove("hidden");
+  $("#ttsProgLabel").textContent = "Speaking…";
+  $("#ttsDirIgnored").classList.add("hidden");
+  try {
+    const r = await fetch("/v1/audio/speech", {
+      method: "POST", headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ input, voice_id: voice, speed, response_format: "wav" })
+    });
+    const metaRaw = r.headers.get("x-pyre-speech-meta");
+    if (metaRaw) {
+      try {
+        const meta = JSON.parse(metaRaw);
+        if (meta.ignored && meta.ignored.length) {
+          $("#ttsDirIgnored").classList.remove("hidden");
+          $("#ttsDirIgnored").textContent = "Ignored directions: " + meta.ignored.map(i => i.tag + " (" + i.reason + ")").join("; ");
+        }
+      } catch {}
+    }
+    if (!r.ok) {
+      const txt = await r.text();
+      let msg = txt; try { msg = JSON.parse(txt).error?.message || txt; } catch {}
+      showToast(msg); return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = $("#ttsAudio"); a.src = url; a.classList.remove("hidden"); a.play().catch(()=>{});
+  } catch (e) { showToast(String(e)); }
+  finally { $("#ttsProg").classList.add("hidden"); }
+};
+refreshVoicePicker();
+
+
 const STS_DEFAULT_SYS = "You are a helpful voice assistant. Answer clearly and concisely in plain spoken language. Avoid markdown, bullet lists, and URLs unless asked.";
 function loadStsPrefs() {
   return LS.get("stsPrefs", { quality: "balanced", voice: "default", speed: 1.0, system: STS_DEFAULT_SYS });
@@ -1579,7 +1704,7 @@ if ($("#stsGo")) $("#stsGo").onclick = async () => {
       body: JSON.stringify({
         model: ttsModel,
         input: spoken,
-        voice: pref.voice || "default",
+        voice_id: (pref.voice && pref.voice !== "default") ? pref.voice : "mms", voice: pref.voice || "mms",
         speed: pref.speed || 1.0,
         response_format: "wav",
       }),
