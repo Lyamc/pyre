@@ -6586,6 +6586,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyre-voice-clone"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "safetensors",
+ "serde_json",
+]
+
+[[package]]
 name = "pyre-whisper-audio"
 version = "0.2.0"
 dependencies = [
