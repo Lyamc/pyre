@@ -184,7 +184,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         tracing::info!("reasoning auto: self-rating {:?} (digit mass {:?}) first-token entropy {h0:.3} bias {bias} -> {} (probe {} tokens, {probe_ms:.0} ms)", rating.map(|r| r.0), rating.map(|r| r.1), lvl.name(), pids.len());
         let _ = r.tx.send(Event::Info(serde_json::json!({"auto": {"level": lvl.name(), "rating": rating.map(|r| r.0), "digit_mass": rating.map(|r| r.1), "entropy0": h0, "top1_p0": p0, "bias": bias, "probe_ms": probe_ms, "budget": think_budget}})));
     }
-    let (mut text, mut emitted, mut finish, mut stop_word) = (String::new(), 0usize, "length", String::new());
+    let (mut text, mut emitted, mut ids_sent, mut finish, mut stop_word) = (String::new(), 0usize, 0usize, "length", String::new());
     crate::spec::CTX_MAX.store(ctx, std::sync::atomic::Ordering::Relaxed);
     // FAST loop guard: exact routing for the rest of this request once the output loops or the context is long
     let guard = crate::spec::route_guard() && crate::spec::route_prior() > 0.0; let gctx = crate::spec::route_prior_ctx();
@@ -207,7 +207,12 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
             if text.ends_with('\u{FFFD}') { safe = text.trim_end_matches('\u{FFFD}').len(); }
             if max_stop > 0 { safe = safe.min(text.len().saturating_sub(max_stop - 1)); }
             while safe > emitted && !text.is_char_boundary(safe) { safe -= 1; }
-            if safe > emitted { if r.tx.send(Event::Token(text[emitted..safe].to_string())).is_err() { finish = "abort"; return false; } emitted = safe; }
+            if safe > emitted {
+                let ids = out[ids_sent..].to_vec();
+                ids_sent = out.len();
+                if r.tx.send(Event::Token { text: text[emitted..safe].to_string(), ids }).is_err() { finish = "abort"; return false; }
+                emitted = safe;
+            }
             // reasoning effort budget (effort.rs): the server force-closes the think block and continues
             if crate::effort::over_budget(think_budget, out.len(), &text) { finish = "think_budget"; return false; }
             if out.len() >= r.max_tokens || prompt.len() + out.len() >= ctx { finish = "length"; return false; }
@@ -221,7 +226,10 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
     // the stop token; take them into the output so the server's continuation (prompt + tokens + close) extends the state
     if finish == "think_budget" { let base = prompt.len() + out.len();
         if st.tokens.len() > base && st.tokens.len() <= base + 16 && st.tokens[..base] == history[..base] { let extra = st.tokens[base..].to_vec(); out.extend_from_slice(&extra); text = tok.decode(&out, true).unwrap_or_default(); } }
-    if text.len() > emitted && finish != "abort" { let _ = r.tx.send(Event::Token(text[emitted..].to_string())); }
+    if text.len() > emitted && finish != "abort" {
+        let ids = out[ids_sent..].to_vec();
+        let _ = r.tx.send(Event::Token { text: text[emitted..].to_string(), ids });
+    }
     if let Some(p) = tf.as_ref() { if !std::path::Path::new(p).exists() { let _ = std::fs::write(p, out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); } }
     tm.predicted_n = out.len();
     tm.predicted_ms = t1.elapsed().as_secs_f64() * 1e3;

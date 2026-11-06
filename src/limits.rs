@@ -134,6 +134,7 @@ pub fn vlog(tag: &str) { if std::env::var("PYRE_VRAMLOG").is_ok() { if let Some(
 pub fn vram_floor_mb() -> u64 { static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new(); *F.get_or_init(|| std::env::var("PYRE_VRAM_FLOOR_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1100)) }
 fn vram_breach(free: u64, need: u64, why: &str) -> ! {
     eprintln!("pyre: VRAM FLOOR BREACH ({why}): free {} MiB, about to allocate {} MiB, floor {} MiB (PYRE_VRAM_FLOOR_MB); aborting", free >> 20, need >> 20, vram_floor_mb());
+    pyre_resume::drain().fire_and_wait(std::time::Duration::from_millis(400));
     std::process::exit(86)
 }
 /// Check before allocating `bytes` on the GPU (only allocations >= 8 MiB pay for an NVML query).
@@ -285,7 +286,13 @@ pub fn request_stop() { if !STOP.swap(true, Ordering::Relaxed) { STOP_AT_MS.stor
 pub fn stop_requested() -> bool { STOP.load(Ordering::Relaxed) }
 pub fn stop_file() -> std::path::PathBuf { std::env::temp_dir().join("pyre").join(format!("stop.{}", std::process::id())) }
 /// Called by the model at a step boundary after its GPU work is drained.
-pub fn stop_now() -> ! { let _ = std::fs::remove_file(stop_file()); eprintln!("pyre: stopped gracefully (GPU drained)"); crate::logbuf::event("stop", "WARN", serde_json::json!({"graceful": true})); std::process::exit(87) }
+pub fn stop_now() -> ! {
+    let _ = std::fs::remove_file(stop_file());
+    eprintln!("pyre: stopped gracefully (GPU drained)");
+    crate::logbuf::event("stop", "WARN", serde_json::json!({"graceful": true}));
+    pyre_resume::drain().fire_and_wait(std::time::Duration::from_millis(pyre_resume::drain_ms()));
+    std::process::exit(87)
+}
 
 pub fn governor_start() {
     static S: std::sync::Once = std::sync::Once::new();
@@ -305,7 +312,7 @@ pub fn governor_start() {
                 // int45d: idle (no step for ACTIVE_MS) = nothing in flight on the GPU: stop now instead of waiting out the grace
                 if STOP.load(Ordering::Relaxed) && !is_active() { stop_now(); }
                 if STOP.load(Ordering::Relaxed) && t.saturating_sub(STOP_AT_MS.load(Ordering::Relaxed)) > grace {
-                    eprintln!("pyre: stop grace ({} s) elapsed without a step boundary; exiting", grace / 1000); let _ = std::fs::remove_file(stop_file()); std::process::exit(88);
+                    eprintln!("pyre: stop grace ({} s) elapsed without a step boundary; exiting", grace / 1000); let _ = std::fs::remove_file(stop_file()); pyre_resume::drain().fire_and_wait(std::time::Duration::from_millis(400)); std::process::exit(88);
                 }
                 let Some(d) = dev.as_ref() else { continue };
                 let util = d.utilization_rates().map(|u| u.gpu as f64).unwrap_or(0.0);

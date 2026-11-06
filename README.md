@@ -378,6 +378,28 @@ The startup log prints the URLs other machines can use (e.g. `http://192.168.0.3
 UI uses same-origin relative URLs, and the API answers CORS preflights from any origin (like
 llama-server). Without `--api-key` anyone on the network can use the server (a warning is logged).
 
+## Streaming resume
+
+A chat completion that dies with the process (crash, VRAM watchdog, `srv.ps1` restart) is
+written to `PYRE_RESUME_DIR` (default `{temp}/pyre/generations`) as it runs. The next process
+marks it `aborted`. Clients learn that from `finish_reason: "error"` plus `pyre.status`, or
+from the socket going quiet: the server sends an SSE comment every `PYRE_SSE_PING_SECS`
+(default 5). Resume with the same id:
+
+```json
+POST /v1/chat/completions
+{ "resume": "chatcmpl-...", "stream": true }
+```
+
+`GET /v1/generations/{id}` returns the partial text. Details, timeouts, and the pi setup
+(proxy on the client machine, no pi source change) are in
+[docs/streaming-resume.md](docs/streaming-resume.md). The proxy is
+`tools/pyre_resume_client.py`. Journal and resume behaviour is tested without a GPU:
+
+```bash
+cargo test --manifest-path tools/pyre-resume/Cargo.toml
+```
+
 ## Apps (companion programs)
 
     pyre app list | pyre app install peal | pyre app run peal -- transcribe -i a.wav | pyre app remove peal

@@ -59,6 +59,8 @@ pub struct App {
     pub defaults: LoadDefaults,
     pub api_key: Option<String>,
     pub started: std::time::Instant,
+    /// Partial chat generations, so a restart can resume them.
+    pub generations: pyre_resume::Store,
 }
 
 fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() }

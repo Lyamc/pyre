@@ -343,7 +343,11 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         return backend::oneshot(&llama, &tok, &template, &eos, p);
     }
 
-    let app = Arc::new(registry::App { models: Default::default(), storage: sctx, defaults: defaults.clone(), api_key: args.api_key.clone(), started: std::time::Instant::now() });
+    let generations = pyre_resume::Store::open(pyre_resume::default_dir()).context("resume journal")?;
+    let recovered = generations.recover().context("resume journal")?;
+    if recovered > 0 { tracing::warn!("resume: marked {recovered} in-flight generation(s) aborted after restart"); }
+    tracing::info!("generation journal: {} (PYRE_RESUME_DIR)", generations.dir().display());
+    let app = Arc::new(registry::App { models: Default::default(), storage: sctx, defaults: defaults.clone(), api_key: args.api_key.clone(), started: std::time::Instant::now(), generations });
     for (i, (kind, r, be)) in want.iter().enumerate() {
         let alias = if i == 0 && *kind == Kind::Llm { args.alias.clone() } else { None };
         let m = registry::load(&app.storage, &defaults, LoadReq { kind: *kind, r, alias, backend: be.clone(), dtype: None, ctx_size: None, stt_progress: None, })?;
@@ -373,7 +377,11 @@ fn serve(sctx: storage::Ctx, args: ServeArgs) -> Result<()> {
         if args.host != "127.0.0.1" && args.host != "localhost" && args.api_key.is_none() {
             tracing::warn!("listening beyond localhost without --api-key: anyone on the network can use this server");
         }
-        axum::serve(l, server::router(app)).await?;
+        axum::serve(l, server::router(app)).with_graceful_shutdown(async {
+            pyre_resume::shutdown_signal().await;
+            tracing::info!("pyre: draining in-flight streams");
+            pyre_resume::drain().fire_and_wait(std::time::Duration::from_millis(pyre_resume::drain_ms()));
+        }).await?;
         Ok(())
     })
 }
