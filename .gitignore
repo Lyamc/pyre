@@ -1,5 +1,5 @@
 /target
-/tools/pyre-resume/target
+/crates/pyre-resume/target
 /samples
 /models
 *.log

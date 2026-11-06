@@ -6,8 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Durable chat-generation journal, SSE terminal events, and resume planning for pyre"
 publish = false
 
-# Own workspace so `cargo test` here does not load pyre's Burn patches.
-[workspace]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

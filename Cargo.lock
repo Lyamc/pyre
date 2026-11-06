@@ -6530,6 +6530,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "nvml-wrapper",
+ "pyre-resume",
  "pyre-sd",
  "pyre-whisper-audio",
  "pyre-whisper-core",
@@ -6554,6 +6555,19 @@ dependencies = [
  "visioncortex",
  "vtracer",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pyre-resume"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

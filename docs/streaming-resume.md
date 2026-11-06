@@ -150,11 +150,11 @@ means the stream died and resume could not finish it; the stderr line says which
 
 ## Tests without a GPU
 
-`tools/pyre-resume` has no Burn dependency. From a host toolchain (the repo `.cargo/config.toml`
+`crates/pyre-resume` has no Burn dependency. From the repo root (the repo `.cargo/config.toml`
 pins the Windows MSVC target used on HYTE; on another OS pass `--target` for that host):
 
 ```bash
-cargo test --manifest-path tools/pyre-resume/Cargo.toml
+cargo test -p pyre-resume
 ```
 
 That covers the journal (including a torn last line and crash recovery), the terminal frames,

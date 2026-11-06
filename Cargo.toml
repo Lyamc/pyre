@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [".", "crates/*"]
-exclude = ["third_party/hf-hub", "gui", "vendor/**", "tools/pyre-resume"]
+exclude = ["third_party/hf-hub", "gui", "vendor/**"]
 
 [workspace.dependencies]
 # ONE Burn for the whole workspace: Lyamc/burn @ pyre-fused-quant (matches vendor/burn-pyre submodule).
@@ -103,7 +103,7 @@ pyre-whisper-audio = { path = "crates/pyre-whisper-audio", optional = true }
 pyre-whisper-engine = { path = "crates/pyre-whisper-engine", optional = true }
 pyre-whisper-models = { path = "crates/pyre-whisper-models", optional = true }
 # Journal, SSE terminal contract, and resume planning. No Burn dependency.
-pyre-resume = { path = "tools/pyre-resume" }
+pyre-resume = { path = "crates/pyre-resume" }
 
 [dev-dependencies]
 tempfile = "3"

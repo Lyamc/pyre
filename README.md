@@ -397,7 +397,7 @@ POST /v1/chat/completions
 `tools/pyre_resume_client.py`. Journal and resume behaviour is tested without a GPU:
 
 ```bash
-cargo test --manifest-path tools/pyre-resume/Cargo.toml
+cargo test -p pyre-resume
 ```
 
 ## Apps (companion programs)
