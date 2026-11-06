@@ -7,8 +7,10 @@
 //! - `<break/>` — default 500 ms pause
 //! - `<prosody rate="slow|medium|fast|x-slow|x-fast|N%">...</prosody>`
 //!
-//! **Chatterbox-Nano event tags** (and a few aliases) (official OpenBMB tags; on MMS these become short silences
-//! because the built-in VITS cannot emit non-speech sounds — not spoken aloud):
+//! **Bracket events as MMS approximations.** These are not Chatterbox-Nano GPT-2
+//! ids. Nano's trained tags live in `pyre-voice-clone` (`[laugh]`, `[clear throat]`, …)
+//! and are unused until T3 speaks. Here the built-in VITS cannot emit non-speech
+//! sounds, so a few bracket names become short silences and are not spoken aloud:
 //! - `[breath]`, `[laughing]` / `[laughs]`, `[sigh]` / `[sighs]`, `[Uhm]`, `[Shh]`
 //!
 //! **Bracket emotions** like `[frustrated]` are accepted as *style hints*. On the built-in
@@ -136,7 +138,7 @@ fn rate_to_speed(rate: &str) -> Option<f64> {
 
 /// Nonverbal VoxCPM tags → silence seconds on engines that cannot emit them.
 fn nonverbal_silence(tag: &str) -> Option<f64> {
-    // Chatterbox-Nano event tags (approx as silence on MMS) + a few aliases.
+    // MMS silence stand-ins. Names overlap some Nano tags; the ids are not emitted.
     match tag.trim().to_ascii_lowercase().as_str() {
         "breath" | "clear throat" => Some(0.35),
         "laughing" | "laughs" | "laughter" | "laugh" | "chuckle" => Some(0.45),
@@ -151,7 +153,7 @@ fn nonverbal_silence(tag: &str) -> Option<f64> {
 
 /// Map a bracket emotion to (speed, noise) when MMS can approximate it; None = ignore.
 fn emotion_map(tag: &str) -> Option<(f64, f64)> {
-    // Chatterbox delivery tags + a few aliases. Mapped to MMS rate/noise only.
+    // MMS rate/noise stand-ins for a few delivery words. Not Nano token ids.
     match tag.trim().to_ascii_lowercase().as_str() {
         "slow" | "calm" | "sad" | "tired" | "whisper" | "whispers" | "whispering"
         | "crying" | "fear" => Some((0.75, 0.8)),

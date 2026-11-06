@@ -32,16 +32,16 @@ const STAGES: &[Stage] = &[
     Stage {
         id: "inline-directions",
         state: StageState::Running,
-        weights: "added_tokens.json token ids 50257–50275, hardcoded. vocab.json and merges.txt are not read yet.",
-        reuses: "Nothing from MMS. MMS is a character vocab with no bracket tags. Qwen's chat template is a different tokenizer.",
-        missing: "GPT-2 BPE (vocab 50276, bos off, pad = eos). Tags must stay single ids. Nano generate() ignores exaggeration and cfg_weight, so those are not a syntax.",
+        weights: "vocab.json, merges.txt, added_tokens.json, tokenizer_config.json. About 1.4 MB. Not the 1.9 GB weight set.",
+        reuses: "The same `tokenizers` GPT-2 byte-level BPE pyre already uses for Qwen3. This crate does not call the Whisper tokenizer, which adds Whisper special tokens.",
+        missing: "Nothing for text ids. `encode_like_generate` is punc_norm then BPE and matches HF, including leaving [CLEAR THROAT] split. `encode_script` casefolds a known tag onto its single id. The server's MMS markup is a different parser: it turns some brackets into silence or rate and does not emit these ids. Nano generate() ignores exaggeration and cfg_weight.",
     },
     Stage {
         id: "t3-nano",
         state: StageState::NotStarted,
         weights: "t3_nano_v1.safetensors (~870 MB). GPT-2 small (`llama_config_name = GPT2_small`), text vocab 50276, speech vocab 6563, speech_cond_prompt_len 375, no perceiver, emotion_adv off.",
         reuses: "Qwen and Whisper already have causal self-attention, RMS/LayerNorm, and a sampler. The graph is not theirs: a GPT-2 backbone with a speech-token head and Turbo decoding (temperature 0.8, top-k 1000, top-p 0.95, repetition penalty 1.2, cfg 0).",
-        missing: "GPT-2 weight load, dual text/speech embeddings, the T3 conditioning path (speaker embedding + S3 prompt tokens), and the Turbo token loop. Output is speech-token ids, not audio.",
+        missing: "The GPT-2 forward (12 layers, gelu_new, Conv1D QKV [768, 2304], wpe added to inputs_embeds, wte ignored). Config, tensor contract, and a header check live in t3.rs. Still missing: conditioning concat, KV cache, and the Turbo sample loop. Output would be speech-token ids, not audio.",
     },
     Stage {
         id: "s3-tokenizer",
@@ -77,8 +77,15 @@ pub fn stages() -> &'static [Stage] {
     STAGES
 }
 
+/// Cloned speech is a Burn waveform from text plus a reference clip.
+///
+/// This stays `false` until that path exists. It is not derived from [`stages`]:
+/// a running tokenizer, a checked T3 header, or the MMS bracket approximations
+/// in `src/tts_markup.rs` do not make it true. Those approximations insert
+/// silence or change rate; they are not Nano GPT-2 token ids and they are not
+/// a cloned voice.
 pub fn text_to_cloned_speech_ready() -> bool {
-    stages().iter().all(|s| s.state == StageState::Running)
+    false
 }
 
 #[cfg(test)]
@@ -90,6 +97,10 @@ mod tests {
         assert!(stages()
             .iter()
             .any(|s| s.id == "speaker-encoder" && s.state == StageState::Running));
+        assert!(stages()
+            .iter()
+            .any(|s| s.id == "inline-directions" && s.state == StageState::Running));
+        // Tokenizer and encoder stages running still do not mean cloned audio.
         assert!(!text_to_cloned_speech_ready());
         assert!(stages()
             .iter()

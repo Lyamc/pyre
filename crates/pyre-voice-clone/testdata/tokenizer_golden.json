@@ -1,0 +1,271 @@
+{
+  "vocab_size": 50276,
+  "eos_id": 50256,
+  "cases": [
+    {
+      "text": "Hello",
+      "ids": [
+        15496
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "Hello world",
+      "ids": [
+        15496,
+        995
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "Hello, world.",
+      "ids": [
+        15496,
+        11,
+        995,
+        13
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "[laugh]",
+      "ids": [
+        50275
+      ],
+      "single_tag": true
+    },
+    {
+      "text": "[clear throat]",
+      "ids": [
+        50267
+      ],
+      "single_tag": true
+    },
+    {
+      "text": "[CLEAR THROAT]",
+      "ids": [
+        58,
+        29931,
+        1503,
+        2320,
+        13252,
+        1404,
+        60
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "a [laugh] b",
+      "ids": [
+        64,
+        220,
+        50275,
+        275
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "Hi there [chuckle], have you got one minute.",
+      "ids": [
+        17250,
+        612,
+        220,
+        50274,
+        11,
+        423,
+        345,
+        1392,
+        530,
+        5664,
+        13
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "Hello\u2026world",
+      "ids": [
+        15496,
+        1399,
+        6894
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "<|endoftext|>",
+      "ids": [
+        50256
+      ],
+      "single_tag": false
+    },
+    {
+      "text": "wait [sigh] okay.",
+      "ids": [
+        17077,
+        220,
+        50268,
+        8788,
+        13
+      ],
+      "single_tag": false
+    }
+  ],
+  "scripts": [
+    {
+      "input": "hi there [chuckle], have you got one minute",
+      "normalized": "Hi there [chuckle], have you got one minute.",
+      "ids": [
+        17250,
+        612,
+        220,
+        50274,
+        11,
+        423,
+        345,
+        1392,
+        530,
+        5664,
+        13
+      ]
+    },
+    {
+      "input": "Hello\u2026world",
+      "normalized": "Hello, world.",
+      "ids": [
+        15496,
+        11,
+        995,
+        13
+      ]
+    },
+    {
+      "input": "  hello",
+      "normalized": "hello.",
+      "ids": [
+        31373,
+        13
+      ]
+    },
+    {
+      "input": "",
+      "normalized": "You need to add some text for me to talk.",
+      "ids": [
+        1639,
+        761,
+        284,
+        751,
+        617,
+        2420,
+        329,
+        502,
+        284,
+        1561,
+        13
+      ]
+    },
+    {
+      "input": "wait [CLEAR THROAT] okay",
+      "normalized": "Wait [CLEAR THROAT] okay.",
+      "ids": [
+        21321,
+        685,
+        29931,
+        1503,
+        2320,
+        13252,
+        1404,
+        60,
+        8788,
+        13
+      ]
+    },
+    {
+      "input": "a [laugh] b",
+      "normalized": "A [laugh] b.",
+      "ids": [
+        32,
+        220,
+        50275,
+        275,
+        13
+      ]
+    }
+  ],
+  "tags": [
+    {
+      "tag": "[angry]",
+      "id": 50257
+    },
+    {
+      "tag": "[fear]",
+      "id": 50258
+    },
+    {
+      "tag": "[surprised]",
+      "id": 50259
+    },
+    {
+      "tag": "[whispering]",
+      "id": 50260
+    },
+    {
+      "tag": "[advertisement]",
+      "id": 50261
+    },
+    {
+      "tag": "[dramatic]",
+      "id": 50262
+    },
+    {
+      "tag": "[narration]",
+      "id": 50263
+    },
+    {
+      "tag": "[crying]",
+      "id": 50264
+    },
+    {
+      "tag": "[happy]",
+      "id": 50265
+    },
+    {
+      "tag": "[sarcastic]",
+      "id": 50266
+    },
+    {
+      "tag": "[clear throat]",
+      "id": 50267
+    },
+    {
+      "tag": "[sigh]",
+      "id": 50268
+    },
+    {
+      "tag": "[shush]",
+      "id": 50269
+    },
+    {
+      "tag": "[cough]",
+      "id": 50270
+    },
+    {
+      "tag": "[groan]",
+      "id": 50271
+    },
+    {
+      "tag": "[sniff]",
+      "id": 50272
+    },
+    {
+      "tag": "[gasp]",
+      "id": 50273
+    },
+    {
+      "tag": "[chuckle]",
+      "id": 50274
+    },
+    {
+      "tag": "[laugh]",
+      "id": 50275
+    }
+  ]
+}

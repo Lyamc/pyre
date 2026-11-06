@@ -194,6 +194,11 @@ pub fn parse_script(text: &str) -> Script {
     }
 }
 
+/// The 19 bracket tags in tokenizer order of their ids.
+pub fn all_tags() -> Vec<(&'static str, u32, DirectionKind)> {
+    TAGS.iter().map(|t| (t.tag, t.token_id, t.kind)).collect()
+}
+
 pub fn tag_token_id(tag: &str) -> Option<u32> {
     let lower = tag.to_ascii_lowercase();
     TAGS.iter().find(|t| t.tag == lower).map(|t| t.token_id)

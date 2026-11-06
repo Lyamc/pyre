@@ -6594,7 +6594,9 @@ dependencies = [
  "anyhow",
  "burn",
  "safetensors",
+ "serde",
  "serde_json",
+ "tokenizers",
 ]
 
 [[package]]
