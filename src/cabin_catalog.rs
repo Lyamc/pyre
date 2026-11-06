@@ -66,6 +66,14 @@ pub const OFFERS: &[Offer] = &[
     Offer { id: "isnet-rmbg", name: "BRIA RMBG-1.4 (IS-Net)", component: "isnet", size_bytes: 176_000_000, licence: "bria-rmbg-1.4 (non-commercial)",
         repo: "briaai/RMBG-1.4", note: "general / photo cut-out — non-commercial licence",
         kind: OfferKind::HfFiles { files: &[("model.safetensors", "isnet_rmbg.safetensors")], cabin_subdir: "isnet" } },
+    Offer { id: "chatterbox-nano-tok", name: "Chatterbox-Nano GPT-2 tokenizer", component: "chatterbox-nano", size_bytes: 2_500_000, licence: "MIT",
+        repo: "ResembleAI/chatterbox-nano", note: "vocab/merges/added_tokens for Nano encode_script; not the T3 weights",
+        kind: OfferKind::HfFiles { files: &[
+            ("vocab.json", "vocab.json"),
+            ("merges.txt", "merges.txt"),
+            ("added_tokens.json", "added_tokens.json"),
+            ("tokenizer_config.json", "tokenizer_config.json"),
+        ], cabin_subdir: "chatterbox-nano" } },
     Offer { id: "rife46", name: "RIFE 4.6", component: "rife", size_bytes: 21_000_000, licence: "MIT (code); check weight mirror",
         repo: "hzwer/Practical-RIFE", note: "frame interpolation; converted safetensors from flownet.pkl",
         kind: OfferKind::Url { url: "https://github.com/hzwer/Practical-RIFE/releases/download/v4.6/flownet.pkl", filename: "flownet.pkl", cabin_subdir: "rife" } },
@@ -128,6 +136,7 @@ pub fn present(app: &App, component: &str) -> bool {
         "rife" => crate::rife::available(&crate::rife::weights_dir(&app.storage.store.root)),
         "segformer" => crate::segformer::available(&crate::segformer::weights_dir(&app.storage.store.root)),
         "triposr" => crate::triposr::available(&crate::triposr::weights_dir(&app.storage.store.root)),
+        "chatterbox-nano" => cabin_root(app).join("chatterbox-nano").join("vocab.json").is_file(),
         _ => false,
     }
 }

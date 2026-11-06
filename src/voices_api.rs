@@ -22,6 +22,12 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
 }
 
 async fn directions_help() -> Response {
+    let tag_table: Vec<Value> = pyre_voice_clone::directions::all_tags().into_iter().map(|(tag, id, kind)| json!({
+        "tag": tag,
+        "token_id": id,
+        "kind": format!("{:?}", kind).to_ascii_lowercase(),
+    })).collect();
+    let tokenizer_dir = pyre_voice_clone::discover_tokenizer_dir().map(|p| p.display().to_string());
     let chatterbox_events = [
         "[clear throat]", "[sigh]", "[shush]", "[cough]", "[groan]",
         "[sniff]", "[gasp]", "[chuckle]", "[laugh]",
@@ -49,6 +55,8 @@ async fn directions_help() -> Response {
             "example": "Hi there [chuckle], have you got one minute?",
             "event_tags": chatterbox_events,
             "delivery_tags": chatterbox_delivery,
+            "tag_token_ids": tag_table,
+            "tokenizer_dir": tokenizer_dir,
             "notes": [
                 "Official Nano UI / added_tokens.json tags. Unknown brackets are reported, never silently remapped.",
                 "Nano generate() ignores exaggeration and cfg_weight.",
@@ -182,12 +190,70 @@ async fn speech_preview(State(_app): S, body: Option<Json<Value>>) -> Response {
     let speed = b.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0);
     let noise = b.get("noise_scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
     let (_segs, meta) = crate::tts_markup::parse(&input, speed, noise);
+    // Nano boundary: strip portable SSML, keep bracket tags, encode with GPT-2 so known
+    // event/delivery tags become exact single token ids (not later string rewrites).
+    let nano = nano_encode_boundary(&input);
     Json(json!({
         "meta": meta,
+        "mms_approximation": true,
         "supported": crate::tts_markup::supported_tags(),
         "voice_id": b.get("voice_id").and_then(|v| v.as_str()).unwrap_or("mms"),
+        "nano": nano,
+        "text_to_cloned_speech_ready": pyre_voice_clone::text_to_cloned_speech_ready(),
     })).into_response()
 }
+
+/// Strip SSML timing tags so only Nano-facing text+brackets remain, then encode_script
+/// when the tokenizer is discoverable. Without tokenizer files, returns status only.
+fn nano_encode_boundary(input: &str) -> Value {
+    let without_ssml = strip_ssml_for_nano(input);
+    let script = pyre_voice_clone::parse_script(&without_ssml);
+    let dirs: Vec<Value> = script.directions.iter().map(|d| json!({
+        "tag": d.tag,
+        "token_id": d.token_id,
+        "kind": format!("{:?}", d.kind).to_ascii_lowercase(),
+        "start": d.start,
+        "end": d.end,
+    })).collect();
+    let tok_dir = pyre_voice_clone::discover_tokenizer_dir();
+    match tok_dir.as_ref().and_then(|d| pyre_voice_clone::NanoTokenizer::load(d).ok()) {
+        Some(tok) => match tok.encode_script(&without_ssml) {
+            Ok(enc) => json!({
+                "tokenizer": "ready",
+                "tokenizer_dir": tok_dir.as_ref().map(|p| p.display().to_string()),
+                "normalized": enc.script.normalized,
+                "ids": enc.ids,
+                "directions": dirs,
+                "unknown": enc.script.unknown,
+                "note": "Known Nano tags are exact single GPT-2 added-token ids. SSML was stripped before encode; apply SSML silences/rate on the waveform path (MMS today)."
+            }),
+            Err(e) => json!({
+                "tokenizer": "error",
+                "error": format!("{e:#}"),
+                "directions": dirs,
+                "unknown": script.unknown,
+            }),
+        },
+        None => json!({
+            "tokenizer": "missing",
+            "directions": dirs,
+            "unknown": script.unknown,
+            "note": "Place ResembleAI/chatterbox-nano tokenizer files in the HF hub cache (or set PYRE_CHATTERBOX_TOKENIZER). Direction token_ids above are from the hardcoded Nano table; encode_script needs the files for the full id stream."
+        }),
+    }
+}
+
+fn strip_ssml_for_nano(input: &str) -> String {
+    // Drop portable SSML so Nano encode only sees text + bracket tags.
+    let re_break = regex::Regex::new(r#"(?i)<break\b[^>]*/?>"#).unwrap();
+    let re_prosody_open = regex::Regex::new(r#"(?i)<prosody\b[^>]*>"#).unwrap();
+    let re_prosody_close = regex::Regex::new(r"(?i)</prosody>").unwrap();
+    let s = re_break.replace_all(input, " ");
+    let s = re_prosody_open.replace_all(&s, "");
+    let s = re_prosody_close.replace_all(&s, "");
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 
 async fn speech(State(app): S, body: Option<Json<Value>>) -> Response {
     let Some(Json(b)) = body else { return err(StatusCode::BAD_REQUEST, "expected a JSON body with 'input'"); };
