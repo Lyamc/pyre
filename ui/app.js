@@ -265,6 +265,87 @@ function plainAnswer(m) { return splitThink(m.content).answer.trim(); }
 document.addEventListener("click", e => { if (e.target.classList.contains("copy")) { navigator.clipboard.writeText(e.target.nextElementSibling.textContent); e.target.textContent = "copied"; setTimeout(() => e.target.textContent = "copy", 1000); } });
 
 // ---------- tabs / theme ----------
+// ---------- Audio section toggles (STT | STS | TTS), independent ----------
+function audioLayoutIsWide() {
+  const el = document.querySelector(".audio-layout");
+  if (el && typeof el.clientWidth === "number" && el.clientWidth > 0) return el.clientWidth >= 1100;
+  return window.matchMedia("(min-width: 1280px)").matches;
+}
+function defaultAudioSecs() {
+  const wide = audioLayoutIsWide();
+  return { stt: true, sts: !!wide, tts: !!wide };
+}
+function loadAudioSecs() {
+  try {
+    const raw = localStorage.getItem("pyre.audioSecs");
+    if (raw) {
+      const o = JSON.parse(raw);
+      return {
+        stt: o.stt !== false,
+        sts: !!o.sts,
+        tts: !!o.tts,
+      };
+    }
+  } catch {}
+  return defaultAudioSecs();
+}
+function saveAudioSecs(secs) {
+  try { localStorage.setItem("pyre.audioSecs", JSON.stringify(secs)); } catch {}
+}
+function applyAudioSecs(secs) {
+  ["stt", "sts", "tts"].forEach((k) => {
+    const on = !!secs[k];
+    const btn = document.querySelector('.audio-tog[data-audio-sec="' + k + '"]');
+    const card = document.querySelector('.audio-sec[data-audio-sec="' + k + '"]');
+    if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false");
+    if (card) {
+      if (on) card.removeAttribute("hidden");
+      else card.setAttribute("hidden", "");
+    }
+  });
+}
+function initAudioSectionToggles() {
+  const bar = $("#audioToggles"); if (!bar) return;
+  let secs = loadAudioSecs();
+  applyAudioSecs(secs);
+  bar.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-audio-sec]"); if (!b) return;
+    const k = b.dataset.audioSec;
+    secs = loadAudioSecs();
+    secs[k] = !(secs[k]);
+    if (!secs.stt && !secs.sts && !secs.tts) secs[k] = true;
+    saveAudioSecs(secs);
+    applyAudioSecs(secs);
+  });
+  bar.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== " " && e.key !== "Enter") return;
+    const tabs = $$("#audioToggles .audio-tog"); if (!tabs.length) return;
+    let i = tabs.indexOf(document.activeElement);
+    if (i < 0) i = 0;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      i = e.key === "ArrowRight" ? (i + 1) % tabs.length : (i - 1 + tabs.length) % tabs.length;
+      tabs[i].focus();
+      return;
+    }
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      tabs[i].click();
+    }
+  });
+  try {
+    if (!localStorage.getItem("pyre.audioSecs")) {
+      const ro = new ResizeObserver(() => {
+        if (localStorage.getItem("pyre.audioSecs")) return;
+        applyAudioSecs(defaultAudioSecs());
+      });
+      const lay = document.querySelector(".audio-layout");
+      if (lay) ro.observe(lay);
+    }
+  } catch {}
+}
+initAudioSectionToggles();
+
 $$("#tabs button").forEach(b => b.onclick = () => { $$("#tabs button").forEach(x => x.classList.toggle("active", x === b)); $$(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + b.dataset.tab)); location.hash = b.dataset.tab; onTab(b.dataset.tab); });
 function onTab(t) { /* never await ? tab switch must stay instant even when backend is busy */
   if (t === "models") loadModels(); if (t === "status") loadStatus(); if (t === "images" || t === "audio") loadKinds(); if (t === "apps") loadApps(); if (t === "cabin" && window.cabin && cabin.refreshStatus) cabin.refreshStatus(); }
@@ -1292,6 +1373,252 @@ if ($("#ttsGo")) $("#ttsGo").onclick = async () => {
     $("#ttsAudio").src = URL.createObjectURL(await r.blob()); $("#ttsAudio").classList.remove("hidden"); $("#ttsAudio").play();
   } catch (e) { alert(e.message); if ($("#ttsProgLabel")) $("#ttsProgLabel").textContent = "error: " + e.message; }
 };
+
+// ---------- Speech to Speech (STS) ----------
+let stsRec = null, stsRecBlob = null, stsRecTimer = null, stsRecStarted = 0, stsCtrl = null, stsReplyBlob = null;
+const STS_DEFAULT_SYS = "You are a helpful voice assistant. Answer clearly and concisely in plain spoken language. Avoid markdown, bullet lists, and URLs unless asked.";
+function loadStsPrefs() {
+  return LS.get("stsPrefs", { quality: "balanced", voice: "default", speed: 1.0, system: STS_DEFAULT_SYS });
+}
+function saveStsPrefs(p) { LS.set("stsPrefs", p); }
+function stsPrefsFromUi() {
+  return {
+    quality: ($("#stsQuality") && $("#stsQuality").value) || "balanced",
+    voice: ($("#stsVoice") && $("#stsVoice").value) || "default",
+    speed: ($("#stsSpeed") && +$("#stsSpeed").value) || 1.0,
+    system: ($("#stsSystem") && $("#stsSystem").value) || STS_DEFAULT_SYS,
+  };
+}
+function applyStsPrefs(p) {
+  if ($("#stsQuality")) $("#stsQuality").value = p.quality || "balanced";
+  if ($("#stsQualitySeg")) $$("#stsQualitySeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.stsQ === ($("#stsQuality").value)));
+  if ($("#stsVoice") && p.voice) try { $("#stsVoice").value = p.voice; } catch {}
+  if ($("#stsSpeed") && p.speed != null) $("#stsSpeed").value = p.speed;
+  if ($("#stsSystem")) $("#stsSystem").value = p.system || STS_DEFAULT_SYS;
+}
+function setStsSourceMode(mode) {
+  const file = mode !== "record";
+  if ($("#stsModeFile")) $("#stsModeFile").classList.toggle("active", file);
+  if ($("#stsModeRec")) $("#stsModeRec").classList.toggle("active", !file);
+  if ($("#stsFilePane")) $("#stsFilePane").classList.toggle("hidden", !file);
+  if ($("#stsRecPane")) $("#stsRecPane").classList.toggle("hidden", file);
+  if ($("#stsMicHint")) {
+    const ok = micAllowed();
+    $("#stsMicHint").classList.toggle("hidden", ok);
+    if ($("#stsLocalUrl")) $("#stsLocalUrl").textContent = "http://127.0.0.1:" + (location.port || "8099") + "/";
+  }
+  if ($("#stsRecBtn")) setAvail($("#stsRecBtn"), micAllowed() ? availOk() : { enabled: false, reason_kind: "no_permission", message: "Microphone needs HTTPS or localhost" });
+}
+function currentStsAudio() {
+  if (stsRecBlob) return stsRecBlob;
+  const inp = $("#stsFile");
+  return (inp && inp.files && inp.files[0]) || null;
+}
+function setStsProg(show, pct, label) {
+  const box = $("#stsProg"); if (!box) return;
+  box.classList.toggle("hidden", !show);
+  if (pct != null && $("#stsBar")) $("#stsBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (label != null && $("#stsProgLabel")) $("#stsProgLabel").textContent = label;
+}
+function syncStsVoicesFromTts() {
+  const src = $("#ttsVoice"); const dst = $("#stsVoice"); if (!src || !dst) return;
+  const cur = dst.value;
+  dst.innerHTML = src.innerHTML;
+  if ([...dst.options].some(o => o.value === cur)) dst.value = cur;
+}
+if ($("#stsModeFile")) $("#stsModeFile").onclick = () => setStsSourceMode("file");
+if ($("#stsModeRec")) $("#stsModeRec").onclick = () => setStsSourceMode("record");
+if ($("#stsDrop")) {
+  const dz = $("#stsDrop");
+  ["dragenter", "dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", e => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (!f) return;
+    const dt = new DataTransfer(); dt.items.add(f);
+    $("#stsFile").files = dt.files; stsRecBlob = null;
+    if ($("#stsFileMeta")) $("#stsFileMeta").textContent = (f.name || "audio") + (f.size ? (" · " + human(f.size)) : "");
+    dz.classList.add("has-file");
+    if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(f); $("#stsPreview").classList.remove("hidden"); }
+  });
+}
+if ($("#stsFile")) $("#stsFile").onchange = () => {
+  stsRecBlob = null;
+  const f = $("#stsFile").files[0];
+  if (f) {
+    if ($("#stsFileMeta")) $("#stsFileMeta").textContent = (f.name || "audio") + (f.size ? (" · " + human(f.size)) : "");
+    if ($("#stsDrop")) $("#stsDrop").classList.add("has-file");
+    if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(f); $("#stsPreview").classList.remove("hidden"); }
+  }
+};
+if ($("#stsQualitySeg")) $("#stsQualitySeg").onclick = (e) => {
+  const b = e.target.closest("[data-sts-q]"); if (!b) return;
+  $$("#stsQualitySeg .seg-btn").forEach(x => x.classList.toggle("active", x === b));
+  if ($("#stsQuality")) { $("#stsQuality").value = b.dataset.stsQ; saveStsPrefs(stsPrefsFromUi()); }
+};
+["stsVoice", "stsSpeed", "stsSystem"].forEach(id => {
+  const el = document.getElementById(id); if (el) el.addEventListener("change", () => saveStsPrefs(stsPrefsFromUi()));
+});
+if ($("#stsRecBtn")) $("#stsRecBtn").onclick = async () => {
+  if (stsRec) { stsRec.stop(); return; }
+  if (!micAllowed()) { setStsSourceMode("record"); return; }
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const chunks = [];
+    stsRec = new MediaRecorder(s);
+    stsRec.ondataavailable = e => chunks.push(e.data);
+    stsRec.onstop = () => {
+      stsRecBlob = new Blob(chunks, { type: stsRec.mimeType || "audio/webm" });
+      try { s.getTracks().forEach(t => t.stop()); } catch {}
+      stsRec = null;
+      if (stsRecTimer) { clearInterval(stsRecTimer); stsRecTimer = null; }
+      $("#stsRecBtn").textContent = "Start recording";
+      if ($("#stsRecAfter")) $("#stsRecAfter").classList.remove("hidden");
+      if ($("#stsRecMeta")) $("#stsRecMeta").textContent = "Recording ready · " + human(stsRecBlob.size);
+      if ($("#stsFile")) try { $("#stsFile").value = ""; } catch {}
+      if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(stsRecBlob); $("#stsPreview").classList.remove("hidden"); }
+    };
+    stsRec.start();
+    $("#stsRecBtn").textContent = "Stop recording";
+    if ($("#stsRecAfter")) $("#stsRecAfter").classList.add("hidden");
+    stsRecStarted = Date.now();
+    if ($("#stsRecTimer")) $("#stsRecTimer").textContent = "0:00";
+    stsRecTimer = setInterval(() => {
+      if ($("#stsRecTimer")) $("#stsRecTimer").textContent = fmtDur((Date.now() - stsRecStarted) / 1000);
+    }, 250);
+  } catch (e) { alert("microphone: " + e.message); }
+};
+if ($("#stsRecAgain")) $("#stsRecAgain").onclick = () => {
+  stsRecBlob = null;
+  if ($("#stsRecAfter")) $("#stsRecAfter").classList.add("hidden");
+  if ($("#stsPreview")) { $("#stsPreview").removeAttribute("src"); $("#stsPreview").classList.add("hidden"); }
+  if ($("#stsRecBtn") && !$("#stsRecBtn").disabled) $("#stsRecBtn").click();
+};
+if ($("#stsCancel")) $("#stsCancel").onclick = () => { if (stsCtrl) stsCtrl.abort(); };
+if ($("#stsDlWav")) $("#stsDlWav").onclick = () => {
+  if (!stsReplyBlob) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(stsReplyBlob);
+  a.download = "sts-reply.wav";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+if ($("#stsToChat")) $("#stsToChat").onclick = () => {
+  const t = ($("#stsReply") && $("#stsReply").textContent) || "";
+  if (!t.trim()) return;
+  const c = conv(); if (!c) return;
+  c.messages.push({ role: "assistant", content: t });
+  renderMessages(); save();
+  onTab("chat");
+};
+if ($("#stsGo")) $("#stsGo").onclick = async () => {
+  const f = currentStsAudio(); if (!f) return alert("Choose or record audio first");
+  const pref = stsPrefsFromUi(); saveStsPrefs(pref);
+  const model = QUALITY_MODELS[pref.quality] || "base";
+  const llm = (kinds.llm && kinds.llm[0] && kinds.llm[0].id) || ($("#model") && $("#model").value) || "";
+  if (!llm) return alert("No chat model loaded");
+  const ttsModel = kinds.tts && kinds.tts[0] && kinds.tts[0].id;
+  if (!ttsModel) return alert("No TTS model loaded");
+  stsCtrl = new AbortController();
+  stsReplyBlob = null;
+  if ($("#stsDlWav")) $("#stsDlWav").classList.add("hidden");
+  if ($("#stsToChat")) $("#stsToChat").classList.add("hidden");
+  if ($("#stsTranscript")) $("#stsTranscript").textContent = "";
+  if ($("#stsReply")) $("#stsReply").textContent = "";
+  if ($("#stsAudio")) { $("#stsAudio").classList.add("hidden"); $("#stsAudio").removeAttribute("src"); }
+  $("#stsGo").classList.add("hidden");
+  $("#stsCancel").classList.remove("hidden");
+  try {
+    setStsProg(true, 5, "Transcribing…");
+    const fd = new FormData();
+    fd.append("file", f, f.name || "recording.webm");
+    fd.append("model", model);
+    fd.append("response_format", "verbose_json");
+    fd.append("task", "transcriptions");
+    let transcript = "";
+    for await (const ev of audioJobSse(fd, stsCtrl.signal)) {
+      if (ev.stage === "error" || ev.stage === "cancelled") throw new Error(ev.message || ev.stage);
+      const pct = sttStagePct(ev);
+      setStsProg(true, pct != null ? Math.min(40, pct * 0.4) : null, ev.message || ev.stage || "transcribing");
+      if (ev.stage === "done") {
+        const j = ev.result || {};
+        transcript = (j.text || j.rendered || "").trim();
+      }
+    }
+    if (!transcript) throw new Error("empty transcript");
+    if ($("#stsTranscript")) $("#stsTranscript").textContent = transcript;
+    setStsProg(true, 45, "Thinking…");
+    let reply = "";
+    const body = {
+      model: llm,
+      stream: true,
+      reasoning_effort: "medium",
+      messages: [
+        { role: "system", content: pref.system || STS_DEFAULT_SYS },
+        { role: "user", content: transcript },
+      ],
+    };
+    for await (const ch of sse("/v1/chat/completions", body, stsCtrl.signal)) {
+      if (ch.error) throw new Error(ch.error.message || "chat error");
+      const d = ch.choices && ch.choices[0] && ch.choices[0].delta && ch.choices[0].delta.content;
+      if (d) {
+        reply += d;
+        if ($("#stsReply")) $("#stsReply").textContent = reply;
+        setStsProg(true, 55 + Math.min(25, reply.length / 20), "Writing reply…");
+      }
+    }
+    reply = (reply || "").trim();
+    if (!reply) throw new Error("empty chat reply");
+    const spoken = reply.replace(/^#+\s+/gm, "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1").replace(/^\s*[-*]\s+/gm, "");
+    setStsProg(true, 85, "Synthesizing speech…");
+    // One-shot TTS for the full reply. Sentence-by-sentence streaming would need
+    // N extra /v1/audio/speech round-trips (load+encode per sentence) and is not
+    // wired here; expect full-reply latency ~seconds after chat finishes.
+    const r = await fetch("/v1/audio/speech", {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        model: ttsModel,
+        input: spoken,
+        voice: pref.voice || "default",
+        speed: pref.speed || 1.0,
+        response_format: "wav",
+      }),
+      signal: stsCtrl.signal,
+    });
+    if (!r.ok) {
+      let m = r.statusText;
+      try { m = (await r.json()).error.message || m; } catch {}
+      throw new Error(m);
+    }
+    stsReplyBlob = await r.blob();
+    if ($("#stsAudio")) {
+      $("#stsAudio").src = URL.createObjectURL(stsReplyBlob);
+      $("#stsAudio").classList.remove("hidden");
+      try { $("#stsAudio").play(); } catch {}
+    }
+    if ($("#stsDlWav")) $("#stsDlWav").classList.remove("hidden");
+    if ($("#stsToChat")) $("#stsToChat").classList.remove("hidden");
+    setStsProg(true, 100, "done");
+  } catch (e) {
+    const msg = (e && e.name === "AbortError") ? "cancelled" : ((e && e.message) || String(e));
+    setStsProg(true, 0, "error: " + msg);
+    if ($("#stsReply") && !$("#stsReply").textContent) $("#stsReply").textContent = "error: " + msg;
+  } finally {
+    $("#stsGo").classList.remove("hidden");
+    $("#stsCancel").classList.add("hidden");
+    stsCtrl = null;
+  }
+};
+setStsSourceMode("file");
+applyStsPrefs(loadStsPrefs());
+{
+  const _obsTtsVoice = $("#ttsVoice");
+  if (_obsTtsVoice) {
+    const mo = new MutationObserver(() => syncStsVoicesFromTts());
+    mo.observe(_obsTtsVoice, { childList: true });
+    syncStsVoicesFromTts();
+  }
+}
 
 // ---------- apps ----------
 async function loadApps() {

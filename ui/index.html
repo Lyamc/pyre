@@ -123,10 +123,26 @@
 
 <!-- AUDIO -->
 <section id="tab-audio" class="tab">
-  <div class="cards audio-flow">
-    <div class="card" id="sttCard">
-      <h3>Speech to text</h3>
-      <p class="muted small" id="sttNote">Speech models load on demand. Pick quality below, or a specific model under Advanced.</p>
+  <div class="audio-layout">
+    <div class="audio-toggles" id="audioToggles" role="group" aria-label="Show audio sections">
+      <button type="button" class="audio-tog" id="audioTogStt" data-audio-sec="stt"
+              aria-pressed="true" title="Show or hide Speech to Text">
+        <svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg><span>Speech to Text (STT)</span>
+      </button>
+      <button type="button" class="audio-tog" id="audioTogSts" data-audio-sec="sts"
+              aria-pressed="false" title="Show or hide Speech to Speech">
+        <svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 10v4h3l4 4V6l-4 4H8zm9.5 2a3.5 3.5 0 0 0-1.8-3.05v6.1A3.5 3.5 0 0 0 17.5 12z"/></svg><span>Speech to Speech (STS)</span>
+      </button>
+      <button type="button" class="audio-tog" id="audioTogTts" data-audio-sec="tts"
+              aria-pressed="false" title="Show or hide Text to Speech">
+        <svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z"/></svg><span>Text to Speech (TTS)</span>
+      </button>
+    </div>
+
+    <div class="audio-columns cards">
+      <div class="card audio-sec" id="sttCard" data-audio-sec="stt">
+        <h3 class="audio-pane-title"><svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg><span>Speech to Text (STT)</span></h3>
+        <p class="muted small" id="sttNote">Speech models load on demand. Pick quality below, or a specific model under Advanced.</p>
       <fieldset id="sttForm">
 
         <div class="astep" id="sttStepSource">
@@ -277,11 +293,95 @@
           <option value="json">JSON</option>
         </select>
       </fieldset>
-    </div>
+      </div>
 
-    <div class="card tts-card" id="ttsCard">
-      <h3>Text to speech</h3>
-      <p class="muted small">Separate from transcription — turns text into spoken audio.</p>
+      <div class="card audio-sec" id="stsCard" data-audio-sec="sts" hidden>
+        <h3 class="audio-pane-title"><svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 10v4h3l4 4V6l-4 4H8zm9.5 2a3.5 3.5 0 0 0-1.8-3.05v6.1A3.5 3.5 0 0 0 17.5 12z"/></svg><span>Speech to Speech (STS)</span></h3>
+        <p class="muted small">Record or upload speech → transcribe → chat reply (Qwen) → speak the reply.</p>
+        <fieldset id="stsForm">
+          <div class="astep">
+            <div class="astep-h"><span class="astep-n">1</span> Your audio</div>
+            <div class="seg" role="tablist" aria-label="STS audio source" id="stsSourceMode">
+              <button type="button" class="seg-btn active" data-sts-mode="file" id="stsModeFile">Upload a file</button>
+              <button type="button" class="seg-btn" data-sts-mode="record" id="stsModeRec">Record audio</button>
+            </div>
+            <div id="stsFilePane">
+              <label class="dropzone" id="stsDrop" for="stsFile">
+                <input type="file" id="stsFile" accept="audio/*" class="sr-only">
+                <span class="drop-ico" aria-hidden="true">♪</span>
+                <span class="drop-title">Drop an audio file or click to choose</span>
+                <span class="drop-meta muted small" id="stsFileMeta">MP3, WAV, M4A, FLAC, WebM…</span>
+              </label>
+            </div>
+            <div id="stsRecPane" class="hidden">
+              <p id="stsMicHint" class="callout hidden">Recording needs HTTPS or localhost. Open <code id="stsLocalUrl">http://127.0.0.1:8099/</code> on this PC for the mic.</p>
+              <div class="row wrap">
+                <button id="stsRecBtn" type="button" class="primary">Start recording</button>
+                <span id="stsRecTimer" class="rec-timer muted">0:00</span>
+              </div>
+              <div class="row wrap hidden" id="stsRecAfter">
+                <span class="muted small" id="stsRecMeta">Recording ready</span>
+                <button id="stsRecAgain" type="button">Re-record</button>
+              </div>
+            </div>
+            <audio id="stsPreview" controls class="stt-preview hidden"></audio>
+          </div>
+          <div class="astep">
+            <div class="astep-h"><span class="astep-n">2</span> Options</div>
+            <div class="opt-block">
+              <div class="opt-label">STT quality</div>
+              <div class="seg" id="stsQualitySeg" role="radiogroup">
+                <button type="button" class="seg-btn" data-sts-q="fast">Fast</button>
+                <button type="button" class="seg-btn active" data-sts-q="balanced">Balanced</button>
+                <button type="button" class="seg-btn" data-sts-q="best">Best</button>
+              </div>
+              <select id="stsQuality" class="hidden" aria-hidden="true">
+                <option value="fast">Fast</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="best">Best</option>
+              </select>
+            </div>
+            <div class="opt-block">
+              <div class="opt-label">Reply voice</div>
+              <div class="row wrap">
+                <select id="stsVoice"><option>default</option></select>
+                <label>Speed <input id="stsSpeed" type="number" step="0.1" value="1.0" style="width:4em"></label>
+              </div>
+            </div>
+            <details id="stsAdvanced" class="prefs">
+              <summary>Advanced</summary>
+              <label class="opt-label" for="stsSystem">System prompt</label>
+              <textarea id="stsSystem" rows="3">You are a helpful voice assistant. Answer clearly and concisely in plain spoken language. Avoid markdown, bullet lists, and URLs unless asked.</textarea>
+              <p class="muted small">Chat uses the loaded LLM with reasoning effort <b>medium</b>. Voice matches the TTS section.</p>
+            </details>
+          </div>
+          <div class="astep">
+            <div class="astep-h"><span class="astep-n">3</span> Run</div>
+            <button id="stsGo" class="primary stt-run" type="button">Speak with AI</button>
+            <button id="stsCancel" type="button" class="primary stt-run hidden">Cancel</button>
+            <div id="stsProg" class="aprogress hidden">
+              <div class="abar"><div id="stsBar" class="abar-fill"></div></div>
+              <div id="stsProgLabel" class="muted small"></div>
+            </div>
+          </div>
+          <div class="astep">
+            <div class="astep-h"><span class="astep-n">4</span> Results</div>
+            <div class="opt-label">You said</div>
+            <pre id="stsTranscript" class="out"></pre>
+            <div class="opt-label">Reply</div>
+            <div id="stsReply" class="sumout"></div>
+            <audio id="stsAudio" controls class="hidden"></audio>
+            <div class="row wrap">
+              <button id="stsDlWav" type="button" class="hidden">Download reply audio</button>
+              <button id="stsToChat" type="button" class="hidden">Send reply to chat</button>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="card tts-card audio-sec" id="ttsCard" data-audio-sec="tts" hidden>
+        <h3 class="audio-pane-title"><svg class="audio-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z"/></svg><span>Text to Speech (TTS)</span></h3>
+        <p class="muted small">Separate from transcription — turns text into spoken audio.</p>
       <div class="disabled-note" id="ttsNote">No text-to-speech model is loaded (start with <code>--tts-model facebook/mms-tts-eng</code>).</div>
       <fieldset id="ttsForm" disabled>
         <textarea id="ttsText" rows="3" placeholder="Text to speak"></textarea>
@@ -294,10 +394,10 @@
         <div id="ttsProg" class="aprogress hidden"><div class="abar"><div id="ttsBar" class="abar-fill"></div></div><div id="ttsProgLabel" class="muted small"></div></div>
         <audio id="ttsAudio" controls class="hidden"></audio>
       </fieldset>
+      </div>
     </div>
   </div>
 </section>
-
 
 <!-- APPS -->
 <section id="tab-cabin" class="tab">
