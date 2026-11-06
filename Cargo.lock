@@ -846,13 +846,14 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burn"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-core",
  "burn-linalg",
  "burn-nn",
  "burn-optim",
  "burn-signal",
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-store",
  "burn-vision",
  "cubecl",
@@ -861,22 +862,44 @@ dependencies = [
 [[package]]
 name = "burn-autodiff"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "derive-new",
  "hashbrown 0.16.1",
  "num-traits",
  "parking_lot",
  "portable-atomic",
  "spin 0.12.3",
+ "tracing",
 ]
 
 [[package]]
 name = "burn-backend"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "cubecl",
+ "derive-new",
+ "enumset",
+ "hashbrown 0.16.1",
+ "log",
+ "num-traits",
+ "oneshot 0.2.1",
+ "rand 0.10.3",
+ "rand_distr",
+ "serde",
+ "spin 0.12.3",
+]
+
+[[package]]
+name = "burn-backend"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
+dependencies = [
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "cubecl",
  "derive-new",
  "enumset",
@@ -893,6 +916,7 @@ dependencies = [
 [[package]]
 name = "burn-backend-extension"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -902,20 +926,22 @@ dependencies = [
 [[package]]
 name = "burn-core"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-backend-extension",
  "burn-cpu",
- "burn-cubecl",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-cuda",
+ "burn-dataset",
  "burn-derive",
  "burn-dispatch",
- "burn-fusion",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-instrument",
- "burn-ir",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-pack",
  "burn-rocm",
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-tensor",
  "burn-wgpu",
  "derive-new",
@@ -933,22 +959,44 @@ dependencies = [
 [[package]]
 name = "burn-cpu"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-cubecl",
- "burn-fusion",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "cubecl",
 ]
 
 [[package]]
 name = "burn-cubecl"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-cubecl-fusion",
- "burn-fusion",
- "burn-ir",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-cubecl-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "cubecl",
+ "cubek",
+ "derive-new",
+ "futures-lite",
+ "log",
+ "serde",
+ "text_placeholder",
+ "tracing",
+]
+
+[[package]]
+name = "burn-cubecl"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
+dependencies = [
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-cubecl-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "cubecl",
  "cubek",
  "derive-new",
@@ -961,11 +1009,30 @@ dependencies = [
 [[package]]
 name = "burn-cubecl-fusion"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-fusion",
- "burn-ir",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "ciborium",
+ "cubecl",
+ "cubek",
+ "derive-new",
+ "hashbrown 0.16.1",
+ "serde",
+ "spin 0.12.3",
+]
+
+[[package]]
+name = "burn-cubecl-fusion"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
+dependencies = [
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "ciborium",
  "cubecl",
  "cubek",
@@ -978,16 +1045,37 @@ dependencies = [
 [[package]]
 name = "burn-cuda"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-cubecl",
- "burn-fusion",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "cubecl",
+]
+
+[[package]]
+name = "burn-dataset"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
+dependencies = [
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "csv",
+ "derive-new",
+ "dirs 7.0.0",
+ "rand 0.10.3",
+ "rmp-serde",
+ "sanitize-filename",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "burn-derive"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-einsum",
  "derive-new",
@@ -999,11 +1087,12 @@ dependencies = [
 [[package]]
 name = "burn-dispatch"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-autodiff",
- "burn-backend",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-backend-extension",
- "burn-cubecl",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-flex",
  "burn-remote",
  "paste",
@@ -1013,14 +1102,16 @@ dependencies = [
 [[package]]
 name = "burn-einsum"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 
 [[package]]
 name = "burn-flex"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-ir",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "bytemuck",
  "gemm",
  "half",
@@ -1034,10 +1125,27 @@ dependencies = [
 [[package]]
 name = "burn-fusion"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-ir",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "derive-new",
+ "hashbrown 0.16.1",
+ "log",
+ "serde",
+ "spin 0.12.3",
+ "tracing",
+]
+
+[[package]]
+name = "burn-fusion"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
+dependencies = [
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "derive-new",
  "hashbrown 0.16.1",
  "log",
@@ -1050,23 +1158,29 @@ dependencies = [
 name = "burn-gguf"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "burn-core",
- "burn-std",
+ "burn-nn",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-store",
  "burn-tensor",
+ "bytemuck",
  "bytes",
  "half",
  "memmap2",
  "regex",
+ "safetensors",
+ "tempfile",
 ]
 
 [[package]]
 name = "burn-instrument"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-fusion",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-instrument-macros",
- "burn-ir",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-tensor",
  "cubecl",
  "cubecl-common",
@@ -1078,6 +1192,7 @@ dependencies = [
 [[package]]
 name = "burn-instrument-macros"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1087,9 +1202,21 @@ dependencies = [
 [[package]]
 name = "burn-ir"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "hashbrown 0.16.1",
+ "serde",
+]
+
+[[package]]
+name = "burn-ir"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
+dependencies = [
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "hashbrown 0.16.1",
  "serde",
 ]
@@ -1097,11 +1224,12 @@ dependencies = [
 [[package]]
 name = "burn-linalg"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-core",
- "burn-cubecl",
- "burn-fusion",
- "burn-std",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "gemm",
  "num-traits",
 ]
@@ -1109,6 +1237,7 @@ dependencies = [
 [[package]]
 name = "burn-nn"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-core",
  "burn-linalg",
@@ -1118,6 +1247,7 @@ dependencies = [
 [[package]]
 name = "burn-optim"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-core",
  "burn-derive",
@@ -1132,8 +1262,9 @@ dependencies = [
 [[package]]
 name = "burn-pack"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "byteorder",
  "ciborium",
  "serde",
@@ -1142,12 +1273,13 @@ dependencies = [
 [[package]]
 name = "burn-remote"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-fusion",
- "burn-ir",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-router",
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "bytes",
  "futures-util",
  "gloo-timers",
@@ -1163,21 +1295,23 @@ dependencies = [
 [[package]]
 name = "burn-rocm"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-cubecl",
- "burn-fusion",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "cubecl",
 ]
 
 [[package]]
 name = "burn-router"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-fusion",
- "burn-ir",
- "burn-std",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-ir 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "hashbrown 0.16.1",
  "portable-atomic",
  "serde",
@@ -1187,19 +1321,49 @@ dependencies = [
 [[package]]
 name = "burn-signal"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-autodiff",
  "burn-core",
- "burn-cubecl",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-flex",
- "burn-fusion",
- "burn-std",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "libm",
 ]
 
 [[package]]
 name = "burn-std"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "bytes",
+ "cubecl-common",
+ "cubecl-environment",
+ "cubecl-zspace",
+ "data-encoding",
+ "derive-new",
+ "half",
+ "hashbrown 0.16.1",
+ "indicatif",
+ "num-traits",
+ "rand 0.10.3",
+ "rand_distr",
+ "reqwest 0.13.5",
+ "serde",
+ "smallvec",
+ "spin 0.12.3",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "burn-std"
+version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f#9db7598f09ce29036a949a8635343f8a58780d4f"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1224,6 +1388,7 @@ dependencies = [
 [[package]]
 name = "burn-store"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "burn-core",
  "burn-pack",
@@ -1240,12 +1405,13 @@ dependencies = [
 [[package]]
 name = "burn-tensor"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "burn-derive",
  "burn-dispatch",
  "burn-einsum",
- "burn-std",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "colored",
  "derive-new",
  "num-traits",
@@ -1255,13 +1421,14 @@ dependencies = [
 [[package]]
 name = "burn-vision"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "aligned-vec",
  "bon",
  "burn-core",
- "burn-cubecl",
- "burn-fusion",
- "burn-std",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-std 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "bytemuck",
  "cubecl",
  "derive-new",
@@ -1275,10 +1442,11 @@ dependencies = [
 [[package]]
 name = "burn-wgpu"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
- "burn-backend",
- "burn-cubecl",
- "burn-fusion",
+ "burn-backend 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
+ "burn-fusion 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7)",
  "cubecl",
 ]
 
@@ -1880,6 +2048,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ctor"
 version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1901,6 +2090,7 @@ dependencies = [
 [[package]]
 name = "cubecl"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cubecl-core",
  "cubecl-cpu",
@@ -1919,6 +2109,7 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bytemuck",
  "cfg_aliases",
@@ -1942,6 +2133,7 @@ dependencies = [
 [[package]]
 name = "cubecl-core"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -1965,12 +2157,14 @@ dependencies = [
  "sanitize-filename",
  "serde",
  "serde_json",
+ "tracing",
  "variadics_please",
 ]
 
 [[package]]
 name = "cubecl-cpp"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -1992,6 +2186,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cpu"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bytemuck",
  "crossbeam-utils",
@@ -2013,6 +2208,7 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -2027,11 +2223,13 @@ dependencies = [
  "half",
  "log",
  "serde",
+ "tracing",
 ]
 
 [[package]]
 name = "cubecl-environment"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "async-channel",
  "backtrace",
@@ -2059,6 +2257,7 @@ dependencies = [
  "serde_json",
  "spin 0.12.3",
  "toml 1.1.8+spec-1.1.0",
+ "tracing",
  "turso",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2069,6 +2268,7 @@ dependencies = [
 [[package]]
 name = "cubecl-hip"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -2084,6 +2284,7 @@ dependencies = [
  "log",
  "paste",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -2100,6 +2301,7 @@ dependencies = [
 [[package]]
 name = "cubecl-ir"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bumpalo",
  "cubecl-common",
@@ -2130,6 +2332,7 @@ dependencies = [
 [[package]]
 name = "cubecl-llvm"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cc",
  "cubecl-core",
@@ -2149,6 +2352,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "darling 0.24.1",
  "derive-new",
@@ -2165,6 +2369,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros-internal"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "darling 0.24.1",
  "inflections",
@@ -2176,6 +2381,7 @@ dependencies = [
 [[package]]
 name = "cubecl-metal"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "block2",
  "bytemuck",
@@ -2199,6 +2405,7 @@ dependencies = [
 [[package]]
 name = "cubecl-monitoring"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cfg_aliases",
  "cubecl-ir",
@@ -2211,6 +2418,7 @@ dependencies = [
 [[package]]
 name = "cubecl-opt"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2232,6 +2440,7 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2256,12 +2465,14 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
+ "tracing",
  "wasm-bindgen-futures",
 ]
 
 [[package]]
 name = "cubecl-server"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -2284,11 +2495,13 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
 name = "cubecl-spirv"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "bitflags 2.13.2",
  "cubecl-common",
@@ -2311,6 +2524,7 @@ dependencies = [
 [[package]]
 name = "cubecl-std"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2327,6 +2541,7 @@ dependencies = [
 [[package]]
 name = "cubecl-tile"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "cubecl-core",
  "cubecl-ir",
@@ -2340,6 +2555,7 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "ash",
  "bytemuck",
@@ -2364,6 +2580,7 @@ dependencies = [
  "pliron",
  "thiserror 2.0.21",
  "tracel-ash",
+ "tracing",
  "wasm-bindgen-futures",
  "wgpu",
 ]
@@ -2371,6 +2588,7 @@ dependencies = [
 [[package]]
 name = "cubecl-zspace"
 version = "0.12.0-pre.1"
+source = "git+https://github.com/Lyamc/cubecl-pipe?rev=29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd#29f42dbef208b63f1b9d8cb1a689aea4d6aab5bd"
 dependencies = [
  "derive-new",
  "serde",
@@ -2901,6 +3119,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -3931,7 +4158,7 @@ checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 name = "hf-hub"
 version = "0.5.0"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
  "futures",
  "hex-literal",
  "http",
@@ -6289,7 +6516,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "burn",
- "burn-cubecl",
+ "burn-cubecl 0.23.0-pre.1 (git+https://github.com/Lyamc/burn?rev=9db7598f09ce29036a949a8635343f8a58780d4f)",
  "burn-gguf",
  "clap 4.6.7",
  "cubecl-environment",
@@ -6364,7 +6591,7 @@ name = "pyre-whisper-core"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "dirs",
+ "dirs 6.0.0",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6431,6 +6658,7 @@ dependencies = [
 [[package]]
 name = "pytorch-reader"
 version = "0.23.0-pre.1"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -7479,7 +7707,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "bstr",
- "dirs",
+ "dirs 6.0.0",
  "os_str_bytes",
 ]
 
@@ -7702,6 +7930,9 @@ name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
 
 [[package]]
 name = "strum_macros"
@@ -8508,7 +8739,7 @@ dependencies = [
  "bytes",
  "cc",
  "constcat",
- "dirs",
+ "dirs 6.0.0",
  "liblzma",
  "serde",
  "serde_json",
@@ -10068,7 +10299,7 @@ dependencies = [
  "colored",
  "const-str",
  "ctor",
- "dirs",
+ "dirs 6.0.0",
  "futures",
  "git-version",
  "humantime",
@@ -10221,6 +10452,7 @@ dependencies = [
 [[package]]
 name = "zip"
 version = "9.0.4"
+source = "git+https://github.com/Lyamc/burn?rev=4b9af57ff044b0e3157b985361a4c6f2004f3ae7#4b9af57ff044b0e3157b985361a4c6f2004f3ae7"
 dependencies = [
  "crc32fast",
  "flate2",
