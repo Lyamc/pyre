@@ -122,49 +122,6 @@ pub fn timestamps_collapsed(kept: &[usize], all: &[usize]) -> bool {
     all.len() >= 12 && kept.len() * 2 < all.len()
 }
 
-/// Split ids at `min_frame`. The left side is the overlap the previous window
-/// already saw. Callers word-dedupe that side instead of deleting it, so a
-/// boundary phrase the previous window missed is kept.
-pub fn split_at_frame(ids: &[usize], frames: &[usize], min_frame: usize) -> (Vec<usize>, Vec<usize>) {
-    if frames.len() != ids.len() || min_frame == 0 {
-        return (Vec::new(), ids.to_vec());
-    }
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    for (id, frame) in ids.iter().zip(frames) {
-        if *frame < min_frame {
-            left.push(*id);
-        } else {
-            right.push(*id);
-        }
-    }
-    (left, right)
-}
-
-/// Split Whisper tokens on the last timestamp before each token.
-/// `min_t` is the overlap in seconds. Tokens with no timestamp in the list
-/// come back as `(ids, empty)` so the caller can use the plain word stitch.
-pub fn split_at_time(ids: &[usize], times: &[Option<f64>], min_t: f64) -> Option<(Vec<usize>, Vec<usize>)> {
-    if times.len() != ids.len() || !times.iter().any(|t| t.is_some()) || min_t <= 0.0 {
-        return None;
-    }
-    let mut t = 0.0;
-    let mut left = Vec::new();
-    let mut right = Vec::new();
-    for (id, stamp) in ids.iter().zip(times) {
-        if let Some(ts) = stamp {
-            t = *ts;
-            continue;
-        }
-        if t < min_t {
-            left.push(*id);
-        } else {
-            right.push(*id);
-        }
-    }
-    Some((left, right))
-}
-
 pub fn drop_left_context_tokens(ids: &[usize], frames: &[usize], min_frame: usize) -> Vec<usize> {
     if frames.len() != ids.len() || min_frame == 0 {
         return ids.to_vec();
@@ -230,7 +187,7 @@ pub fn find_chunk_overlap(prev_tokens: &[usize], curr_tokens: &[usize], max_n_of
 
 #[cfg(test)]
 mod tests {
-    use super::{append_without_word_overlap, drop_left_context_tokens, split_at_frame, split_at_time, timestamps_collapsed, trim_trailing_hallucination};
+    use super::{append_without_word_overlap, drop_left_context_tokens, timestamps_collapsed, trim_trailing_hallucination};
 
     #[test]
     fn later_window_drops_only_the_left_context_frames() {
@@ -240,13 +197,6 @@ mod tests {
         assert_eq!(drop_left_context_tokens(&ids, &frames, 0), vec![1, 2, 3, 4]);
         assert!(timestamps_collapsed(&[1], &[0; 20]));
         assert!(!timestamps_collapsed(&[1, 2, 3, 4, 5, 6, 7, 8], &[0; 12]));
-        let (left, right) = split_at_frame(&[1, 2, 3], &[1, 9, 12], 8);
-        assert_eq!(left, vec![1]);
-        assert_eq!(right, vec![2, 3]);
-        let times = [Some(0.0), None, None, Some(4.0), None];
-        let (left, right) = split_at_time(&[9, 1, 2, 8, 3], &times, 3.0).unwrap();
-        assert_eq!(left, vec![1, 2]);
-        assert_eq!(right, vec![3]);
     }
 
     #[test]

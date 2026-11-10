@@ -10,7 +10,7 @@ pub use pass::{with_whisper_pass, DecoderKind, MelTail, WhisperPass, Windowing};
 
 pub use task::DecodeTask;
 
-pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, drop_left_context_tokens, find_chunk_overlap, split_at_frame, split_at_time, timestamps_collapsed, trim_trailing_hallucination};
+pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, drop_left_context_tokens, find_chunk_overlap, timestamps_collapsed, trim_trailing_hallucination};
 
 use crate::audio::max_waveform_samples;
 use crate::model::{get_model_stats, Model};
@@ -308,45 +308,30 @@ pub fn waveform_to_text(
         };
 
         let use_frames = encoder_frames > 0 && token_frames.len() == new_tokens.len();
-        // Overlap words are deduped against the previous window. Words that
-        // window missed (v2's 16- and 7-word gaps, Whisper's boundary phrase)
-        // stay. Text past the overlap is appended whole, so a long string
-        // match cannot eat it.
-        let (overlap_text, rest_piece) = if use_frames {
+        let frame_ids = if use_frames {
             let window_samples = end.saturating_sub(start).max(1);
             let min_frame = if i == 0 {
                 0
             } else {
                 overlap.saturating_mul(encoder_frames) / window_samples
             };
-            let (left, right) = split_at_frame(&new_tokens, &token_frames, min_frame);
-            (
-                clean_text(&parakeet_tokens_to_text(bpe, &left)),
-                clean_text(&parakeet_tokens_to_text(bpe, &right)),
-            )
-        } else if i > 0 {
-            let kept: Vec<usize> = new_tokens
-                .iter()
-                .copied()
-                .filter(|&t| !bpe.is_special(t) || bpe.is_timestamp(t))
-                .collect();
-            let times: Vec<Option<f64>> = kept.iter().copied().map(|t| bpe.token_to_timestamp(t)).collect();
-            if let Some((left, right)) = split_at_time(&kept, &times, overlap_secs as f64) {
-                (
-                    clean_text(&bpe.decode(&left, true).unwrap_or_default()),
-                    clean_text(&bpe.decode(&right, true).unwrap_or_default()),
-                )
-            } else {
-                (clean_text(&new_text), String::new())
-            }
+            drop_left_context_tokens(&new_tokens, &token_frames, min_frame)
         } else {
-            (String::new(), clean_text(&new_text))
+            Vec::new()
         };
-        if !overlap_text.trim().is_empty() {
-            append_without_word_overlap(&mut accumulated_text, &overlap_text);
-        }
-        if rest_piece.trim().is_empty()
-            && overlap_text.trim().is_empty()
+        // v2 timestamped one whole window inside the 8 s overlap, and the frame
+        // drop deleted it (151 consecutive words). Fall back to the word stitch.
+        let collapsed = i > 0 && use_frames && timestamps_collapsed(&frame_ids, &new_tokens);
+        let mut cleaned = if use_frames && !collapsed {
+            clean_text(&parakeet_tokens_to_text(bpe, &frame_ids))
+        } else {
+            clean_text(&new_text)
+        };
+        // A 60 s window that decodes blank loses ~50 s. One split into halves
+        // covers that span at a length v2 already transcribes (single utterances
+        // are well under 30 s). v3's good windows are non-empty and skip this.
+        let mut recovered = false;
+        if cleaned.trim().is_empty()
             && end.saturating_sub(start) > sample_rate.saturating_mul(25)
             && matches!(model, Model::Parakeet(_))
         {
@@ -371,14 +356,20 @@ pub fn waveform_to_text(
                 }
             }
             if !joined.is_empty() {
-                append_without_word_overlap(&mut accumulated_text, &joined);
+                cleaned = joined;
+                recovered = true;
             }
         }
-        if !rest_piece.trim().is_empty() {
-            if !accumulated_text.is_empty() && !accumulated_text.ends_with(' ') {
-                accumulated_text.push(' ');
+        if use_frames && !collapsed && !recovered {
+            let piece = cleaned.trim();
+            if !piece.is_empty() {
+                if !accumulated_text.is_empty() {
+                    accumulated_text.push(' ');
+                }
+                accumulated_text.push_str(piece);
             }
-            accumulated_text.push_str(rest_piece.trim());
+        } else {
+            append_without_word_overlap(&mut accumulated_text, &cleaned);
         }
 
         let chunk_offset = i as f64 * shift_duration;
