@@ -85,6 +85,18 @@ mod tests {
         assert_eq!(tdt_step(true, 0, &table, 3, 10), (1, 0));
         assert_eq!(tdt_step(false, 0, &table, 9, 10), (1, 0));
     }
+
+    #[test]
+    fn control_tokens_lose_to_blank_and_to_text() {
+        let mut logits = vec![0.0; 8];
+        logits[1] = 5.0; // <|nospeech|>
+        logits[7] = 1.0; // a word
+        logits[4] = 3.0; // blank
+        let control = [false, true, false, false, false, false, false, false];
+        assert_eq!(best_tdt_token(&logits, 8, 4, &control), 4);
+        logits[7] = 6.0;
+        assert_eq!(best_tdt_token(&logits, 8, 4, &control), 7);
+    }
 }
 
 /// SentencePiece pieces that are not blank and not Whisper-style specials.
@@ -246,6 +258,27 @@ impl ParakeetDecodeConfig {
 /// NeMo looks the duration *index* up in `durations` (not the raw index). A blank
 /// with duration 0 is forced to 1. A run of zero-duration labels stops at
 /// `max_symbols` and then advances one frame so the loop cannot sit on one frame.
+/// Pick the best text token, or blank when blank outscores every text token.
+///
+/// v3's vocab starts with control tokens (`<|nospeech|>`, `<|pnc|>`, `<|fr|>`, …).
+/// Letting one of those win the argmax embeds it into the LSTM and advances by its
+/// duration, which drops the start of a French clip or leaves only its last words.
+/// They are not blank, and they are not transcript text.
+pub fn best_tdt_token(logits: &[f32], vocab: usize, blank: usize, control: &[bool]) -> usize {
+    let mut best = blank;
+    let mut best_s = logits.get(blank).copied().unwrap_or(f32::NEG_INFINITY);
+    for (i, &score) in logits.iter().take(vocab).enumerate() {
+        if i == blank || control.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if score > best_s {
+            best_s = score;
+            best = i;
+        }
+    }
+    best
+}
+
 pub fn tdt_step(token_is_blank: bool, dur_index: usize, durations: &[usize], symbols_at_frame: usize, max_symbols: usize) -> (usize, usize) {
     let mut skip = durations.get(dur_index).copied().unwrap_or(dur_index);
     let mut symbols = if token_is_blank { 0 } else { symbols_at_frame.saturating_add(1) };
@@ -350,11 +383,44 @@ pub fn decode_nemotron(
     with_frames(text, kept, &tokens, &frames, encoder_frames)
 }
 
+/// v3 control prompt. Absent on v2, whose tokenizer has none of these pieces.
+/// `<|nopnc|>` keeps pieces as plain words. A non-English language code appends `<|xx|>`.
+pub fn context_prompt(bpe: &Gpt2Tokenizer, language_code: &str) -> Vec<usize> {
+    if bpe.token_to_id("<|startofcontext|>").is_none() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    for name in ["<|startofcontext|>", "<|nopnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>"] {
+        if let Some(id) = bpe.token_to_id(name) {
+            ids.push(id);
+        }
+    }
+    let code = language_code.trim().to_ascii_lowercase();
+    let code = code.split(['-', '_']).next().unwrap_or("");
+    if !code.is_empty() && code != "en" && code != "english" {
+        if let Some(id) = bpe.token_to_id(&format!("<|{code}|>")) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+pub fn control_token_mask(bpe: &Gpt2Tokenizer, vocab: usize) -> Vec<bool> {
+    (0..vocab)
+        .map(|id| {
+            bpe.id_to_token(id as u32).is_some_and(|piece| {
+                piece.starts_with("<|") || piece == "<unk>" || piece == "<pad>" || piece.contains("spltoken")
+            })
+        })
+        .collect()
+}
+
 pub fn decode_parakeet(
     parakeet: &Parakeet,
     bpe: &Gpt2Tokenizer,
     mel: Tensor<3>,
     model_name: &str,
+    language_code: &str,
     verbose: bool,
 ) -> TimedChunk {
     if verbose {
@@ -375,6 +441,8 @@ pub fn decode_parakeet(
             );
             (ids, Vec::new(), 0)
         } else {
+            let prompt = context_prompt(bpe, language_code);
+            let control = control_token_mask(bpe, decode_cfg.vocab_size);
             let (pairs, encoder_frames) = parakeet.decode_tdt_greedy(
                 mel.clone(),
                 decode_cfg.blank_token_id,
@@ -383,6 +451,8 @@ pub fn decode_parakeet(
                 &decode_cfg.duration_table(),
                 decode_cfg.max_symbols_per_step.max(1),
                 decode_cfg.start_token(),
+                &prompt,
+                &control,
                 verbose,
             );
             let (ids, frames): (Vec<usize>, Vec<usize>) = pairs.into_iter().unzip();

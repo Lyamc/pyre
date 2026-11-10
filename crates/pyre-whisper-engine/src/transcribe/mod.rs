@@ -10,7 +10,7 @@ pub use pass::{with_whisper_pass, DecoderKind, MelTail, WhisperPass, Windowing};
 
 pub use task::DecodeTask;
 
-pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, drop_left_context_tokens, find_chunk_overlap, trim_trailing_hallucination};
+pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, drop_left_context_tokens, find_chunk_overlap, timestamps_collapsed, trim_trailing_hallucination};
 
 use crate::audio::max_waveform_samples;
 use crate::model::{get_model_stats, Model};
@@ -294,7 +294,7 @@ pub fn waveform_to_text(
                 (text, tokens, Vec::new(), 0)
             }
             Model::Parakeet(m) => {
-                let chunk = decode_parakeet(m, bpe, mel, model_name, verbose);
+                let chunk = decode_parakeet(m, bpe, mel, model_name, language_code, verbose);
                 (chunk.text, chunk.tokens, chunk.frames, chunk.encoder_frames)
             }
             Model::Nemotron(m) => {
@@ -307,19 +307,60 @@ pub fn waveform_to_text(
             Model::Moonshine(_) => unreachable!("moonshine handled before mel loop"),
         };
 
-        let cleaned = if encoder_frames > 0 && token_frames.len() == new_tokens.len() {
+        let use_frames = encoder_frames > 0 && token_frames.len() == new_tokens.len();
+        let frame_ids = if use_frames {
             let window_samples = end.saturating_sub(start).max(1);
             let min_frame = if i == 0 {
                 0
             } else {
                 overlap.saturating_mul(encoder_frames) / window_samples
             };
-            let kept = drop_left_context_tokens(&new_tokens, &token_frames, min_frame);
-            clean_text(&parakeet_tokens_to_text(bpe, &kept))
+            drop_left_context_tokens(&new_tokens, &token_frames, min_frame)
+        } else {
+            Vec::new()
+        };
+        // v2 timestamped one whole window inside the 8 s overlap, and the frame
+        // drop deleted it (151 consecutive words). Fall back to the word stitch.
+        let collapsed = i > 0 && use_frames && timestamps_collapsed(&frame_ids, &new_tokens);
+        let mut cleaned = if use_frames && !collapsed {
+            clean_text(&parakeet_tokens_to_text(bpe, &frame_ids))
         } else {
             clean_text(&new_text)
         };
-        if encoder_frames > 0 {
+        // A 60 s window that decodes blank loses ~50 s. One split into halves
+        // covers that span at a length v2 already transcribes (single utterances
+        // are well under 30 s). v3's good windows are non-empty and skip this.
+        let mut recovered = false;
+        if cleaned.trim().is_empty()
+            && end.saturating_sub(start) > sample_rate.saturating_mul(25)
+            && matches!(model, Model::Parakeet(_))
+        {
+            let mid = start + (end - start) / 2;
+            let mut joined = String::new();
+            for (a, b) in [(start, mid), (mid, end)] {
+                let mut half = slice_to_mel(&waveform, a, b, &processor, &device);
+                if let (Some(m), Some(s)) = (&mean, &std) {
+                    half = (half - m.clone().unsqueeze()) / s.clone().unsqueeze();
+                }
+                let text = if let Model::Parakeet(m) = model {
+                    clean_text(&decode_parakeet(m, bpe, half, model_name, language_code, verbose).text)
+                } else {
+                    String::new()
+                };
+                let piece = text.trim();
+                if !piece.is_empty() {
+                    if !joined.is_empty() {
+                        joined.push(' ');
+                    }
+                    joined.push_str(piece);
+                }
+            }
+            if !joined.is_empty() {
+                cleaned = joined;
+                recovered = true;
+            }
+        }
+        if use_frames && !collapsed && !recovered {
             let piece = cleaned.trim();
             if !piece.is_empty() {
                 if !accumulated_text.is_empty() {

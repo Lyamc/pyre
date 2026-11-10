@@ -114,6 +114,14 @@ pub fn clean_text(text: &str) -> String {
 /// The previous window already covers that audio. Keeping both copies inserted
 /// the overlap (Nemotron's extra words). Matching words in the string and
 /// deleting them also ate real words when the boundary text did not line up.
+/// Frame timestamps collapsed into the overlap when a long window keeps less than
+/// half of its tokens and at least a dozen were thrown away. v2 did this on one
+/// 60 s window of the 6-minute clip (151 reference words, all timestamped in the
+/// left context and then deleted). The word stitch is the fallback for that window.
+pub fn timestamps_collapsed(kept: &[usize], all: &[usize]) -> bool {
+    all.len() >= 12 && kept.len() * 2 < all.len()
+}
+
 pub fn drop_left_context_tokens(ids: &[usize], frames: &[usize], min_frame: usize) -> Vec<usize> {
     if frames.len() != ids.len() || min_frame == 0 {
         return ids.to_vec();
@@ -179,7 +187,7 @@ pub fn find_chunk_overlap(prev_tokens: &[usize], curr_tokens: &[usize], max_n_of
 
 #[cfg(test)]
 mod tests {
-    use super::{append_without_word_overlap, drop_left_context_tokens, trim_trailing_hallucination};
+    use super::{append_without_word_overlap, drop_left_context_tokens, timestamps_collapsed, trim_trailing_hallucination};
 
     #[test]
     fn later_window_drops_only_the_left_context_frames() {
@@ -187,6 +195,8 @@ mod tests {
         let frames = [1, 4, 9, 12];
         assert_eq!(drop_left_context_tokens(&ids, &frames, 8), vec![3, 4]);
         assert_eq!(drop_left_context_tokens(&ids, &frames, 0), vec![1, 2, 3, 4]);
+        assert!(timestamps_collapsed(&[1], &[0; 20]));
+        assert!(!timestamps_collapsed(&[1, 2, 3, 4, 5, 6, 7, 8], &[0; 12]));
     }
 
     #[test]

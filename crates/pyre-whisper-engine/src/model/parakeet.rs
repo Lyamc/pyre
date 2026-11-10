@@ -171,6 +171,8 @@ impl Parakeet {
         durations: &[usize],
         max_symbols: usize,
         start_token_id: usize,
+        prompt: &[usize],
+        control: &[bool],
         verbose: bool,
     ) -> (Vec<(usize, usize)>, usize) {
         let decoder = match &self.decoder {
@@ -192,7 +194,15 @@ impl Parakeet {
 
         let mut frame_idx = 0usize;
         // HF `decoder_start_token_id` is the blank (8192 on v3). Pad (2) is not a start token.
+        // A v3 prompt (context + nopnc + language) is stepped into the LSTM first. The loop
+        // then embeds only the last prompt id, so it is not applied twice.
         let mut current_token = start_token_id;
+        if let Some((last, earlier)) = prompt.split_last() {
+            for &tok in earlier {
+                let _ = decoder.forward_step(tok, blank_token_id, &mut cache, true);
+            }
+            current_token = *last;
+        }
         let mut decoded = Vec::new();
         let mut steps = 0usize;
         let mut symbols_at_frame = 0usize;
@@ -212,14 +222,12 @@ impl Parakeet {
             let logits = self.joint_step(enc_frame, dec_frame);
             let logit_vec = logits.into_data().to_vec::<f32>().unwrap();
 
-            let mut best_token = 0usize;
-            let mut best_token_score = f32::NEG_INFINITY;
-            for (i, &v) in logit_vec.iter().take(vocab_size).enumerate() {
-                if v > best_token_score {
-                    best_token_score = v;
-                    best_token = i;
-                }
-            }
+            let best_token = crate::transcribe::decode::parakeet::best_tdt_token(
+                &logit_vec,
+                vocab_size,
+                blank_token_id,
+                control,
+            );
 
             let n_dur = if durations.is_empty() { 0 } else { durations.len() };
             let mut dur_index = 0usize;

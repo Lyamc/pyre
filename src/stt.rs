@@ -140,6 +140,15 @@ pub(crate) struct Req {
 
 fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
 
+/// A gated model or a gated long clip is a bad request, not an engine failure.
+fn stt_error_status(msg: &str) -> StatusCode {
+    if msg.contains("experimental and off by default") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// Formats: OpenAI's `json`/`text`/`srt`/`vtt`/`verbose_json`, plus whisburn's own renderings
 /// `txt` (timestamped lines when timestamps are on) and `whisburn_json` (whisburn's result JSON).
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
@@ -239,7 +248,10 @@ pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bo
             tracing::info!("stt {id}: {dur:.2}s audio in {secs:.2}s ({:.1}x realtime)", dur / secs.max(1e-6));
             if stream { render_stream(&r, dur, translate, routing.as_ref()) } else { render(&r, &fmt, dur, translate, opts, routing.as_ref()) }
         }
-        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Ok(Err(e)) => {
+            let msg = format!("{e:#}");
+            err(stt_error_status(&msg), msg)
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -738,5 +750,15 @@ mod map_ref_tests {
         let (name, explicit) = result.unwrap();
         assert_eq!(name, "base");
         assert!(explicit.is_none(), "registry name was treated as {explicit:?}");
+    }
+
+    #[test]
+    fn long_audio_refusal_is_a_bad_request() {
+        let msg = "long audio (365s) on parakeet-tdt-0.6b-v2 is experimental and off by default.";
+        assert_eq!(super::stt_error_status(msg), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::stt_error_status("stt engine panic: reshape"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
