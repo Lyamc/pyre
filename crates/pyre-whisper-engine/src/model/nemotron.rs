@@ -17,23 +17,6 @@ use burn::tensor::{Tensor, TensorData};
 use crate::model::conformer::FeedForwardModule;
 use crate::model::parakeet_decoder::{ParakeetDecoder, ParakeetDecoderCache, ParakeetDecoderConfig};
 
-/// Mel frames of leading silence so the encoder grows by at least `left` frames.
-///
-/// `left` is the attention left context (sliding window minus the current frame).
-/// The causal stack is not exactly 8×, so the pad grows until the frame count does.
-pub fn mel_frames_for_left_context(mel_frames: usize, left: usize, kernel: usize) -> usize {
-    if left == 0 {
-        return 0;
-    }
-    let base = nemotron_subsampled_frames(mel_frames, kernel, 2, 3);
-    let mut pad = left.saturating_mul(8);
-    let cap = left.saturating_mul(16).max(pad);
-    while nemotron_subsampled_frames(mel_frames + pad, kernel, 2, 3).saturating_sub(base) < left && pad < cap {
-        pad += 8;
-    }
-    pad
-}
-
 /// Time frames after `n_conv` causal stride-2 convolutions. Offline pad is `(k-1, stride-1)`.
 pub fn nemotron_subsampled_frames(mel_frames: usize, kernel: usize, stride: usize, n_conv: usize) -> usize {
     let mut len = mel_frames;
@@ -439,27 +422,13 @@ impl NemotronAsr {
     /// Greedy RNN-T. Advance one frame on blank, or after `max_symbols` non-blanks.
     /// Token ids, the encoder frame each token was emitted on, and the valid frame count.
     ///
-    /// The mel is padded on the left by the attention left context (70 frames, about
-    /// 5.6 s) before the encoder, and those frames are sliced off before the decoder.
-    /// The first speech frame can then attend to a full left window. Without that,
-    /// chunk 0 only sees itself, and utterance starts come out substituted
-    /// ("We as a bondage…") or a short phrase collapses.
+    /// No extra left-context silence. Padding ~5.6 s and then slicing it off doubled the
+    /// error (LDC 27.3% → 63.6%) and dropped the first 5–15 words. The chunk mask already
+    /// gives frame 0 only its own chunk, which is how this checkpoint was trained.
     pub fn decode_rnnt(&self, mel: Tensor<3>, blank: usize, vocab: usize, max_symbols: usize) -> (Vec<usize>, Vec<usize>, usize) {
-        let [_, n_mels, mel_t] = mel.dims();
-        let left = self.sliding_window.saturating_sub(1);
-        let mel_pad = mel_frames_for_left_context(mel_t, left, self.sub_kernel);
-        let enc_all = if mel_pad == 0 {
-            self.encode(mel.clone())
-        } else {
-            let zeros = Tensor::<3>::zeros([1, n_mels, mel_pad], &mel.device());
-            self.encode(Tensor::cat(vec![zeros, mel.clone()], 2))
-        };
-        let shift = nemotron_subsampled_frames(mel_t + mel_pad, self.sub_kernel, 2, 3)
-            .saturating_sub(nemotron_subsampled_frames(mel_t, self.sub_kernel, 2, 3));
-        let [_, frames_all, joint] = enc_all.dims();
-        let shift = shift.min(frames_all.saturating_sub(1));
-        let enc = enc_all.slice([0..1, shift..frames_all, 0..joint]);
-        let frames = enc.dims()[1];
+        let enc = self.encode(mel.clone());
+        let [_, frames, joint] = enc.dims();
+        let [_, _, mel_t] = mel.dims();
         let valid = nemotron_subsampled_frames(mel_t, self.sub_kernel, 2, 3).min(frames);
         let device = enc.device();
         let mut cache = ParakeetDecoderCache::new(&device, self.decoder.lstm.layers.len(), self.decoder.hidden_size());
@@ -535,14 +504,6 @@ mod tests {
 
     fn emb_len_ok(v: &[f32]) -> bool {
         v.len() == 3 * 8
-    }
-
-    #[test]
-    fn left_context_pad_adds_at_least_seventy_encoder_frames() {
-        let pad = mel_frames_for_left_context(400, 70, 3);
-        let base = nemotron_subsampled_frames(400, 3, 2, 3);
-        let grown = nemotron_subsampled_frames(400 + pad, 3, 2, 3);
-        assert!(grown >= base + 70, "pad {pad} grew {} frames", grown - base);
     }
 
     #[test]
