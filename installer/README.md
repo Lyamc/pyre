@@ -1,5 +1,9 @@
 # pyre Windows installer (MSI, WiX v5)
 
+The day-to-day launch path is the repo-root `pyre.ps1`, which calls `pyre-launch.ps1`. You do not need an MSI for that. See the repository README. The MSI, tray, and Start-menu shortcuts below are what `build-installer.ps1` packages; this tree does not run the installer.
+
+`pyre-launch.ps1` also accepts `-Model`, `-Quant` (sets `PYRE_QN_QUANT`, default in a new config is `IQ3_S`), `-Save`, `-Port`, `-Foreground`, and `-Watch` (restart after a crash; exit 87 or `-Stop` does not restart). From a checkout it runs `target\release\pyre.exe` or `target\x86_64-pc-windows-msvc\release\pyre.exe` and keeps config under `%LOCALAPPDATA%\pyre\config.toml`. An install (pyre.exe beside the script) still uses `%ProgramData%\pyre\config.toml`.
+
 ```powershell
 # Exes must already be built via C:\Temp\qnx\build.ps1: once in the repo root (pyre) and once in gui\ (pyre-gui, own workspace).
 # tray: cd installer\tray; & C:\Temp\qnx\build.ps1   (own workspace; RUSTFLAGS=-C target-feature=+crt-static optional)
@@ -44,8 +48,8 @@ Start-menu entries: Dashboard, Web Chat, Start/Stop server, Model Setup, Edit co
 - **Top-level keys** (`models_dir`, `offline`, `search_order`, `spec`, `route_prior`) are read by pyre itself.
 - **`[serve]`** is mapped by `pyre-launch.ps1` to flags: `--host --port -m -b -c -n --image-model --stt-model --tts-model --vram-reserve --gpu-util-max`.
   It also sets these env vars: `PYRE_QN_FAST`, `PYRE_VRAM_FLOOR_MB`, `PYRE_API_KEY`, `PYRE_METRICS_BIND`, `PYRE_METRICS_TOKEN`, `PYRE_LOG_FILE`, `PYRE_INSTANCE`.
-  `-b` is only passed when `backend` is set.
-- **`[env]`** passes any other variable through.
+  `-b` is only passed when `backend` is set. Empty means pyre's own default, which is `cuda`.
+- **`[env]`** passes any other variable through. A new config sets `PYRE_QN_QUANT` to `IQ3_S`. Existing `config.toml` files are not rewritten.
 
 To see the resolved command line without starting anything, run `pyre-launch.ps1 -DryRun`.
 
@@ -53,7 +57,7 @@ To see the resolved command line without starting anything, run `pyre-launch.ps1
 If `[serve] model` is empty, the launcher opens `pyre-firstrun.ps1`, which offers three choices:
 1. Download the IQ2_XS shards of `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` plus the tokenizer from `Qwen/Qwen3.8-Flash-Next` into `models_dir`
    (curl, resumable; set `HF_TOKEN` for gated repos).
-2. Use an existing folder, `.gguf` file, store name, or HF repo id.
+2. Use an existing folder (GGUF or split shards, for example an IQ3_S directory), a `.gguf` file, a store name, or an HF repo id.
 3. Skip.
 
 ## Background / service
