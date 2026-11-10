@@ -129,6 +129,8 @@ pub(crate) struct Req {
     pub diarize: bool, pub attribution: String,
     /// When set via jobs API: true = translations endpoint behaviour.
     pub translate_task: bool,
+    /// Filled by `apply_route` so the client can see which model served the request.
+    pub routing: Option<serde_json::Value>,
 }
 
 fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") }
@@ -138,7 +140,7 @@ fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str()
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
 pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false };
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false, routing: None };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
@@ -189,9 +191,27 @@ fn resolve_stt(app: &crate::registry::App, name: Option<&str>) -> Result<std::sy
     app.find(crate::registry::Kind::Stt, name)
 }
 
+fn apply_route(app: &crate::registry::App, q: &mut Req, translate: bool) -> Result<(), String> {
+    let loaded: Vec<String> = app.loaded().iter().filter(|m| m.kind == crate::registry::Kind::Stt).map(|m| m.id.clone()).collect();
+    let requested = q.model.clone().or_else(|| loaded.first().cloned()).unwrap_or_else(|| "base".into());
+    match crate::speech_caps::route(&requested, &loaded, q.language.as_deref(), translate || q.translate_task) {
+        Ok(d) => {
+            q.model = Some(d.served.clone());
+            q.routing = Some(crate::speech_caps::decision_json(&d));
+            if d.redirected {
+                tracing::info!("stt route: {}", d.reason);
+            }
+            Ok(())
+        }
+        Err(msg) => Err(msg),
+    }
+}
+
 pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bool) -> Response {
     use crate::server::err;
     let mut q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
+    if let Err(msg) = apply_route(&app, &mut q, translate) { return err(StatusCode::BAD_REQUEST, msg); }
+    let routing = q.routing.clone();
     let m = match resolve_stt(&app, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch") };
     if !FORMATS.contains(&q.format.as_str()) {
@@ -210,7 +230,7 @@ pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bo
     match res {
         Ok(Ok((r, dur, secs, fmt))) => {
             tracing::info!("stt {id}: {dur:.2}s audio in {secs:.2}s ({:.1}x realtime)", dur / secs.max(1e-6));
-            if stream { render_stream(&r, dur, translate) } else { render(&r, &fmt, dur, translate, opts) }
+            if stream { render_stream(&r, dur, translate, routing.as_ref()) } else { render(&r, &fmt, dur, translate, opts, routing.as_ref()) }
         }
         Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -222,9 +242,9 @@ fn run(_: &SttModel, _: &Req, _: bool) -> Result<(Transcript, f64, f64, String)>
 #[cfg(not(feature = "stt"))]
 struct Transcript;
 #[cfg(not(feature = "stt"))]
-fn render_stream(_: &Transcript, _: f64, _: bool) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
+fn render_stream(_: &Transcript, _: f64, _: bool, _: Option<&serde_json::Value>) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
 #[cfg(not(feature = "stt"))]
-fn render(_: &Transcript, _: &str, _: f64, _: bool, _: (Option<bool>, bool)) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
+fn render(_: &Transcript, _: &str, _: f64, _: bool, _: (Option<bool>, bool), _: Option<&serde_json::Value>) -> Response { crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt") }
 
 #[cfg(feature = "stt")]
 type Transcript = pyre_whisper_core::TranscriptResult;
@@ -320,6 +340,12 @@ pub(crate) fn run_job(
     };
     if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     let translate = translate || q.translate_task;
+    if let Err(msg) = apply_route(&app, &mut q, translate) {
+        bail!("{msg}");
+    }
+    if let Some(r) = &q.routing {
+        emit("resolving_model", json!({"message": r["reason"], "model": r["served"], "routing": r}));
+    }
     emit("resolving_model", json!({"message": "resolving speech model", "model": q.model}));
 
     // Exact match only — never silently fall back to another loaded STT (e.g. tiny → base).
@@ -420,10 +446,11 @@ pub(crate) fn run_job(
     if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     tracing::info!("stt {}: {:.2}s audio in {:.2}s ({:.1}x realtime)", m.id, dur, secs, dur / secs.max(1e-6));
     emit("rendering", json!({"message": format!("rendering {fmt}"), "duration_s": dur, "process_s": secs}));
-    let mut body = verbose(&r, dur, translate);
+    let mut body = verbose(&r, dur, translate, q.routing.as_ref());
     body["response_format"] = json!(fmt);
     body["seconds"] = json!(secs);
     body["model"] = json!(m.id);
+    if let Some(r) = &q.routing { body["routing"] = r.clone(); }
     Ok(body)
 }
 
@@ -630,8 +657,8 @@ fn diarized(tx: &dyn Fn(Vec<f32>) -> Result<Transcript>, samples: Vec<f32>, mode
 }
 
 #[cfg(feature = "stt")]
-fn verbose(r: &Transcript, dur: f64, translate: bool) -> serde_json::Value {
-    json!({
+fn verbose(r: &Transcript, dur: f64, translate: bool, routing: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut v = json!({
         "task": if translate { "translate" } else { "transcribe" },
         "language": r.language, "duration": dur, "text": r.text.trim(), "model": r.model,
         "segments": r.segments.iter().enumerate().map(|(i, s)| {
@@ -639,15 +666,17 @@ fn verbose(r: &Transcript, dur: f64, translate: bool) -> serde_json::Value {
             if let Some(sp) = &s.speaker { v["speaker"] = json!(sp); }
             v
         }).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(route) = routing { v["routing"] = route.clone(); }
+    v
 }
 
 /// `stream=true`: SSE with one `segment` event per segment, then `done` carrying verbose_json.
 /// (whisburn decodes a file in one call, so the events go out once decoding finishes.)
 #[cfg(feature = "stt")]
-fn render_stream(r: &Transcript, dur: f64, translate: bool) -> Response {
+fn render_stream(r: &Transcript, dur: f64, translate: bool, routing: Option<&serde_json::Value>) -> Response {
     use axum::response::sse::{Event, Sse};
-    let v = verbose(r, dur, translate);
+    let v = verbose(r, dur, translate, routing);
     let mut evs: Vec<Result<Event, std::convert::Infallible>> = v["segments"].as_array().unwrap().iter()
         .map(|s| Ok(Event::default().event("segment").data(s.to_string()))).collect();
     evs.push(Ok(Event::default().event("done").data(v.to_string())));
@@ -655,7 +684,7 @@ fn render_stream(r: &Transcript, dur: f64, translate: bool) -> Response {
 }
 
 #[cfg(feature = "stt")]
-fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool, (ts, sentences): (Option<bool>, bool)) -> Response {
+fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool, (ts, sentences): (Option<bool>, bool), routing: Option<&serde_json::Value>) -> Response {
     use pyre_whisper_core::OutputFormat as F;
     let text = r.text.trim().to_string();
     let whis = |f: F, ct: &'static str| match pyre_whisper_audio::encode_result_with_options(r, f, ts.unwrap_or(true), sentences) {
@@ -670,7 +699,12 @@ fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool, (ts, sentences):
         "text" => (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], text + "\n").into_response(),
         "srt" => (StatusCode::OK, [("content-type", "application/x-subrip")], pyre_whisper_audio::format_srt(&r.segments, false)).into_response(),
         "vtt" => (StatusCode::OK, [("content-type", "text/vtt")], pyre_whisper_audio::format_vtt(&r.segments, false)).into_response(),
-        "verbose_json" => Json(verbose(r, dur, translate)).into_response(),
+        "verbose_json" => Json(verbose(r, dur, translate, routing)).into_response(),
+        "json" => {
+            let mut v = json!({"text": text});
+            if let Some(route) = routing { v["routing"] = route.clone(); }
+            Json(v).into_response()
+        }
         _ => Json(json!({"text": text})).into_response(),
     }
 }

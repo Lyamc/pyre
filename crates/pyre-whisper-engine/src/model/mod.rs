@@ -8,6 +8,8 @@ pub mod whisper;
 pub mod conformer;
 pub mod parakeet;
 pub mod parakeet_decoder;
+pub mod nemotron;
+pub mod whisper_host;
 pub mod tone;
 pub mod moonshine;
 pub mod qwen3;
@@ -50,6 +52,7 @@ pub enum ModelConfig {
     Qwen3(qwen3::Qwen3ASRConfig),
     VibeVoice(vibevoice::VibeVoiceASRConfig),
     Moonshine(moonshine::MoonshineASRConfig),
+    Nemotron(nemotron::NemotronConfig),
 }
 
 impl ModelConfig {
@@ -61,6 +64,7 @@ impl ModelConfig {
             ModelConfig::Qwen3(config) => Model::Qwen3(config.init(device)),
             ModelConfig::VibeVoice(config) => Model::VibeVoice(config.init(device)),
             ModelConfig::Moonshine(config) => Model::Moonshine(config.init(device)),
+            ModelConfig::Nemotron(config) => Model::Nemotron(config.init(device)),
         }
     }
 }
@@ -73,6 +77,7 @@ pub enum Model {
     Qwen3(qwen3::Qwen3ASR),
     VibeVoice(vibevoice::VibeVoiceASR),
     Moonshine(moonshine::MoonshineASR),
+    Nemotron(nemotron::NemotronAsr),
 }
 
 impl Model {
@@ -84,6 +89,7 @@ impl Model {
             Model::Qwen3(m) => m.encoder_ctx_size(),
             Model::VibeVoice(m) => m.encoder_ctx_size(),
             Model::Moonshine(m) => m.encoder_ctx_size(),
+            Model::Nemotron(m) => m.encoder_ctx_size(),
         }
     }
 
@@ -95,6 +101,7 @@ impl Model {
             Model::Qwen3(m) => m.encoder_mel_size(),
             Model::VibeVoice(m) => m.encoder_mel_size(),
             Model::Moonshine(m) => m.encoder_mel_size(),
+            Model::Nemotron(m) => m.encoder_mel_size(),
         }
     }
 }

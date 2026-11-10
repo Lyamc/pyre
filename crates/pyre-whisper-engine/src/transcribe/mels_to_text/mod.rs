@@ -80,7 +80,12 @@ pub fn mels_to_text(
         )
     };
 
-    let encoder_output = whisper.forward_encoder(mels);
+    let encode_started = std::time::Instant::now();
+    let encoder_output = match crate::model::whisper_host::try_encode(&whisper.encoder, mels.clone()) {
+        Some(hidden) => hidden,
+        None => whisper.forward_encoder(mels),
+    };
+    let encode_secs = encode_started.elapsed().as_secs_f64();
     let end_token = end_token(bpe);
     let initial_tokens_vec = build_initial_tokens(bpe, lang, decode_task, model_name, include_timestamps);
     let prompt_len = initial_tokens_vec.len();
@@ -96,6 +101,7 @@ pub fn mels_to_text(
 
     let max_depth = max_depth.min(whisper.decoder_ctx_size() - initial_seq.len());
     let finished = |toks: &[BeamSearchToken]| beamsearch_is_finished(toks, end_token);
+    let decode_started = std::time::Instant::now();
     let tokens = match super::pass::current().decoder {
         DecoderKind::Eager => eager_beam(
             whisper,
@@ -125,6 +131,13 @@ pub fn mels_to_text(
             max_depth,
         ),
     };
+
+    if std::env::var("PYRE_STT_PROFILE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "profile encode={encode_secs:.3}s decode={:.3}s",
+            decode_started.elapsed().as_secs_f64()
+        );
+    }
 
     let text_tokens: Vec<usize> = tokens
         .get(prompt_len..)

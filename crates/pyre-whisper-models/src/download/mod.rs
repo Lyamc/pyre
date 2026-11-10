@@ -19,7 +19,8 @@ use std::path::PathBuf;
 use pyre_whisper_engine::model::registry::find_model;
 
 use crate::convert::{
-    is_moonshine_model, is_parakeet_model, is_qwen3_model, is_tone_model, is_vibevoice_model,
+    is_moonshine_model, is_nemotron_asr_model, is_parakeet_model, is_qwen3_model, is_tone_model,
+    is_vibevoice_model,
     is_whisper_model, needs_reconversion_for,
 };
 use crate::paths::{has_burn_bundle, model_dir, models_dir, resolve_model_dir};
@@ -125,7 +126,7 @@ pub fn download_model(name: &str, options: &DownloadOptions) -> anyhow::Result<P
 
     if is_whisper_model(name) {
         download_whisper_hf(&api, &source, &dir, name, options)?;
-    } else if is_parakeet_model(name) {
+    } else if is_parakeet_model(name) || is_nemotron_asr_model(name) {
         download_parakeet_hf(&api, &source, &dir, name, options)?;
     } else if is_vibevoice_model(name) {
         download_vibevoice_hf(&api, &source, &dir, name, options)?;

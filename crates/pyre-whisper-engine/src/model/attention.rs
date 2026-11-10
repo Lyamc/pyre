@@ -256,9 +256,28 @@ pub fn qkv_attention(
     out_linear: &nn::Linear,
 ) -> Tensor<3> {
     let [n_batch, n_qctx, n_state] = q.dims();
-    let [_, n_ctx, _] = k.dims();
+    let [k_batch, n_ctx, _] = k.dims();
     let scale = (n_state as f64 / n_head as f64).powf(-0.5);
     let n_hstate = n_state / n_head;
+
+    // One new token against a shared encoder K/V: put heads in front so the
+    // matmul is [H, B, 1, D] @ [H, 1, D, T], the skinny GEMV shape.
+    if n_qctx == 1 && k_batch == 1 && n_batch > 1 {
+        let q = q.reshape([n_batch, 1, n_head, n_hstate]).swap_dims(1, 2).swap_dims(0, 1) * scale;
+        let k = k
+            .reshape([1, n_ctx, n_head, n_hstate])
+            .swap_dims(1, 2)
+            .swap_dims(2, 3)
+            .swap_dims(0, 1);
+        let v = v
+            .reshape([1, n_ctx, n_head, n_hstate])
+            .swap_dims(1, 2)
+            .swap_dims(0, 1);
+        let qk = q.matmul(k);
+        let w = softmax(qk, 3);
+        let context = w.matmul(v).swap_dims(0, 1).reshape([n_batch, 1, n_state]);
+        return out_linear.forward(context);
+    }
 
     let q = q.reshape([n_batch, n_qctx, n_head, n_hstate]).swap_dims(1, 2) * scale;
     let k = k.reshape([n_batch, n_ctx, n_head, n_hstate]).swap_dims(1, 2).swap_dims(2, 3);

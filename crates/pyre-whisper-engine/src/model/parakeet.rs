@@ -169,7 +169,7 @@ impl Parakeet {
         vocab_size: usize,
         duration_start: usize,
         num_durations: usize,
-        pad_token_id: usize,
+        start_token_id: usize,
         verbose: bool,
     ) -> Vec<usize> {
         let decoder = match &self.decoder {
@@ -190,15 +190,16 @@ impl Parakeet {
         );
 
         let mut frame_idx = 0usize;
-        // HF v3 starts at pad_token_id=2; NeMo v2 uses blank_as_pad so this is blank.
-        let mut current_token = pad_token_id;
+        // HF `decoder_start_token_id` is the blank (8192 on v3). Pad (2) is not a start token.
+        let mut current_token = start_token_id;
         let mut decoded = Vec::new();
         let mut steps = 0usize;
         // TDT stops when the frame pointer exhausts the encoder (no RNN-T max_symbols guard).
         let max_steps = valid_frames * 64;
 
         while frame_idx < valid_frames && steps < max_steps {
-            let enc_frame = enc.clone().slice([0..1, frame_idx..frame_idx + 1, 0..640])
+            let joint = enc.dims()[2];
+            let enc_frame = enc.clone().slice([0..1, frame_idx..frame_idx + 1, 0..joint])
                  .squeeze_dim::<2>(1);
             let update_decoder = current_token != blank_token_id;
             let dec_frame = decoder.forward_step(
@@ -258,6 +259,63 @@ impl Parakeet {
             steps += 1;
         }
 
+        decoded
+    }
+
+    /// RNN-T greedy used when the joint head has no duration bins (Nemotron-style, or a
+    /// Parakeet RNNT checkpoint). Advance one frame on blank or after `max_symbols` labels.
+    pub fn decode_rnnt_greedy(
+        &self,
+        mel: Tensor<3>,
+        blank_token_id: usize,
+        vocab_size: usize,
+        max_symbols: usize,
+        start_token_id: usize,
+    ) -> Vec<usize> {
+        let decoder = match &self.decoder {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let [_, _, mel_frames] = mel.dims();
+        let enc = self.encode(mel);
+        let [_, n_frames, joint] = enc.dims();
+        let valid = crate::audio::parakeet_subsampled_frames(mel_frames).min(n_frames);
+        let device = enc.device();
+        let mut cache = ParakeetDecoderCache::new(&device, decoder.lstm.layers.len(), decoder.hidden_size());
+        let mut frame = 0usize;
+        let mut symbols = 0usize;
+        let mut current = start_token_id;
+        let mut decoded = Vec::new();
+        let limit = valid.saturating_mul(max_symbols.max(1) + 1).max(1);
+        let mut steps = 0usize;
+        while frame < valid && steps < limit {
+            let enc_frame = enc.clone().slice([0..1, frame..frame + 1, 0..joint]).squeeze_dim::<2>(1);
+            let update = current != blank_token_id;
+            let dec = decoder.forward_step(current, blank_token_id, &mut cache, update);
+            let row = self.joint_step(enc_frame, dec).into_data().to_vec::<f32>().unwrap();
+            let mut best = 0usize;
+            let mut best_s = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().take(vocab_size).enumerate() {
+                if v > best_s {
+                    best_s = v;
+                    best = i;
+                }
+            }
+            if best == blank_token_id {
+                frame += 1;
+                symbols = 0;
+                current = blank_token_id;
+            } else {
+                decoded.push(best);
+                current = best;
+                symbols += 1;
+                if symbols >= max_symbols.max(1) {
+                    frame += 1;
+                    symbols = 0;
+                }
+            }
+            steps += 1;
+        }
         decoded
     }
 

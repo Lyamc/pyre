@@ -2,15 +2,20 @@ pub mod burn_mpk;
 pub mod dtype;
 pub mod npy;
 pub mod moonshine;
+pub mod nemo_archive;
 pub mod parakeet;
 pub mod qwen3;
 pub mod tone;
 pub mod vibevoice;
 pub mod whisper;
 
+use std::fs;
+
 pub use burn_mpk::save_model_from_npy;
+pub use nemo_archive::extract_nemo_to_hf;
 pub use parakeet::{
-    convert_parakeet_from_hf, is_parakeet_burn_ready, is_parakeet_model, ParakeetDecodeConfig,
+    convert_parakeet_from_hf, is_nemotron_asr_model, is_parakeet_burn_ready, is_parakeet_model,
+    ParakeetDecodeConfig,
 };
 pub use moonshine::{is_moonshine_model, prepare_moonshine_bundle};
 pub use qwen3::{is_qwen3_model, prepare_qwen3_bundle, Qwen3RuntimeConfig};
@@ -35,6 +40,10 @@ pub fn needs_reconversion_for(name: &str, model_dir: &std::path::Path) -> bool {
         moonshine::needs_moonshine_reconversion(model_dir)
     } else if tone::is_tone_model(name) {
         tone::needs_tone_reconversion(model_dir)
+    } else if parakeet::is_parakeet_model(name) || parakeet::is_nemotron_asr_model(name) {
+        fs::read_to_string(model_dir.join(".burn_version"))
+            .map(|v| v.trim() != "0.21.0")
+            .unwrap_or(true)
     } else {
         whisper::needs_reconversion(model_dir)
     }

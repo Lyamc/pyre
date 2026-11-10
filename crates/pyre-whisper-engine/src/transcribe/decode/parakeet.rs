@@ -13,10 +13,41 @@ struct ParakeetDecodeConfig {
     num_durations: usize,
     #[serde(default = "default_pad_token_id")]
     pad_token_id: usize,
+    #[serde(default = "default_max_symbols")]
+    max_symbols_per_step: usize,
+    #[serde(default)]
+    decoder_start_token_id: Option<usize>,
+}
+
+fn default_max_symbols() -> usize {
+    10
+}
+
+impl ParakeetDecodeConfig {
+    fn start_token(&self) -> usize {
+        // HF generation feeds the blank id. v3's pad id is 2 and is not the blank.
+        self.decoder_start_token_id.unwrap_or(self.blank_token_id)
+    }
 }
 
 fn default_pad_token_id() -> usize {
     2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_start_token_is_the_blank_not_the_pad() {
+        let cfg: ParakeetDecodeConfig = serde_json::from_str(
+            r#"{"blank_token_id":8192,"vocab_size":8193,"duration_start":8193,"num_durations":5,"pad_token_id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.start_token(), 8192);
+        assert_eq!(cfg.pad_token_id, 2);
+        assert_eq!(cfg.max_symbols_per_step, 10);
+    }
 }
 
 fn is_valid_parakeet_text_token(bpe: &Gpt2Tokenizer, token: usize, blank_token_id: usize) -> bool {
@@ -134,6 +165,8 @@ fn load_parakeet_decode_config(model_name: &str) -> ParakeetDecodeConfig {
             duration_start: 8193,
             num_durations: 5,
             pad_token_id: 2,
+            max_symbols_per_step: 10,
+            decoder_start_token_id: None,
         })
 }
 
@@ -188,6 +221,23 @@ fn count_token_classes(
     )
 }
 
+pub fn decode_nemotron(
+    model: &crate::model::nemotron::NemotronAsr,
+    bpe: &Gpt2Tokenizer,
+    mel: Tensor<3>,
+    model_name: &str,
+    _verbose: bool,
+) -> (String, Vec<usize>) {
+    let cfg = load_parakeet_decode_config(model_name);
+    let tokens = model.decode_rnnt(
+        mel,
+        cfg.blank_token_id,
+        cfg.vocab_size.max(1),
+        cfg.max_symbols_per_step.max(1),
+    );
+    finalize_parakeet_decode(bpe, &tokens, cfg.blank_token_id, model_name)
+}
+
 pub fn decode_parakeet(
     parakeet: &Parakeet,
     bpe: &Gpt2Tokenizer,
@@ -203,15 +253,25 @@ pub fn decode_parakeet(
     let decode_cfg = load_parakeet_decode_config(model_name);
 
     if parakeet.has_decoder() {
-        let decoded_tokens = parakeet.decode_tdt_greedy(
-            mel.clone(),
-            decode_cfg.blank_token_id,
-            decode_cfg.vocab_size,
-            decode_cfg.duration_start,
-            decode_cfg.num_durations,
-            decode_cfg.pad_token_id,
-            verbose,
-        );
+        let decoded_tokens = if decode_cfg.num_durations == 0 {
+            parakeet.decode_rnnt_greedy(
+                mel.clone(),
+                decode_cfg.blank_token_id,
+                decode_cfg.vocab_size,
+                decode_cfg.max_symbols_per_step.max(1),
+                decode_cfg.start_token(),
+            )
+        } else {
+            parakeet.decode_tdt_greedy(
+                mel.clone(),
+                decode_cfg.blank_token_id,
+                decode_cfg.vocab_size,
+                decode_cfg.duration_start,
+                decode_cfg.num_durations,
+                decode_cfg.start_token(),
+                verbose,
+            )
+        };
         if verbose {
             println!(
                 "DEBUG Parakeet TDT Decoded IDs: {:?}",

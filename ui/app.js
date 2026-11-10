@@ -868,7 +868,9 @@ async function refreshSttModels() {
     for (const m of (sttCatalog.models || [])) {
       const o = document.createElement("option");
       o.value = m.id;
+      const cap = (m.capabilities && m.capabilities.summary) || "";
       o.textContent = m.id + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
+      o.title = cap;
       o.dataset.present = m.present ? "1" : "0";
       sel.append(o);
     }
@@ -916,6 +918,7 @@ function paintSttResult(opts) {
     meta.classList.remove("hidden");
     const bits = [];
     if (sttState.model) bits.push("model " + sttState.model);
+    if (sttState.routing && sttState.routing.reason) bits.push(sttState.routing.reason);
     if (sttState.language) bits.push("language " + sttState.language);
     if (sttState.duration) bits.push(sttState.duration.toFixed(1) + "s audio");
     if (opts.elapsed) bits.push(opts.elapsed.toFixed(2) + "s wall");
@@ -1351,6 +1354,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
         sttState = {
           sourceName: f.name || "recording.webm",
           model: j.model || model,
+          routing: j.routing || null,
           language: j.language || "",
           duration: j.duration || 0,
           segments: segs,
@@ -1364,6 +1368,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
         paintSttResult({
           elapsed,
           footer: elapsed.toFixed(2) + " s" + (j.model ? ", model " + j.model : "") +
+            (j.routing && j.routing.redirected ? ", routed: " + j.routing.reason : "") +
             (segs.some(s => s.speaker) ? ", " + speakerIds().length + " speakers" : "") +
             (j.language ? ", language " + j.language : ""),
         });

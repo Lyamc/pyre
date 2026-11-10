@@ -158,6 +158,7 @@ pub fn waveform_to_text(
         Model::Qwen3(_) => unreachable!("qwen3 handled before mel loop"),
         Model::VibeVoice(m) => m.acoustic_connector.fc1.weight.device(),
         Model::Moonshine(_) => unreachable!("moonshine handled before mel loop"),
+        Model::Nemotron(m) => m.final_proj.weight.device(),
     };
 
     let n_waveform_samples_per_window = chunk_size_samples.unwrap_or(match model {
@@ -165,7 +166,7 @@ pub fn waveform_to_text(
         _ => model.encoder_ctx_size() * 160,
     });
 
-    let is_nemo = matches!(model, Model::Parakeet(_));
+    let is_nemo = matches!(model, Model::Parakeet(_) | Model::Nemotron(_));
     let n_mels = model.encoder_mel_size();
 
     if debug {
@@ -257,6 +258,7 @@ pub fn waveform_to_text(
                 model_name,
             )?,
             Model::Parakeet(m) => decode_parakeet(m, bpe, mel, model_name, verbose),
+            Model::Nemotron(m) => decode_nemotron(m, bpe, mel, model_name, verbose),
             Model::TONE(_) => unreachable!("t-one handled before mel loop"),
             Model::Qwen3(_) => unreachable!("qwen3 handled before mel loop"),
             Model::VibeVoice(_) => unreachable!("vibevoice handled before mel loop"),

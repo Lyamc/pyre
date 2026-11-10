@@ -8,6 +8,7 @@ use crate::model::conformer::*;
 use crate::model::load::helpers::*;
 use crate::model::load::whisper::*;
 use crate::model::load::parakeet::*;
+use crate::model::load::nemotron::load_nemotron;
 use crate::model::load::qwen3::load_qwen3_model;
 use crate::model::load::vibevoice::load_vibevoice_model;
 use crate::token::Gpt2Tokenizer;
@@ -26,6 +27,11 @@ pub fn load_model_from_npy(
             "T-one uses safetensors, not npy. Load via `load_model(\"t-one\", ...)` after download."
                 .into(),
         );
+    } else if Path::new(&format!("{path}/encoder/kind.npy")).exists()
+        && load_usize("kind", &format!("{path}/encoder"), device).unwrap_or(1) == 2
+    {
+        let (nemotron, config) = load_nemotron(path, device)?;
+        Ok((Model::Nemotron(nemotron), ModelConfig::Nemotron(config)))
     } else if Path::new(&format!("{}/ctc_linear", path)).exists() {
         let parakeet = load_parakeet(path, device)?;
         

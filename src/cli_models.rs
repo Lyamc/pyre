@@ -15,13 +15,13 @@ pub fn list_json(ctx: &Ctx) -> serde_json::Value {
         rows.push(json!({"name": m.name, "alias": m.alias, "kind": m.kind.as_str(), "source": "store", "architecture": m.architecture,
             "size": e.size(), "location": &dir, "storage": links.into_iter().collect::<Vec<_>>().join("+"),
             "revision": m.source_revision, "repo": m.source_repo,
-            "capabilities": crate::capabilities::Capabilities::for_model(m.kind, &dir).to_value()}));
+            "capabilities": crate::capabilities::Capabilities::for_model(m.kind, &dir).to_value_for(&m.name)}));
     }
     for c in hfcache::list(&ctx.hf_cache) {
         let (kind, arch) = detect(&c.path);
         rows.push(json!({"name": c.repo, "alias": null, "kind": kind.as_str(), "source": "hf-cache", "architecture": arch,
             "size": c.size, "location": c.path, "storage": format!("shared ({})", c.mode), "revision": c.revision, "refs": c.refs, "repo": c.repo,
-            "capabilities": crate::capabilities::Capabilities::for_model(kind, &c.path).to_value()}));
+            "capabilities": crate::capabilities::Capabilities::for_model(kind, &c.path).to_value_for(&c.repo)}));
     }
     json!({"store_root": ctx.store.root, "hf_cache": ctx.hf_cache, "models": rows})
 }

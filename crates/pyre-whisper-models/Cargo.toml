@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 pyre-whisper-core = { workspace = true }
 pyre-whisper-engine = { workspace = true }
-burn = { workspace = true }
+burn = { workspace = true, features = ["flex"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -22,6 +22,8 @@ tokio = { workspace = true }
 tokenizers = { workspace = true }
 safetensors = { workspace = true }
 half = { workspace = true }
+pytorch-reader = { git = "https://github.com/Lyamc/burn", rev = "4b9af57ff044b0e3157b985361a4c6f2004f3ae7" }
+tar = "0.4"
 
 [features]
 cpu = ["burn/flex", "pyre-whisper-engine/cpu"]

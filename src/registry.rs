@@ -64,7 +64,7 @@ impl Loaded {
             "busy": self.busy(),
             "queued": self.queued(),
             "unloadable": true,
-            "capabilities": self.capabilities().to_value(),
+            "capabilities": self.capabilities().to_value_for(&self.id),
             "meta": self.meta(),
         })
     }

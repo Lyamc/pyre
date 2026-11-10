@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
-use burn::tensor::cast::ToElement;
 use burn::tensor::Tensor;
 use npy::NpyData;
 use pyre_whisper_engine::model::load_model;
@@ -19,11 +17,12 @@ fn parakeet_hf_mel_encode_parity() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let _ = std::env::set_current_dir(&root);
 
-    let mpk = root.join("models/parakeet-tdt-0.6b-v3/model.mpk");
+    let mpk = root.join("models/parakeet-tdt-0.6b-v3/model.bpk");
+    let legacy = root.join("models/parakeet-tdt-0.6b-v3/model.mpk");
     let hf_mel = root.join("temp_dump_parakeet-tdt-0.6b-v3/hf_mel_bct.npy");
     let hf_enc = root.join("temp_dump_parakeet-tdt-0.6b-v3/hf_enc_pooler.npy");
     let hf_pre = root.join("temp_dump_parakeet-tdt-0.6b-v3/hf_enc_preproj.npy");
-    if !mpk.exists() || !hf_mel.exists() || !hf_enc.exists() || !hf_pre.exists() {
+    if !(mpk.exists() || legacy.exists()) || !hf_mel.exists() || !hf_enc.exists() || !hf_pre.exists() {
         eprintln!("skip: missing parakeet mpk or HF reference npy");
         return;
     }
@@ -35,11 +34,13 @@ fn parakeet_hf_mel_encode_parity() {
     let n_mels = 128usize;
     let enc_frames = enc_vec.len() / 640;
 
-    let device = WgpuDevice::DefaultDevice;
-    let mel = Tensor::<Wgpu, 1>::from_floats(mel_vec.as_slice(), &device)
-        .reshape([1, n_mels, mel_frames]);
-    let (_, _, model) =
-        load_model::<Wgpu>("parakeet-tdt-0.6b-v3", &device, false).expect("load parakeet");
+    let device = pyre_whisper_engine::cli::get_device(&Some("cpu".into()));
+    let mel = Tensor::<1>::from_data(
+        burn::tensor::TensorData::new(mel_vec.clone(), [mel_vec.len()]),
+        &device,
+    )
+    .reshape([1, n_mels, mel_frames]);
+    let (_, _, model) = load_model("parakeet-tdt-0.6b-v3", &device, false).expect("load parakeet");
     let Model::Parakeet(parakeet) = model else {
         panic!("expected parakeet model");
     };
@@ -55,7 +56,6 @@ fn parakeet_hf_mel_encode_parity() {
                 .powf_scalar(2.0)
                 .sum()
                 .into_scalar()
-                .to_f32()
                 .sqrt()
         })
         .unwrap_or(0.0);
