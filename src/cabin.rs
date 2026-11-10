@@ -141,7 +141,7 @@ async fn workflows(State(app): S) -> Json<Value> {
     let (n, b) = crate::limits::leases();
     let comps = ["sd15","sd15-inpaint","lcm","openpose","tagger","esr","isnet","rife","segformer","triposr"];
     let components: Vec<Value> = comps.iter().map(|c| json!({"id": c, "present": crate::cabin_catalog::present(&app, c)})).collect();
-    let loaded: Vec<Value> = app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend})).collect();
+    let loaded: Vec<Value> = app.loaded().iter().filter(|m| m.kind != Kind::Llm).map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "capabilities": m.capabilities().to_value()})).collect();
     Json(json!({
         "workflows": w,
         "loaded": loaded,
@@ -192,7 +192,7 @@ async fn ensure_ep(State(app): S, Json(b): Json<Value>) -> Response {
         w => return err(StatusCode::BAD_REQUEST, format!("unknown model kind '{w}'")),
     };
     match r {
-        Ok(m) => Json(json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "seconds": t.elapsed().as_secs_f64(), "vram_free_mib": crate::limits::vram().map(|v| v.free >> 20)})).into_response(),
+        Ok(m) => Json(json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "capabilities": m.capabilities().to_value(), "seconds": t.elapsed().as_secs_f64(), "vram_free_mib": crate::limits::vram().map(|v| v.free >> 20)})).into_response(),
         Err(r) => r,
     }
 }

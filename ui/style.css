@@ -49,7 +49,8 @@ textarea{resize:vertical;width:100%}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
 td.loc{font-family:ui-monospace,monospace;font-size:11px;color:var(--muted);word-break:break-all;max-width:380px}
 .tag{display:inline-block;padding:1px 6px;border-radius:6px;font-size:11px;background:var(--panel2);border:1px solid var(--border)}
-.tag.llm{color:#7cc4ff}.tag.stt{color:#7dffb0}.tag.image{color:#ffb3f0}.tag.tts{color:#ffd27c}
+.tag.llm{color:#7cc4ff}.tag.stt{color:#7dffb0}.tag.image{color:#ffb3f0}.tag.tts{color:#ffd27c}.tag.tagger{color:#e5c07b}.tag.diar{color:#c9b6ff}
+.caps{white-space:normal}.caps .tag{margin:1px 3px 1px 0}
 .progress{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden;margin-top:8px}.progress div{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .2s}
 .out{background:var(--code);padding:10px;border-radius:8px;white-space:pre-wrap;min-height:40px;margin:8px 0 0}
 .logs{max-height:360px;overflow:auto;font-size:11px}

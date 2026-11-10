@@ -323,8 +323,9 @@ impl PyreGui {
         for (i, m) in loaded.iter().enumerate() {
             let id = m["id"].as_str().unwrap_or("").to_string();
             let id2 = id.clone();
+            let caps = m["capabilities"]["summary"].as_str().unwrap_or("");
             rows = rows.child(div().flex().gap(px(8.)).items_center().p(px(6.)).rounded_md().bg(rgb(PANEL))
-                .child(div().flex_1().child(format!("{}  [{}] on {}{}", id, m["kind"].as_str().unwrap_or(""), m["backend"].as_str().unwrap_or(""), if m["busy"].as_bool() == Some(true) { "  (busy)" } else { "" })))
+                .child(div().flex_1().child(format!("{}  [{}] on {}{}{}", id, m["kind"].as_str().unwrap_or(""), m["backend"].as_str().unwrap_or(""), if caps.is_empty() { String::new() } else { format!("  {caps}") }, if m["busy"].as_bool() == Some(true) { "  (busy)" } else { "" })))
                 .child(self.button(&format!("unload-{i}"), "Unload", false, cx, move |t| net::post(t.base(), "/api/models/unload", json!({"id": id2}), "unload", t.tx.clone()))));
         }
         let all = self.models["models"].as_array().cloned().unwrap_or_default();
@@ -334,8 +335,9 @@ impl PyreGui {
             let kind = m["kind"].as_str().unwrap_or("llm").to_string();
             let (n1, n2, k1) = (name.clone(), name.clone(), kind.clone());
             let alias = m["alias"].as_str().map(|a| format!("  alias={a}")).unwrap_or_default();
+            let caps = m["capabilities"]["summary"].as_str().unwrap_or("");
             rows = rows.child(div().flex().gap(px(8.)).items_center().p(px(6.)).rounded_md().bg(rgb(PANEL))
-                .child(div().flex_1().child(format!("{name}  [{kind}]  {}  {}{alias}", m["source"].as_str().unwrap_or(""), m["architecture"].as_str().unwrap_or(""))))
+                .child(div().flex_1().child(format!("{name}  [{kind}]  {}  {}{alias}{}", m["source"].as_str().unwrap_or(""), m["architecture"].as_str().unwrap_or(""), if caps.is_empty() { String::new() } else { format!("  {caps}") })))
                 .child(self.button(&format!("load-{i}"), "Load", true, cx, move |t| {
                     let kind: &'static str = match k1.as_str() { "image" => "image", "stt" => "stt", "tts" => "tts", _ => "llm" };
                     t.load_kind = kind; t.load_ref = n1.clone(); t.do_load();
@@ -423,7 +425,10 @@ impl Render for PyreGui {
             Page::Status => self.status_page(cx),
             Page::Dashboard => self.dashboard_page(cx),
         };
-        let loaded = self.status["models"].as_array().map(|a| a.iter().map(|m| format!("{} ({})", m["id"].as_str().unwrap_or(""), m["kind"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let loaded = self.status["models"].as_array().map(|a| a.iter().map(|m| {
+            let caps = m["capabilities"]["summary"].as_str().unwrap_or("");
+            format!("{} ({}){}", m["id"].as_str().unwrap_or(""), m["kind"].as_str().unwrap_or(""), if caps.is_empty() { String::new() } else { format!(" {caps}") })
+        }).collect::<Vec<_>>().join(", ")).unwrap_or_default();
         let mut log = div().flex().flex_col().text_xs().text_color(rgb(MUTED));
         for l in self.log.iter().rev().take(3) { log = log.child(l.clone()); }
         div()

@@ -48,6 +48,32 @@ fn finds_snapshot_via_refs_copy_mode() {
 }
 
 #[test]
+fn qwen4exp_gguf_detects_as_text_llm() {
+    let t = tmp();
+    let d = t.path().join("qn");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("model.gguf"), b"GGUF....qwen4exp....").unwrap();
+    assert_eq!(super::detect(&d).0, Kind::Llm);
+    assert_eq!(super::detect(&d).1, "qwen4exp");
+    let c = crate::capabilities::Capabilities::for_model(Kind::Llm, &d);
+    assert!(c.text_input && c.text_output && c.tools);
+    assert!(!c.embeddings && !c.image_input && !c.image_output && !c.audio_input && !c.audio_output && !c.diarization);
+}
+
+#[test]
+fn nemotron_diarizer_config_is_not_an_llm() {
+    let t = tmp();
+    let d = t.path().join("diar");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("config.json"), br#"{"num_hidden_layers":31,"audio_config":{"num_mel_bins":128},"head_config":{"num_speakers":8}}"#).unwrap();
+    let (k, a) = super::detect(&d);
+    assert_eq!(k, Kind::Unknown);
+    assert_eq!(a, "nemotron-diarization");
+    let c = crate::capabilities::Capabilities::for_model(k, &d);
+    assert!(c.audio_input && c.diarization && !c.text_output && !c.embeddings);
+}
+
+#[test]
 fn symlink_mode_resolves_to_blobs() {
     let t = tmp();
     if !fake_cache(t.path(), true) { eprintln!("symlinks not permitted here; skipping"); return; }
