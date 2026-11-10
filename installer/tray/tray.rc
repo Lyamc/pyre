@@ -1,0 +1,4 @@
+// 1 = app icon (first icon resource => Explorer/taskbar icon), 2/3 = tray state icons
+1 ICON "../assets/pyre.ico"
+2 ICON "../assets/pyre-starting.ico"
+3 ICON "../assets/pyre-stopped.ico"

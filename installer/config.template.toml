@@ -1,0 +1,46 @@
+# pyre configuration. Lives in %ProgramData%\pyre\config.toml (copied from config.template.toml on first launch).
+# NOT owned by the installer: upgrades and uninstall keep it (uninstall with PURGEDATA=1 to delete).
+# Read by pyre itself (PYRE_CONFIG points here; top-level keys) and by pyre-launch.ps1 ([serve] and [env]).
+# Use single quotes for Windows paths.
+
+# ---- top-level keys: parsed by pyre (src/store/store.rs ConfigFile) ----
+models_dir = 'C:\ProgramData\pyre\models'   # pyre model store (else PYRE_MODELS_DIR / %LOCALAPPDATA%\pyre\models)
+# offline = false        # never download (HF_HUB_OFFLINE=1 also works)
+# search_order = ["path", "store", "hf", "download"]
+# spec = 0               # qwen-next speculative draft length (0 = off)
+# route_prior = 0.0
+
+# ---- [serve]: mapped by pyre-launch.ps1 to `pyre serve` flags / env vars ----
+[serve]
+model = ''             # -m : alias, store name, HF repo id[@rev] or folder. Empty => first-run setup opens.
+image_model = ''       # --image-model
+stt_model = ''         # --stt-model   (e.g. openai/whisper-tiny.en)
+tts_model = ''         # --tts-model
+host = '127.0.0.1'     # --host  (bind). '0.0.0.0' = LAN; you must add a firewall rule yourself.
+port = 8099            # --port  (pyre's own default is 8080)
+backend = ''           # -b : cuda | wgpu | vulkan | cpu | ndarray. Empty = let pyre choose.
+ctx_size = 4096        # -c
+n_predict = 512        # -n
+fast = true            # --fast (env PYRE_QN_FAST); false = exact outputs
+vram_floor_mb = 1100   # env PYRE_VRAM_FLOOR_MB (0 = off)
+vram_reserve = ''      # --vram-reserve e.g. '1G' (empty = pyre default)
+gpu_util_max = 0       # --gpu-util-max percent (0 = pyre default 90)
+api_key = ''           # env PYRE_API_KEY (Bearer auth on the API). Keep secret.
+metrics_bind = ''      # env PYRE_METRICS_BIND e.g. '0.0.0.0:9099'
+metrics_token = ''     # env PYRE_METRICS_TOKEN (Bearer for /metrics, /api/metrics, /api/logs)
+log_file = 'C:\ProgramData\pyre\logs\pyre.jsonl'   # env PYRE_LOG_FILE ('off' disables)
+instance = ''          # env PYRE_INSTANCE (metrics label)
+extra_args = ''        # appended verbatim to `pyre serve`
+
+# ---- [env]: any extra environment variables passed to pyre, e.g. PYRE_QN_QUANT = 'IQ2_XS' ----
+[env]
+PYRE_QN_QUANT = 'IQ2_XS'
+# --- Need a pyre build newer than cf84f1d (int45+); older builds ignore them ---
+# PYRE_GPU_DUTY = '85'       # adaptive GPU duty cap in % (default 85; 'off'/0/100 = disabled; clamped 30-99). Paces each step so smoothed
+#                            # util stays under the target; target auto-drops 5 pts/5 s when hot (>=80 C), near power limit or saturated,
+#                            # to base-15 while another app uses the GPU, and recovers +1 pt/5 s after 30 s calm.
+# PYRE_GPU_DUTY_MIN = '50'   # floor for the auto-tuned duty target (default 50, clamped 20-95)
+# PYRE_VRAM_ADAPT = '1'      # adaptive expert cache (default 1, 0 = off): when free VRAM < floor+512 MiB, shrink the expert cache so free
+#                            # returns to floor+768 MiB (256 MiB steps); regrow (<=512 MiB at a time) after 30 s with free > floor+832 MiB.
+#                            # Under the floor the watcher shrinks first, then requests a graceful stop, then hard-exits.
+# PYRE_STOP_GRACE_S = '10'   # graceful stop: max seconds to wait for a step boundary before exiting (Stop shortcut also waits this +5 s)

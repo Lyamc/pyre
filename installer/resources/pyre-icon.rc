@@ -1,0 +1,5 @@
+// Embed the pyre icon into pyre.exe / pyre-gui.exe on their NEXT build (not applied yet).
+// Usage: add `embed-resource = "3"` to [build-dependencies] and in build.rs:
+//     embed_resource::compile("../installer/resources/pyre-icon.rc", embed_resource::NONE);   // path relative to the crate
+// (gui/ has its own build.rs: from gui/ use "../installer/resources/pyre-icon.rc"; .rc paths below are relative to this file)
+1 ICON "../assets/pyre.ico"

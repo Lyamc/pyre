@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- pyre MSI (WiX v5). Built by build-installer.ps1; pass -d StageDir=... -d Version=x.y.z -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="pyre" Manufacturer="Lyam Witherow" Version="$(var.Version)"
+           UpgradeCode="6B1E3C5A-2F4D-4E8B-9A7C-1D0F5E3B7A21" Scope="perMachine" Compressed="yes">
+    <!-- Major upgrade: old version removed after new files are laid down. User data lives in
+         %ProgramData%\pyre (never MSI-owned) so it survives upgrade and uninstall. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer pyre is already installed." Schedule="afterInstallExecute" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- CUDA is NOT required: pyre auto-selects cuda / wgpu / vulkan / cpu. Non-blocking driver notice only.
+         NVCUDA    = nvcuda.dll new enough for the bundled NVRTC (DriverMinVersion, set by build-installer.ps1 from -CudaMajor)
+         NVCUDAANY = any nvcuda.dll (i.e. an NVIDIA driver is installed). Old driver => notice on the finish page.
+         NVIDIA GPU with no driver at all is detected (PCI vendor 10DE) by pyre-firstrun.ps1, which shows the same notice. -->
+    <Property Id="NVCUDA">
+      <DirectorySearch Id="SysDir" Path="[System64Folder]" Depth="0">
+        <FileSearch Name="nvcuda.dll" MinVersion="$(var.DriverMinVersion)" />
+      </DirectorySearch>
+    </Property>
+    <Property Id="NVCUDAANY">
+      <DirectorySearch Id="SysDirAny" Path="[System64Folder]" Depth="0">
+        <FileSearch Name="nvcuda.dll" />
+      </DirectorySearch>
+    </Property>
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" Sequence="ui" Before="CostFinalize" Condition="NVCUDAANY AND NOT NVCUDA"
+                 Value="Note: your NVIDIA driver is older than pyre's CUDA path needs (driver $(var.DriverMinLabel)+). pyre still works (it falls back to Vulkan/wgpu or CPU), but for best speed update the driver: https://www.nvidia.com/Download/index.aspx" />
+
+    <!-- MSVC runtime (MSVCP140/VCRUNTIME140/_1) is deployed app-local next to pyre.exe; no VC++ redist prereq.
+         pyre-gui.exe is built with +crt-static. -->
+
+    <!-- Opt-in data purge on uninstall: msiexec /x pyre.msi PURGEDATA=1 (removes %ProgramData%\pyre incl. config,
+         logs and models stored there; models elsewhere / HF cache are never touched). -->
+    <SetProperty Id="PURGEDIR" Value="[CommonAppDataFolder]pyre\" Before="CostInitialize" Sequence="execute" Condition="PURGEDATA=1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="pyre" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MenuDir" Name="pyre" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Core" Directory="INSTALLFOLDER">
+      <Component Id="PyreExe" Bitness="always64">
+        <File Id="pyre.exe" Source="$(var.StageDir)\pyre.exe" KeyPath="yes" />
+        <Environment Id="PathAdd" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" />
+        <util:RemoveFolderEx On="uninstall" Property="PURGEDIR" />
+      </Component>
+      <Component Id="c_vcruntime140" Bitness="always64"><File Id="vcruntime140" Source="$(var.StageDir)\vcruntime140.dll" KeyPath="yes" /></Component>
+      <Component Id="c_vcruntime140_1" Bitness="always64"><File Id="vcruntime140_1" Source="$(var.StageDir)\vcruntime140_1.dll" KeyPath="yes" /></Component>
+      <Component Id="c_msvcp140" Bitness="always64"><File Id="msvcp140" Source="$(var.StageDir)\msvcp140.dll" KeyPath="yes" /></Component>
+      <Component Id="c_nvrtc" Bitness="always64"><File Id="nvrtc" Source="$(var.StageDir)\$(var.NvrtcDll)" KeyPath="yes" /></Component>
+      <Component Id="c_nvrtcbuiltins" Bitness="always64"><File Id="nvrtcbuiltins" Source="$(var.StageDir)\$(var.NvrtcBuiltinsDll)" KeyPath="yes" /></Component>
+      <Component Id="c_tray" Bitness="always64"><File Id="pyretray.exe" Source="$(var.StageDir)\pyre-tray.exe" KeyPath="yes" /></Component>
+      <Component Id="c_icon" Bitness="always64"><File Id="pyreico" Source="$(var.StageDir)\pyre.ico" KeyPath="yes" /></Component>
+      <Component Id="c_launch" Bitness="always64"><File Id="launch" Source="$(var.StageDir)\pyre-launch.ps1" KeyPath="yes" /></Component>
+      <Component Id="c_firstrun" Bitness="always64"><File Id="firstrun" Source="$(var.StageDir)\pyre-firstrun.ps1" KeyPath="yes" /></Component>
+      <Component Id="c_service" Bitness="always64"><File Id="service" Source="$(var.StageDir)\pyre-service.ps1" KeyPath="yes" /></Component>
+      <Component Id="c_cfgtemplate" Bitness="always64"><File Id="cfgtemplate" Source="$(var.StageDir)\config.template.toml" KeyPath="yes" /></Component>
+      <Component Id="c_notices" Bitness="always64"><File Id="notices" Source="$(var.StageDir)\THIRD_PARTY_NOTICES.txt" KeyPath="yes" /></Component>
+      <Component Id="c_manifest" Bitness="always64"><File Id="manifest" Source="$(var.StageDir)\MANIFEST.txt" KeyPath="yes" /></Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Gui" Directory="INSTALLFOLDER">
+      <Component Id="GuiExe" Bitness="always64">
+        <File Id="pyregui.exe" Source="$(var.StageDir)\pyre-gui.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <?define PS = "[System64Folder]WindowsPowerShell\v1.0\powershell.exe" ?>
+    <?define PSARGS = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;[INSTALLFOLDER]pyre-launch.ps1&quot;" ?>
+
+    <ComponentGroup Id="Shortcuts" Directory="MenuDir">
+      <Component Id="MenuShortcuts">
+        <Shortcut Id="scGui" Icon="pyre.ico" Name="pyre Dashboard" Description="Start pyre (if needed) and open the desktop dashboard"
+                  Target="$(var.PS)" Arguments="$(var.PSARGS) -Gui" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scTray" Icon="pyre.ico" Name="pyre Tray" Description="Notification-area icon: status, open, start/stop" Target="[INSTALLFOLDER]pyre-tray.exe" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scServe" Icon="pyre.ico" Name="Start pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS)" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scStop" Icon="pyre.ico" Name="Stop pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -Stop" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scWeb" Icon="pyre.ico" Name="pyre Web Chat" Target="$(var.PS)" Arguments="$(var.PSARGS) -Web" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scModels" Icon="pyre.ico" Name="pyre Model Setup" Target="$(var.PS)" Arguments="$(var.PSARGS) -FirstRun" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scCfg" Icon="pyre.ico" Name="Edit pyre config" Target="$(var.PS)" Arguments="$(var.PSARGS) -EditConfig" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="scUninst" Icon="pyre.ico" Name="Uninstall pyre" Target="[System64Folder]msiexec.exe" Arguments="/x [ProductCode]" />
+        <RemoveFolder Id="RmMenu" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\pyre" Name="menu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Optional: start the server hidden at user logon (tray-less background mode). Off by default. -->
+    <StandardDirectory Id="StartupFolder">
+      <Component Id="AutoStart">
+        <Shortcut Id="scAuto" Icon="pyre.ico" Name="pyre server" Target="$(var.PS)" Arguments="$(var.PSARGS) -NoFirstRun" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="Software\pyre" Name="autostart" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- Tray icon at logon (default ON). Starts only the tray, not the server. -->
+    <StandardDirectory Id="StartupFolder">
+      <Component Id="TrayAutoStart">
+        <Shortcut Id="scTrayAuto" Icon="pyre.ico" Name="pyre tray" Target="[INSTALLFOLDER]pyre-tray.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="Software\pyre" Name="trayautostart" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Icon Id="pyre.ico" SourceFile="$(var.StageDir)\pyre.ico" />
+    <Property Id="ARPPRODUCTICON" Value="pyre.ico" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Feature Id="Main" Title="pyre server" Description="pyre.exe, NVRTC runtime, launcher scripts, Start-menu entries." Level="1" AllowAbsent="no" ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentGroupRef Id="Core" />
+      <ComponentGroupRef Id="Shortcuts" />
+    </Feature>
+    <Feature Id="GuiFeature" Title="Desktop dashboard" Description="Native GPUI dashboard (pyre-gui.exe)." Level="1">
+      <ComponentGroupRef Id="Gui" />
+    </Feature>
+    <Feature Id="TrayAutoStartFeature" Title="Tray icon at logon" Description="Show the pyre notification-area icon at every logon (status, open, start/stop). Does not start the server." Level="1">
+      <ComponentRef Id="TrayAutoStart" />
+    </Feature>
+    <Feature Id="AutoStartFeature" Title="Start server at logon" Description="Run the pyre server hidden at every logon (uses %ProgramData%\pyre\config.toml)." Level="1000">
+      <ComponentRef Id="AutoStart" />
+    </Feature>
+
+    <!-- After install: optionally open first-run model setup -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Set up a model now (first-run)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction Id="RunFirstRun" Directory="INSTALLFOLDER" Impersonate="yes" Return="asyncNoWait"
+                  ExeCommand="&quot;$(var.PS)&quot; $(var.PSARGS) -FirstRun" />
+    <UI>
+      <ui:WixUI Id="WixUI_FeatureTree" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="RunFirstRun"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+  </Package>
+</Wix>
