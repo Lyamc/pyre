@@ -39,6 +39,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sentencepiece_keeps_prefixes_boundaries_and_bytes() {
+        assert!(keep_parakeet_piece("▁O"));
+        assert!(keep_parakeet_piece("▁"));
+        assert!(keep_parakeet_piece("<0xC3>"));
+        assert!(keep_parakeet_piece("'"));
+        assert!(!keep_parakeet_piece("<|en|>"));
+
+        assert_eq!(pieces_to_text(["▁O", "ther"]), "Other");
+        assert_eq!(pieces_to_text(["▁Not", "withstanding"]), "Notwithstanding");
+        assert_eq!(pieces_to_text(["▁C", "ome", "▁c", "ome"]), "Come come");
+        assert_eq!(pieces_to_text(["▁Sh", "e"]), "She");
+        assert_eq!(pieces_to_text(["▁", "the", "▁", "utter"]), "the utter");
+        assert_eq!(pieces_to_text(["▁the", "▁utter"]), "the utter");
+        assert_eq!(
+            pieces_to_text(["p", "<0xC3>", "<0xAA>", "cheur"]),
+            "pêcheur"
+        );
+        assert_eq!(pieces_to_text(["j", "'", "ai"]), "j'ai");
+        assert_eq!(pieces_to_text(["l", "l"]), "ll");
+        assert!(!is_garbage_parakeet_text("pêcheur"));
+    }
+
+    #[test]
     fn missing_start_token_is_the_blank_not_the_pad() {
         let cfg: ParakeetDecodeConfig = serde_json::from_str(
             r#"{"blank_token_id":8192,"vocab_size":8193,"duration_start":8193,"num_durations":5,"pad_token_id":2}"#,
@@ -50,33 +73,26 @@ mod tests {
     }
 }
 
-fn is_valid_parakeet_text_token(bpe: &Gpt2Tokenizer, token: usize, blank_token_id: usize) -> bool {
+/// SentencePiece pieces that are not blank and not Whisper-style specials.
+/// Short pieces (`▁O`, `e`), the word-boundary token `▁`, apostrophes, and
+/// byte-fallback (`<0xC3>`) are text. Dropping them turned "Other" into "ther",
+/// "She" into nothing, "pêcheur" into "pcheur", and "the utter" into "theutter".
+pub fn keep_parakeet_piece(piece: &str) -> bool {
+    if piece.is_empty() || piece.contains("spltoken") {
+        return false;
+    }
+    if piece.starts_with("<|") && piece.ends_with("|>") {
+        return false;
+    }
+    true
+}
+
+fn is_text_token(bpe: &Gpt2Tokenizer, token: usize, blank_token_id: usize) -> bool {
     if token >= blank_token_id {
         return false;
     }
-    bpe.id_to_token(token as u32).is_some_and(|s| {
-        !s.contains("spltoken")
-            && !s.starts_with("<|")
-            && s.chars().any(|c| c.is_ascii_alphabetic())
-    })
-}
-
-fn is_leading_garbage_token(bpe: &Gpt2Tokenizer, token: usize) -> bool {
     bpe.id_to_token(token as u32)
-        .map(|s| {
-            let letters: String = s.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-            !(letters.len() >= 3 || s.starts_with("▁And") || s.starts_with("And"))
-        })
-        .unwrap_or(true)
-}
-
-fn dedup_consecutive(tokens: impl IntoIterator<Item = usize>) -> Vec<usize> {
-    tokens.into_iter().fold(Vec::new(), |mut acc, t| {
-        if acc.last() != Some(&t) {
-            acc.push(t);
-        }
-        acc
-    })
+        .is_some_and(|s| keep_parakeet_piece(&s))
 }
 
 pub fn filter_parakeet_text_tokens(
@@ -84,43 +100,73 @@ pub fn filter_parakeet_text_tokens(
     blank_token_id: usize,
     bpe: &Gpt2Tokenizer,
 ) -> Vec<usize> {
-    let collapsed = dedup_consecutive(
-        tokens
-            .iter()
-            .copied()
-            .filter(|&t| is_valid_parakeet_text_token(bpe, t, blank_token_id)),
-    );
-
-    let skip = collapsed
+    // TDT/RNNT may emit the same piece twice ("ll"). CTC already collapsed repeats.
+    tokens
         .iter()
-        .take_while(|&&t| is_leading_garbage_token(bpe, t))
-        .count();
-    collapsed.into_iter().skip(skip).collect()
+        .copied()
+        .filter(|&t| is_text_token(bpe, t, blank_token_id))
+        .collect()
+}
+
+/// Join SentencePiece pieces. `▁` (U+2581) is a word boundary, including when it
+/// is its own token. `<0xHH>` runs are UTF-8 byte fallback.
+pub fn pieces_to_text(pieces: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+    let mut raw = String::new();
+    for piece in pieces {
+        let piece = piece.as_ref();
+        if !keep_parakeet_piece(piece) {
+            continue;
+        }
+        if let Some(rest) = piece.strip_prefix('▁') {
+            if !raw.is_empty() && !raw.ends_with(' ') {
+                raw.push(' ');
+            }
+            raw.push_str(rest);
+        } else {
+            raw.push_str(piece);
+        }
+    }
+    decode_sp_byte_fallback(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_sp_byte_fallback(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(hex) = rest.strip_prefix("<0x").or_else(|| rest.strip_prefix("<0X")) {
+            if hex.len() >= 3 && hex.as_bytes()[2] == b'>' {
+                if let Ok(byte) = u8::from_str_radix(&hex[..2], 16) {
+                    pending.push(byte);
+                    rest = &hex[3..];
+                    continue;
+                }
+            }
+        }
+        if !pending.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&pending));
+            pending.clear();
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    if !pending.is_empty() {
+        out.push_str(&String::from_utf8_lossy(&pending));
+    }
+    out
 }
 
 /// Join Parakeet/SentencePiece BPE tokens into readable text.
 pub fn parakeet_tokens_to_text(bpe: &Gpt2Tokenizer, tokens: &[usize]) -> String {
-    if tokens.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    for &token in tokens {
-        let Some(piece) = bpe.id_to_token(token as u32) else {
-            continue;
-        };
-        if piece.contains("spltoken") || piece.starts_with("<|") {
-            continue;
-        }
-        if let Some(rest) = piece.strip_prefix('▁') {
-            if !out.is_empty() && !out.ends_with(' ') {
-                out.push(' ');
-            }
-            out.push_str(rest);
-        } else {
-            out.push_str(&piece);
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let pieces: Vec<String> = tokens
+        .iter()
+        .filter_map(|&token| bpe.id_to_token(token as u32))
+        .collect();
+    pieces_to_text(pieces.iter().map(String::as_str))
 }
 
 fn finalize_parakeet_decode(
@@ -147,7 +193,7 @@ pub fn is_garbage_parakeet_text(text: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    let letters = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
     let commas = trimmed.chars().filter(|c| *c == ',').count();
     letters == 0 || commas > letters
 }

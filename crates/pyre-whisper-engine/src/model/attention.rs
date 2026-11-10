@@ -76,14 +76,25 @@ impl MultiHeadAttention {
 pub struct RelPosMultiHeadAttentionConfig {
     pub n_state: usize,
     pub n_head: usize,
+    /// `attention_bias` from the checkpoint. Published Parakeet v2/v3 are false.
+    #[config(default = false)]
+    pub bias: bool,
 }
 
 impl RelPosMultiHeadAttentionConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> RelPosMultiHeadAttention {
-        let query = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let key = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let value = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let out = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
+        let query = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let key = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let value = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let out = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
         let pos = nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device);
 
         let n_hstate = self.n_state / self.n_head;
@@ -100,6 +111,22 @@ impl RelPosMultiHeadAttentionConfig {
             pos_bias_u: Param::from_tensor(pos_bias_u.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
             pos_bias_v: Param::from_tensor(pos_bias_v.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
         }
+    }
+}
+
+#[cfg(test)]
+mod rel_pos_tests {
+    use super::RelPosMultiHeadAttentionConfig;
+
+    #[test]
+    fn relative_attention_has_no_projection_bias() {
+        let device = burn::tensor::Device::flex();
+        let attn = RelPosMultiHeadAttentionConfig::new(8, 2).init(&device);
+        assert!(attn.query.bias.is_none());
+        assert!(attn.key.bias.is_none());
+        assert!(attn.value.bias.is_none());
+        assert!(attn.out.bias.is_none());
+        assert!(attn.pos.bias.is_none());
     }
 }
 

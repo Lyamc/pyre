@@ -55,7 +55,7 @@ fn parakeet_hf_mel_encode_parity() {
                 .clone()
                 .powf_scalar(2.0)
                 .sum()
-                .into_scalar()
+                .into_scalar::<f32>()
                 .sqrt()
         })
         .unwrap_or(0.0);

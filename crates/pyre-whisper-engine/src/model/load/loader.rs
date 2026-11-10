@@ -50,12 +50,14 @@ pub fn load_model_from_npy(
         // Burn Linear weight is [d_in, d_out]; joint head output is d_out.
         let n_vocab = parakeet.ctc_linear.weight.dims()[1];
 
+        let layer_bias = tensor_exists("bias", &format!("{path}/encoder/block_0/ff1/lin1"));
         let config = ModelConfig::Parakeet(ParakeetConfig {
             encoder: ConformerEncoderConfig {
                 d_model,
                 n_head,
                 n_layers,
                 kernel_size,
+                layer_bias,
             },
             n_vocab,
             n_mels,

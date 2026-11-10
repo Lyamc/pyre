@@ -107,7 +107,10 @@ pub fn convert_parakeet_from_hf(
     let mut unmapped = Vec::new();
     for key in tensors.names() {
         let tensor = tensors.tensor(key)?;
-        if !matches!(tensor.dtype(), safetensors::Dtype::F32 | safetensors::Dtype::F16) {
+        if !matches!(
+            tensor.dtype(),
+            safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16
+        ) {
             continue;
         }
         let shape: Vec<usize> = tensor.shape().iter().copied().collect();

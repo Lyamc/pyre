@@ -10,7 +10,7 @@ pub use pass::{with_whisper_pass, DecoderKind, MelTail, WhisperPass, Windowing};
 
 pub use task::DecodeTask;
 
-pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, clean_text, find_chunk_overlap, trim_trailing_hallucination};
+pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, find_chunk_overlap, trim_trailing_hallucination};
 
 use crate::audio::max_waveform_samples;
 use crate::model::{get_model_stats, Model};
@@ -266,12 +266,7 @@ pub fn waveform_to_text(
         };
 
         let cleaned = clean_text(&new_text);
-        if !cleaned.is_empty() {
-            if !accumulated_text.is_empty() && !cleaned.starts_with(' ') {
-                accumulated_text.push(' ');
-            }
-            accumulated_text.push_str(&cleaned);
-        }
+        append_without_word_overlap(&mut accumulated_text, &cleaned);
 
         let chunk_offset = i as f64 * shift_duration;
         if include_timestamps {

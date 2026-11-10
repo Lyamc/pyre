@@ -37,12 +37,20 @@ pub struct ConformerEncoderConfig {
     pub n_head: usize,
     pub n_layers: usize,
     pub kernel_size: usize,
+    /// Feed-forward, attention, and conformer-conv projection bias.
+    /// Published Parakeet v2/v3 set this false. Missing from an older cfg means false.
+    #[config(default = false)]
+    pub layer_bias: bool,
 }
 
 impl ConformerEncoderConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> ConformerEncoder {
         let layers = (0..self.n_layers)
-            .map(|_| ConformerBlockConfig::new(self.d_model, self.n_head, self.kernel_size).init(device))
+            .map(|_| {
+                ConformerBlockConfig::new(self.d_model, self.n_head, self.kernel_size)
+                    .with_layer_bias(self.layer_bias)
+                    .init(device)
+            })
             .collect();
         ConformerEncoder { layers }
     }
@@ -67,15 +75,25 @@ pub struct ConformerBlockConfig {
     pub d_model: usize,
     pub n_head: usize,
     pub kernel_size: usize,
+    #[config(default = false)]
+    pub layer_bias: bool,
 }
 
 impl ConformerBlockConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> ConformerBlock {
-        let ff1 = FeedForwardModuleConfig::new(self.d_model).init(device);
-        let attn = RelPosMultiHeadAttentionConfig::new(self.d_model, self.n_head).init(device);
+        let ff1 = FeedForwardModuleConfig::new(self.d_model)
+            .with_bias(self.layer_bias)
+            .init(device);
+        let attn = RelPosMultiHeadAttentionConfig::new(self.d_model, self.n_head)
+            .with_bias(self.layer_bias)
+            .init(device);
         let attn_ln = LayerNormConfig::new(self.d_model).init(device);
-        let conv = ConvolutionModuleConfig::new(self.d_model, self.kernel_size).init(device);
-        let ff2 = FeedForwardModuleConfig::new(self.d_model).init(device);
+        let conv = ConvolutionModuleConfig::new(self.d_model, self.kernel_size)
+            .with_bias(self.layer_bias)
+            .init(device);
+        let ff2 = FeedForwardModuleConfig::new(self.d_model)
+            .with_bias(self.layer_bias)
+            .init(device);
         let final_ln = LayerNormConfig::new(self.d_model).init(device);
 
         ConformerBlock {
@@ -112,13 +130,19 @@ impl ConformerBlock {
 #[derive(Config, Debug)]
 pub struct FeedForwardModuleConfig {
     pub d_model: usize,
+    #[config(default = false)]
+    pub bias: bool,
 }
 
 impl FeedForwardModuleConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> FeedForwardModule {
         let ln = LayerNormConfig::new(self.d_model).init(device);
-        let lin1 = LinearConfig::new(self.d_model, self.d_model * 4).init(device);
-        let lin2 = LinearConfig::new(self.d_model * 4, self.d_model).init(device);
+        let lin1 = LinearConfig::new(self.d_model, self.d_model * 4)
+            .with_bias(self.bias)
+            .init(device);
+        let lin2 = LinearConfig::new(self.d_model * 4, self.d_model)
+            .with_bias(self.bias)
+            .init(device);
         FeedForwardModule { ln, lin1, lin2 }
     }
 }
@@ -159,18 +183,27 @@ impl FeedForwardModule {
 pub struct ConvolutionModuleConfig {
     pub d_model: usize,
     pub kernel_size: usize,
+    #[config(default = false)]
+    pub bias: bool,
 }
 
 impl ConvolutionModuleConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> ConvolutionModule {
         let ln = LayerNormConfig::new(self.d_model).init(device);
-        let point_conv1 = Conv1dConfig::new(self.d_model, self.d_model * 2, 1).init(device);
+        // Batch-norm keeps its own affine parameters. These projections follow
+        // `convolution_bias` from the checkpoint (`bias` on this config).
+        let point_conv1 = Conv1dConfig::new(self.d_model, self.d_model * 2, 1)
+            .with_bias(self.bias)
+            .init(device);
         let depth_conv = Conv1dConfig::new(self.d_model, self.d_model, self.kernel_size)
             .with_groups(self.d_model)
             .with_padding(PaddingConfig1d::Explicit(self.kernel_size / 2, self.kernel_size / 2))
+            .with_bias(self.bias)
             .init(device);
         let bn = BatchNormConfig::new(self.d_model).init(device);
-        let point_conv2 = Conv1dConfig::new(self.d_model, self.d_model, 1).init(device);
+        let point_conv2 = Conv1dConfig::new(self.d_model, self.d_model, 1)
+            .with_bias(self.bias)
+            .init(device);
         
         ConvolutionModule { ln, point_conv1, depth_conv, bn, point_conv2 }
     }
@@ -203,5 +236,22 @@ impl ConvolutionModule {
         let x = self.point_conv2.forward(x);
         
         x.swap_dims(1, 2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConvolutionModuleConfig, FeedForwardModuleConfig};
+
+    #[test]
+    fn published_checkpoints_omit_ff_and_conv_bias() {
+        let device = burn::tensor::Device::flex();
+        let ff = FeedForwardModuleConfig::new(8).init(&device);
+        assert!(ff.lin1.bias.is_none());
+        assert!(ff.lin2.bias.is_none());
+        let conv = ConvolutionModuleConfig::new(8, 9).init(&device);
+        assert!(conv.point_conv1.bias.is_none());
+        assert!(conv.depth_conv.bias.is_none());
+        assert!(conv.point_conv2.bias.is_none());
     }
 }
