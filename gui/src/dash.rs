@@ -74,8 +74,9 @@ impl PyreGui {
         let port = self.server.rsplit(':').next().unwrap_or("").trim_end_matches('/').to_string();
         let lan = m["lan_ip"].as_str().map(|ip| format!("http://{ip}:{port}/v1")).unwrap_or_else(|| "?".into());
 
-        let models = m["models"].as_array().map(|a| a.iter().map(|x| format!("{} [{}{}{}]",
+        let models = m["models"].as_array().map(|a| a.iter().map(|x| format!("{} [{}{}{}{}]",
             x["id"].as_str().unwrap_or(""), x["kind"].as_str().unwrap_or(""),
+            x["capabilities"]["summary"].as_str().map(|s| format!(", {s}")).unwrap_or_default(),
             x["meta"]["n_ctx"].as_u64().map(|n| format!(", ctx {}", num(n as f64))).unwrap_or_default(),
             if x["busy"].as_bool() == Some(true) { ", busy" } else { "" })).collect::<Vec<_>>().join("   ")).unwrap_or_default();
 

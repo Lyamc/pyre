@@ -32,6 +32,43 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// What this loaded model can do. Qwen-Next (`dtype == "gguf"`) has no embedding worker.
+    pub fn capabilities(&self) -> crate::capabilities::Capabilities {
+        use crate::capabilities::Capabilities;
+        match &self.inner {
+            Inner::Llm(l) => Capabilities::text_llm(l.dtype != "gguf"),
+            Inner::Stt(_) => Capabilities::stt(),
+            Inner::Image(_) => Capabilities::image(),
+            Inner::Tts(_) => Capabilities::tts(),
+            Inner::Tagger(_) => Capabilities::tagger(),
+            Inner::Placeholder(_) => {
+                let mut c = Capabilities::for_model(self.kind, std::path::Path::new(&self.path));
+                c.tools = false;
+                c.embeddings = false;
+                c
+            }
+        }
+    }
+
+    /// One model record for `/v1/models`, `/api/models`, `/api/status`, and `/api/metrics`.
+    pub fn card(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "model",
+            "created": self.created,
+            "owned_by": "pyre",
+            "kind": self.kind.as_str(),
+            "task": self.kind.task(),
+            "backend": self.backend,
+            "path": self.path,
+            "busy": self.busy(),
+            "queued": self.queued(),
+            "unloadable": true,
+            "capabilities": self.capabilities().to_value(),
+            "meta": self.meta(),
+        })
+    }
+
     pub fn meta(&self) -> Value {
         match &self.inner {
             Inner::Llm(l) => json!({"n_ctx": l.n_ctx_now(), "context_length": l.n_ctx_now(), "max_model_len": l.n_ctx_now(), "backend": l.backend, "dtype": l.dtype, "path": self.path,
@@ -68,6 +105,13 @@ fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EP
 
 impl App {
     pub fn loaded(&self) -> Vec<Arc<Loaded>> { self.models.read().unwrap().clone() }
+
+    /// Loaded models plus the diarizer, when one is running. Same card shape everywhere.
+    pub fn model_cards(&self) -> Vec<Value> {
+        let mut v: Vec<Value> = self.loaded().iter().map(|m| m.card()).collect();
+        if let Some(d) = crate::diar::DIAR.get() { v.push(d.card()); }
+        v
+    }
 
     /// Find a model of `kind`. A name that matches a model of another kind is an error; an
     /// unknown name falls back to the first model of the right kind (OpenAI clients often send

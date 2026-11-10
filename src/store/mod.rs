@@ -40,6 +40,12 @@ pub fn detect(dir: &Path) -> (Kind, String) {
     if dir.join("model_index.json").exists() || dir.join("unet").is_dir() {
         return (Kind::Image, "stable-diffusion".into());
     }
+    if crate::qn_find::is_qwen4exp(dir) {
+        return (Kind::Llm, "qwen4exp".into());
+    }
+    if crate::capabilities::diarizer_dir(dir) {
+        return (Kind::Unknown, "nemotron-diarization".into());
+    }
     if let Ok(s) = std::fs::read_to_string(dir.join("config.json")) {
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(&s) {
             let mt = j.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string();

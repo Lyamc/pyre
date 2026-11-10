@@ -598,23 +598,30 @@ $("#convList").addEventListener("click", () => document.body.classList.remove("s
 
 // ---------- models ----------
 let kinds = {};
+function capHtml(c) {
+  const s = c && c.summary;
+  if (!s || s === "none") return `<span class="muted">none</span>`;
+  return s.split(", ").map(t => `<span class="tag">${esc(t)}</span>`).join("");
+}
 async function loadKinds() {
   try {
     const r = await api("/v1/models"); kinds = {}; r.data.forEach(m => (kinds[m.kind] ??= []).push(m));
     const sel = $("#modelPick"); const prev = sel.value || LS.get("model", "");
-    sel.innerHTML = (kinds.llm || []).map(m => `<option>${esc(m.id)}</option>`).join("") || `<option value="">(no text model loaded)</option>`;
+    sel.innerHTML = (kinds.llm || []).map(m => `<option title="${esc(m.capabilities?.summary || "")}">${esc(m.id)}</option>`).join("") || `<option value="">(no text model loaded)</option>`;
     if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+    const picked = (kinds.llm || []).find(m => m.id === sel.value);
+    sel.title = picked?.capabilities?.summary ? `${picked.id}: ${picked.capabilities.summary}` : "Model";
     const en = (k, form, note) => { const on = !!(kinds[k]?.length) && kinds[k].some(m => m.meta?.status !== "not-runnable"); $(form).disabled = !on; $(note).classList.toggle("hidden", on); };
     en("image", "#imgForm", "#imgNote"); /* stt form stays enabled for model download */ en("tts", "#ttsForm", "#ttsNote");
     if (typeof refreshSttModels === "function") refreshSttModels();
   } catch (e) { console.warn(e); }
 }
-$("#modelPick").onchange = () => LS.set("model", $("#modelPick").value);
+$("#modelPick").onchange = () => { LS.set("model", $("#modelPick").value); const m = (kinds.llm || []).find(x => x.id === $("#modelPick").value); $("#modelPick").title = m?.capabilities?.summary ? `${m.id}: ${m.capabilities.summary}` : "Model"; };
 async function loadModels() {
   let r; try { r = await api("/api/models"); } catch (e) { $("#storeInfo").textContent = e.message; return; }
   $("#storeInfo").textContent = `store: ${r.store_root} · HF cache: ${r.hf_cache}${r.offline ? " · OFFLINE" : ""}`;
-  $("#loadedTbl tbody").innerHTML = r.loaded.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${esc(m.backend)} ${m.meta?.dtype ? "· " + m.meta.dtype : ""}</td><td>${m.busy ? "busy" : "idle"}</td><td><button class="small" data-unload="${esc(m.id)}">Unload</button></td></tr>`).join("") || `<tr><td colspan=5 class="muted">nothing loaded</td></tr>`;
-  $("#availTbl tbody").innerHTML = r.models.map(m => `<tr><td>${esc(m.name)}${m.alias ? ` <span class="tag">${esc(m.alias)}</span>` : ""}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${m.source}</td><td>${human(m.size)}</td><td>${esc(m.storage || "")}</td><td class="loc">${esc(String(m.location))}</td>
+  $("#loadedTbl tbody").innerHTML = r.loaded.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td class="caps">${capHtml(m.capabilities)}</td><td>${esc(m.backend)} ${m.meta?.dtype ? "· " + m.meta.dtype : ""}</td><td>${m.busy ? "busy" : "idle"}</td><td>${m.unloadable === false ? "" : `<button class="small" data-unload="${esc(m.id)}">Unload</button>`}</td></tr>`).join("") || `<tr><td colspan=6 class="muted">nothing loaded</td></tr>`;
+  $("#availTbl tbody").innerHTML = r.models.map(m => `<tr><td>${esc(m.name)}${m.alias ? ` <span class="tag">${esc(m.alias)}</span>` : ""}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td class="caps">${capHtml(m.capabilities)}</td><td>${m.source}</td><td>${human(m.size)}</td><td>${esc(m.storage || "")}</td><td class="loc">${esc(String(m.location))}</td>
     <td><button class="small" data-load="${esc(m.alias || m.name)}" data-kind="${m.kind}">Load</button> <button class="small" data-alias="${esc(m.name)}">Alias</button> ${m.source === "hf-cache" ? `<button class="small" data-import="${esc(m.name)}">Link to store</button>` : ""} <button class="small" data-rm="${esc(m.name)}" data-src="${m.source}">Remove</button></td></tr>`).join("");
 }
 function dialog(text, extraHtml = "") { return new Promise(res => { $("#dlgText").textContent = text; $("#dlgExtra").innerHTML = extraHtml; const d = $("#dlg"); d.returnValue = ""; d.showModal(); d.onclose = () => res(d.returnValue === "ok" ? d : null); }); }
@@ -1959,7 +1966,7 @@ async function loadStatus() {
       ["Autotune", s.autotune?.suggest ? esc(s.autotune.message) : (s.autotune?.message || "matches this GPU")],
       ["Settings source", s.profiles ? `${esc(s.profiles.active?.source || "default")}${s.profiles.active?.name ? " · " + esc(s.profiles.active.name) : ""}${s.profiles.tune ? " · tune saved" : " · no tune yet"}${s.profiles.tune_stale ? " · hardware changed, tune kept" : ""}` : "n/a"],
       ["batching", s.batching], ["requests", metricsText(s.metrics)]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
-    $("#slotsTbl tbody").innerHTML = s.models.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${m.busy}</td><td>${m.queued}</td></tr>`).join("");
+    $("#slotsTbl tbody").innerHTML = s.models.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td class="caps">${capHtml(m.capabilities)}</td><td>${m.busy}</td><td>${m.queued}</td></tr>`).join("");
     const base = location.origin; const model = s.models.find(m => m.kind === "llm")?.id || "model"; const key = s.auth ? "$PYRE_API_KEY" : "none";
     $("#apiSnippet").textContent = `# curl
 curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${s.auth ? '-H "Authorization: Bearer $PYRE_API_KEY" ' : ""}\\

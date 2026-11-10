@@ -59,7 +59,7 @@ fn bad(e: anyhow::Error) -> Response { err(StatusCode::BAD_REQUEST, format!("{e:
 async fn list(State(app): S) -> Json<Value> {
     let a = app.clone();
     let mut v = tokio::task::spawn_blocking(move || crate::cli_models::list_json(&a.storage)).await.unwrap_or(json!({}));
-    v["loaded"] = json!(app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "path": m.path, "busy": m.busy(), "meta": m.meta()})).collect::<Vec<_>>());
+    v["loaded"] = json!(app.model_cards());
     v["offline"] = json!(app.storage.offline);
     Json(v)
 }
@@ -248,7 +248,7 @@ async fn status(State(app): S) -> Json<Value> {
         "default_backend": app.defaults.backend, "backends_compiled": crate::backend::enabled(),
         "auth": app.api_key.is_some(), "offline": app.storage.offline,
         "gpus": gpus, "ram": {"process_rss": rss, "total": sys.total_memory(), "used": sys.used_memory()},
-        "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>(),
+        "models": app.model_cards(),
         "store_root": app.storage.store.root, "hf_cache": app.storage.hf_cache,
         "limits": crate::limits::status(),
         "metrics": m,
@@ -376,7 +376,7 @@ async fn metrics_json(app: Arc<App>) -> Json<Value> {
     v["limits"] = limits;
     v["cpu_pct"] = json!(cpu);
     v["ram"] = json!({"used": used, "total": total, "process_rss": rss});
-    v["models"] = json!(app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>());
+    v["models"] = json!(app.model_cards());
     v["qwen_context"] = crate::qn_ctx::status_value();
     v["autotune"] = crate::hw_tune::status_value();
     v["profiles"] = crate::profiles::status_value();

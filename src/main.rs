@@ -29,6 +29,7 @@ mod ui;
 mod cli_models;
 mod storage;
 mod store;
+mod capabilities;
 mod model;
 mod sampler;
 mod server;

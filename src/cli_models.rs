@@ -11,14 +11,17 @@ pub fn list_json(ctx: &Ctx) -> serde_json::Value {
     for e in ctx.store.list() {
         let m = &e.manifest;
         let links: std::collections::BTreeSet<&str> = m.files.iter().map(|f| f.link.as_str()).collect();
+        let dir = e.model_dir();
         rows.push(json!({"name": m.name, "alias": m.alias, "kind": m.kind.as_str(), "source": "store", "architecture": m.architecture,
-            "size": e.size(), "location": e.model_dir(), "storage": links.into_iter().collect::<Vec<_>>().join("+"),
-            "revision": m.source_revision, "repo": m.source_repo}));
+            "size": e.size(), "location": &dir, "storage": links.into_iter().collect::<Vec<_>>().join("+"),
+            "revision": m.source_revision, "repo": m.source_repo,
+            "capabilities": crate::capabilities::Capabilities::for_model(m.kind, &dir).to_value()}));
     }
     for c in hfcache::list(&ctx.hf_cache) {
         let (kind, arch) = detect(&c.path);
         rows.push(json!({"name": c.repo, "alias": null, "kind": kind.as_str(), "source": "hf-cache", "architecture": arch,
-            "size": c.size, "location": c.path, "storage": format!("shared ({})", c.mode), "revision": c.revision, "refs": c.refs, "repo": c.repo}));
+            "size": c.size, "location": c.path, "storage": format!("shared ({})", c.mode), "revision": c.revision, "refs": c.refs, "repo": c.repo,
+            "capabilities": crate::capabilities::Capabilities::for_model(kind, &c.path).to_value()}));
     }
     json!({"store_root": ctx.store.root, "hf_cache": ctx.hf_cache, "models": rows})
 }
@@ -33,11 +36,11 @@ pub fn run(ctx: &Ctx, cmd: ModelsCmd) -> Result<()> {
             let v = list_json(ctx);
             if json { println!("{}", serde_json::to_string_pretty(&v)?); return Ok(()); }
             println!("store:    {}\nhf cache: {}\n", ctx.store.root.display(), ctx.hf_cache.display());
-            println!("{:<44} {:<6} {:<9} {:>10}  {:<22} {}", "NAME", "KIND", "SOURCE", "SIZE", "STORAGE", "LOCATION");
+            println!("{:<44} {:<8} {:<9} {:>10}  {:<28} {}", "NAME", "KIND", "SOURCE", "SIZE", "CAPABILITIES", "LOCATION");
             for r in v["models"].as_array().unwrap() {
                 let name = match r["alias"].as_str() { Some(a) => format!("{} ({a})", r["name"].as_str().unwrap()), None => r["name"].as_str().unwrap().to_string() };
-                println!("{:<44} {:<6} {:<9} {:>10}  {:<22} {}", name, r["kind"].as_str().unwrap(), r["source"].as_str().unwrap(),
-                    human(r["size"].as_u64().unwrap_or(0)), r["storage"].as_str().unwrap_or(""), r["location"].as_str().unwrap_or(""));
+                println!("{:<44} {:<8} {:<9} {:>10}  {:<28} {}", name, r["kind"].as_str().unwrap(), r["source"].as_str().unwrap(),
+                    human(r["size"].as_u64().unwrap_or(0)), r["capabilities"]["summary"].as_str().unwrap_or(""), r["location"].as_str().unwrap_or(""));
             }
         }
         ModelsCmd::Pull { repo, store, kind } => {
@@ -104,11 +107,13 @@ pub fn run(ctx: &Ctx, cmd: ModelsCmd) -> Result<()> {
             if let Some(e) = ctx.store.find(&name) {
                 println!("# {}\n", e.dir.join(crate::store::store::MANIFEST).display());
                 println!("{}", toml::to_string_pretty(&e.manifest)?);
+                println!("capabilities: {}", crate::capabilities::Capabilities::for_model(e.manifest.kind, &e.model_dir()).summary());
             } else {
                 let (r, rev) = hfcache::split_rev(&name);
                 let p = hfcache::find(&ctx.hf_cache, r, rev).with_context(|| format!("{name} not found in store or HF cache"))?;
                 let (k, a) = detect(&p);
-                println!("HF cache model {r}\npath: {}\nkind: {}\narchitecture: {a}\nsize: {}", p.display(), k.as_str(), human(dir_size(&p)));
+                let caps = crate::capabilities::Capabilities::for_model(k, &p);
+                println!("HF cache model {r}\npath: {}\nkind: {}\narchitecture: {a}\ncapabilities: {}\nsize: {}", p.display(), k.as_str(), caps.summary(), human(dir_size(&p)));
                 let blobs = hfcache::blobs_of(&p);
                 for f in crate::store::walk(&p) { let (_, m, _) = hfcache::resolve_entry(&f, &blobs); println!("  {:<40} {:>10} {m}", f.strip_prefix(&p)?.display(), human(std::fs::metadata(&f)?.len())); }
             }

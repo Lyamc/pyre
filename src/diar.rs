@@ -413,7 +413,7 @@ pub fn tidy(segs: &[Seg], gap: f64, min: f64) -> Vec<Seg> {
     out
 }
 
-pub struct Diarizer { pub name: String, pub dir: PathBuf, pub backend: String, net: Mutex<Net>, pub busy: AtomicBool, pub queued: AtomicU64 }
+pub struct Diarizer { pub name: String, pub dir: PathBuf, pub backend: String, created: u64, net: Mutex<Net>, pub busy: AtomicBool, pub queued: AtomicU64 }
 
 impl Diarizer {
     /// `r`: a local directory, or an HF repo id (looked up in / downloaded to the HF cache).
@@ -433,7 +433,8 @@ impl Diarizer {
         let t = std::time::Instant::now();
         let net = Net::load(&dir, dev)?;
         tracing::info!("Nemotron-3-Diarization loaded from {} on {label} in {:.1}s", dir.display(), t.elapsed().as_secs_f64());
-        Ok(Self { name: r.to_string(), dir, backend: label.to_string(), net: Mutex::new(net), busy: AtomicBool::new(false), queued: AtomicU64::new(0) })
+        let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        Ok(Self { name: r.to_string(), dir, backend: label.to_string(), created, net: Mutex::new(net), busy: AtomicBool::new(false), queued: AtomicU64::new(0) })
     }
     /// Raw logits `[T,8]`, T, valid frames.
     pub fn logits(&self, samples: &[f32]) -> (Vec<f32>, usize, usize) {
@@ -456,6 +457,25 @@ impl Diarizer {
         tidy(&segments(&lg, valid, 0.5), gap, 0.2)
     }
     pub fn info(&self) -> Value { json!({"model": self.name, "backend": self.backend, "path": self.dir.display().to_string(), "busy": self.busy.load(Ordering::SeqCst), "max_speakers": NSPK}) }
+
+    /// Same card shape as [`crate::registry::Loaded::card`], so `/v1/models` can list the diarizer.
+    pub fn card(&self) -> Value {
+        json!({
+            "id": self.name,
+            "object": "model",
+            "created": self.created,
+            "owned_by": "pyre",
+            "kind": "diar",
+            "task": "speaker-diarization",
+            "backend": self.backend,
+            "path": self.dir.display().to_string(),
+            "busy": self.busy.load(Ordering::SeqCst),
+            "queued": self.queued.load(Ordering::SeqCst),
+            "unloadable": false,
+            "capabilities": crate::capabilities::Capabilities::diarizer().to_value(),
+            "meta": self.info(),
+        })
+    }
 }
 
 pub fn label(s: usize) -> String { format!("SPEAKER_{s:02}") }
@@ -463,7 +483,10 @@ pub fn label(s: usize) -> String { format!("SPEAKER_{s:02}") }
 /// `GET /api/diarizer`: whether a diarizer is loaded (the web UI enables "Separate speakers" from it).
 pub async fn status() -> axum::response::Response {
     use axum::response::IntoResponse;
-    axum::Json(match DIAR.get() { Some(d) => json!({"loaded": true, "info": d.info()}), None => json!({"loaded": false}) }).into_response()
+    axum::Json(match DIAR.get() {
+        Some(d) => json!({"loaded": true, "info": d.info(), "capabilities": crate::capabilities::Capabilities::diarizer().to_value()}),
+        None => json!({"loaded": false, "capabilities": null}),
+    }).into_response()
 }
 
 /// `POST /v1/audio/diarize` (multipart `file`): who spoke when, no text.

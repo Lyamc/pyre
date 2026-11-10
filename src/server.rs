@@ -110,9 +110,7 @@ fn rid(p: &str) -> String { format!("{p}-{:016x}", rand::random::<u64>()) }
 async fn health() -> Json<Value> { Json(json!({"status": "ok"})) }
 
 async fn models(State(st): S) -> Json<Value> {
-    let data: Vec<Value> = st.loaded().iter().map(|m| json!({"id": m.id, "object": "model", "created": m.created, "owned_by": "pyre",
-        "kind": m.kind.as_str(), "task": m.kind.task(), "meta": m.meta()})).collect();
-    Json(json!({"object": "list", "data": data}))
+    Json(json!({"object": "list", "data": st.model_cards()}))
 }
 
 /// Common sampling fields shared by every generation endpoint (OpenAI + llama.cpp names).
@@ -1088,11 +1086,12 @@ async fn props(State(app): S) -> Response {
         "total_slots": 1, "model_path": st.model_path, "model_alias": st.model_id, "chat_template": st.template.source,
         "bos_token": st.template.bos_token, "eos_token": st.template.eos_token,
         "build_info": format!("pyre {} (burn 0.22, backend {}, {})", env!("CARGO_PKG_VERSION"), st.backend, st.dtype),
-        "models": app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str()})).collect::<Vec<_>>(),
+        "models": app.model_cards(),
     })).into_response()
 }
 
 async fn slots(State(app): S) -> Json<Value> {
     Json(json!(app.loaded().iter().enumerate().map(|(i, m)| json!({"id": i, "model": m.id, "kind": m.kind.as_str(),
-        "is_processing": m.busy(), "queued": m.queued(), "n_ctx": m.meta().get("n_ctx").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>()))
+        "is_processing": m.busy(), "queued": m.queued(), "capabilities": m.capabilities().to_value(),
+        "n_ctx": m.meta().get("n_ctx").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>()))
 }
