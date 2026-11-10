@@ -30,22 +30,25 @@ pub struct SttModel {
 /// Map a user ref to (whisburn model name, explicit bundle dir if a path was given).
 #[cfg(feature = "stt")]
 fn map_ref(r: &str) -> Result<(String, Option<PathBuf>)> {
-    let p = Path::new(r);
-    if p.is_dir() {
-        let name = p.file_name().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad path {r}"))?.to_string();
-        return Ok((name, Some(p.to_path_buf())));
-    }
-    let r = r.strip_prefix("whisburn:").unwrap_or(r);
+    let named = r.strip_prefix("whisburn:").unwrap_or(r);
     for m in MODEL_REGISTRY {
-        if m.name.eq_ignore_ascii_case(r) || m.hf_id.eq_ignore_ascii_case(r) {
+        if m.name.eq_ignore_ascii_case(named) || m.hf_id.eq_ignore_ascii_case(named) {
             if !matches!(m.category, pyre_whisper_engine::model::registry::ModelCategory::Asr) {
                 bail!("whisburn model '{}' is not a speech-recognition model", m.name);
             }
             return Ok((m.name.to_string(), None));
         }
     }
+    // A registry name wins over a relative directory. If the server's cwd is the
+    // models folder, `base` is a directory and used to be treated as an explicit
+    // bundle path ("no whisburn bundle for 'base' in models\\base").
+    let p = Path::new(r);
+    if p.is_dir() {
+        let name = p.file_name().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad path {r}"))?.to_string();
+        return Ok((name, Some(p.to_path_buf())));
+    }
     let names: Vec<_> = MODEL_REGISTRY.iter().filter(|m| matches!(m.category, pyre_whisper_engine::model::registry::ModelCategory::Asr)).map(|m| m.name).collect();
-    bail!("unknown speech-to-text model '{r}'. whisburn supports: {}", names.join(", "))
+    bail!("unknown speech-to-text model '{named}'. whisburn supports: {}", names.join(", "))
 }
 
 impl SttModel {
@@ -129,6 +132,8 @@ pub(crate) struct Req {
     pub diarize: bool, pub attribution: String,
     /// When set via jobs API: true = translations endpoint behaviour.
     pub translate_task: bool,
+    /// Request opt-in. Also honored when `PYRE_STT_EXPERIMENTAL=1`.
+    pub experimental: bool,
     /// Filled by `apply_route` so the client can see which model served the request.
     pub routing: Option<serde_json::Value>,
 }
@@ -140,7 +145,7 @@ fn parse_bool(s: &str) -> bool { matches!(s.trim().to_ascii_lowercase().as_str()
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
 pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false, routing: None };
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false, experimental: false, routing: None };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
@@ -158,6 +163,7 @@ pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
                 let v = f.text().await?.trim().to_ascii_lowercase();
                 q.translate_task = matches!(v.as_str(), "translate" | "translations" | "translation");
             }
+            "experimental" => q.experimental = parse_bool(&f.text().await?),
             _ => { let _ = f.bytes().await; } // prompt, temperature, timestamp_granularities: accepted, ignored
         }
     }
@@ -196,6 +202,7 @@ fn apply_route(app: &crate::registry::App, q: &mut Req, translate: bool) -> Resu
     let requested = q.model.clone().or_else(|| loaded.first().cloned()).unwrap_or_else(|| "base".into());
     match crate::speech_caps::route(&requested, &loaded, q.language.as_deref(), translate || q.translate_task) {
         Ok(d) => {
+            crate::speech_caps::gate_experimental_model(&d.served, q.experimental)?;
             q.model = Some(d.served.clone());
             q.routing = Some(crate::speech_caps::decision_json(&d));
             if d.redirected {
@@ -268,6 +275,7 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
         wav.samples.resize(MIN_SAMPLES, 0.0);
     }
     let dur = wav.duration_secs();
+    crate::speech_caps::gate_long_audio(&stt.name, dur, q.experimental).map_err(|e| anyhow!(e))?;
     let mut o = pyre_whisper_core::TaskOptions::default();
     o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
     if let Some(l) = &q.language { o.language = pyre_whisper_core::LanguageCode::new(l.clone()); }
@@ -706,5 +714,29 @@ fn render(r: &Transcript, fmt: &str, dur: f64, translate: bool, (ts, sentences):
             Json(v).into_response()
         }
         _ => Json(json!({"text": text})).into_response(),
+    }
+}
+
+#[cfg(all(test, feature = "stt"))]
+mod map_ref_tests {
+    use super::map_ref;
+    use std::sync::Mutex;
+
+    static CWD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn registry_name_is_not_a_relative_directory() {
+        let _guard = CWD.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("pyre-stt-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("base")).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let result = map_ref("base");
+        std::env::set_current_dir(&prev).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (name, explicit) = result.unwrap();
+        assert_eq!(name, "base");
+        assert!(explicit.is_none(), "registry name was treated as {explicit:?}");
     }
 }

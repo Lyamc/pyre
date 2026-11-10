@@ -160,10 +160,20 @@ impl ParakeetDecoder {
         }
 
         let device = self.embedding.weight.device();
-        let token = Tensor::<2, Int>::from_ints([[token_id as i32]], &device);
-        let embedded = self.embedding.forward(token);
-        let [_, _, d_model] = embedded.dims();
-        let input = embedded.reshape([1, d_model]);
+        // NeMo's predictor treats the blank / SOS as "no token": a zero vector, not
+        // embedding[blank]. v3's blank id is 8192; feeding that row (often not the
+        // pad) makes the first joint emit blank plus a long duration and the
+        // utterance comes back empty or only as its last few words. v2's blank is
+        // the pad row, which is why it was less affected.
+        let hidden = self.embedding.weight.dims()[1];
+        let input = if token_id == blank_token_id {
+            Tensor::<2>::zeros([1, hidden], &device)
+        } else {
+            let token = Tensor::<2, Int>::from_ints([[token_id as i32]], &device);
+            let embedded = self.embedding.forward(token);
+            let [_, _, d_model] = embedded.dims();
+            embedded.reshape([1, d_model])
+        };
 
         let (lstm_out, new_hidden, new_cell) =
             self.lstm.step(input, &cache.hidden, &cache.cell);

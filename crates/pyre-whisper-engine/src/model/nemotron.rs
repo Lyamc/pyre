@@ -420,7 +420,8 @@ impl NemotronAsr {
     }
 
     /// Greedy RNN-T. Advance one frame on blank, or after `max_symbols` non-blanks.
-    pub fn decode_rnnt(&self, mel: Tensor<3>, blank: usize, vocab: usize, max_symbols: usize) -> Vec<usize> {
+    /// Token ids, the encoder frame each token was emitted on, and the valid frame count.
+    pub fn decode_rnnt(&self, mel: Tensor<3>, blank: usize, vocab: usize, max_symbols: usize) -> (Vec<usize>, Vec<usize>, usize) {
         let enc = self.encode(mel.clone());
         let [_, frames, joint] = enc.dims();
         let [_, _, mel_t] = mel.dims();
@@ -431,6 +432,7 @@ impl NemotronAsr {
         let mut symbols = 0usize;
         let mut current = blank;
         let mut decoded = Vec::new();
+        let mut frames = Vec::new();
         let limit = valid.saturating_mul(max_symbols.max(1).saturating_add(1)).max(1);
         let mut steps = 0usize;
         while frame < valid && steps < limit {
@@ -453,6 +455,7 @@ impl NemotronAsr {
                 current = blank;
             } else {
                 decoded.push(best);
+                frames.push(frame);
                 current = best;
                 symbols += 1;
                 if symbols >= max_symbols.max(1) {
@@ -462,7 +465,7 @@ impl NemotronAsr {
             }
             steps += 1;
         }
-        decoded
+        (decoded, frames, valid)
     }
 
     pub fn encoder_ctx_size(&self) -> usize {

@@ -109,6 +109,22 @@ pub fn clean_text(text: &str) -> String {
 ///
 /// Long audio is cut with a 3s overlap. Concatenating each window's full text
 /// repeats that overlap (Whisper base inserted 161 words on a 6-minute clip).
+/// Drop tokens emitted in the left-context overlap of a later window.
+///
+/// The previous window already covers that audio. Keeping both copies inserted
+/// the overlap (Nemotron's extra words). Matching words in the string and
+/// deleting them also ate real words when the boundary text did not line up.
+pub fn drop_left_context_tokens(ids: &[usize], frames: &[usize], min_frame: usize) -> Vec<usize> {
+    if frames.len() != ids.len() || min_frame == 0 {
+        return ids.to_vec();
+    }
+    ids.iter()
+        .zip(frames)
+        .filter(|(_, frame)| **frame >= min_frame)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 pub fn append_without_word_overlap(accumulated: &mut String, next: &str) {
     let next = next.trim();
     if next.is_empty() {
@@ -163,7 +179,15 @@ pub fn find_chunk_overlap(prev_tokens: &[usize], curr_tokens: &[usize], max_n_of
 
 #[cfg(test)]
 mod tests {
-    use super::{append_without_word_overlap, trim_trailing_hallucination};
+    use super::{append_without_word_overlap, drop_left_context_tokens, trim_trailing_hallucination};
+
+    #[test]
+    fn later_window_drops_only_the_left_context_frames() {
+        let ids = [1, 2, 3, 4];
+        let frames = [1, 4, 9, 12];
+        assert_eq!(drop_left_context_tokens(&ids, &frames, 8), vec![3, 4]);
+        assert_eq!(drop_left_context_tokens(&ids, &frames, 0), vec![1, 2, 3, 4]);
+    }
 
     #[test]
     fn drops_words_repeated_at_the_window_overlap() {

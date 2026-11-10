@@ -66,6 +66,8 @@ pub struct ParakeetDecodeConfig {
     pub max_symbols_per_step: usize,
     #[serde(default)]
     pub decoder_start_token_id: Option<usize>,
+    #[serde(default)]
+    pub durations: Vec<usize>,
 }
 
 fn default_max_symbols() -> usize {

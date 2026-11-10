@@ -97,6 +97,7 @@ pub fn convert_parakeet_from_hf(
         pad_token_id: config.pad_token_id,
         max_symbols_per_step: config.max_symbols_per_step.unwrap_or(10),
         decoder_start_token_id: config.decoder_start_token_id.or(Some(config.blank_id())),
+        durations: config.durations.clone().unwrap_or_else(|| (0..num_durations).collect()),
     };
     fs::write(
         model_dir.join("parakeet_decode.json"),

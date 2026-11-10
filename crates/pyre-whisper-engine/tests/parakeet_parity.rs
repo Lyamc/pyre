@@ -122,3 +122,53 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 }
 
 use pyre_whisper_engine::model::Model;
+use pyre_whisper_engine::transcribe::{drop_left_context_tokens, experimental_gate};
+
+/// Runs in CI with no checkpoint and no HF dump. The neural parity test above
+/// still skips until those files exist; this one does not.
+#[test]
+fn public_domain_reference_stitch_and_gates() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let audio = root.join("tests/fixtures/jfk.flac");
+    let reference = std::fs::read_to_string(root.join("tests/fixtures/jfk.txt")).expect("jfk.txt");
+    let reference = reference.trim();
+    assert!(audio.metadata().expect("jfk.flac").len() > 10_000, "bundled clip is empty");
+    assert!(reference.split_whitespace().count() > 10);
+
+    assert_eq!(word_error_rate(reference, reference), 0.0);
+    let shortened = "and so my fellow americans ask not what your country can do for you";
+    let score = word_error_rate(reference, shortened);
+    assert!(score > 0.15 && score < 0.5, "wer {score}");
+
+    // First window keeps the opening tokens. A later window drops the left context.
+    assert_eq!(drop_left_context_tokens(&[7, 8, 9], &[0, 3, 40], 0), vec![7, 8, 9]);
+    assert_eq!(drop_left_context_tokens(&[7, 8, 9], &[0, 3, 40], 8), vec![9]);
+
+    let refused = experimental_gate("parakeet-tdt-0.6b-v3", 16_000, 16_000).unwrap_err();
+    assert!(refused.contains("experimental"));
+    assert!(experimental_gate("nemotron-speech-streaming-en-0.6b", 16_000, 16_000).is_err());
+    assert!(experimental_gate("parakeet-tdt-0.6b-v2", 16_000 * 20, 16_000).is_ok());
+    assert!(experimental_gate("parakeet-tdt-0.6b-v2", 16_000 * 120, 16_000).is_err());
+    assert!(experimental_gate("base", 16_000 * 400, 16_000).is_ok());
+}
+
+fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
+    let r: Vec<String> = reference.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+    let h: Vec<String> = hypothesis.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+    let n = r.len();
+    let m = h.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 0..=n {
+        dp[i][0] = i;
+    }
+    for j in 0..=m {
+        dp[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = if r[i - 1] == h[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1).min(dp[i][j - 1] + 1).min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[n][m] as f64 / n.max(1) as f64
+}

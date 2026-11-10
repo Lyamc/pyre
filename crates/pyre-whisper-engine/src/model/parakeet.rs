@@ -168,13 +168,14 @@ impl Parakeet {
         blank_token_id: usize,
         vocab_size: usize,
         duration_start: usize,
-        num_durations: usize,
+        durations: &[usize],
+        max_symbols: usize,
         start_token_id: usize,
         verbose: bool,
-    ) -> Vec<usize> {
+    ) -> (Vec<(usize, usize)>, usize) {
         let decoder = match &self.decoder {
             Some(d) => d,
-            None => return Vec::new(),
+            None => return (Vec::new(), 0),
         };
 
         let [_, _, mel_frames] = mel.dims();
@@ -194,8 +195,8 @@ impl Parakeet {
         let mut current_token = start_token_id;
         let mut decoded = Vec::new();
         let mut steps = 0usize;
-        // TDT stops when the frame pointer exhausts the encoder (no RNN-T max_symbols guard).
-        let max_steps = valid_frames * 64;
+        let mut symbols_at_frame = 0usize;
+        let max_steps = valid_frames.saturating_mul(max_symbols.max(1).saturating_add(1)).max(1);
 
         while frame_idx < valid_frames && steps < max_steps {
             let joint = enc.dims()[2];
@@ -220,25 +221,33 @@ impl Parakeet {
                 }
             }
 
-            let mut duration = 0usize;
+            let n_dur = if durations.is_empty() { 0 } else { durations.len() };
+            let mut dur_index = 0usize;
             let mut best_dur_score = f32::NEG_INFINITY;
-            let d_end = (duration_start + num_durations).min(logit_vec.len());
-            for (offset, &v) in logit_vec[duration_start..d_end].iter().enumerate() {
-                if v > best_dur_score {
-                    best_dur_score = v;
-                    duration = offset;
+            let d_end = (duration_start + n_dur).min(logit_vec.len());
+            if duration_start < d_end {
+                for (offset, &v) in logit_vec[duration_start..d_end].iter().enumerate() {
+                    if v > best_dur_score {
+                        best_dur_score = v;
+                        dur_index = offset;
+                    }
                 }
             }
 
-            // HF ParakeetTDTGenerationMixin: only force progress for blank + duration 0.
-            if best_token == blank_token_id && duration == 0 {
-                duration = 1;
-            }
+            let is_blank = best_token == blank_token_id || best_token >= vocab_size;
+            let (skip, symbols) = crate::transcribe::decode::parakeet::tdt_step(
+                is_blank,
+                dur_index,
+                durations,
+                symbols_at_frame,
+                max_symbols,
+            );
+            symbols_at_frame = if skip == 0 { symbols } else { 0 };
 
             if verbose && steps < 10 {
                 println!(
-                    "DEBUG TDT step {}: frame={}, token={}, dur={}",
-                    steps, frame_idx, best_token, duration
+                    "DEBUG TDT step {}: frame={}, token={}, dur_index={}, skip={}",
+                    steps, frame_idx, best_token, dur_index, skip
                 );
             }
             if verbose && steps == 0 {
@@ -248,18 +257,18 @@ impl Parakeet {
                 );
             }
 
-            if best_token != blank_token_id && best_token < vocab_size {
-                decoded.push(best_token);
+            if !is_blank {
+                decoded.push((best_token, frame_idx));
                 current_token = best_token;
             } else {
                 current_token = blank_token_id;
             }
 
-            frame_idx += duration;
+            frame_idx += skip;
             steps += 1;
         }
 
-        decoded
+        (decoded, valid_frames)
     }
 
     /// RNN-T greedy used when the joint head has no duration bins (Nemotron-style, or a

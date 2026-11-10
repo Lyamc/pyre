@@ -45,6 +45,47 @@ pub struct SpeechProfile {
     pub architecture_streaming: bool,
     pub lookahead_frames: Option<u32>,
     pub license: &'static str,
+    /// Off unless `PYRE_STT_EXPERIMENTAL=1` or the request sets `experimental=true`.
+    /// Parakeet v3 and Nemotron are not in the published WER range yet.
+    pub experimental: bool,
+}
+
+/// Single utterances at or under this length stay on for Parakeet v2.
+/// Longer audio is chunked and is experimental for the new models.
+pub const SHORT_CLIP_SECS: f64 = 60.0;
+
+pub fn experimental_opt_in(request_flag: bool) -> bool {
+    request_flag
+        || matches!(
+            std::env::var("PYRE_STT_EXPERIMENTAL").ok().as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+}
+
+pub fn chunks_long_audio(id: &str) -> bool {
+    let family = profile(id).family;
+    matches!(family, "parakeet" | "parakeet-tdt" | "nemotron-speech-rnnt")
+}
+
+/// v3 and Nemotron stay unloaded-from-the-default-path until their WER is in range.
+pub fn gate_experimental_model(id: &str, opted_in: bool) -> Result<(), String> {
+    if profile(id).experimental && !experimental_opt_in(opted_in) {
+        Err(format!(
+            "{id} is experimental and off by default (its WER is not in the published range yet). Set PYRE_STT_EXPERIMENTAL=1 or pass experimental=true to transcribe with it. Whisper and Parakeet v2 on clips up to {SHORT_CLIP_SECS:.0}s stay available."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Joined audio for Parakeet and Nemotron still loses or repeats words at window edges.
+pub fn gate_long_audio(id: &str, duration_secs: f64, opted_in: bool) -> Result<(), String> {
+    if duration_secs <= SHORT_CLIP_SECS || !chunks_long_audio(id) || experimental_opt_in(opted_in) {
+        return Ok(());
+    }
+    Err(format!(
+        "long audio ({duration_secs:.0}s) on {id} is experimental and off by default. Clips up to {SHORT_CLIP_SECS:.0}s are transcribed in one window. Set PYRE_STT_EXPERIMENTAL=1 or pass experimental=true to run the chunked path."
+    ))
 }
 
 impl SpeechProfile {
@@ -71,10 +112,15 @@ impl SpeechProfile {
         };
         let tr = if self.translation { "translation" } else { "no translation" };
         let ts = if self.timestamps { "timestamps" } else { "no timestamps" };
-        if self.architecture_streaming {
+        let base = if self.architecture_streaming {
             format!("{langs}, {tr}, {ts}, chunked attention")
         } else {
             format!("{langs}, {tr}, {ts}")
+        };
+        if self.experimental {
+            format!("{base}, experimental")
+        } else {
+            base
         }
     }
 
@@ -94,6 +140,7 @@ impl SpeechProfile {
             "architecture_streaming": self.architecture_streaming,
             "lookahead_frames": self.lookahead_frames,
             "license": self.license,
+            "experimental": self.experimental,
         })
     }
 }
@@ -110,6 +157,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: true,
             lookahead_frames: Some(13),
             license: "NVIDIA Open Model License",
+            experimental: true,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v3") {
@@ -122,6 +170,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "CC-BY-4.0",
+            experimental: true,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v2") || key.contains("parakeet-ctc") {
@@ -134,6 +183,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "CC-BY-4.0",
+            experimental: false,
         };
     }
     if key.contains("t-one") {
@@ -146,6 +196,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "Apache-2.0",
+            experimental: false,
         };
     }
     if key.contains("moonshine") {
@@ -158,6 +209,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "MIT",
+            experimental: false,
         };
     }
     if is_english_whisper(&key) {
@@ -176,6 +228,7 @@ pub fn profile(id: &str) -> SpeechProfile {
         architecture_streaming: false,
         lookahead_frames: None,
         license: "",
+        experimental: false,
     }
 }
 
@@ -189,6 +242,7 @@ fn whisper(english_only: bool, translation: bool) -> SpeechProfile {
         architecture_streaming: false,
         lookahead_frames: None,
         license: "Apache-2.0",
+        experimental: false,
     }
 }
 
@@ -343,6 +397,21 @@ mod tests {
             LangSet::Listed(l) => assert_eq!(l.len(), 25),
             LangSet::Unspecified => panic!("v3 list missing"),
         }
+    }
+
+    #[test]
+    fn v3_and_nemotron_are_experimental_v2_and_whisper_are_not() {
+        assert!(profile("parakeet-tdt-0.6b-v3").experimental);
+        assert!(profile("nemotron-speech-streaming-en-0.6b").experimental);
+        assert!(!profile("parakeet-tdt-0.6b-v2").experimental);
+        assert!(!profile("base").experimental);
+        assert!(profile("parakeet-tdt-0.6b-v3").brief().contains("experimental"));
+        let err = gate_experimental_model("parakeet-tdt-0.6b-v3", false).unwrap_err();
+        assert!(err.contains("experimental"));
+        assert!(gate_experimental_model("parakeet-tdt-0.6b-v2", false).is_ok());
+        assert!(gate_long_audio("parakeet-tdt-0.6b-v2", 20.0, false).is_ok());
+        assert!(gate_long_audio("parakeet-tdt-0.6b-v2", 360.0, false).is_err());
+        assert!(gate_long_audio("base", 360.0, false).is_ok());
     }
 
     #[test]

@@ -17,6 +17,10 @@ struct ParakeetDecodeConfig {
     max_symbols_per_step: usize,
     #[serde(default)]
     decoder_start_token_id: Option<usize>,
+    /// Duration table. The argmax index is looked up here (`[0, 1, 2, 3, 4]` on v2/v3).
+    /// Missing on older decode files: `0..num_durations`.
+    #[serde(default)]
+    durations: Vec<usize>,
 }
 
 fn default_max_symbols() -> usize {
@@ -70,6 +74,16 @@ mod tests {
         assert_eq!(cfg.start_token(), 8192);
         assert_eq!(cfg.pad_token_id, 2);
         assert_eq!(cfg.max_symbols_per_step, 10);
+        assert!(cfg.durations.is_empty());
+        assert_eq!(cfg.duration_table(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn duration_index_is_looked_up_and_a_blank_zero_advances() {
+        let table = [0, 2, 4, 8];
+        assert_eq!(tdt_step(false, 2, &table, 0, 10), (4, 1));
+        assert_eq!(tdt_step(true, 0, &table, 3, 10), (1, 0));
+        assert_eq!(tdt_step(false, 0, &table, 9, 10), (1, 0));
     }
 }
 
@@ -213,7 +227,36 @@ fn load_parakeet_decode_config(model_name: &str) -> ParakeetDecodeConfig {
             pad_token_id: 2,
             max_symbols_per_step: 10,
             decoder_start_token_id: None,
+            durations: vec![0, 1, 2, 3, 4],
         })
+}
+
+impl ParakeetDecodeConfig {
+    fn duration_table(&self) -> Vec<usize> {
+        if self.durations.is_empty() {
+            (0..self.num_durations).collect()
+        } else {
+            self.durations.clone()
+        }
+    }
+}
+
+/// How far the TDT frame pointer moves, and the updated per-frame symbol count.
+///
+/// NeMo looks the duration *index* up in `durations` (not the raw index). A blank
+/// with duration 0 is forced to 1. A run of zero-duration labels stops at
+/// `max_symbols` and then advances one frame so the loop cannot sit on one frame.
+pub fn tdt_step(token_is_blank: bool, dur_index: usize, durations: &[usize], symbols_at_frame: usize, max_symbols: usize) -> (usize, usize) {
+    let mut skip = durations.get(dur_index).copied().unwrap_or(dur_index);
+    let mut symbols = if token_is_blank { 0 } else { symbols_at_frame.saturating_add(1) };
+    if token_is_blank && skip == 0 {
+        skip = 1;
+    }
+    if !token_is_blank && skip == 0 && symbols >= max_symbols.max(1) {
+        skip = 1;
+        symbols = 0;
+    }
+    (skip, symbols)
 }
 
 fn ctc_greedy_tokens(raw_ids: &[i32], blank_token: usize) -> Vec<usize> {
@@ -267,21 +310,44 @@ fn count_token_classes(
     )
 }
 
+pub struct TimedChunk {
+    pub text: String,
+    pub tokens: Vec<usize>,
+    pub frames: Vec<usize>,
+    pub encoder_frames: usize,
+}
+
+fn with_frames(text: String, tokens: Vec<usize>, raw_ids: &[usize], raw_frames: &[usize], encoder_frames: usize) -> TimedChunk {
+    let mut frames = Vec::with_capacity(tokens.len());
+    let mut cursor = 0usize;
+    for &tok in &tokens {
+        if let Some(pos) = raw_ids[cursor..].iter().position(|&id| id == tok) {
+            let at = cursor + pos;
+            if at < raw_frames.len() {
+                frames.push(raw_frames[at]);
+            }
+            cursor = at + 1;
+        }
+    }
+    TimedChunk { text, tokens, frames, encoder_frames }
+}
+
 pub fn decode_nemotron(
     model: &crate::model::nemotron::NemotronAsr,
     bpe: &Gpt2Tokenizer,
     mel: Tensor<3>,
     model_name: &str,
     _verbose: bool,
-) -> (String, Vec<usize>) {
+) -> TimedChunk {
     let cfg = load_parakeet_decode_config(model_name);
-    let tokens = model.decode_rnnt(
+    let (tokens, frames, encoder_frames) = model.decode_rnnt(
         mel,
         cfg.blank_token_id,
         cfg.vocab_size.max(1),
         cfg.max_symbols_per_step.max(1),
     );
-    finalize_parakeet_decode(bpe, &tokens, cfg.blank_token_id, model_name)
+    let (text, kept) = finalize_parakeet_decode(bpe, &tokens, cfg.blank_token_id, model_name);
+    with_frames(text, kept, &tokens, &frames, encoder_frames)
 }
 
 pub fn decode_parakeet(
@@ -290,7 +356,7 @@ pub fn decode_parakeet(
     mel: Tensor<3>,
     model_name: &str,
     verbose: bool,
-) -> (String, Vec<usize>) {
+) -> TimedChunk {
     if verbose {
         let max_feat = mel.clone().max().into_data().to_vec::<f32>().unwrap()[0];
         println!("DEBUG Parakeet Input: Max feature value: {}", max_feat);
@@ -299,37 +365,42 @@ pub fn decode_parakeet(
     let decode_cfg = load_parakeet_decode_config(model_name);
 
     if parakeet.has_decoder() {
-        let decoded_tokens = if decode_cfg.num_durations == 0 {
-            parakeet.decode_rnnt_greedy(
+        let (raw_ids, raw_frames, encoder_frames) = if decode_cfg.num_durations == 0 {
+            let ids = parakeet.decode_rnnt_greedy(
                 mel.clone(),
                 decode_cfg.blank_token_id,
                 decode_cfg.vocab_size,
                 decode_cfg.max_symbols_per_step.max(1),
                 decode_cfg.start_token(),
-            )
+            );
+            (ids, Vec::new(), 0)
         } else {
-            parakeet.decode_tdt_greedy(
+            let (pairs, encoder_frames) = parakeet.decode_tdt_greedy(
                 mel.clone(),
                 decode_cfg.blank_token_id,
                 decode_cfg.vocab_size,
                 decode_cfg.duration_start,
-                decode_cfg.num_durations,
+                &decode_cfg.duration_table(),
+                decode_cfg.max_symbols_per_step.max(1),
                 decode_cfg.start_token(),
                 verbose,
-            )
+            );
+            let (ids, frames): (Vec<usize>, Vec<usize>) = pairs.into_iter().unzip();
+            (ids, frames, encoder_frames)
         };
         if verbose {
             println!(
                 "DEBUG Parakeet TDT Decoded IDs: {:?}",
-                &decoded_tokens[..20.min(decoded_tokens.len())]
+                &raw_ids[..20.min(raw_ids.len())]
             );
         }
-        return finalize_parakeet_decode(
+        let (text, kept) = finalize_parakeet_decode(
             bpe,
-            &decoded_tokens,
+            &raw_ids,
             decode_cfg.blank_token_id,
             model_name,
         );
+        return with_frames(text, kept, &raw_ids, &raw_frames, encoder_frames);
     }
 
     let logits = parakeet.forward(mel.clone());
@@ -346,12 +417,13 @@ pub fn decode_parakeet(
             println!("DEBUG Parakeet CTC Raw IDs: {:?}", &raw_ids[..20.min(raw_ids.len())]);
         }
         let decoded_tokens = ctc_greedy_tokens(&raw_ids, decode_cfg.blank_token_id);
-        return finalize_parakeet_decode(
+        let (text, kept) = finalize_parakeet_decode(
             bpe,
             &decoded_tokens,
             decode_cfg.blank_token_id,
             model_name,
         );
+        return with_frames(text, kept, &decoded_tokens, &[], 0);
     }
 
     if verbose {
@@ -427,12 +499,13 @@ pub fn decode_parakeet(
         );
     }
 
-    finalize_parakeet_decode(
+    let (text, kept) = finalize_parakeet_decode(
         bpe,
         &decoded_tokens,
         decode_cfg.blank_token_id,
         model_name,
-    )
+    );
+    with_frames(text, kept, &decoded_tokens, &[], 0)
 }
 
 fn vocab_fallback_text(model_name: &str, decoded_tokens: &[usize]) -> String {
