@@ -1,4 +1,4 @@
-pub mod config; pub mod kv8;
+pub mod config; pub mod kv8; pub mod kv4;
 pub mod llama;
 pub mod loader;
 pub mod kquant;

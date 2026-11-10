@@ -23,7 +23,15 @@ textarea{resize:vertical;width:100%}
 .chatbar{display:flex;gap:12px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--border)}
 .chatbar select{max-width:340px}
 .settings{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px 12px;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
-.settings label{display:flex;flex-direction:column;font-size:12px;color:var(--muted)}.settings .full{grid-column:1/-1}
+.settings label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:4px}.settings .full{grid-column:1/-1}
+.settings .lab{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.prof-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.prof-bar .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0}
+.prov{font-size:10px;letter-spacing:.04em;text-transform:uppercase;padding:1px 6px;border-radius:99px;border:1px solid var(--border);color:var(--muted)}
+.prov[data-prov="tune"]{color:#7bd88f;border-color:#7bd88f88}
+.prov[data-prov="modified"]{color:#e5c07b;border-color:#e5c07b88}
+.prov.edited::after{content:" · unsaved"}
 .hidden{display:none!important}
 .messages{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:860px;width:100%;margin:0 auto;padding:10px 14px;border-radius:12px;background:var(--panel);border:1px solid var(--border)}

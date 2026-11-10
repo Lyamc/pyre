@@ -88,8 +88,9 @@ same-file = "1"
 sysinfo = "0.37"
 matrixmultiply = "0.3"
 nvml-wrapper = "0.13"
-# Only for the fused-quant switch in tests/benches (patched to the local fork).
-burn-cubecl = { git = "https://github.com/Lyamc/burn", rev = "9db7598f09ce29036a949a8635343f8a58780d4f", default-features = false, features = ["std"] }
+# Same revision as the workspace Burn. The fused-quant helpers kquant calls
+# (`set_fused_qmatmul`) live on this rev; 9db7598 does not export them.
+burn-cubecl = { git = "https://github.com/Lyamc/burn", rev = "4b9af57ff044b0e3157b985361a4c6f2004f3ae7", default-features = false, features = ["std"] }
 # Image generation: Stable Diffusion, vendored from oxiglade/diffusers-burn (MIT/Apache) and ported to the workspace Burn.
 pyre-sd = { path = "crates/pyre-sd", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"], optional = true }

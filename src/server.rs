@@ -30,6 +30,13 @@ pub struct Llm {
     pub dtype: String,
     pub default_max_tokens: usize,
 }
+
+impl Llm {
+    /// Context cap for this request. Qwen-Next follows the live setting (`/api/qwen/context`).
+    pub fn n_ctx_now(&self) -> usize {
+        if self.dtype == "gguf" { crate::qn_ctx::live_cap(self.n_ctx) } else { self.n_ctx }
+    }
+}
 use crate::registry::App;
 type S = State<Arc<App>>;
 type AppState = Llm;
@@ -160,7 +167,7 @@ impl Gen {
         }
     }
     fn max(&self, st: &AppState, prompt_len: usize) -> usize {
-        let room = st.n_ctx.saturating_sub(prompt_len);
+        let room = st.n_ctx_now().saturating_sub(prompt_len);
         let m = self.max_completion_tokens.or(self.max_tokens)
             .or(self.n_predict.and_then(|n| if n < 0 { None } else { Some(n as usize) }))
             .unwrap_or(st.default_max_tokens.min(room));
@@ -177,7 +184,7 @@ fn start_tb(st: &AppState, prompt: Vec<u32>, g: &Gen, think_budget: Option<usize
     let (tx, mut rx_in) = unbounded_channel();
     let (tx_out, rx) = unbounded_channel();
     let max_tokens = g.max(st, prompt.len());
-    let mid = crate::metrics::begin(&st.model_id, prompt.len(), st.n_ctx, max_tokens);
+    let mid = crate::metrics::begin(&st.model_id, prompt.len(), st.n_ctx_now(), max_tokens);
     st.engine.submit(Job::Gen(GenRequest { prompt, max_tokens, params: g.params(), stop: g.stops(), tx, think_budget, auto_bias, auto_tools }));
     // Forward engine events to the handler while recording live metrics (/api/metrics).
     // Dropping `rx_in` when the client goes away still cancels the job as before.
@@ -499,7 +506,7 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
     let mut ids = match encode(&st, &prompt, false) { Ok(i) => i, Err(r) => return r };
     let mut prompt = prompt;
     // ctx-tooltrim: only above the threshold (below it the prompt is untouched)
-    let lim = crate::ctx::trim_at(st.n_ctx);
+    let lim = crate::ctx::trim_at(st.n_ctx_now());
     if crate::ctx::tooltrim_on() && ids.len() > lim {
         let mut count = |m: &[Value]| -> Option<usize> { let p = st.template.render(m, true, req.tools.as_ref()).ok()?; encode(&st, &p, false).ok().map(|i| i.len()) };
         if crate::ctx::tooltrim(&mut msgs, lim, &mut count) > 0 {
@@ -507,14 +514,14 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
         }
     }
     // ctx-summarize: only above the threshold; one remembered compaction per history (prefix-cache friendly)
-    let slim = crate::ctx::sum_at(st.n_ctx);
+    let slim = crate::ctx::sum_at(st.n_ctx_now());
     if crate::ctx::summarize_on() && ids.len() > slim {
         let mut changed = false; while crate::ctx::apply_memo(&mut msgs) { changed = true; }
         let mut n = ids.len();
         if changed { if let Ok(p) = st.template.render(&msgs, true, req.tools.as_ref()) { if let Ok(i) = encode(&st, &p, false) { n = i.len(); prompt = p; ids = i; } } }
         if n > slim { if let Some((h0, end)) = crate::ctx::span(&msgs) {
             let sreq = crate::ctx::summary_request(&msgs[h0..end]);
-            if let Ok(sp) = st.template.render(&sreq, true, None) { let sp = crate::ctx::no_think(sp); if let Ok(si) = encode(&st, &sp, false) { if si.len() + 2500 < st.n_ctx {
+            if let Ok(sp) = st.template.render(&sreq, true, None) { let sp = crate::ctx::no_think(sp); if let Ok(si) = encode(&st, &sp, false) { if si.len() + 2500 < st.n_ctx_now() {
                 let g = Gen { temperature: Some(0.0), max_tokens: Some(2500), ..Default::default() };
                 let mut th = Think::new(&sp);
                 if let Ok((text, _, t, _)) = collect(start(&st, si, &g)).await {
@@ -1076,7 +1083,7 @@ async fn props(State(app): S) -> Response {
     let st = match app.llm(None) { Ok(m) => m, Err(r) => return r };
     let d = SamplingParams::default();
     Json(json!({
-        "default_generation_settings": {"n_ctx": st.n_ctx, "params": {"temperature": d.temperature, "top_k": d.top_k, "top_p": d.top_p,
+        "default_generation_settings": {"n_ctx": st.n_ctx_now(), "params": {"temperature": d.temperature, "top_k": d.top_k, "top_p": d.top_p,
             "min_p": d.min_p, "repeat_penalty": d.repeat_penalty, "repeat_last_n": d.repeat_last_n, "n_predict": st.default_max_tokens}},
         "total_slots": 1, "model_path": st.model_path, "model_alias": st.model_id, "chat_template": st.template.source,
         "bos_token": st.template.bos_token, "eos_token": st.template.eos_token,

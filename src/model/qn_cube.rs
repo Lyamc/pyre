@@ -6482,7 +6482,7 @@ impl Cube {
     }
     /// kv8: attn_qsa over an int8 region [0, q8n) + f32 window (positions q8n..), qsa2 path only.
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_qsa8(&self, q8: &[Handle; 4], q8n: usize, p: &Handle, pn: usize, ko: usize, vo: usize, iqo: usize, qn: &Handle, kn: &Handle, iqn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, ib: &Handle, ibn: usize, nb: usize,
+    pub fn attn_qsa8(&self, q8: &[Handle; 4], q8n: usize, bits: u32, p: &Handle, pn: usize, ko: usize, vo: usize, iqo: usize, qn: &Handle, kn: &Handle, iqn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, ib: &Handle, ibn: usize, nb: usize,
                     out: &Handle, nh: usize, nkv: usize, hd: usize, half: usize, pos: usize, eps: f32, inh: usize, ihd: usize, ir: usize, kk: usize) {
         let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
         let q = self.empty(nh * hd); let sc = self.empty(nh * cap); let iq = self.empty(inh * ihd); let bs = self.empty(nb.max(1)); let sel = self.empty(nb.max(1));
@@ -6492,7 +6492,7 @@ impl Cube {
             k_qsa_q::launch_unchecked(&self.client, CubeCount::Static(inh as u32, 1, 1), CubeDim::new_1d(32), a(p, pn), a(iqn, ihd), a(cs, 2 * half), a(&iq, inh * ihd), iqo as u32, ihd as u32, half as u32, eps);
             k_qsa_score::launch_unchecked(&self.client, CubeCount::Static(nb as u32, 1, 1), CubeDim::new_1d(32), a(&iq, inh * ihd), a(ib, ibn), a(&bs, nb), inh as u32, ihd as u32, (ihd as f32).sqrt().recip());
             debug_assert!(qsa2_ok(nb, kk) && pos >= q8n, "kv8 needs the qsa2 decode path");
-            self.qsa2_tail8(q, &q8[0], &q8[1], &q8[2], &q8[3], q8n, kc, vc, cap - q8n, p, pn, &sc, &bs, &sel, out, nh, nkv, hd, pos + 1, cap, nb, ir, kk);
+            self.qsa2_tail8(q, &q8[0], &q8[1], &q8[2], &q8[3], q8n, bits, kc, vc, cap - q8n, p, pn, &sc, &bs, &sel, out, nh, nkv, hd, pos + 1, cap, nb, ir, kk);
         }
     }
     /// PYRE_QN_QSABENCH (diagnostic): time the QSA decode kernels on synthetic data at context n (us per call,
@@ -6548,16 +6548,16 @@ impl Cube {
     }    /// kv8: qsa2_tail with positions < q8n read from int8 (kq/ks, vq/vs) and the rest from the f32 window kc/vc
     /// (positions q8n.., `wn` rows each of nkv*hd).
     #[allow(clippy::too_many_arguments)]
-    pub fn qsa2_tail8(&self, q: Handle, kq: &Handle, ks: &Handle, vq: &Handle, vs: &Handle, q8n: usize, kc: &Handle, vc: &Handle, wn: usize, p: &Handle, pn: usize, sc: &Handle, bs: &Handle, sel: &Handle, out: &Handle, nh: usize, nkv: usize, hd: usize, n: usize, cap: usize, nb: usize, ir: usize, kk: usize) {
+    pub fn qsa2_tail8(&self, q: Handle, kq: &Handle, ks: &Handle, vq: &Handle, vs: &Handle, q8n: usize, bits: u32, kc: &Handle, vc: &Handle, wn: usize, p: &Handle, pn: usize, sc: &Handle, bs: &Handle, sel: &Handle, out: &Handle, nh: usize, nkv: usize, hd: usize, n: usize, cap: usize, nb: usize, ir: usize, kk: usize) {
         let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
-        let row = nkv * hd; let (qw, qs) = (q8n * row / 4, q8n * row / 32);
+        let row = nkv * hd; let per = if bits == 4 { 8 } else { 4 }; let (qw, qs) = (q8n * row / per, q8n * row / 32);
         let gy = (kk + 1).div_ceil(8); let lists = self.empty(9 * kk); let cnt = self.empty(9); let pm = self.empty(nh * gy);
         unsafe {
             k_qsa_sel2::launch_unchecked(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1024), a(bs, nb), a(sel, nb), a(&lists, 9 * kk), a(&cnt, 9), nb as u32, kk as u32);
             k_attn3sc8::launch_unchecked(&self.client, CubeCount::Static(nh as u32, gy as u32, 1), CubeDim::new_2d(32, 8),
-                a(&q, nh * hd), a(kq, qw.max(1)), a(ks, qs.max(1)), a(kc, wn * row), q8n as u32, a(sc, nh * cap), a(&pm, nh * gy), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, (hd as f32).sqrt().recip(), ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
+                a(&q, nh * hd), a(kq, qw.max(1)), a(ks, qs.max(1)), a(kc, wn * row), q8n as u32, bits, a(sc, nh * cap), a(&pm, nh * gy), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, (hd as f32).sqrt().recip(), ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
             k_attn3r8::launch_unchecked(&self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_2d(32, 8),
-                a(vq, qw.max(1)), a(vs, qs.max(1)), a(vc, wn * row), q8n as u32, a(p, pn), a(sc, nh * cap), a(&pm, nh * gy), a(out, nh * hd), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
+                a(vq, qw.max(1)), a(vs, qs.max(1)), a(vc, wn * row), q8n as u32, bits, a(p, pn), a(sc, nh * cap), a(&pm, nh * gy), a(out, nh * hd), a(&lists, 9 * kk), a(&cnt, 9), nh as u32, nkv as u32, hd as u32, n as u32, cap as u32, ir as u32, nb as u32, kk as u32, gy as u32, (hd / 32) as u32);
         }
     }
     pub fn hup_u32(&self, v: &[u32]) -> Handle { self.hup(u32::as_bytes(v)) }
@@ -7059,7 +7059,7 @@ mod kv8_gpu_tests {
             let run = |eight: bool| -> Vec<f32> { let sc = cb.empty(nh * cap); let bs = cb.buf(&bsv); let sel = cb.empty(nb.max(1)); let out = cb.empty(nh * hd); let q = cb.buf(&qv);
                 if eight { let z = [0u32]; let zf = [0f32];
                     let (kq, ks, vq, vs) = if q8n > 0 { (cb.hup_u32(&kw), cb.buf(&ksc), cb.hup_u32(&vw), cb.buf(&vsc)) } else { (cb.hup_u32(&z), cb.buf(&zf), cb.hup_u32(&z), cb.buf(&zf)) };
-                    cb.qsa2_tail8(q, &kq, &ks, &vq, &vs, q8n, &cb.buf(&k[q8n * row..]), &cb.buf(&v[q8n * row..]), cap - q8n, &p, pn, &sc, &bs, &sel, &out, nh, nkv, hd, n, cap, nb, ir, kk);
+                    cb.qsa2_tail8(q, &kq, &ks, &vq, &vs, q8n, 8, &cb.buf(&k[q8n * row..]), &cb.buf(&v[q8n * row..]), cap - q8n, &p, pn, &sc, &bs, &sel, &out, nh, nkv, hd, n, cap, nb, ir, kk);
                 } else { cb.qsa2_tail(q, &cb.buf(&kd), &cb.buf(&vd), &p, pn, &sc, &bs, &sel, &out, nh, nkv, hd, n, cap, nb, ir, kk); }
                 cb.read(&out) };
             let (a0, a8) = (run(false), run(true));
@@ -7090,7 +7090,7 @@ fn kv8_at(w: &[u32], s: &[f32], f: &[f32], q8n: u32, pos: u32, rowoff: u32, row:
 }
 /// kv8 copies of k_attn3sc / k_attn3r (K/V reads through kv8_at; everything else identical).
 #[cube(launch_unchecked)]
-fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, sc: &mut [f32], pm: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, scale: f32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
+fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, bits: u32, sc: &mut [f32], pm: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, scale: f32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
     let h = CUBE_POS_X; let c = CUBE_POS_Y;
     let lane = UNIT_POS_X; let wy = UNIT_POS_Y;
     let kvh = h / (nh / nkv);
@@ -7110,9 +7110,15 @@ fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, sc: &mut 
             let kb = (pp * nkv + kvh) * hd;
             let mut dd = 0.0f32;
             if pp < q8n {
-                // int8 row: one bounds check per position (last element), branch-free sign extension, shifts for word/scale
+                // one bounds check per position (last element). 8-bit: 4 codes per word. 4-bit: 8 nibbles, sign bit 8.
                 let eb = kb + lane; let el = eb + (nd - 1u32) * 32u32;
-                if ((el >> 2u32) as usize) < kq.len() && ((el >> 5u32) as usize) < ks.len() {
+                if bits == 4u32 {
+                    if ((el >> 3u32) as usize) < kq.len() && ((el >> 5u32) as usize) < ks.len() {
+                        #[unroll]
+                        for d in 0..nd { let e = eb + d * 32u32; let w = (kq[(e >> 3u32) as usize] >> ((e & 7u32) * 4u32)) & 15u32;
+                            dd += qr[d as usize] * (f32::cast_from(w) - 16.0f32 * f32::cast_from(w >> 3u32)) * ks[(e >> 5u32) as usize]; }
+                    }
+                } else if ((el >> 2u32) as usize) < kq.len() && ((el >> 5u32) as usize) < ks.len() {
                     #[unroll]
                     for d in 0..nd { let e = eb + d * 32u32; let w = (kq[(e >> 2u32) as usize] >> ((e & 3u32) * 8u32)) & 255u32;
                         dd += qr[d as usize] * (f32::cast_from(w) - 256.0f32 * f32::cast_from(w >> 7u32)) * ks[(e >> 5u32) as usize]; }
@@ -7136,7 +7142,7 @@ fn k_attn3sc8(q: &[f32], kq: &[u32], ks: &[f32], kc: &[f32], q8n: u32, sc: &mut 
     }
 }
 #[cube(launch_unchecked)]
-fn k_attn3r8(vq: &[u32], vs: &[f32], vc: &[f32], q8n: u32, p: &[f32], sc: &mut [f32], pm: &[f32], o: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
+fn k_attn3r8(vq: &[u32], vs: &[f32], vc: &[f32], q8n: u32, bits: u32, p: &[f32], sc: &mut [f32], pm: &[f32], o: &mut [f32], lists: &[u32], cnt: &[u32], nh: u32, nkv: u32, hd: u32, n: u32, cap: u32, ir: u32, nbs: u32, kk: u32, gy: u32, #[comptime] nd: u32) {
     let h = CUBE_POS_X;
     let lane = UNIT_POS_X;
     let wy = UNIT_POS_Y;
@@ -7179,7 +7185,13 @@ fn k_attn3r8(vq: &[u32], vs: &[f32], vc: &[f32], q8n: u32, p: &[f32], sc: &mut [
             let e = sc[(h * cap + t) as usize]; let vb = (t * nkv + kvh) * hd;
             if t < q8n {
                 let eb = vb + lane; let el = eb + (nd - 1u32) * 32u32;
-                if ((el >> 2u32) as usize) < vq.len() && ((el >> 5u32) as usize) < vs.len() {
+                if bits == 4u32 {
+                    if ((el >> 3u32) as usize) < vq.len() && ((el >> 5u32) as usize) < vs.len() {
+                        #[unroll]
+                        for d in 0..nd { let x = eb + d * 32u32; let w = (vq[(x >> 3u32) as usize] >> ((x & 7u32) * 4u32)) & 15u32;
+                            acc[d as usize] += e * (f32::cast_from(w) - 16.0f32 * f32::cast_from(w >> 3u32)) * vs[(x >> 5u32) as usize]; }
+                    }
+                } else if ((el >> 2u32) as usize) < vq.len() && ((el >> 5u32) as usize) < vs.len() {
                     #[unroll]
                     for d in 0..nd { let x = eb + d * 32u32; let w = (vq[(x >> 2u32) as usize] >> ((x & 3u32) * 8u32)) & 255u32;
                         acc[d as usize] += e * (f32::cast_from(w) - 256.0f32 * f32::cast_from(w >> 7u32)) * vs[(x >> 5u32) as usize]; }

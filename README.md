@@ -529,9 +529,8 @@ Ideas borrowed from Strata (github.com/Niko1221/Strata, MIT); pyre's own impleme
   Off by default: on the RTX 3060 it is not faster (verify cost grows almost linearly with the window
   because routed experts run on the CPU), and on a 400-token code-edit run greedy output still diverged
   from plain decode at token 294 (64-token story/code runs are identical).
-- 128k context: `PYRE_QN_CTX` (default 131072, capped at the GGUF's 262144). The dense attention range
-  (indexer top-k, 2048) stays on the GPU; past it the KV lives in host RAM and the QSA indexer picks the
-  attended positions. A 3072-token prompt used the same ~8.1 GB VRAM as a short one.
+- Context window: `PYRE_QN_CTX` or the chat setting (default 131072). Presets run 8k–512k, and a raw count is accepted up to 1048576. Past the GGUF's trained length (usually 262144) uses YaRN. The dense attention range
+  (indexer top-k, 2048) stays exact. Older KV is stored at 4-bit by default (`PYRE_QN_KV_BITS=8` or the KV control selects 8-bit; `PYRE_QN_KV8=0` keeps f32). Both packed widths are lossy. A window that would cross the VRAM floor is refused, and the response offers 4-bit or a shorter preset.
 - Route prior (`--route-prior X` / `PYRE_ROUTE_PRIOR` / config `route_prior`): residency-biased routing
   toward GPU-cached experts. It changes outputs, so it is off (0) by default.
 - `/api/status` reports `speculative` (draft len, rounds, drafted, accepted, acceptance), `route_prior`

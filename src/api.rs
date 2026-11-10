@@ -28,6 +28,15 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/status/stream", get(status_stream))
         .route("/api/activity/cancel", post(activity_cancel))
         .route("/api/metrics", get(metrics))
+        .route("/api/qwen/context", get(qwen_context).post(qwen_context_set))
+        .route("/api/autotune", get(autotune_status))
+        .route("/api/autotune/retune", post(autotune_retune))
+        .route("/api/autotune/ack", post(autotune_ack))
+        .route("/api/settings/profiles", get(profiles_get))
+        .route("/api/settings/profiles/select", post(profiles_select))
+        .route("/api/settings/profiles/tune", post(profiles_tune))
+        .route("/api/settings/profiles/custom", post(profiles_custom))
+        .route("/api/settings/profiles/custom/delete", post(profiles_custom_delete))
         .route("/api/logs", get(logs))
         .route("/metrics", get(prom))
         .route("/v1/images/generations", post(images).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
@@ -246,7 +255,74 @@ async fn status(State(app): S) -> Json<Value> {
         "activity": crate::activity::snapshot(),
         "batching": format!("continuous batching, up to PYRE_PARALLEL slots per LLM"),
         "speculative": crate::spec::status()["speculative"], "route_prior": crate::spec::status()["route_prior"], "fast": crate::spec::fast(), "context": crate::spec::status()["context"],
+        "qwen_context": crate::qn_ctx::status_value(),
+        "autotune": crate::hw_tune::status_value(),
+        "profiles": crate::profiles::status_value(),
     }))
+}
+
+async fn qwen_context() -> Json<Value> { Json(crate::qn_ctx::status_value()) }
+
+async fn qwen_context_set(Json(b): Json<Value>) -> Response {
+    let ctx = b.get("context").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .or_else(|| b.get("context_tokens").and_then(|v| v.as_u64()).map(|n| n.to_string()));
+    let bits = b.get("kv_bits").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let force = b.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    match crate::qn_ctx::apply(ctx.as_deref(), bits, force) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn autotune_status() -> Json<Value> { Json(crate::hw_tune::status_value()) }
+async fn autotune_retune() -> Json<Value> { Json(crate::hw_tune::request_retune()) }
+async fn autotune_ack() -> Json<Value> { Json(crate::hw_tune::ack()) }
+
+async fn profiles_get() -> Json<Value> { Json(crate::profiles::status_value()) }
+
+async fn profiles_select(Json(b): Json<Value>) -> Response {
+    let source = b.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let name = b.get("name").and_then(|v| v.as_str());
+    let values = match crate::profiles::values_for(source, name) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let ctx = values.get("context_tokens").and_then(|n| n.as_u64()).map(|n| n.to_string());
+    let bits = values.get("kv_bits").and_then(|n| n.as_u64()).map(|n| n as u32);
+    if let Err(e) = crate::qn_ctx::apply(ctx.as_deref(), bits, false) {
+        return err(StatusCode::BAD_REQUEST, format!("{e} Default, tune, and custom presets were left unchanged."));
+    }
+    match crate::profiles::set_active(source, name) {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() { o.insert("values".into(), Value::Object(values)); }
+            Json(v).into_response()
+        }
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn profiles_tune(Json(b): Json<Value>) -> Response {
+    match crate::profiles::save_tune(b.get("values").unwrap_or(&Value::Null)) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn profiles_custom(Json(b): Json<Value>) -> Response {
+    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let replace = b.get("replace").and_then(|v| v.as_bool()).unwrap_or(false);
+    match crate::profiles::save_custom(name, b.get("values").unwrap_or(&Value::Null), replace) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn profiles_custom_delete(Json(b): Json<Value>) -> Response {
+    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    match crate::profiles::delete_custom(name) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 static SYS: std::sync::Mutex<Option<sysinfo::System>> = std::sync::Mutex::new(None);
@@ -301,6 +377,9 @@ async fn metrics_json(app: Arc<App>) -> Json<Value> {
     v["cpu_pct"] = json!(cpu);
     v["ram"] = json!({"used": used, "total": total, "process_rss": rss});
     v["models"] = json!(app.loaded().iter().map(|m| json!({"id": m.id, "kind": m.kind.as_str(), "backend": m.backend, "busy": m.busy(), "queued": m.queued(), "meta": m.meta()})).collect::<Vec<_>>());
+    v["qwen_context"] = crate::qn_ctx::status_value();
+    v["autotune"] = crate::hw_tune::status_value();
+    v["profiles"] = crate::profiles::status_value();
     Json(v)
 }
 
