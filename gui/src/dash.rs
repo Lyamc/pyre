@@ -2,7 +2,7 @@
 //! request table at a glance) inspired by Strata's TUI (github.com/Niko1221/Strata); no code shared.
 use crate::{PyreGui, ACCENT, MUTED, PANEL, RAISED, TEXT, DANGER};
 use gpui::{div, prelude::*, px, rgb, Context};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const GOOD: u32 = 0x7bd88f;
 const WARN: u32 = 0xe5c07b;
@@ -50,7 +50,7 @@ fn cells(cols: &[(f32, String)], color: u32) -> impl IntoElement {
 }
 
 impl PyreGui {
-    pub fn dashboard_page(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub fn dashboard_page(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let m = &self.metrics;
         if m.is_null() {
             return div().text_color(rgb(MUTED)).child(format!("no /api/metrics from {} (older pyre or not running)", self.server)).into_any_element();
@@ -120,9 +120,40 @@ impl PyreGui {
             table = table.child(row(a, a["outcome"].as_str().unwrap_or("").into(), format!("{:.1}s", f(&a["total_ms"]) / 1e3), if ok { TEXT } else { DANGER }));
         }
 
-        div().flex().flex_col().size_full().gap(px(10.))
-            .child(header).child(cards).child(gauges).child(sparks).child(table)
-            .into_any_element()
+        let qc = &m["qwen_context"];
+        let at = &m["autotune"];
+        let prof = &m["profiles"];
+        let prof_line = if prof.is_null() { String::new() } else {
+            let src = prof["active"]["source"].as_str().unwrap_or("default");
+            let name = prof["active"]["name"].as_str().unwrap_or("");
+            let shown = if src == "custom" && !name.is_empty() { format!("custom “{name}”") } else { src.to_string() };
+            let stale = if prof["tune_stale"].as_bool() == Some(true) { " · tune was kept; hardware changed" } else { "" };
+            format!("settings source {shown}{stale}")
+        };
+        let ctx_line = if qc.is_null() { String::new() } else {
+            format!("context {} · KV {}-bit · {}", qc["context_label"].as_str().unwrap_or("?"), qc["kv_bits"].as_u64().unwrap_or(4), qc["fit"]["message"].as_str().unwrap_or(""))
+        };
+        let suggest = at["suggest"].as_bool() == Some(true);
+        let tune_msg = at["message"].as_str().unwrap_or("").to_string();
+        let mut page = div().flex().flex_col().size_full().gap(px(10.)).child(header);
+        if suggest {
+            page = page.child(div().p(px(10.)).rounded_md().bg(rgb(PANEL)).text_sm().text_color(rgb(WARN)).child(tune_msg.clone())
+                .child(div().flex().gap(px(8.)).pt(px(8.))
+                    .child(self.button("tune-keep", "Keep these results", false, cx, |t| { crate::net::post(t.base(), "/api/autotune/ack", json!({}), "autotune", t.tx.clone()); }))
+                    .child(self.button("tune-re", "Retune on next start", true, cx, |t| { crate::net::post(t.base(), "/api/autotune/retune", json!({}), "autotune", t.tx.clone()); }))));
+        }
+        if !ctx_line.is_empty() {
+            page = page.child(div().p(px(10.)).rounded_md().bg(rgb(PANEL)).text_sm().child(ctx_line)
+                .when(!prof_line.is_empty(), |d| d.child(div().pt(px(4.)).text_color(rgb(MUTED)).child(prof_line)))
+                .child(div().flex().gap(px(8.)).pt(px(8.))
+                    .child(self.button("ctx128", "128k", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"context":"128k"}), "qwen-context", t.tx.clone()); }))
+                    .child(self.button("ctx256", "256k", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"context":"256k"}), "qwen-context", t.tx.clone()); }))
+                    .child(self.button("ctx384", "384k", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"context":"384k"}), "qwen-context", t.tx.clone()); }))
+                    .child(self.button("ctx512", "512k", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"context":"512k"}), "qwen-context", t.tx.clone()); }))
+                    .child(self.button("kv4", "KV 4-bit", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"kv_bits":4}), "qwen-kv", t.tx.clone()); }))
+                    .child(self.button("kv8", "KV 8-bit", false, cx, |t| { crate::net::post(t.base(), "/api/qwen/context", json!({"kv_bits":8}), "qwen-kv", t.tx.clone()); }))));
+        }
+        page.child(cards).child(gauges).child(sparks).child(table).into_any_element()
     }
 }
 

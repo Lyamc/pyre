@@ -34,7 +34,8 @@ pub struct Loaded {
 impl Loaded {
     pub fn meta(&self) -> Value {
         match &self.inner {
-            Inner::Llm(l) => json!({"n_ctx": l.n_ctx, "context_length": l.n_ctx, "max_model_len": l.n_ctx, "backend": l.backend, "dtype": l.dtype, "path": self.path}),
+            Inner::Llm(l) => json!({"n_ctx": l.n_ctx_now(), "context_length": l.n_ctx_now(), "max_model_len": l.n_ctx_now(), "backend": l.backend, "dtype": l.dtype, "path": self.path,
+                "kv_bits": if l.dtype == "gguf" { serde_json::json!(crate::qn_ctx::kv_bits()) } else { serde_json::Value::Null }}),
             Inner::Stt(s) => json!({"backend": self.backend, "path": self.path, "engine": s.describe()}),
             Inner::Image(i) => json!({"backend": self.backend, "path": self.path, "engine": i.describe(), "image": i.info()}),
             Inner::Tts(t) => json!({"backend": self.backend, "path": self.path, "engine": t.describe()}),

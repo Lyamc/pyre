@@ -37,8 +37,9 @@ struct Layer { hc_a: Hc, hc_f: Hc, mix: Mixer, ple: Option<Ple>, router: QMat, g
 pub struct KvG { k: burn_cubecl::cubecl::server::Handle, v: burn_cubecl::cubecl::server::Handle, ik: burn_cubecl::cubecl::server::Handle, cap: usize, len: usize,
     /// QSA pooled block keys on the GPU (cap/ratio blocks) and how many leading blocks are pooled and still valid
     pb: Option<burn_cubecl::cubecl::server::Handle>, nbp: usize,
-    /// kv8 (PYRE_QN_KV8, opt-in): positions [0, q8n) as int8 (kq, ks, vq, vs); k/v then hold positions [q8n, cap) at (pos - q8n)
-    q8: Option<[burn_cubecl::cubecl::server::Handle; 4]>, q8n: usize }
+    /// Quantized KV (4-bit default, or 8-bit): positions [0, q8n) packed (kq, ks, vq, vs); k/v then hold
+    /// positions [q8n, cap) at (pos - q8n). `qbits` is 4 or 8.
+    q8: Option<[burn_cubecl::cubecl::server::Handle; 4]>, q8n: usize, qbits: u8 }
 /// Pre-packed host copies of missed experts in the GPU arena layout (Strata's host expert arena, expert_source.cpp:
 /// experts kept in the device layout in RAM so a PCIe upload is a plain copy). Filled on first use up to
 /// PYRE_QN_XARENA_GB, and never while less than PYRE_QN_RAM_RESERVE_GB (default 16) of RAM would stay free.
@@ -177,7 +178,7 @@ pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, 
 type H = burn_cubecl::cubecl::server::Handle;
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
-pub struct Model { mtp_gkv: std::sync::Mutex<Option<super::mtp::GRing>>, vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, mtp: Option<super::mtp::Mtp> }
+pub struct Model { mtp_gkv: std::sync::Mutex<Option<super::mtp::GRing>>, vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, rope_mscale: f32, mtp: Option<super::mtp::Mtp> }
 
 pub struct State {
     pub tokens: Vec<u32>,
@@ -485,8 +486,8 @@ impl Model {
         };
         let mut cfg = cfg;
         let has_idx = cfg.idx_nh > 0 && g.has("blk.3.indexer.q_proj.weight");
-        // 128k by default (PYRE_QN_CTX overrides); without indexer weights only the dense range is exact
-        cfg.max_ctx = if has_idx { env_usize("PYRE_QN_CTX").unwrap_or(131072).min(cfg.ctx_train).max(16) } else { cfg.idx_budget };
+        // 128k unless PYRE_QN_CTX or the saved context says otherwise. Above ctx_train is kept and YaRN-scaled.
+        cfg.max_ctx = crate::qn_ctx::startup_tokens(cfg.ctx_train, has_idx, cfg.idx_budget).map_err(|e| anyhow::anyhow!(e))?;
         let hc = |p: &str, inj: bool| -> Result<Hc> { Ok(Hc { norm: g.vec(&format!("{p}_norm.weight"))?, down: g.mat(&format!("{p}_down.weight"))?, up: g.mat(&format!("{p}_up.weight"))?, inject: if inj { Some(g.mat(&format!("{p}_inject.weight"))?) } else { None }, q8: None }) };
         let mut layers = vec![];
         for il in 0..n_layers {
@@ -508,17 +509,27 @@ impl Model {
         let head = hc("output_hc", false)?;
         let out = if g.has("output.weight") { g.mat("output.weight")? } else { g.mat("token_embd.weight")? };
         let ple_tab = if cfg.ple_layers.is_empty() { None } else { Some(g.mat("per_layer_token_embd.weight")?) };
-        let half = cfg.n_rot / 2;
-        let rope_inv = (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.n_rot as f32)).collect();
+        let (rope_inv, rope_meta) = crate::qn_ctx::rope_inv(cfg.n_rot, cfg.rope_base, cfg.ctx_train, cfg.max_ctx);
+        let rope_mscale = rope_meta.mscale;
+        let n_attn = (1..=cfg.n_layers).filter(|i| cfg.full_every.max(1) > 0 && i % cfg.full_every.max(1) == 0).count();
+        crate::qn_ctx::note_loaded(crate::qn_ctx::Geom { n_attn, n_kv: cfg.n_kv, hd: cfg.hd, idx_hd: cfg.idx_hd, ctx_train: cfg.ctx_train, recent: env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64), source: "model" }, cfg.max_ctx);
+        if rope_meta.scale > 1.0 { eprintln!("qwen-next: context {} past trained {} — YaRN x{:.3} (mscale {:.3})", cfg.max_ctx, cfg.ctx_train, rope_meta.scale, rope_mscale); }
         let mut layers = layers; let mut head = head;
         if env_var("PYRE_QN_HC_Q8").map(|v| v == "1").unwrap_or(false) {
             let mk = |h: &mut Hc| { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } let di = super::qdot::Q8Mat::from_rows(&a); let up = super::qdot::Q8Mat::from_rows(&[&h.up]); h.q8 = Some((di, up)); };
             for l in layers.iter_mut() { mk(&mut l.hc_a); mk(&mut l.hc_f); } mk(&mut head);
         }
-        Ok(Model { mtp_gkv: Default::default(), vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, mtp: None, cfg, g })
+        Ok(Model { mtp_gkv: Default::default(), vg: Default::default(), vxs: Default::default(), mtp_headc: Default::default(), mtp_dense: Default::default(), xpk: Default::default(), xper: Default::default(), lg: Default::default(), headc: None, xc: None, cube: None, cl: vec![], gpu: None, gmats: Default::default(), gl: vec![], embd: g.mat("token_embd.weight")?, out, head, ple_tab, layers, rope_inv, rope_mscale, mtp: None, cfg, g })
     }
 
-    pub fn max_ctx(&self) -> usize { self.cfg.max_ctx }
+    pub fn max_ctx(&self) -> usize { crate::qn_ctx::live_cap(self.cfg.max_ctx) }
+
+    /// cos, then sin, with YaRN mscale applied only when it is not 1 (unscaled runs stay bit-identical).
+    fn rope_cs(&self, pos: usize, i: usize) -> (f32, f32) {
+        let a = pos as f32 * self.rope_inv[i];
+        let (s, co) = a.sin_cos();
+        if self.rope_mscale == 1.0 { (co, s) } else { (co * self.rope_mscale, s * self.rope_mscale) }
+    }
 
     /// Bring every routed-expert page into this process's working set once, up front (the idea of
     /// Strata's resident expert arena, without a copy: the pages stay the OS file cache's). Without
@@ -953,7 +964,7 @@ impl Model {
     /// The rope cos/sin row of `pos` on the device, uploaded once and shared by every attention layer (each small
     /// write costs tens of microseconds on the stream); PYRE_QN_ROPEC=0 uploads it per layer as before.
     fn rope_h(&self, cb: &super::qn_cube::Cube, pos: usize, half: usize) -> H {
-        let mk = || { let cs: Vec<f32> = (0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos()).chain((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())).collect(); cb.buf(&cs) };
+        let mk = || { let cs: Vec<f32> = (0..half).map(|i| self.rope_cs(pos, i).0).chain((0..half).map(|i| self.rope_cs(pos, i).1)).collect(); cb.buf(&cs) };
         if env_var("PYRE_QN_ROPEC").map(|v| v == "0").unwrap_or(false) { return mk(); }
         static C: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), H>>> = std::sync::Mutex::new(None);
         let mut g = C.lock().unwrap(); let m = g.get_or_insert_with(Default::default);
@@ -982,7 +993,7 @@ impl Model {
         g.nbp = g.nbp.min(pos / ir); let nb = (pos + 1) / ir;
         for b in g.nbp..nb { let cs = self.rope_h(cb, b * ir, half); cb.qsa_pool(&g.ik, g.cap * ihd, &ikh, &cs, &pb, nbc * ihd, b, ir, ihd, half, c.eps); }
         g.nbp = nb;
-        if let Some(q8) = &g.q8 { cb.attn_qsa8(q8, g.q8n, pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir); return; }
+        if let Some(q8) = &g.q8 { let bits = if g.qbits == 4 { 4 } else { 8 }; cb.attn_qsa8(q8, g.q8n, bits, pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir); return; }
         cb.attn_qsa(pj, pr, sp[1], sp[2], sp[3], qnh, knh, &iqh, &csb, &g.k, &g.v, g.cap, &pb, nbc * ihd, nb, out, nh, nkv, hd, half, pos, c.eps, c.idx_nh, ihd, ir, c.idx_budget / ir);
     }
     fn xpk_prefill(&self, skip: usize, cbp: Option<&super::qn_cube::Cube>) {
@@ -1410,7 +1421,7 @@ impl Model {
 
     fn rope(&self, v: &mut [f32], pos: usize) {
         let half = self.cfg.n_rot / 2;
-        for i in 0..half { let a = pos as f32 * self.rope_inv[i]; let (s, co) = a.sin_cos(); let (x0, x1) = (v[i], v[i + half]); v[i] = x0 * co - x1 * s; v[i + half] = x1 * co + x0 * s; }
+        for i in 0..half { let (co, s) = self.rope_cs(pos, i); let (x0, x1) = (v[i], v[i + half]); v[i] = x0 * co - x1 * s; v[i + half] = x1 * co + x0 * s; }
     }
 
     fn attn(&self, l: &Layer, ai: usize, st: &mut State, x: &[f32], start: usize, t: usize) -> Vec<f32> {
@@ -1438,19 +1449,34 @@ impl Model {
         let row = (self.cfg.n_kv * self.cfg.hd * 2 + self.cfg.idx_hd) as u64 * 4; let nn = need as u64; let bytes = (nn + (nn / 8).max(1024)) * row;
         let old = st.kvg.get(ai).and_then(|g| g.as_ref()).map_or(0, |g| g.cap as u64 * row);
         let free = crate::limits::vram().map_or(u64::MAX, |v| v.free);
+        let mode = crate::qn_ctx::quant_mode(); let bits = crate::qn_ctx::kv_bits();
+        let long = self.has_idx() && nn as usize > self.dense_n() + 2048 + 64;
+        // 4-bit (default) or 8-bit is the layout kv_push will actually upload once the context is long.
+        if mode == 1 && long {
+            let bq = self.kv_quant_bytes(nn, bits);
+            if free >= bq.saturating_sub(old) + ((fl + 128) << 20) { return true; }
+        }
         if free >= bytes.saturating_sub(old) + ((fl + 256) << 20) { return true; }
-        // kv8 auto: the int8 layout of this layer (recent window f32 + older positions int8) instead of moving it to the host
-        if kv8_mode() == 2 && self.has_idx() && nn as usize > self.dense_n() + 2048 + 64 {
-            let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64) as u64; let rowkv = (self.cfg.n_kv * self.cfg.hd) as u64;
-            let q8n = ((nn - rec) / 64) * 64; let capn = nn + (nn / 8).max(1024);
-            let b8 = (capn - q8n) * rowkv * 8 + q8n * rowkv * 2 * 9 / 8 + capn * self.cfg.idx_hd as u64 * 4;
-            if free >= b8.saturating_sub(old) + ((fl + 128) << 20) { // smaller slack than f32 growth: the governor holds free near floor + ~200 MiB
+        // auto: the packed layout of this layer (recent window f32 + older positions at kv_bits) instead of the host
+        if mode == 2 && long {
+            let bq = self.kv_quant_bytes(nn, bits);
+            if free >= bq.saturating_sub(old) + ((fl + 128) << 20) { // smaller slack than f32 growth: the governor holds free near floor + ~200 MiB
                 KV8_ENGAGED.store(true, std::sync::atomic::Ordering::Relaxed); KV8_AUTO_ENGAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); KV8_CONVERT.store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::logbuf::event("kv8_auto", "WARN", serde_json::json!({"layer": ai, "need": need, "free_mib": free >> 20, "f32_mib": bytes >> 20, "int8_mib": b8 >> 20}));
+                crate::logbuf::event("kv8_auto", "WARN", serde_json::json!({"layer": ai, "need": need, "bits": bits, "free_mib": free >> 20, "f32_mib": bytes >> 20, "quant_mib": bq >> 20}));
                 return true; } }
         if st.kvg.get(ai).map_or(false, |g| g.is_some()) { self.kv_pull(ai, st); st.kvg[ai] = None;
             crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host", "layer": ai, "need": need, "free_mib": free >> 20})); }
         false
+    }
+    /// Bytes of one layer's packed KV for `need` positions at 4 or 8 bits (recent window stays f32).
+    /// The 8-bit formula matches the previous int8 estimate (`* 9 / 8` per value).
+    fn kv_quant_bytes(&self, nn: u64, bits: u32) -> u64 {
+        let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64) as u64;
+        let rowkv = (self.cfg.n_kv * self.cfg.hd) as u64;
+        let q8n = ((nn.saturating_sub(rec)) / 64) * 64;
+        let capn = nn + (nn / 8).max(1024);
+        let per = if bits <= 4 { 5u64 } else { 9u64 };
+        (capn - q8n) * rowkv * 8 + q8n * rowkv * 2 * per / 8 + capn * self.cfg.idx_hd as u64 * 4
     }
     /// kv8 auto: right after an engage, re-upload every other eligible f32 GPU layer KV as int8 (one layer at a time, so the
     /// transient is one int8 copy) so the pressure is relieved before more layers fall back to the host.
@@ -1479,13 +1505,19 @@ impl Model {
         if let Some(recent) = kv8_recent() { if self.has_idx() && cl > self.dense_n() + recent + 64 {
             let q8n = ((cl - recent) / 64) * 64; let nn = need.max(cl);
             let gr = env_usize("PYRE_QN_KVGRAN").unwrap_or(1024).max(64); let cap = (nn + (nn / 8).max(1024)).next_multiple_of(gr);
-            let (kw, ks) = super::kv8::pack(&st.k[ai][..q8n * row]); let (vw, vs) = super::kv8::pack(&st.v[ai][..q8n * row]);
+            let bits = crate::qn_ctx::kv_bits();
+            let (kw, ks, vw, vs) = if bits <= 4 {
+                let (kw, ks) = super::kv4::pack(&st.k[ai][..q8n * row]); let (vw, vs) = super::kv4::pack(&st.v[ai][..q8n * row]); (kw, ks, vw, vs)
+            } else {
+                let (kw, ks) = super::kv8::pack(&st.k[ai][..q8n * row]); let (vw, vs) = super::kv8::pack(&st.v[ai][..q8n * row]); (kw, ks, vw, vs)
+            };
             let mut kb = st.k[ai][q8n * row..].to_vec(); kb.resize((cap - q8n) * row, 0.0); let mut vb = st.v[ai][q8n * row..].to_vec(); vb.resize((cap - q8n) * row, 0.0);
             let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
             let q8 = [cb.hup_u32(&kw), cb.buf(&ks), cb.hup_u32(&vw), cb.buf(&vs)];
+            let packed = if bits <= 4 { q8n * row / 2 + q8n * row / 8 } else { q8n * row + q8n * row / 8 };
             static LOGN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            if LOGN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 { eprintln!("kv8: layer {ai} positions {cl} int8 {q8n} cap {cap} ({:.0} MiB f32 -> {:.0} MiB)", (2 * cap * row * 4) as f64 / 1048576.0, (2 * ((cap - q8n) * row * 4 + q8n * row + q8n * row / 8)) as f64 / 1048576.0); }
-            st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: Some(q8), q8n }); return; } }
+            if LOGN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 { eprintln!("kv{bits}: layer {ai} positions {cl} packed {q8n} cap {cap} ({:.0} MiB f32 -> {:.0} MiB)", (2 * cap * row * 4) as f64 / 1048576.0, (2 * ((cap - q8n) * row * 4 + packed)) as f64 / 1048576.0); }
+            st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: Some(q8), q8n, qbits: if bits <= 4 { 4 } else { 8 } }); return; } }
         if let Some((bits, recent)) = kvq_measure() { let old = cl.saturating_sub(recent) * row; kvq_roundtrip(&mut st.k[ai][..old], bits); kvq_roundtrip(&mut st.v[ai][..old], bits); }
         if dbg { let nn = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count(); eprintln!("kvdbg pulled ai {ai} host_k {cl} host_ik {} nonfinite k {} v {} ik {}", st.ik[ai].len() / self.cfg.idx_hd.max(1), nn(&st.k[ai]), nn(&st.v[ai]), nn(&st.ik[ai])); }
         // int45: need + 1/8 headroom (>= 1024 rows), 1024-row multiples, instead of the next power of two (32769 -> 65536
@@ -1499,10 +1531,10 @@ impl Model {
             let src = if up.is_empty() { None } else { Some((cb.buf(&up), up.len())) };
             let mk = |n: usize, off: usize, used: usize| -> H { if n == 0 { return cb.buf(&[]); } let h = cb.empty(n); cb.copy(&zr.0, zr.1, 0, &h, n, 0, n); if used > 0 { if let Some((s, sn)) = &src { cb.copy(s, *sn, off, &h, n, 0, used); } } h };
             let (k, v, ik) = (mk(nk, 0, uk), mk(nk, uk, uk), mk(ni, 2 * uk, ui));
-            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0 }); return; }
+            st.kvg[ai] = Some(KvG { k, v, ik, cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0, qbits: 0 }); return; }
         let mut kb = st.k[ai].clone(); kb.resize(cap * row, 0.0); let mut vb = st.v[ai].clone(); vb.resize(cap * row, 0.0);
         let mut ib = st.ik[ai].clone(); ib.resize(cap * self.cfg.idx_hd, 0.0);
-        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0 });
+        st.kvg[ai] = Some(KvG { k: cb.buf(&kb), v: cb.buf(&vb), ik: cb.buf(&ib), cap, len: cl, pb: None, nbp: 0, q8: None, q8n: 0, qbits: 0 });
     }
 
     /// Visible tokens up to which every QSA block is selected (attention stays dense and exact).
@@ -2644,7 +2676,7 @@ impl Model {
             self.kv_push(cb, ai0, st, start + t);
             let g = st.kvg[ai0].as_mut().unwrap(); assert_eq!(g.len, start, "gpu kv out of step");
             let mut csv: Vec<f32> = Vec::with_capacity(t * 2 * half);
-            for ti in 0..t { let pos = start + ti; csv.extend((0..half).map(|i| (pos as f32 * self.rope_inv[i]).cos())); csv.extend((0..half).map(|i| (pos as f32 * self.rope_inv[i]).sin())); }
+            for ti in 0..t { let pos = start + ti; csv.extend((0..half).map(|i| self.rope_cs(pos, i).0)); csv.extend((0..half).map(|i| self.rope_cs(pos, i).1)); }
             let csb = cb.buf(&csv);
             if cb.attn_b(&proj, t * pr, pr, sp[1], sp[2], qnh, knh, &csb, &g.k, &g.v, g.cap, &core, core_n, nh, nkv, hd, half, start, t, c.eps) {
                 if idx.is_some() && sp.len() > 5 { let ihd = c.idx_hd; for ti in 0..t { cb.copy(&proj, t * pr, ti * pr + sp[4], &g.ik, g.cap * ihd, (start + ti) * ihd, ihd); } }
@@ -3282,30 +3314,32 @@ fn mtp_qsample(lg: &[f32], ids: &[u32], s: &mut crate::sampler::Sampler) -> (u32
     for &(id, p) in &q { pick = id; if u < p { break; } u -= p; }
     (pick, q)
 }
-/// kv8 switch: Some(recent window) when PYRE_QN_KV8=1 (off by default).
+/// Some(recent f32 window) when quantized KV is active. Default is on, at `qn_ctx::kv_bits` (4).
+/// `PYRE_QN_KV8=0` is f32. `PYRE_QN_KV8=auto` packs only after VRAM pressure engages it.
+/// `PYRE_QN_KV8_FILE=<path>` (diagnostic): "1" enables packing for the next uploads, anything else disables.
 fn kv8_recent() -> Option<usize> {
-    // PYRE_QN_KV8_FILE=<path> (diagnostic A/B): "1" in that file enables kv8 for the next (re)uploads, anything else disables
     if let Ok(p) = env_var("PYRE_QN_KV8_FILE") { return if std::fs::read_to_string(p).map(|s| s.trim() == "1").unwrap_or(false) { Some(env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64)) } else { None }; }
-    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let rec = env_usize("PYRE_QN_KV8_RECENT").unwrap_or(1024).max(64);
-    match kv8_mode() { 1 => Some(rec), 2 if KV8_ENGAGED.load(std::sync::atomic::Ordering::Relaxed) => Some(rec), _ => None }
+    match crate::qn_ctx::quant_mode() {
+        0 => None,
+        1 => Some(rec),
+        _ => if KV8_ENGAGED.load(std::sync::atomic::Ordering::Relaxed) { Some(rec) } else { None },
+    }
 }
-/// PYRE_QN_KV8: 0 = off, 1 = always, unset/"auto" = 2: engage under VRAM pressure (kv_ok would otherwise move a layer
-/// KV to the host); once engaged, every eligible layer converts at its next KV upload.
-fn kv8_mode() -> u8 { static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new(); *M.get_or_init(|| match env_var("PYRE_QN_KV8").as_deref() { Ok("0") => 0, Ok("1") => 1, _ => 2 }) }
 pub static KV8_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static KV8_AUTO_ENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KV8_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// kv8 fallback: turn a layer's int8 region back into plain f32 GPU buffers (dequantized), logging a warning and counting
 /// it, instead of aborting on a case the int8 path does not cover.
 fn kv8_drop(cb: &super::qn_cube::Cube, g: &mut KvG, row: usize, why: &str) {
-    let Some(q8) = g.q8.take() else { return }; let o = g.q8n;
+    let Some(q8) = g.q8.take() else { return }; let o = g.q8n; let bits = g.qbits;
     let (kw, ks, vw, vs) = (cb.read_u32(&q8[0]), cb.read(&q8[1]), cb.read_u32(&q8[2]), cb.read(&q8[3]));
-    let mut k = super::kv8::unpack(&kw, &ks, o * row); let mut v = super::kv8::unpack(&vw, &vs, o * row);
+    let (mut k, mut v) = if bits <= 4 { (super::kv4::unpack(&kw, &ks, o * row), super::kv4::unpack(&vw, &vs, o * row)) }
+        else { (super::kv8::unpack(&kw, &ks, o * row), super::kv8::unpack(&vw, &vs, o * row)) };
     k.extend_from_slice(&cb.read(&g.k)[..(g.cap - o) * row]); v.extend_from_slice(&cb.read(&g.v)[..(g.cap - o) * row]);
-    g.k = cb.buf(&k); g.v = cb.buf(&v); g.q8n = 0;
+    g.k = cb.buf(&k); g.v = cb.buf(&v); g.q8n = 0; g.qbits = 0;
     KV8_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::logbuf::event("kv8_fallback", "WARN", serde_json::json!({"why": why, "q8n": o, "len": g.len}));
+    crate::logbuf::event("kv8_fallback", "WARN", serde_json::json!({"why": why, "q8n": o, "bits": bits, "len": g.len}));
 }
 pub static KV8_CONVERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static KV8_DISENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3313,7 +3347,7 @@ pub static KV8_DISENGAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// floor + PYRE_QN_KV8_HYST_MB (default 2048) above the floor, later uploads go back to exact f32 KV.
 pub fn kv8_new_conversation() {
     use std::sync::atomic::Ordering::Relaxed;
-    if kv8_mode() != 2 || !KV8_ENGAGED.load(Relaxed) { return; }
+    if crate::qn_ctx::quant_mode() != 2 || !KV8_ENGAGED.load(Relaxed) { return; }
     let fl = crate::limits::vram_floor_mb() as u64; let h = env_usize("PYRE_QN_KV8_HYST_MB").unwrap_or(2048) as u64;
     let free = crate::limits::vram().map_or(0, |v| v.free) >> 20;
     if free >= fl + h { KV8_ENGAGED.store(false, Relaxed); KV8_DISENGAGES.fetch_add(1, Relaxed);

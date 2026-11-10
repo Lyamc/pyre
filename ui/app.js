@@ -356,8 +356,161 @@ $("#keyBtn").onclick = askKey;
 // ---------- chat ----------
 let convs = LS.get("convs", []); let cur = LS.get("cur", null); let ctrl = null;
 const settingsIds = ["sysPrompt", "sTemp", "sTopP", "sTopK", "sMax", "sSeed"];
-const saved = LS.get("settings", {}); settingsIds.forEach(id => { if (saved[id] !== undefined) $("#" + id).value = saved[id]; $("#" + id).onchange = () => { const s = {}; settingsIds.forEach(i => s[i] = $("#" + i).value); LS.set("settings", s); }; });
-$("#settingsBtn").onclick = () => $("#settings").classList.toggle("hidden");
+const saved = LS.get("settings", {}); settingsIds.forEach(id => { if (saved[id] !== undefined) $("#" + id).value = saved[id]; $("#" + id).onchange = () => { const s = {}; settingsIds.forEach(i => s[i] = $("#" + i).value); LS.set("settings", s); paintProv(); }; });
+["sCtx", "sCtxN", "sKv"].forEach(id => { const el = $("#" + id); if (el) el.addEventListener("input", paintProv); });
+$("#settingsBtn").onclick = () => { $("#settings").classList.toggle("hidden"); if (!$("#settings").classList.contains("hidden")) { loadQwenCtx(); loadProfiles(); } };
+async function loadQwenCtx() {
+  try {
+    const c = await api("/api/qwen/context");
+    const sel = $("#sCtx");
+    const cur = String(c.context_tokens);
+    sel.innerHTML = (c.presets || []).map(p => `<option value="${esc(p.id)}" data-tokens="${p.tokens}"${p.tokens === c.context_tokens ? " selected" : ""}>${esc(p.id)} (${p.tokens}${p.yarn ? ", YaRN" : ""})</option>`).join("");
+    if (![...sel.options].some(o => o.selected)) {
+      const o = document.createElement("option"); o.value = cur; o.textContent = cur + " tokens"; o.selected = true; sel.appendChild(o);
+    }
+    $("#sKv").value = String(c.kv_bits || 4);
+    const fit = c.fit || {};
+    $("#ctxFit").textContent = (fit.message || "") + (c.reload_required ? " Saved size needs a model reload before YaRN changes." : "");
+    paintProv();
+  } catch (e) { $("#ctxFit").textContent = e.message; }
+}
+let profState = null;
+function sameVal(a, b) {
+  if (a == null && b == null) return true;
+  if (typeof a === "number" && typeof b === "number") return Math.abs(a - b) < 1e-6;
+  return String(a ?? "") === String(b ?? "");
+}
+function contextTokensNow() {
+  const custom = $("#sCtxN").value.trim();
+  if (custom) return +custom;
+  const opt = $("#sCtx").selectedOptions && $("#sCtx").selectedOptions[0];
+  if (opt && opt.dataset.tokens) return +opt.dataset.tokens;
+  return profState && profState.active && profState.defaults ? profState.defaults.context_tokens : 131072;
+}
+function currentSettings() {
+  return {
+    temperature: +$("#sTemp").value, top_p: +$("#sTopP").value, top_k: +$("#sTopK").value,
+    max_tokens: +$("#sMax").value, seed: $("#sSeed").value === "" ? null : +$("#sSeed").value,
+    context_tokens: contextTokensNow(), kv_bits: +$("#sKv").value, system: $("#sysPrompt").value.trim(),
+  };
+}
+function sourceValues(src, name) {
+  if (!profState) return null;
+  if (src === "default") return profState.defaults;
+  if (src === "tune") return profState.tune;
+  return profState.customs && profState.customs[name];
+}
+function paintProv() {
+  if (!profState || !profState.defaults) return;
+  const cur = currentSettings();
+  const active = profState.active || { source: "default" };
+  const base = sourceValues(active.source, active.name);
+  document.querySelectorAll(".prov").forEach(el => {
+    const k = el.dataset.for;
+    const d = profState.defaults[k];
+    const t = profState.tune ? profState.tune[k] : undefined;
+    let label = "modified";
+    if (profState.tune && sameVal(cur[k], t) && !sameVal(t, d)) label = "tune";
+    else if (sameVal(cur[k], d)) label = "default";
+    el.dataset.prov = label;
+    el.textContent = label;
+    el.classList.toggle("edited", !!(base && !sameVal(cur[k], base[k])));
+  });
+}
+function applySettings(v) {
+  if (!v) return;
+  $("#sTemp").value = v.temperature;
+  $("#sTopP").value = v.top_p;
+  $("#sTopK").value = v.top_k;
+  $("#sMax").value = v.max_tokens;
+  $("#sSeed").value = v.seed == null ? "" : v.seed;
+  $("#sysPrompt").value = v.system || "";
+  $("#sKv").value = String(v.kv_bits || 4);
+  const tok = v.context_tokens;
+  const opt = [...$("#sCtx").options].find(o => +o.dataset.tokens === tok);
+  if (opt) { $("#sCtx").value = opt.value; $("#sCtxN").value = ""; }
+  else { $("#sCtxN").value = tok || ""; }
+  const s = {}; settingsIds.forEach(i => s[i] = $("#" + i).value); LS.set("settings", s);
+}
+function markProfileSource() {
+  const a = (profState && profState.active) || { source: "default" };
+  $("#profDefault").classList.toggle("active", a.source === "default");
+  $("#profTune").classList.toggle("active", a.source === "tune");
+  const sel = $("#profCustom");
+  const names = Object.keys((profState && profState.customs) || {}).sort();
+  const keep = a.source === "custom" ? a.name : sel.value;
+  sel.innerHTML = `<option value="">Custom…</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  if (keep && names.includes(keep)) sel.value = keep;
+  sel.classList.toggle("active", a.source === "custom");
+  $("#profDelete").classList.toggle("hidden", !(a.source === "custom" && a.name));
+  const note = $("#profNote");
+  if (profState && profState.tune_stale) note.textContent = "Hardware changed since autotune was recorded. The tune snapshot is still here and was not overwritten. Each row says default, tune, or modified.";
+  else note.textContent = "Each setting is marked default, tune, or modified. Default is built in. Tune is the autotune snapshot. A custom name is saved with the disk icon and does not replace either.";
+  paintProv();
+}
+async function loadProfiles() {
+  try { profState = await api("/api/settings/profiles"); markProfileSource(); }
+  catch (e) { $("#profNote").textContent = e.message; }
+}
+async function selectProfile(source, name) {
+  const r = await api("/api/settings/profiles/select", { source, name: name || undefined });
+  profState = r;
+  if (r.values) applySettings(r.values);
+  markProfileSource();
+  loadQwenCtx();
+}
+$("#profDefault").onclick = async () => { try { await selectProfile("default"); } catch (e) { $("#profNote").textContent = e.message; } };
+$("#profTune").onclick = async () => { try { await selectProfile("tune"); } catch (e) { $("#profNote").textContent = e.message; } };
+$("#profCustom").onchange = async () => {
+  const name = $("#profCustom").value;
+  if (!name) return;
+  try { await selectProfile("custom", name); } catch (e) { $("#profNote").textContent = e.message; }
+};
+$("#profSave").onclick = async () => {
+  const name = prompt("Name this custom preset. Default and tune stay as they are.", $("#profCustom").value || "");
+  if (!name) return;
+  const body = { name, values: currentSettings(), replace: false };
+  try {
+    profState = await api("/api/settings/profiles/custom", body);
+  } catch (e) {
+    if (!/already exists/.test(e.message) || !confirm(e.message)) { $("#profNote").textContent = e.message; return; }
+    try { profState = await api("/api/settings/profiles/custom", Object.assign(body, { replace: true })); }
+    catch (e2) { $("#profNote").textContent = e2.message; return; }
+  }
+  try { await selectProfile("custom", name.trim()); } catch (e) { $("#profNote").textContent = e.message; markProfileSource(); }
+};
+$("#profTuneSave").onclick = async () => {
+  const exists = profState && profState.tune;
+  if (exists && !confirm("Replace the tune snapshot with the current settings? Default and custom presets stay as they are.")) return;
+  try { profState = await api("/api/settings/profiles/tune", { values: currentSettings() }); markProfileSource(); }
+  catch (e) { $("#profNote").textContent = e.message; }
+};
+$("#profDelete").onclick = async () => {
+  const name = profState && profState.active && profState.active.name;
+  if (!name || !confirm(`Delete custom preset “${name}”? Default and tune stay as they are.`)) return;
+  try { profState = await api("/api/settings/profiles/custom/delete", { name }); markProfileSource(); }
+  catch (e) { $("#profNote").textContent = e.message; }
+};
+$("#ctxApply").onclick = async () => {
+  const custom = $("#sCtxN").value.trim();
+  const context = custom || $("#sCtx").value;
+  try {
+    const r = await api("/api/qwen/context", { context, kv_bits: +$("#sKv").value });
+    $("#ctxFit").textContent = r.message || "saved";
+    loadQwenCtx();
+  } catch (e) { $("#ctxFit").textContent = e.message; }
+};
+async function loadTune() {
+  try {
+    const a = await api("/api/autotune");
+    const b = $("#tuneBanner");
+    if (!a.suggest || !a.message) { b.classList.add("hidden"); b.innerHTML = ""; return; }
+    b.classList.remove("hidden");
+    b.innerHTML = `<div>${esc(a.message)}</div><div class="row" style="margin-top:8px"><button type="button" id="tuneAck" class="ghost small">Keep these results</button><button type="button" id="tuneRe" class="small">Retune on next start</button></div>`;
+    $("#tuneAck").onclick = async () => { try { await api("/api/autotune/ack", {}); loadTune(); } catch (e) { b.textContent = e.message; } };
+    $("#tuneRe").onclick = async () => { try { const r = await api("/api/autotune/retune", {}); b.textContent = r.message; } catch (e) { b.textContent = e.message; } };
+  } catch {}
+}
 function save() { LS.set("convs", convs); LS.set("cur", cur); }
 function conv() { return convs.find(c => c.id === cur); }
 function newConv() { const c = { id: Date.now().toString(36), title: "New chat", messages: [] }; convs.unshift(c); cur = c.id; save(); renderConvs(); renderMsgs(); $("#input").focus(); }
@@ -1801,7 +1954,11 @@ async function loadStatus() {
     const g = s.gpus.map(g => `${g.name} — ${g.memory_used_mib}/${g.memory_total_mib} MiB VRAM, ${g.utilization_pct}% util`).join("<br>") || "n/a";
     $("#statusBox").innerHTML = [["version", `pyre ${s.version} (Burn ${s.burn})`], ["default backend", s.default_backend], ["compiled backends", s.backends_compiled.join(", ")], ["GPU", g],
       ["RAM", `process ${human(s.ram.process_rss)} · system ${human(s.ram.used)} / ${human(s.ram.total)}`], ["uptime", s.uptime_s + " s"], ["auth", s.auth ? "API key required" : "open"],
-      ["store", s.store_root], ["HF cache", s.hf_cache], ["GPU limits", limitsText(s.limits)], ["batching", s.batching], ["requests", metricsText(s.metrics)]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
+      ["store", s.store_root], ["HF cache", s.hf_cache], ["GPU limits", limitsText(s.limits)],
+      ["Qwen context", s.qwen_context ? `${s.qwen_context.context_label} · KV ${s.qwen_context.kv_bits}-bit · ${esc(s.qwen_context.fit?.message || "")}` : "n/a"],
+      ["Autotune", s.autotune?.suggest ? esc(s.autotune.message) : (s.autotune?.message || "matches this GPU")],
+      ["Settings source", s.profiles ? `${esc(s.profiles.active?.source || "default")}${s.profiles.active?.name ? " · " + esc(s.profiles.active.name) : ""}${s.profiles.tune ? " · tune saved" : " · no tune yet"}${s.profiles.tune_stale ? " · hardware changed, tune kept" : ""}` : "n/a"],
+      ["batching", s.batching], ["requests", metricsText(s.metrics)]].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join("");
     $("#slotsTbl tbody").innerHTML = s.models.map(m => `<tr><td>${esc(m.id)}</td><td><span class="tag ${m.kind}">${m.kind}</span></td><td>${m.busy}</td><td>${m.queued}</td></tr>`).join("");
     const base = location.origin; const model = s.models.find(m => m.kind === "llm")?.id || "model"; const key = s.auth ? "$PYRE_API_KEY" : "none";
     $("#apiSnippet").textContent = `# curl
@@ -1822,7 +1979,7 @@ curl ${base}/completion -d '{"prompt":"Once upon a time","n_predict":32}'`;
 $("#logRefresh").onclick = loadStatus;
 
 function refreshAll() { loadKinds(); const t = location.hash.slice(1); if (t) onTab(t); }
-renderConvs(); renderMsgs(); loadKinds();
+renderConvs(); renderMsgs(); loadKinds(); loadQwenCtx(); loadTune(); loadProfiles();
 // Status pill: paint immediately, then connect (tabs already bound above — never wait on this).
 try { renderStatusPill(); connectStatusStream(); } catch (e) { console.error(e); showToast("Status pill failed: " + (e.message || e)); }
 const h = location.hash.slice(1); if (h) $(`#tabs button[data-tab="${h}"]`)?.click();
