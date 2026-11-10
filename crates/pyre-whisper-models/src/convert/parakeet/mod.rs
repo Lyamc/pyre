@@ -60,6 +60,7 @@ pub fn convert_parakeet_from_hf(
         .map(String::as_str)
         .unwrap_or("ParakeetForTDT");
     let is_tdt = arch.contains("TDT") || arch.contains("RNNT");
+    let nemotron = arch.contains("Nemotron");
 
     let bytes = fs::read(&safetensors_path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
@@ -71,6 +72,19 @@ pub fn convert_parakeet_from_hf(
     dump.write_scalar("encoder/d_model.npy", enc.hidden_size as f32)?;
     dump.write_scalar("encoder/n_head.npy", enc.num_attention_heads as f32)?;
     dump.write_scalar("encoder/n_mels.npy", enc.num_mel_bins as f32)?;
+    dump.write_scalar("encoder/kind.npy", if nemotron { 2.0 } else { 1.0 })?;
+    if nemotron {
+        dump.write_scalar("encoder/conv_kernel.npy", enc.conv_kernel_size.unwrap_or(9) as f32)?;
+        dump.write_scalar("encoder/sub_channels.npy", enc.subsampling_conv_channels.unwrap_or(256) as f32)?;
+        dump.write_scalar("encoder/sub_kernel.npy", enc.subsampling_conv_kernel_size.unwrap_or(3) as f32)?;
+        dump.write_scalar("encoder/ff_inner.npy", enc.intermediate_size.unwrap_or(enc.hidden_size * 4) as f32)?;
+        dump.write_scalar("encoder/lookahead.npy", enc.default_num_lookahead_tokens.unwrap_or(13) as f32)?;
+        dump.write_scalar("encoder/sliding_window.npy", enc.sliding_window.unwrap_or(71) as f32)?;
+        dump.write_scalar("encoder/decoder_hidden.npy", config.decoder_hidden_size.unwrap_or(640) as f32)?;
+        dump.write_scalar("encoder/decoder_layers.npy", config.num_decoder_layers.unwrap_or(2) as f32)?;
+        dump.write_scalar("encoder/max_symbols.npy", config.max_symbols_per_step.unwrap_or(10) as f32)?;
+        dump.write_scalar("encoder/blank_id.npy", config.blank_id() as f32)?;
+    }
 
     let num_durations = config.durations.as_ref().map(|d| d.len()).unwrap_or(0);
     let joint_out = config.vocab_size + num_durations;
@@ -81,6 +95,9 @@ pub fn convert_parakeet_from_hf(
         duration_start: config.vocab_size,
         num_durations,
         pad_token_id: config.pad_token_id,
+        max_symbols_per_step: config.max_symbols_per_step.unwrap_or(10),
+        decoder_start_token_id: config.decoder_start_token_id.or(Some(config.blank_id())),
+        durations: config.durations.clone().unwrap_or_else(|| (0..num_durations).collect()),
     };
     fs::write(
         model_dir.join("parakeet_decode.json"),
@@ -91,13 +108,16 @@ pub fn convert_parakeet_from_hf(
     let mut unmapped = Vec::new();
     for key in tensors.names() {
         let tensor = tensors.tensor(key)?;
-        if !matches!(tensor.dtype(), safetensors::Dtype::F32 | safetensors::Dtype::F16) {
+        if !matches!(
+            tensor.dtype(),
+            safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16
+        ) {
             continue;
         }
         let shape: Vec<usize> = tensor.shape().iter().copied().collect();
         let floats = bytes_to_f32(tensor.data(), tensor.dtype())?;
 
-        if let Some(rel) = map_hf_tensor(key, is_tdt) {
+        if let Some(rel) = map_hf_tensor(key, is_tdt, nemotron) {
             let (data, shape) = layout_tensor(&rel, &floats, &shape);
             dump.write_f32(&rel, &data, &shape)?;
             written += 1;
@@ -143,6 +163,10 @@ pub fn is_parakeet_model(name: &str) -> bool {
             | "parakeet-ctc-0.6b"
             | "parakeet-ctc-1.1b"
     )
+}
+
+pub fn is_nemotron_asr_model(name: &str) -> bool {
+    name == "nemotron-speech-streaming-en-0.6b"
 }
 
 pub fn is_parakeet_burn_ready(name: &str) -> bool {

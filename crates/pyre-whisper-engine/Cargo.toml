@@ -32,6 +32,8 @@ termsize = "0.1"
 cpal = "0.18"
 clap = { workspace = true }
 tracing = { workspace = true }
+matrixmultiply = "0.3"
+libm = "0.2"
 
 [features]
 default = ["wgpu", "cpu"]

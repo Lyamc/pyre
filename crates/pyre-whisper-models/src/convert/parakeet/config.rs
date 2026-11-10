@@ -11,6 +11,18 @@ pub struct ParakeetEncoderConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub scale_input: bool,
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub subsampling_conv_channels: Option<usize>,
+    #[serde(default)]
+    pub subsampling_conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub default_num_lookahead_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +35,14 @@ pub struct ParakeetConfig {
     pub durations: Option<Vec<usize>>,
     pub architectures: Vec<String>,
     pub encoder_config: ParakeetEncoderConfig,
+    #[serde(default)]
+    pub decoder_hidden_size: Option<usize>,
+    #[serde(default)]
+    pub num_decoder_layers: Option<usize>,
+    #[serde(default)]
+    pub max_symbols_per_step: Option<usize>,
+    #[serde(default)]
+    pub decoder_start_token_id: Option<usize>,
 }
 
 impl ParakeetConfig {
@@ -42,4 +62,14 @@ pub struct ParakeetDecodeConfig {
     pub duration_start: usize,
     pub num_durations: usize,
     pub pad_token_id: usize,
+    #[serde(default = "default_max_symbols")]
+    pub max_symbols_per_step: usize,
+    #[serde(default)]
+    pub decoder_start_token_id: Option<usize>,
+    #[serde(default)]
+    pub durations: Vec<usize>,
+}
+
+fn default_max_symbols() -> usize {
+    10
 }

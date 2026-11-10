@@ -51,7 +51,7 @@ pub fn detect(dir: &Path) -> (Kind, String) {
             let mt = j.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let arch = j.get("architectures").and_then(|a| a.get(0)).and_then(|v| v.as_str()).unwrap_or(&mt).to_string();
             let kind = match mt.as_str() {
-                "whisper" | "parakeet" | "wav2vec2" => Kind::Stt,
+                "whisper" | "parakeet" | "parakeet_tdt" | "parakeet_ctc" | "wav2vec2" | "nemotron_asr_streaming" => Kind::Stt,
                 "kokoro" | "vits" | "speecht5" => Kind::Tts,
                 _ if arch.ends_with("ForCausalLM") || j.get("num_hidden_layers").is_some() => Kind::Llm,
                 _ => Kind::Unknown,

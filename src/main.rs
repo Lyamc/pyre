@@ -30,6 +30,7 @@ mod cli_models;
 mod storage;
 mod store;
 mod capabilities;
+mod speech_caps;
 mod model;
 mod sampler;
 mod server;

@@ -10,7 +10,7 @@ pub use pass::{with_whisper_pass, DecoderKind, MelTail, WhisperPass, Windowing};
 
 pub use task::DecodeTask;
 
-pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, clean_text, find_chunk_overlap, trim_trailing_hallucination};
+pub use utils::{get_output_path, format_srt, format_timestamp, parse_time, TranscriptSegment, append_without_word_overlap, clean_text, drop_left_context_tokens, find_chunk_overlap, timestamps_collapsed, trim_trailing_hallucination};
 
 use crate::audio::max_waveform_samples;
 use crate::model::{get_model_stats, Model};
@@ -19,6 +19,34 @@ use self::mel::slice_to_mel;
 use self::decode::*;
 
 use indicatif::{ProgressBar, ProgressStyle};
+
+/// CLI gate. The HTTP server applies the same rule from the request flag before it
+/// reaches the engine, so this only consults `PYRE_STT_EXPERIMENTAL`.
+pub fn experimental_gate(model_name: &str, n_samples: usize, sample_rate: usize) -> std::result::Result<(), String> {
+    let opted = matches!(
+        std::env::var("PYRE_STT_EXPERIMENTAL").ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+    if opted {
+        return Ok(());
+    }
+    let key = model_name.to_ascii_lowercase();
+    let v3 = key.contains("parakeet-tdt-0.6b-v3");
+    let nemotron = key.contains("nemotron-speech") || key.contains("nemotron-3.5-asr");
+    let new_model = v3 || nemotron || key.contains("parakeet");
+    let secs = n_samples as f64 / sample_rate.max(1) as f64;
+    if v3 || nemotron {
+        return Err(format!(
+            "{model_name} is experimental and off by default. Set PYRE_STT_EXPERIMENTAL=1 to transcribe with it."
+        ));
+    }
+    if new_model && secs > 60.0 {
+        return Err(format!(
+            "long audio ({secs:.0}s) on {model_name} is experimental and off by default. Set PYRE_STT_EXPERIMENTAL=1 to run the chunked path."
+        ));
+    }
+    Ok(())
+}
 
 pub fn waveform_to_text(
     model: &Model,
@@ -158,21 +186,27 @@ pub fn waveform_to_text(
         Model::Qwen3(_) => unreachable!("qwen3 handled before mel loop"),
         Model::VibeVoice(m) => m.acoustic_connector.fc1.weight.device(),
         Model::Moonshine(_) => unreachable!("moonshine handled before mel loop"),
+        Model::Nemotron(m) => m.final_proj.weight.device(),
     };
 
     let n_waveform_samples_per_window = chunk_size_samples.unwrap_or(match model {
         Model::Whisper(_) => max_waveform_samples(model.encoder_ctx_size() - padding),
+        // Parakeet/Nemotron are not Whisper's 1500-frame encoder. A 15 s cut
+        // (1500 * 160 samples) dropped the start of every window. 60 s covers
+        // a LibriSpeech or MLS utterance in one pass.
+        Model::Parakeet(_) | Model::Nemotron(_) => sample_rate.saturating_mul(60),
         _ => model.encoder_ctx_size() * 160,
     });
 
-    let is_nemo = matches!(model, Model::Parakeet(_));
+    let is_nemo = matches!(model, Model::Parakeet(_) | Model::Nemotron(_));
     let n_mels = model.encoder_mel_size();
 
     if debug {
         println!("DEBUG: Waveform samples: {}, model: {}", waveform.len(), model_name);
     }
 
-    let overlap = sample_rate.saturating_mul(3);
+    let overlap_secs = if matches!(model, Model::Parakeet(_) | Model::Nemotron(_)) { 8 } else { 3 };
+    let overlap = sample_rate.saturating_mul(overlap_secs);
     let (starts, shift) = window_starts(
         waveform.len(),
         n_waveform_samples_per_window,
@@ -219,7 +253,7 @@ pub fn waveform_to_text(
     };
 
     let chunk_duration = n_waveform_samples_per_window as f64 / sample_rate as f64;
-    let chunk_overlap = 3.0; 
+    let chunk_overlap = overlap_secs as f64;
     let shift_duration = chunk_duration - chunk_overlap;
 
     let mut global_last_end = 0.0;
@@ -242,33 +276,100 @@ pub fn waveform_to_text(
             if let Some(ref p) = pb { p.println(msg); } else { println!("{}", msg); }
         }
 
-        let (new_text, new_tokens) = match model {
-            Model::Whisper(m) => decode_whisper(
-                m,
-                bpe,
-                lang,
-                mel,
-                padding,
-                streaming_mode,
-                include_timestamps,
-                beam_size,
-                max_tokens,
-                decode_task,
-                model_name,
-            )?,
-            Model::Parakeet(m) => decode_parakeet(m, bpe, mel, model_name, verbose),
+        let (new_text, new_tokens, token_frames, encoder_frames) = match model {
+            Model::Whisper(m) => {
+                let (text, tokens) = decode_whisper(
+                    m,
+                    bpe,
+                    lang,
+                    mel,
+                    padding,
+                    streaming_mode,
+                    include_timestamps,
+                    beam_size,
+                    max_tokens,
+                    decode_task,
+                    model_name,
+                )?;
+                (text, tokens, Vec::new(), 0)
+            }
+            Model::Parakeet(m) => {
+                let chunk = decode_parakeet(m, bpe, mel, model_name, verbose);
+                (chunk.text, chunk.tokens, chunk.frames, chunk.encoder_frames)
+            }
+            Model::Nemotron(m) => {
+                let chunk = decode_nemotron(m, bpe, mel, model_name, verbose);
+                (chunk.text, chunk.tokens, chunk.frames, chunk.encoder_frames)
+            }
             Model::TONE(_) => unreachable!("t-one handled before mel loop"),
             Model::Qwen3(_) => unreachable!("qwen3 handled before mel loop"),
             Model::VibeVoice(_) => unreachable!("vibevoice handled before mel loop"),
             Model::Moonshine(_) => unreachable!("moonshine handled before mel loop"),
         };
 
-        let cleaned = clean_text(&new_text);
-        if !cleaned.is_empty() {
-            if !accumulated_text.is_empty() && !cleaned.starts_with(' ') {
-                accumulated_text.push(' ');
+        let use_frames = encoder_frames > 0 && token_frames.len() == new_tokens.len();
+        let frame_ids = if use_frames {
+            let window_samples = end.saturating_sub(start).max(1);
+            let min_frame = if i == 0 {
+                0
+            } else {
+                overlap.saturating_mul(encoder_frames) / window_samples
+            };
+            drop_left_context_tokens(&new_tokens, &token_frames, min_frame)
+        } else {
+            Vec::new()
+        };
+        // v2 timestamped one whole window inside the 8 s overlap, and the frame
+        // drop deleted it (151 consecutive words). Fall back to the word stitch.
+        let collapsed = i > 0 && use_frames && timestamps_collapsed(&frame_ids, &new_tokens);
+        let mut cleaned = if use_frames && !collapsed {
+            clean_text(&parakeet_tokens_to_text(bpe, &frame_ids))
+        } else {
+            clean_text(&new_text)
+        };
+        // A 60 s window that decodes blank loses ~50 s. One split into halves
+        // covers that span at a length v2 already transcribes (single utterances
+        // are well under 30 s). v3's good windows are non-empty and skip this.
+        let mut recovered = false;
+        if cleaned.trim().is_empty()
+            && end.saturating_sub(start) > sample_rate.saturating_mul(25)
+            && matches!(model, Model::Parakeet(_))
+        {
+            let mid = start + (end - start) / 2;
+            let mut joined = String::new();
+            for (a, b) in [(start, mid), (mid, end)] {
+                let mut half = slice_to_mel(&waveform, a, b, &processor, &device);
+                if let (Some(m), Some(s)) = (&mean, &std) {
+                    half = (half - m.clone().unsqueeze()) / s.clone().unsqueeze();
+                }
+                let text = if let Model::Parakeet(m) = model {
+                    clean_text(&decode_parakeet(m, bpe, half, model_name, verbose).text)
+                } else {
+                    String::new()
+                };
+                let piece = text.trim();
+                if !piece.is_empty() {
+                    if !joined.is_empty() {
+                        joined.push(' ');
+                    }
+                    joined.push_str(piece);
+                }
             }
-            accumulated_text.push_str(&cleaned);
+            if !joined.is_empty() {
+                cleaned = joined;
+                recovered = true;
+            }
+        }
+        if use_frames && !collapsed && !recovered {
+            let piece = cleaned.trim();
+            if !piece.is_empty() {
+                if !accumulated_text.is_empty() {
+                    accumulated_text.push(' ');
+                }
+                accumulated_text.push_str(piece);
+            }
+        } else {
+            append_without_word_overlap(&mut accumulated_text, &cleaned);
         }
 
         let chunk_offset = i as f64 * shift_duration;

@@ -8,6 +8,10 @@ pub fn bytes_to_f32(data: &[u8], dtype: safetensors::Dtype) -> anyhow::Result<Ve
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
         other => anyhow::bail!("unsupported tensor dtype: {other:?}"),
     })
 }
@@ -49,6 +53,14 @@ mod tests {
         //  [1, 4],
         //  [2, 5]]
         assert_eq!(data, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn bf16_checkpoint_bytes_become_f32() {
+        let value = half::bf16::from_f32(1.5);
+        let bytes = value.to_le_bytes();
+        let out = super::bytes_to_f32(&bytes, safetensors::Dtype::BF16).unwrap();
+        assert!((out[0] - 1.5).abs() < 1e-3);
     }
 
     #[test]

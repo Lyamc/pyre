@@ -3,6 +3,7 @@ pub mod components;
 pub mod whisper;
 pub mod numpy;
 pub mod parakeet;
+pub mod nemotron;
 pub mod tone;
 pub mod qwen3;
 pub mod vibevoice;

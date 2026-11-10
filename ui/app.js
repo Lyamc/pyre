@@ -704,7 +704,7 @@ let recBlob = null, rec = null;
 let stsRecBlob = null, stsRec = null, stsCtrl = null, stsReplyBlob = null, stsRecTimer = null, stsRecStarted = 0;
 
 function loadSttPrefs() {
-  const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
+  const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, experimental: false, beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
   return Object.assign(d, LS.get(STT_PREF_KEY, {}));
 }
 function saveSttPrefs(p) { LS.set(STT_PREF_KEY, p); }
@@ -717,6 +717,7 @@ function sttPrefsFromUi() {
     timestamps: !!( $("#sttTimestamps") && $("#sttTimestamps").checked ),
     sentences: !!( $("#sttSentences") && $("#sttSentences").checked ),
     diarize: !!( $("#sttDiar") && $("#sttDiar").checked ),
+    experimental: !!( $("#sttExperimental") && $("#sttExperimental").checked ),
     beam: +(( $("#sttBeam") && $("#sttBeam").value ) || 5),
     maxTok: +(( $("#sttMaxTok") && $("#sttMaxTok").value ) || 448),
     task: ($("#sttTask") && $("#sttTask").value) || "transcriptions",
@@ -734,6 +735,7 @@ function applySttPrefs(p) {
   if ($("#sttTimestamps")) $("#sttTimestamps").checked = !!p.timestamps;
   if ($("#sttSentences")) $("#sttSentences").checked = !!p.sentences;
   if ($("#sttDiar") && !$("#sttDiar").disabled) $("#sttDiar").checked = !!p.diarize;
+  if ($("#sttExperimental")) $("#sttExperimental").checked = !!p.experimental;
   if ($("#sttBeam")) $("#sttBeam").value = p.beam || 5;
   if ($("#sttMaxTok")) $("#sttMaxTok").value = p.maxTok || 448;
   if ($("#sttTask")) $("#sttTask").value = p.task || "transcriptions";
@@ -868,7 +870,10 @@ async function refreshSttModels() {
     for (const m of (sttCatalog.models || [])) {
       const o = document.createElement("option");
       o.value = m.id;
-      o.textContent = m.id + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
+      const cap = (m.capabilities && m.capabilities.summary) || "";
+      const experimental = m.capabilities && m.capabilities.speech && m.capabilities.speech.experimental;
+      o.textContent = m.id + (experimental ? " (experimental)" : "") + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
+      o.title = cap;
       o.dataset.present = m.present ? "1" : "0";
       sel.append(o);
     }
@@ -916,6 +921,7 @@ function paintSttResult(opts) {
     meta.classList.remove("hidden");
     const bits = [];
     if (sttState.model) bits.push("model " + sttState.model);
+    if (sttState.routing && sttState.routing.reason) bits.push(sttState.routing.reason);
     if (sttState.language) bits.push("language " + sttState.language);
     if (sttState.duration) bits.push(sttState.duration.toFixed(1) + "s audio");
     if (opts.elapsed) bits.push(opts.elapsed.toFixed(2) + "s wall");
@@ -1302,6 +1308,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   fd.append("max_tokens", String(pref.maxTok || 448));
   const diar = pref.diarize && $("#sttDiar") && !$("#sttDiar").disabled && pref.task === "transcriptions";
   if (diar) fd.append("diarize", "true");
+  if (pref.experimental) fd.append("experimental", "true");
   $("#sttSpk").classList.add("hidden"); $("#sttSpk").innerHTML = "";
   if ($("#sttLegend")) { $("#sttLegend").classList.add("hidden"); $("#sttLegend").innerHTML = ""; }
   if ($("#sttTimeline")) { $("#sttTimeline").classList.add("hidden"); $("#sttTimeline").innerHTML = ""; }
@@ -1351,6 +1358,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
         sttState = {
           sourceName: f.name || "recording.webm",
           model: j.model || model,
+          routing: j.routing || null,
           language: j.language || "",
           duration: j.duration || 0,
           segments: segs,
@@ -1364,6 +1372,7 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
         paintSttResult({
           elapsed,
           footer: elapsed.toFixed(2) + " s" + (j.model ? ", model " + j.model : "") +
+            (j.routing && j.routing.redirected ? ", routed: " + j.routing.reason : "") +
             (segs.some(s => s.speaker) ? ", " + speakerIds().length + " speakers" : "") +
             (j.language ? ", language " + j.language : ""),
         });

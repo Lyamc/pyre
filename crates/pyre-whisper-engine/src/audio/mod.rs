@@ -49,7 +49,8 @@ pub struct AudioProcessor {
 impl AudioProcessor {
     pub fn new(device: &burn::tensor::Device, sample_rate: f64, n_mels: usize, is_nemo: bool, model_name: &str) -> Self {
         let is_tone = model_name.contains("t-one");
-        let is_parakeet = model_name.contains("parakeet");
+        // Nemotron Speech uses the same NeMo log-mel as Parakeet. The diarizer does not.
+        let is_parakeet = model_name.contains("parakeet") || model_name.contains("nemotron-speech");
         let is_qwen3 = model_name.contains("qwen3");
         let n_fft = if is_nemo || is_tone || is_parakeet { 512 } else { WHISPER_N_FFT };
         let win_length = 400;

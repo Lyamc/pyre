@@ -144,6 +144,10 @@ pub fn run_transcribe_file(
     let chunk_size_samples = chunk_size.map(|s| (s * 16000.0) as usize);
 
     let model_name = common.model.as_str();
+    if let Err(e) = crate::transcribe::experimental_gate(model_name, waveform.len(), sample_rate) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     let (text, segments) = match waveform_to_text(
         model, 
         model_name,
@@ -220,6 +224,10 @@ pub fn run_stream_logic(args: CommonArgs, backend_name: &str) {
         };
         if args.verbose { println!("Received audio segment {}, length: {}", i, audio_data_vectors.len()); }
         let speech_segment_f32: Vec<f32> = audio_data_vectors.into_iter().map(|x| x as f32 / 32767.0).collect();
+        if let Err(e) = crate::transcribe::experimental_gate(&args.model, speech_segment_f32.len(), 16000) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
         let start_time = Instant::now();
         let (text, _segments) = match waveform_to_text(
             &model, 

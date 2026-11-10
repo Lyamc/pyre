@@ -105,6 +105,67 @@ pub fn clean_text(text: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Append `next` after dropping a shared word prefix that the previous window already emitted.
+///
+/// Long audio is cut with a 3s overlap. Concatenating each window's full text
+/// repeats that overlap (Whisper base inserted 161 words on a 6-minute clip).
+/// Drop tokens emitted in the left-context overlap of a later window.
+///
+/// The previous window already covers that audio. Keeping both copies inserted
+/// the overlap (Nemotron's extra words). Matching words in the string and
+/// deleting them also ate real words when the boundary text did not line up.
+/// Frame timestamps collapsed into the overlap when a long window keeps less than
+/// half of its tokens and at least a dozen were thrown away. v2 did this on one
+/// 60 s window of the 6-minute clip (151 reference words, all timestamped in the
+/// left context and then deleted). The word stitch is the fallback for that window.
+pub fn timestamps_collapsed(kept: &[usize], all: &[usize]) -> bool {
+    all.len() >= 12 && kept.len() * 2 < all.len()
+}
+
+pub fn drop_left_context_tokens(ids: &[usize], frames: &[usize], min_frame: usize) -> Vec<usize> {
+    if frames.len() != ids.len() || min_frame == 0 {
+        return ids.to_vec();
+    }
+    ids.iter()
+        .zip(frames)
+        .filter(|(_, frame)| **frame >= min_frame)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+pub fn append_without_word_overlap(accumulated: &mut String, next: &str) {
+    let next = next.trim();
+    if next.is_empty() {
+        return;
+    }
+    if accumulated.is_empty() {
+        accumulated.push_str(next);
+        return;
+    }
+    let acc_words: Vec<&str> = accumulated.split_whitespace().collect();
+    let next_words: Vec<&str> = next.split_whitespace().collect();
+    let max = acc_words.len().min(next_words.len()).min(40);
+    let mut overlap = 0usize;
+    for n in (1..=max).rev() {
+        let same = acc_words[acc_words.len() - n..]
+            .iter()
+            .zip(&next_words[..n])
+            .all(|(a, b)| a.eq_ignore_ascii_case(b));
+        if same {
+            overlap = n;
+            break;
+        }
+    }
+    let rest = next_words[overlap..].join(" ");
+    if rest.is_empty() {
+        return;
+    }
+    if !accumulated.ends_with(' ') {
+        accumulated.push(' ');
+    }
+    accumulated.push_str(&rest);
+}
+
 pub fn find_chunk_overlap(prev_tokens: &[usize], curr_tokens: &[usize], max_n_offsets: usize, min_n_overlaps: usize) -> Option<(usize, usize)> {
     let mut max_overlap = 0;
     let mut max_overlap_indices = (0, 0);
@@ -126,7 +187,32 @@ pub fn find_chunk_overlap(prev_tokens: &[usize], curr_tokens: &[usize], max_n_of
 
 #[cfg(test)]
 mod tests {
-    use super::trim_trailing_hallucination;
+    use super::{append_without_word_overlap, drop_left_context_tokens, timestamps_collapsed, trim_trailing_hallucination};
+
+    #[test]
+    fn later_window_drops_only_the_left_context_frames() {
+        let ids = [1, 2, 3, 4];
+        let frames = [1, 4, 9, 12];
+        assert_eq!(drop_left_context_tokens(&ids, &frames, 8), vec![3, 4]);
+        assert_eq!(drop_left_context_tokens(&ids, &frames, 0), vec![1, 2, 3, 4]);
+        assert!(timestamps_collapsed(&[1], &[0; 20]));
+        assert!(!timestamps_collapsed(&[1, 2, 3, 4, 5, 6, 7, 8], &[0; 12]));
+    }
+
+    #[test]
+    fn drops_words_repeated_at_the_window_overlap() {
+        let mut text = String::from("ask not what your country can do for you");
+        append_without_word_overlap(&mut text, "can do for you ask what you can do for your country");
+        assert_eq!(
+            text,
+            "ask not what your country can do for you ask what you can do for your country"
+        );
+        append_without_word_overlap(&mut text, "for your country");
+        assert_eq!(
+            text,
+            "ask not what your country can do for you ask what you can do for your country"
+        );
+    }
 
     #[test]
     fn trims_short_suffix_after_period() {

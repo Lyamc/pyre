@@ -134,6 +134,17 @@ impl Capabilities {
             "summary": self.summary(),
         })
     }
+
+    /// Same record, plus a `speech` object when this id is a transcription model.
+    pub fn to_value_for(&self, id: &str) -> Value {
+        let mut v = self.to_value();
+        if self.audio_input && self.text_output && !self.diarization {
+            let speech = crate::speech_caps::profile(id);
+            v["speech"] = speech.to_json();
+            v["summary"] = json!(format!("{}, {}", self.summary(), speech.brief()));
+        }
+        v
+    }
 }
 
 #[cfg(test)]

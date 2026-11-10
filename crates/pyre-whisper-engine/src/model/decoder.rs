@@ -197,8 +197,11 @@ impl DecoderKv {
         for layer in 0..n_layers {
             self_k.push(Tensor::cat(parts.iter().map(|p| p.self_k[layer].clone()).collect::<Vec<_>>(), 0));
             self_v.push(Tensor::cat(parts.iter().map(|p| p.self_v[layer].clone()).collect::<Vec<_>>(), 0));
-            cross_k.push(Tensor::cat(parts.iter().map(|p| p.cross_k[layer].clone()).collect::<Vec<_>>(), 0));
-            cross_v.push(Tensor::cat(parts.iter().map(|p| p.cross_v[layer].clone()).collect::<Vec<_>>(), 0));
+            // Cross K/V are the encoder projections. Every beam in a chunk shares them,
+            // so keep batch 1 and let attention broadcast. Copying 1500 frames per
+            // beam per token does not change the scores.
+            cross_k.push(parts[0].cross_k[layer].clone());
+            cross_v.push(parts[0].cross_v[layer].clone());
         }
         DecoderKv { self_k, self_v, cross_k, cross_v }
     }
@@ -209,11 +212,25 @@ impl DecoderKv {
             .map(|i| DecoderKv {
                 self_k: split_row(&self.self_k, i),
                 self_v: split_row(&self.self_v, i),
-                cross_k: split_row(&self.cross_k, i),
-                cross_v: split_row(&self.cross_v, i),
+                cross_k: split_row_shared(&self.cross_k, i),
+                cross_v: split_row_shared(&self.cross_v, i),
             })
             .collect()
     }
+}
+
+fn split_row_shared(layers: &[Tensor<3>], index: usize) -> Vec<Tensor<3>> {
+    layers
+        .iter()
+        .map(|t| {
+            let [b, time, dim] = t.dims();
+            if b == 1 {
+                t.clone()
+            } else {
+                t.clone().slice([index..index + 1, 0..time, 0..dim])
+            }
+        })
+        .collect()
 }
 
 fn split_row(layers: &[Tensor<3>], index: usize) -> Vec<Tensor<3>> {

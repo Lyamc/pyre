@@ -76,14 +76,25 @@ impl MultiHeadAttention {
 pub struct RelPosMultiHeadAttentionConfig {
     pub n_state: usize,
     pub n_head: usize,
+    /// `attention_bias` from the checkpoint. Published Parakeet v2/v3 are false.
+    #[config(default = false)]
+    pub bias: bool,
 }
 
 impl RelPosMultiHeadAttentionConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> RelPosMultiHeadAttention {
-        let query = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let key = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let value = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let out = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
+        let query = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let key = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let value = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
+        let out = nn::LinearConfig::new(self.n_state, self.n_state)
+            .with_bias(self.bias)
+            .init(device);
         let pos = nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device);
 
         let n_hstate = self.n_state / self.n_head;
@@ -100,6 +111,22 @@ impl RelPosMultiHeadAttentionConfig {
             pos_bias_u: Param::from_tensor(pos_bias_u.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
             pos_bias_v: Param::from_tensor(pos_bias_v.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
         }
+    }
+}
+
+#[cfg(test)]
+mod rel_pos_tests {
+    use super::RelPosMultiHeadAttentionConfig;
+
+    #[test]
+    fn relative_attention_has_no_projection_bias() {
+        let device = burn::tensor::Device::flex();
+        let attn = RelPosMultiHeadAttentionConfig::new(8, 2).init(&device);
+        assert!(attn.query.bias.is_none());
+        assert!(attn.key.bias.is_none());
+        assert!(attn.value.bias.is_none());
+        assert!(attn.out.bias.is_none());
+        assert!(attn.pos.bias.is_none());
     }
 }
 
@@ -256,9 +283,28 @@ pub fn qkv_attention(
     out_linear: &nn::Linear,
 ) -> Tensor<3> {
     let [n_batch, n_qctx, n_state] = q.dims();
-    let [_, n_ctx, _] = k.dims();
+    let [k_batch, n_ctx, _] = k.dims();
     let scale = (n_state as f64 / n_head as f64).powf(-0.5);
     let n_hstate = n_state / n_head;
+
+    // One new token against a shared encoder K/V: put heads in front so the
+    // matmul is [H, B, 1, D] @ [H, 1, D, T], the skinny GEMV shape.
+    if n_qctx == 1 && k_batch == 1 && n_batch > 1 {
+        let q = q.reshape([n_batch, 1, n_head, n_hstate]).swap_dims(1, 2).swap_dims(0, 1) * scale;
+        let k = k
+            .reshape([1, n_ctx, n_head, n_hstate])
+            .swap_dims(1, 2)
+            .swap_dims(2, 3)
+            .swap_dims(0, 1);
+        let v = v
+            .reshape([1, n_ctx, n_head, n_hstate])
+            .swap_dims(1, 2)
+            .swap_dims(0, 1);
+        let qk = q.matmul(k);
+        let w = softmax(qk, 3);
+        let context = w.matmul(v).swap_dims(0, 1).reshape([n_batch, 1, n_state]);
+        return out_linear.forward(context);
+    }
 
     let q = q.reshape([n_batch, n_qctx, n_head, n_hstate]).swap_dims(1, 2) * scale;
     let k = k.reshape([n_batch, n_ctx, n_head, n_hstate]).swap_dims(1, 2).swap_dims(2, 3);

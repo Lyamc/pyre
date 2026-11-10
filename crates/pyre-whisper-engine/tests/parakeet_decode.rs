@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use pyre_whisper_audio::decode_bytes_to_mono_pcm;
 use pyre_whisper_engine::model::load_model;
 use pyre_whisper_engine::model::Model;
@@ -13,17 +12,18 @@ fn parakeet_jfk_decode_is_readable_not_commas() {
     let _ = std::env::set_current_dir(&root);
 
     let wav_path = root.join("samples/jfk.wav");
-    let mpk = root.join("models/parakeet-tdt-0.6b-v3/model.mpk");
-    if !wav_path.exists() || !mpk.exists() {
+    let mpk = root.join("models/parakeet-tdt-0.6b-v3/model.bpk");
+    let legacy = root.join("models/parakeet-tdt-0.6b-v3/model.mpk");
+    if !wav_path.exists() || !(mpk.exists() || legacy.exists()) {
         eprintln!("skip: missing jfk.wav or parakeet model");
         return;
     }
 
     let bytes = std::fs::read(&wav_path).unwrap();
     let wf = decode_bytes_to_mono_pcm(&bytes, "wav").unwrap();
-    let device = WgpuDevice::DefaultDevice;
+    let device = pyre_whisper_engine::cli::get_device(&Some("cpu".into()));
     let (bpe, _, model) =
-        load_model::<Wgpu>("parakeet-tdt-0.6b-v3", &device, false).expect("load parakeet");
+        load_model("parakeet-tdt-0.6b-v3", &device, false).expect("load parakeet");
     let Model::Parakeet(_) = model else {
         panic!("expected parakeet");
     };

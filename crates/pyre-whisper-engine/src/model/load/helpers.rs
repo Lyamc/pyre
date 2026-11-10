@@ -4,29 +4,29 @@ use std::error::Error;
 use std::io::Read;
 use std::fs::File;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex};
 
-pub static SHAPES: OnceLock<HashMap<String, Vec<usize>>> = OnceLock::new();
+/// Replaced on every `init_shapes` call. A process converts v2 and then v3;
+/// `OnceLock` kept v2's joint shape and reshaped v3's `[640, 8198]` head into `[640, 1030]`.
+pub static SHAPES: LazyLock<Mutex<HashMap<String, Vec<usize>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shapes_map() -> std::sync::MutexGuard<'static, HashMap<String, Vec<usize>>> {
+    SHAPES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn init_shapes(path: &str) {
     let shapes_path = format!("{}/shapes.json", path);
-    if let Ok(content) = std::fs::read_to_string(&shapes_path) {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<usize>>>(&content) {
-            let _ = SHAPES.set(map);
-        }
-    }
+    let map = std::fs::read_to_string(&shapes_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<HashMap<String, Vec<usize>>>(&content).ok())
+        .unwrap_or_default();
+    *shapes_map() = map;
 }
 
 pub fn tensor_exists(name: &str, path: &str) -> bool {
     let tensor_path = format!("{}/{}.npy", path, name).replace("\\", "/");
-    if let Some(m) = SHAPES.get() {
-        for k in m.keys() {
-            if tensor_path.ends_with(k) {
-                return true;
-            }
-        }
-    }
-    false
+    shapes_map().keys().any(|k| tensor_path.ends_with(k))
 }
 
 pub fn load_tensor<const D: usize>(
@@ -61,13 +61,11 @@ pub fn load_tensor<const D: usize>(
     let mut shape_vec = Vec::new();
     let mut found = false;
     
-    if let Some(m) = SHAPES.get() {
-        for (k, v) in m {
-            if rel_path.ends_with(k) {
-                shape_vec = v.clone();
-                found = true;
-                break;
-            }
+    for (k, v) in shapes_map().iter() {
+        if rel_path.ends_with(k) {
+            shape_vec = v.clone();
+            found = true;
+            break;
         }
     }
 
@@ -111,4 +109,46 @@ pub fn load_usize(name: &str, path: &str, device: &burn::tensor::Device) -> Resu
     let data = tensor.into_data();
     let val = data.to_vec::<f32>().unwrap()[0] as usize;
     Ok(val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_shapes;
+
+    #[test]
+    fn second_conversion_replaces_the_shape_map() {
+        let root = std::env::temp_dir().join(format!(
+            "pyre-shapes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let v2 = root.join("v2");
+        let v3 = root.join("v3");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::create_dir_all(&v3).unwrap();
+        // v2 joint is [640, 1030]. v3's same key is [640, 8198] (5246720 values).
+        std::fs::write(
+            v2.join("shapes.json"),
+            r#"{"joint/weight.npy":[640,1030]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            v3.join("shapes.json"),
+            r#"{"joint/weight.npy":[640,8198]}"#,
+        )
+        .unwrap();
+
+        init_shapes(v2.to_str().unwrap());
+        init_shapes(v3.to_str().unwrap());
+        let path = format!("{}/joint/weight.npy", v3.display()).replace('\\', "/");
+        let shape = super::shapes_map()
+            .iter()
+            .find(|(k, _)| path.ends_with(k.as_str()))
+            .map(|(_, v)| v.clone());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(shape, Some(vec![640, 8198]));
+    }
 }

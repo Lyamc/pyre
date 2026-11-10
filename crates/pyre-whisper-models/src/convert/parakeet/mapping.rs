@@ -14,8 +14,14 @@ pub fn should_skip_key(key: &str) -> bool {
     key.contains("inv_freq") || key.contains("num_batches_tracked")
 }
 
-pub fn map_hf_tensor(key: &str, is_tdt: bool) -> Option<String> {
+pub fn map_hf_tensor(key: &str, is_tdt: bool, nemotron: bool) -> Option<String> {
     let key = key.strip_prefix("model.").unwrap_or(key);
+
+    if nemotron {
+        if let Some(mapped) = map_nemotron_subsampling(key) {
+            return Some(mapped);
+        }
+    }
 
     SUBSAMPLING_CONV_INDICES
         .iter()
@@ -30,7 +36,7 @@ pub fn map_hf_tensor(key: &str, is_tdt: bool) -> Option<String> {
         })
         .or_else(|| {
             key.strip_prefix("encoder.layers.")
-                .and_then(map_encoder_layer)
+                .and_then(|rest| map_encoder_layer(rest, nemotron))
         })
         .or_else(|| map_tdt_or_ctc_head(key, is_tdt))
 }
@@ -74,7 +80,26 @@ fn map_decoder_lstm(rest: &str) -> Option<String> {
     })
 }
 
-fn map_encoder_layer(rest: &str) -> Option<String> {
+fn map_nemotron_subsampling(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("encoder.subsampling.conv_in.") {
+        return Some(format!("encoder/sub/conv_in/{rest}.npy"));
+    }
+    if let Some(rest) = key.strip_prefix("encoder.subsampling.layers.") {
+        let (idx, tail) = rest.split_once('.')?;
+        let (kind, part) = tail.split_once('.')?;
+        let dest = match (idx, kind) {
+            ("0", "depthwise_conv") => "encoder/sub/dw0",
+            ("0", "pointwise_conv") => "encoder/sub/pw0",
+            ("1", "depthwise_conv") => "encoder/sub/dw1",
+            ("1", "pointwise_conv") => "encoder/sub/pw1",
+            _ => return None,
+        };
+        return Some(format!("{dest}/{part}.npy"));
+    }
+    None
+}
+
+fn map_encoder_layer(rest: &str, nemotron: bool) -> Option<String> {
     let (idx, tail) = split_layer_tail(rest)?;
 
     match tail {
@@ -127,13 +152,25 @@ fn map_encoder_layer(rest: &str) -> Option<String> {
             let part = tail.rsplit_once('.')?.1;
             Some(format!("encoder/block_{idx}/conv/point_conv2/{part}.npy"))
         }
-        "conv.norm.weight" => Some(format!("encoder/block_{idx}/conv/bn/weight.npy")),
-        "conv.norm.bias" => Some(format!("encoder/block_{idx}/conv/bn/bias.npy")),
+        "conv.norm.weight" => Some(if nemotron {
+            format!("encoder/block_{idx}/conv/post_ln/gamma.npy")
+        } else {
+            format!("encoder/block_{idx}/conv/bn/weight.npy")
+        }),
+        "conv.norm.bias" => Some(if nemotron {
+            format!("encoder/block_{idx}/conv/post_ln/beta.npy")
+        } else {
+            format!("encoder/block_{idx}/conv/bn/bias.npy")
+        }),
         "conv.norm.running_mean" => Some(format!("encoder/block_{idx}/conv/bn/running_mean.npy")),
         "conv.norm.running_var" => Some(format!("encoder/block_{idx}/conv/bn/running_var.npy")),
         "norm_conv.weight" | "norm_conv.bias" => {
             let part = ln_component(tail);
-            Some(format!("encoder/block_{idx}/conv/ln/{part}.npy"))
+            if nemotron {
+                Some(format!("encoder/block_{idx}/conv_ln/{part}.npy"))
+            } else {
+                Some(format!("encoder/block_{idx}/conv/ln/{part}.npy"))
+            }
         }
         "feed_forward2.linear1.weight" | "feed_forward2.linear1.bias" => {
             let part = tail.rsplit_once('.')?.1;
@@ -170,15 +207,15 @@ mod tests {
     #[test]
     fn maps_subsampling_and_joint_keys() {
         assert_eq!(
-            map_hf_tensor("encoder.subsampling.layers.0.weight", true),
+            map_hf_tensor("encoder.subsampling.layers.0.weight", true, false),
             Some("encoder/conv1/weight.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("encoder_projector.bias", true),
+            map_hf_tensor("encoder_projector.bias", true, false),
             Some("final_proj/bias.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("joint.head.weight", true),
+            map_hf_tensor("joint.head.weight", true, false),
             Some("ctc_linear/weight.npy".into())
         );
     }
@@ -186,37 +223,57 @@ mod tests {
     #[test]
     fn maps_decoder_lstm_keys() {
         assert_eq!(
-            map_hf_tensor("decoder.lstm.weight_ih_l0", true),
+            map_hf_tensor("decoder.lstm.weight_ih_l0", true, false),
             Some("decoder/lstm/l0/weight_ih.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("decoder.embedding.weight", true),
+            map_hf_tensor("decoder.embedding.weight", true, false),
             Some("decoder/embedding/weight.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("decoder.decoder_projector.bias", true),
+            map_hf_tensor("decoder.decoder_projector.bias", true, false),
             Some("decoder/projector/bias.npy".into())
         );
     }
 
     #[test]
     fn maps_nemo_renames_used_by_v2_extract() {
-        // After extract_nemo_parakeet.py remaps NeMo keys onto the HF layout.
+        // After the Rust .nemo extractor remaps NeMo keys onto the HF layout.
         assert_eq!(
-            map_hf_tensor("encoder.subsampling.layers.0.weight", true),
+            map_hf_tensor("encoder.subsampling.layers.0.weight", true, false),
             Some("encoder/conv1/weight.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("encoder.subsampling.linear.weight", true),
+            map_hf_tensor("encoder.subsampling.linear.weight", true, false),
             Some("encoder/pre_encode_out/weight.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("encoder_projector.weight", true),
+            map_hf_tensor("encoder_projector.weight", true, false),
             Some("final_proj/weight.npy".into())
         );
         assert_eq!(
-            map_hf_tensor("joint.head.weight", true),
+            map_hf_tensor("joint.head.weight", true, false),
             Some("ctc_linear/weight.npy".into())
+        );
+    }
+
+    #[test]
+    fn maps_nemotron_subsampling_and_layernorm_conv() {
+        assert_eq!(
+            map_hf_tensor("encoder.subsampling.conv_in.weight", true, true),
+            Some("encoder/sub/conv_in/weight.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("encoder.subsampling.layers.1.pointwise_conv.bias", true, true),
+            Some("encoder/sub/pw1/bias.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("encoder.layers.0.conv.norm.weight", true, true),
+            Some("encoder/block_0/conv/post_ln/gamma.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("encoder.layers.0.norm_conv.bias", true, true),
+            Some("encoder/block_0/conv_ln/beta.npy".into())
         );
     }
 }

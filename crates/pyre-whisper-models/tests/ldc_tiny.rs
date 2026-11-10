@@ -192,3 +192,53 @@ fn tiny_ldc93s1_padding_and_cache_ablation() {
     eprintln!("ABLATE production_default wall={:.3}s text={:?} seg={}", shipped.seconds, shipped.text, shipped.seg);
     assert_eq!(shipped.text, baseline.text);
 }
+
+/// Production pass (30 s pad, KV cache, covering windows) with the CPU host encoder
+/// against the Burn encoder. Same transcript is required; wall time is printed.
+#[test]
+fn tiny_ldc93s1_host_encoder_matches_burn_text() {
+    let wav = std::env::var("LDC93S1_WAV").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp/stt-fixtures/LDC93S1.wav"));
+    let models = std::env::var("WHISBURN_MODELS_DIR").unwrap_or_else(|_| "/tmp/models".into());
+    std::env::set_var("WHISBURN_MODELS_DIR", &models);
+    let dir = PathBuf::from(&models).join("tiny");
+    if !wav.is_file() || !dir.join("model.safetensors").is_file() {
+        eprintln!("skip host encoder check: missing {wav:?} or {}/model.safetensors", dir.display());
+        return;
+    }
+    if !dir.join("model.bpk").is_file() {
+        convert_whisper_from_hf(&dir, "tiny", &DownloadOptions { verbose: true, ..DownloadOptions::default() })
+            .expect("convert tiny");
+    }
+    let device = pyre_whisper_engine::cli::get_device(&Some("cpu".into()));
+    let (bpe, _cfg, model) = load_model("tiny", &device, false).expect("load tiny");
+    let (full, rate) = wav_samples(&wav);
+    std::env::set_var("PYRE_STT_PROFILE", "1");
+    let _ = transcribe_with_host(&model, &bpe, &full, rate, false);
+    let burn = transcribe_with_host(&model, &bpe, &full, rate, false);
+    std::env::set_var("PYRE_STT_HOST_ENCODER", "0");
+    let greedy = transcribe(&model, &bpe, &full, rate, 1, WhisperPass::historical());
+    eprintln!(
+        "HOST beam1_wall={:.3}s same_as_beam5={} text={:?}",
+        greedy.seconds, greedy.text == burn.text, greedy.text
+    );
+    let _ = transcribe_with_host(&model, &bpe, &full, rate, true);
+    let host = transcribe_with_host(&model, &bpe, &full, rate, true);
+    eprintln!(
+        "HOST warm burn_wall={:.3}s host_wall={:.3}s same={} burn={:?} host={:?}",
+        burn.seconds, host.seconds, burn.text == host.text, burn.text, host.text
+    );
+    assert_eq!(host.text, burn.text, "host encoder changed the transcript");
+    assert!(host.text.to_lowercase().contains("suit"), "{:?}", host.text);
+    assert!(host.text.to_lowercase().contains("year"), "{:?}", host.text);
+}
+
+fn transcribe_with_host(
+    model: &pyre_whisper_engine::model::Model,
+    bpe: &pyre_whisper_engine::token::Gpt2Tokenizer,
+    samples: &[f32],
+    rate: usize,
+    host: bool,
+) -> Run {
+    std::env::set_var("PYRE_STT_HOST_ENCODER", if host { "1" } else { "0" });
+    transcribe(model, bpe, samples, rate, 5, WhisperPass::historical())
+}

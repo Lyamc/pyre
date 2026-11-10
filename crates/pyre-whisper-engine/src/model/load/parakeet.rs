@@ -8,7 +8,7 @@ use crate::model::parakeet_decoder::{ParakeetDecoder, ParakeetLstm, ParakeetLstm
 use std::error::Error;
 use std::path::Path;
 
-fn load_parakeet_decoder(
+pub(crate) fn load_parakeet_decoder(
     path: &str,
     device: &burn::tensor::Device,
 ) -> Result<Option<ParakeetDecoder>, Box<dyn Error>> {

@@ -36,12 +36,17 @@ async fn list_models(State(app): S) -> Response {
             .map(|m| {
                 let present = root.join(m.name).join("model.bpk").is_file()
                     || root.join(m.name).join(format!("{}.bpk", m.name)).is_file();
+                let speech = crate::speech_caps::profile(m.name);
                 json!({
                     "id": m.name, "hf": m.hf_id, "description": m.description, "tagline": m.tagline,
                     "vram_mb": m.vram_mb, "present": present,
                     "loaded": loaded.iter().any(|id| id == m.name || id.contains(m.name)),
                     "size": format!("{:?}", m.size).to_ascii_lowercase(),
                     "quality": format!("{:?}", m.quality).to_ascii_lowercase(),
+                    "capabilities": {
+                        "summary": format!("audio in, text out, {}", speech.brief()),
+                        "speech": speech.to_json(),
+                    },
                 })
             }).collect();
         return Json(json!({

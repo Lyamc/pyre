@@ -1092,6 +1092,6 @@ async fn props(State(app): S) -> Response {
 
 async fn slots(State(app): S) -> Json<Value> {
     Json(json!(app.loaded().iter().enumerate().map(|(i, m)| json!({"id": i, "model": m.id, "kind": m.kind.as_str(),
-        "is_processing": m.busy(), "queued": m.queued(), "capabilities": m.capabilities().to_value(),
+        "is_processing": m.busy(), "queued": m.queued(), "capabilities": m.capabilities().to_value_for(&m.id),
         "n_ctx": m.meta().get("n_ctx").cloned().unwrap_or(Value::Null)})).collect::<Vec<_>>()))
 }
