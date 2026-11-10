@@ -18,7 +18,7 @@ cargo build --release
 .\pyre.ps1 -Model D:\models\Qwen3.8-Flash-Next-IQ3_S -Quant IQ3_S -Foreground
 ```
 
-That serves `http://127.0.0.1:8099/` (web UI at `/`). `-Quant IQ3_S` sets `PYRE_QN_QUANT` for this process. Set it when the directory tree contains more than one quant; a folder that only contains IQ3_S shards is found without it. `-Save` writes the model and quant into the config file.
+That listens on `0.0.0.0:8099` (every interface) and serves the web UI at `http://127.0.0.1:8099/` on this machine. `-Quant IQ3_S` sets `PYRE_QN_QUANT` for this process. Set it when the directory tree contains more than one quant; a folder that only contains IQ3_S shards is found without it. `-Save` writes the model and quant into the config file. Without an API key, anything that can reach the port can call the server. `.\pyre.ps1 -Host 127.0.0.1` (or `host = '127.0.0.1'` in the config) keeps it on this machine.
 
 ```powershell
 .\pyre.ps1 -Stop      # graceful stop, then kill if it does not exit
@@ -30,7 +30,8 @@ That serves `http://127.0.0.1:8099/` (web UI at `/`). `-Quant IQ3_S` sets `PYRE_
 The same command the script runs, on any OS:
 
 ```text
-pyre serve -m D:\models\Qwen3.8-Flash-Next-IQ3_S --host 127.0.0.1 --port 8099 -b cuda
+pyre serve -m D:\models\Qwen3.8-Flash-Next-IQ3_S --port 8099 -b cuda
+pyre serve -m D:\models\Qwen3.8-Flash-Next-IQ3_S --host 127.0.0.1 --port 8099
 ```
 
 `PYRE_QN_QUANT=IQ3_S` when you need to pick a shard. On Linux or macOS, `./scripts/pyre.sh -m /path/to/IQ3_S --quant IQ3_S` is a thin wrapper around that command (no config file). `--stop` sends SIGTERM.
@@ -60,7 +61,7 @@ On Unix, `./scripts/pyre.sh --stop` signals the pid it recorded.
 | Launcher config | Install: `%ProgramData%\pyre\config.toml`. Checkout: `%LOCALAPPDATA%\pyre\config.toml`. Override with `-Config` or `PYRE_CONFIG`. The launcher sets `PYRE_CONFIG` for the process. |
 | `pyre` itself, if you do not set `PYRE_CONFIG` | `%APPDATA%\pyre\config.toml` on Windows, `~/.config/pyre/config.toml` elsewhere. Top-level keys only: `models_dir`, `offline`, `search_order`, `spec`, `route_prior`. |
 | Port | Launcher and the config template use **8099**. `pyre serve` with no `--port` uses **8080**. |
-| Host | Template default `127.0.0.1`. `0.0.0.0` is LAN; open the firewall yourself. Without an API key the server logs a warning. |
+| Host | Default **`0.0.0.0`** (all interfaces), in `pyre serve`, a new config, `pyre.ps1`, and `scripts/pyre.sh`. `--host 127.0.0.1`, `-Host 127.0.0.1`, or `PYRE_HOST=127.0.0.1` is this machine only. A config that already sets `host` is left as it is. Open the firewall yourself. With no API key the server logs a warning. |
 | Backend | `-b cuda` is pyre's default. `wgpu`, `vulkan`, `cpu`, `ndarray` are the other names. The launcher passes `-b` only when `[serve] backend` is set. |
 | Qwen-Next context | `PYRE_QN_CTX` (`8k` … `512k`, or a token count) or `%LOCALAPPDATA%\pyre\qwen-context.json`. Default 131072. `-c` / `ctx_size` applies to other models, not this one. |
 | KV cache | 4-bit by default. `PYRE_QN_KV_BITS=8` selects 8-bit. `PYRE_QN_KV8=0` keeps f32. |

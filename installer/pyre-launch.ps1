@@ -8,8 +8,10 @@
 
     -Model PATH   -m for this run (folder of .gguf shards, one .gguf, store name, or HF repo id)
     -Quant NAME   PYRE_QN_QUANT for this run (IQ3_S picks that shard when several are present)
-    -Save         write -Model / -Quant into the config file
+    -Save         write -Model / -Quant / -Host into the config file
     -Port N       override [serve] port
+    -Host ADDR    bind address for this run (default 0.0.0.0). -Host 127.0.0.1 is this machine only.
+    -Bind ADDR    same as -Host
     -Foreground   server logs in this window (no redirect)
     -Watch        restart after a crash. A graceful stop (exit 87) or -Stop does not restart.
     -Gui          start if needed, then open pyre-gui.exe at http://127.0.0.1:<port>
@@ -24,7 +26,7 @@
 param(
   [switch]$Gui, [switch]$Web, [switch]$Stop, [switch]$FirstRun, [switch]$NoFirstRun,
   [switch]$EditConfig, [switch]$DryRun, [switch]$NoTray, [string]$Config,
-  [string]$Model, [string]$Quant, [switch]$Save, [int]$Port = 0,
+  [string]$Model, [string]$Quant, [switch]$Save, [int]$Port = 0, [Alias('Host')][string]$Bind,
   [switch]$Foreground, [switch]$Watch
 )
 $ErrorActionPreference = 'Stop'
@@ -98,11 +100,13 @@ if ($EditConfig) { Start-Process notepad.exe $Config; return }
 if ($Save) {
   if ($Model) { Set-TomlValue $Config 'serve' 'model' $Model }
   if ($Quant) { Set-TomlValue $Config 'env' 'PYRE_QN_QUANT' $Quant }
+  if ($Bind) { Set-TomlValue $Config 'serve' 'host' $Bind }
 }
 $cfg = Read-Toml $Config; $s = $cfg['serve']; if (-not $s) { $s = @{} }
 function V($k, $d = '') { if ($s.ContainsKey($k) -and "$($s[$k])" -ne '') { "$($s[$k])" } else { $d } }
 $port = if ($Port) { $Port } else { [int](V 'port' '8099') }
-$hostIp = V 'host' '127.0.0.1'
+$hostIp = if ($Bind) { $Bind } else { V 'host' '0.0.0.0' }
+$openHost = if ($hostIp -eq '0.0.0.0' -or $hostIp -eq '::') { '127.0.0.1' } else { $hostIp }
 $pidFile = Join-Path $data 'pyre-server.pid'
 $watchStop = Join-Path $data 'pyre-watch.stop'
 $exe = Find-PyreExe
@@ -151,8 +155,8 @@ if ($cfg['env']) { foreach ($k in $cfg['env'].Keys) { $envs[$k] = $cfg['env'][$k
 if ($Quant) { $envs['PYRE_QN_QUANT'] = $Quant }
 if ($envs.PYRE_LOG_FILE -and $envs.PYRE_LOG_FILE -notin 'off', '0') { New-Item -ItemType Directory -Force (Split-Path $envs.PYRE_LOG_FILE) -ea 0 | Out-Null }
 
-$url = "http://127.0.0.1:$port"
-Write-Host "pyre: $url"
+$url = "http://${openHost}:$port"
+Write-Host "pyre: $url  (bind ${hostIp}:$port)"
 if ($modelArg) { Write-Host "model: $modelArg" }
 Write-Host "config: $Config"
 Write-Host "stop: .\pyre.ps1 -Stop"
@@ -169,7 +173,7 @@ if (-not $exe) {
   throw "pyre executable not found. From the repo: cargo build --release`nThen run .\pyre.ps1 again. An install looks for pyre.exe next to this script."
 }
 
-function Test-Port { try { $c = [Net.Sockets.TcpClient]::new(); $ok = $c.ConnectAsync('127.0.0.1', $port).Wait(500); $c.Dispose(); $ok } catch { $false } }
+function Test-Port { try { $c = [Net.Sockets.TcpClient]::new(); $ok = $c.ConnectAsync($openHost, $port).Wait(500); $c.Dispose(); $ok } catch { $false } }
 function Start-PyreOnce {
   foreach ($k in $envs.Keys) { Set-Item "env:$k" $envs[$k] }
   $out = Join-Path $data 'logs'; New-Item -ItemType Directory -Force $out | Out-Null

@@ -17,7 +17,7 @@ model = ''             # -m : alias, store name, HF repo id[@rev], or a folder o
 image_model = ''       # --image-model
 stt_model = ''         # --stt-model   (e.g. openai/whisper-tiny.en)
 tts_model = ''         # --tts-model
-host = '127.0.0.1'     # --host  (bind). '0.0.0.0' = LAN; you must add a firewall rule yourself.
+host = '0.0.0.0'       # bind address. 0.0.0.0 = all interfaces (default). 127.0.0.1 = this machine only. Open the firewall yourself for LAN.
 port = 8099            # --port  (pyre's own default is 8080)
 backend = ''           # -b : cuda | wgpu | vulkan | cpu | ndarray. Empty = do not pass -b (pyre defaults to cuda).
 ctx_size = 4096        # -c for llama-style models. Qwen-Next ignores this and uses PYRE_QN_CTX (default 131072).

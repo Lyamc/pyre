@@ -8,7 +8,7 @@
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 port="${PYRE_PORT:-8099}"
-host="${PYRE_HOST:-127.0.0.1}"
+host="${PYRE_HOST:-0.0.0.0}"
 backend="${PYRE_BACKEND:-cuda}"
 model="${PYRE_MODEL:-}"
 quant="${PYRE_QN_QUANT:-}"
@@ -28,7 +28,8 @@ while [[ $# -gt 0 ]]; do
     --stop) stop=1; shift ;;
     --background) foreground=0; shift ;;
     -h|--help)
-      echo "usage: ./scripts/pyre.sh -m MODEL_DIR [--quant IQ3_S] [--port 8099] [--watch] [--stop] [--dry-run]"
+      echo "usage: ./scripts/pyre.sh -m MODEL_DIR [--quant IQ3_S] [--port 8099] [--host 0.0.0.0] [--watch] [--stop] [--dry-run]"
+      echo "  --host 127.0.0.1   this machine only (default is 0.0.0.0, all interfaces)"
       exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -76,12 +77,15 @@ fi
 exe=$(find_exe || true)
 args=(serve --host "$host" --port "$port" -b "$backend" -m "$model")
 if [[ -n $quant ]]; then export PYRE_QN_QUANT=$quant; fi
+open_host=$host
+if [[ $host == "0.0.0.0" || $host == "::" ]]; then open_host=127.0.0.1; fi
 
 if [[ $dry -eq 1 ]]; then
   echo "exe  : ${exe:-not found (cargo build --release)}"
   echo "args : ${args[*]}"
   echo "env  : PYRE_QN_QUANT=${PYRE_QN_QUANT:-}"
-  echo "url  : http://127.0.0.1:$port"
+  echo "bind : ${host}:$port"
+  echo "url  : http://$open_host:$port"
   exit 0
 fi
 if [[ -z ${exe:-} ]]; then
@@ -104,7 +108,7 @@ start_one() {
   wait $! || true
 }
 
-echo "pyre: http://127.0.0.1:$port"
+echo "pyre: http://$open_host:$port  (bind $host:$port)"
 echo "model: $model"
 echo "stop: ./scripts/pyre.sh --stop"
 if [[ $watch -eq 0 ]]; then

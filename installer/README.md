@@ -2,7 +2,7 @@
 
 The day-to-day launch path is the repo-root `pyre.ps1`, which calls `pyre-launch.ps1`. You do not need an MSI for that. See the repository README. The MSI, tray, and Start-menu shortcuts below are what `build-installer.ps1` packages; this tree does not run the installer.
 
-`pyre-launch.ps1` also accepts `-Model`, `-Quant` (sets `PYRE_QN_QUANT`, default in a new config is `IQ3_S`), `-Save`, `-Port`, `-Foreground`, and `-Watch` (restart after a crash; exit 87 or `-Stop` does not restart). From a checkout it runs `target\release\pyre.exe` or `target\x86_64-pc-windows-msvc\release\pyre.exe` and keeps config under `%LOCALAPPDATA%\pyre\config.toml`. An install (pyre.exe beside the script) still uses `%ProgramData%\pyre\config.toml`.
+`pyre-launch.ps1` also accepts `-Model`, `-Quant` (sets `PYRE_QN_QUANT`, default in a new config is `IQ3_S`), `-Save`, `-Port`, `-Host` (default `0.0.0.0`; `-Host 127.0.0.1` is this machine only), `-Foreground`, and `-Watch` (restart after a crash; exit 87 or `-Stop` does not restart). From a checkout it runs `target\release\pyre.exe` or `target\x86_64-pc-windows-msvc\release\pyre.exe` and keeps config under `%LOCALAPPDATA%\pyre\config.toml`. An install (pyre.exe beside the script) still uses `%ProgramData%\pyre\config.toml`.
 
 ```powershell
 # Exes must already be built via C:\Temp\qnx\build.ps1: once in the repo root (pyre) and once in gui\ (pyre-gui, own workspace).
