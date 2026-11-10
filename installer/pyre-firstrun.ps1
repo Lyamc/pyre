@@ -54,7 +54,7 @@ if (-not $Mode -and -not $NoUi) {
   $f = New-Object Windows.Forms.Form -Property @{ Text = 'pyre - model setup'; Width = 560; Height = $(if ($notice) { 360 } else { 300 }); StartPosition = 'CenterScreen'; FormBorderStyle = 'FixedDialog'; MaximizeBox = $false }
   $lbl = New-Object Windows.Forms.Label -Property @{ Left = 12; Top = 10; Width = 520; Height = 40; Text = "Choose the text model pyre serves. Models are stored in:`n$modelsDir (change models_dir in config.toml)" }
   $r1 = New-Object Windows.Forms.RadioButton -Property @{ Left = 12; Top = 60; Width = 520; Checked = $true; Text = "Download recommended: Qwen3.8-Flash-Next $Quant GGUF (several GB, from Hugging Face)" }
-  $r2 = New-Object Windows.Forms.RadioButton -Property @{ Left = 12; Top = 90; Width = 520; Text = 'Use an existing model (folder, .gguf, store name or HF repo id):' }
+  $r2 = New-Object Windows.Forms.RadioButton -Property @{ Left = 12; Top = 90; Width = 520; Text = 'Use a local folder (GGUF or split shards, for example an IQ3_S directory), store name, or HF repo id:' }
   $tb = New-Object Windows.Forms.TextBox -Property @{ Left = 30; Top = 118; Width = 410 }
   $br = New-Object Windows.Forms.Button -Property @{ Left = 448; Top = 116; Width = 80; Text = 'Browse...' }
   $br.Add_Click({ $d = New-Object Windows.Forms.FolderBrowserDialog; if ($d.ShowDialog() -eq 'OK') { $tb.Text = $d.SelectedPath; $r2.Checked = $true } })

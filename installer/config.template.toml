@@ -12,14 +12,15 @@ models_dir = 'C:\ProgramData\pyre\models'   # pyre model store (else PYRE_MODELS
 
 # ---- [serve]: mapped by pyre-launch.ps1 to `pyre serve` flags / env vars ----
 [serve]
-model = ''             # -m : alias, store name, HF repo id[@rev] or folder. Empty => first-run setup opens.
+model = ''             # -m : alias, store name, HF repo id[@rev], or a folder of .gguf shards. Empty => first-run setup opens.
+# model = 'D:\models\Qwen3.8-Flash-Next-IQ3_S'   # example only: a local split-GGUF directory (not required)
 image_model = ''       # --image-model
 stt_model = ''         # --stt-model   (e.g. openai/whisper-tiny.en)
 tts_model = ''         # --tts-model
-host = '127.0.0.1'     # --host  (bind). '0.0.0.0' = LAN; you must add a firewall rule yourself.
+host = '0.0.0.0'       # bind address. 0.0.0.0 = all interfaces (default). 127.0.0.1 = this machine only. Open the firewall yourself for LAN.
 port = 8099            # --port  (pyre's own default is 8080)
-backend = ''           # -b : cuda | wgpu | vulkan | cpu | ndarray. Empty = let pyre choose.
-ctx_size = 4096        # -c
+backend = ''           # -b : cuda | wgpu | vulkan | cpu | ndarray. Empty = do not pass -b (pyre defaults to cuda).
+ctx_size = 4096        # -c for llama-style models. Qwen-Next ignores this and uses PYRE_QN_CTX (default 131072).
 n_predict = 512        # -n
 fast = true            # --fast (env PYRE_QN_FAST); false = exact outputs
 vram_floor_mb = 1100   # env PYRE_VRAM_FLOOR_MB (0 = off)
@@ -30,11 +31,13 @@ metrics_bind = ''      # env PYRE_METRICS_BIND e.g. '0.0.0.0:9099'
 metrics_token = ''     # env PYRE_METRICS_TOKEN (Bearer for /metrics, /api/metrics, /api/logs)
 log_file = 'C:\ProgramData\pyre\logs\pyre.jsonl'   # env PYRE_LOG_FILE ('off' disables)
 instance = ''          # env PYRE_INSTANCE (metrics label)
-extra_args = ''        # appended verbatim to `pyre serve`
+extra_args = ''        # extra arguments, split on spaces (no quoting)
 
-# ---- [env]: any extra environment variables passed to pyre, e.g. PYRE_QN_QUANT = 'IQ2_XS' ----
+# ---- [env]: any extra environment variables passed to pyre, e.g. PYRE_QN_QUANT = 'IQ3_S' ----
 [env]
-PYRE_QN_QUANT = 'IQ2_XS'
+PYRE_QN_QUANT = 'IQ3_S'   # shard to open when the model folder contains more than one quant. A folder that only has IQ3_S does not need this.
+# PYRE_QN_CTX = '128k'       # qwen-next context (8k..512k or a token count). Saved default is 131072 in %LOCALAPPDATA%\pyre\qwen-context.json.
+# PYRE_QN_KV_BITS = '4'      # 4 (default) or 8. PYRE_QN_KV8=0 keeps the KV cache f32.
 # --- Need a pyre build newer than cf84f1d (int45+); older builds ignore them ---
 # PYRE_GPU_DUTY = '85'       # adaptive GPU duty cap in % (default 85; 'off'/0/100 = disabled; clamped 30-99). Paces each step so smoothed
 #                            # util stays under the target; target auto-drops 5 pts/5 s when hot (>=80 C), near power limit or saturated,

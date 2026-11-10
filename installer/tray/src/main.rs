@@ -39,7 +39,7 @@ fn config_path() -> PathBuf {
 fn load_cfg() -> Cfg {
     let v: toml::Value = std::fs::read_to_string(config_path()).ok().and_then(|s| s.parse().ok()).unwrap_or(toml::Value::Table(Default::default()));
     let s = v.get("serve");
-    let mut host = s.and_then(|s| s.get("host")).and_then(|h| h.as_str()).unwrap_or("127.0.0.1").to_string();
+    let mut host = s.and_then(|s| s.get("host")).and_then(|h| h.as_str()).unwrap_or("0.0.0.0").to_string();
     if host.is_empty() || host == "0.0.0.0" || host == "::" { host = "127.0.0.1".into(); }
     let port = s.and_then(|s| s.get("port")).and_then(|p| p.as_integer()).unwrap_or(8099) as u16;
     Cfg { host, port }

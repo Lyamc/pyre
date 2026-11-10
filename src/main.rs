@@ -118,7 +118,8 @@ pub struct ServeArgs {
     /// Do not treat HF-cache / store image & tagger snapshots as available unless loaded via a flag
     #[arg(long = "no-auto-models")]
     pub no_auto_models: bool,
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Bind address. Default `0.0.0.0` (all interfaces). `127.0.0.1` is this machine only.
+    #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
