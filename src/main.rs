@@ -40,6 +40,9 @@ mod apps;
 mod engine_qn;
 mod qn_find;
 mod spec;
+mod qn_ctx;
+mod hw_tune;
+mod profiles;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -189,11 +192,15 @@ pub enum ModelsCmd {
 }
 
 fn main() -> Result<()> {
+    // Before any device: pin the CubeCL cache, then honor a requested autotune retune
+    // (rename the db aside) and load the saved Qwen context / KV precision.
+    kernel_cache_config();
+    hw_tune::startup();
+    qn_ctx::init();
     if std::env::var("PYRE_QN_KBENCH").is_ok() { crate::model::qdot::kbench(); return Ok(()); }
     if std::env::var("PYRE_QN_PBENCH").is_ok() { crate::model::qwen4exp_gguf::pool_bench(); return Ok(()); }
     if std::env::var("PYRE_QN_XBENCH").is_ok() { return crate::model::qn_cube::xbench(); }
     logbuf::init(); let _ = metrics::uptime_s();
-    kernel_cache_config();
     let cli = Cli::parse();
     let ctx = storage::Ctx::new(&cli.storage)?;
     match cli.cmd {

@@ -36,6 +36,7 @@
 </header>
 
 <main>
+<div id="tuneBanner" class="callout hidden"></div>
 <!-- CHAT -->
 <section id="tab-chat" class="tab active">
   <aside class="convs">
@@ -51,12 +52,31 @@
       <button id="settingsBtn" class="ghost">⚙ Settings</button>
     </div>
     <div id="settings" class="settings hidden">
-      <label class="full">System prompt<textarea id="sysPrompt" rows="2" placeholder="You are a helpful assistant."></textarea></label>
-      <label>Temperature<input id="sTemp" type="number" step="0.05" min="0" max="2" value="0.7"></label>
-      <label>top_p<input id="sTopP" type="number" step="0.05" min="0" max="1" value="0.95"></label>
-      <label>top_k<input id="sTopK" type="number" step="1" min="0" value="40"></label>
-      <label>Max tokens<input id="sMax" type="number" step="16" min="1" value="4096"></label>
-      <label>Seed<input id="sSeed" type="number" placeholder="random"></label>
+      <div class="full prof-bar" role="group" aria-label="Settings source">
+        <span class="opt-label">Source</span>
+        <div class="seg" id="profSrc">
+          <button type="button" class="seg-btn active" data-src="default" id="profDefault">Default</button>
+          <button type="button" class="seg-btn" data-src="tune" id="profTune" title="The saved autotune snapshot. Saving a custom does not change it.">Tune</button>
+        </div>
+        <select id="profCustom" title="Named custom preset"><option value="">Custom…</option></select>
+        <button type="button" id="profSave" class="ghost icon-btn" title="Save the current values as a named custom preset. Does not change Default or Tune." aria-label="Save custom preset">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M5 3h11l5 5v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm2 2v6h10V5H7zm0 10v6h10v-6H7z"/></svg>
+        </button>
+        <button type="button" id="profTuneSave" class="ghost small" title="Store the current values as the tune snapshot. Default and custom presets stay as they are.">Save as tune</button>
+        <button type="button" id="profDelete" class="ghost small hidden">Delete custom</button>
+      </div>
+      <p id="profNote" class="full muted small">Each setting is marked default, tune, or modified. Default is built in. Tune is the autotune snapshot. A custom name is saved with the disk icon and does not replace either.</p>
+      <label class="full"><span class="lab">System prompt <span class="prov" data-for="system">default</span></span><textarea id="sysPrompt" rows="2" placeholder="You are a helpful assistant."></textarea></label>
+      <label><span class="lab">Temperature <span class="prov" data-for="temperature">default</span></span><input id="sTemp" type="number" step="0.05" min="0" max="2" value="0.7"></label>
+      <label><span class="lab">top_p <span class="prov" data-for="top_p">default</span></span><input id="sTopP" type="number" step="0.05" min="0" max="1" value="0.95"></label>
+      <label><span class="lab">top_k <span class="prov" data-for="top_k">default</span></span><input id="sTopK" type="number" step="1" min="0" max="200" value="40"></label>
+      <label><span class="lab">Max tokens <span class="prov" data-for="max_tokens">default</span></span><input id="sMax" type="number" step="16" min="1" value="4096"></label>
+      <label><span class="lab">Seed <span class="prov" data-for="seed">default</span></span><input id="sSeed" type="number" placeholder="random"></label>
+      <label class="full"><span class="lab">Context window <span class="prov" data-for="context_tokens">default</span></span><select id="sCtx" title="Strata-style sizes. 384k and 512k use YaRN past the trained 262144."></select></label>
+      <label>Custom tokens<input id="sCtxN" type="number" min="16" max="1048576" placeholder="or 393216" title="Any length up to 1048576. Overrides the preset. Not capped at 256k."></label>
+      <label><span class="lab">KV cache <span class="prov" data-for="kv_bits">default</span></span><select id="sKv" title="How the older context is stored. 4-bit is lossy and the default."><option value="4">4-bit (default, lossy)</option><option value="8">8-bit (lossy, closer to f32)</option></select></label>
+      <p id="ctxFit" class="full muted small">Context and KV precision apply to Qwen-Next. 4-bit is on by default.</p>
+      <div class="full"><button type="button" id="ctxApply" class="ghost">Apply context</button></div>
     </div>
     <div id="messages" class="messages"></div>
     <form id="composer" class="composer">

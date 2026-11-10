@@ -26,6 +26,24 @@ fn nvml() -> Option<&'static nvml_wrapper::Nvml> {
 #[derive(Clone, Copy, Debug)]
 pub struct Vram { pub total: u64, pub free: u64, pub used: u64 }
 
+/// Identity of device 0. Used to notice when CubeCL's autotune cache was measured on another card.
+#[derive(Clone, Debug)]
+pub struct GpuId { pub name: String, pub uuid: String, pub vram_mib: u64, pub compute: String, pub sms: u32 }
+
+pub fn gpu_identity() -> Option<GpuId> {
+    let d = nvml()?.device_by_index(0).ok()?;
+    let mem = d.memory_info().ok()?;
+    let cc = d.cuda_compute_capability().ok();
+    let attrs = d.attributes().ok();
+    Some(GpuId {
+        name: d.name().unwrap_or_default(),
+        uuid: d.uuid().unwrap_or_default(),
+        vram_mib: mem.total >> 20,
+        compute: cc.map(|c| format!("{}.{}", c.major, c.minor)).unwrap_or_default(),
+        sms: attrs.map(|a| a.multiprocessor_count).unwrap_or(0),
+    })
+}
+
 /// Device 0 memory (the device pyre runs on).
 pub fn vram() -> Option<Vram> {
     let d = nvml()?.device_by_index(0).ok()?;
