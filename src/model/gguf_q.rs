@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QType { F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q2_0, Q3K, Q4K, Q5K, Q6K, IQ4NL, IQ4XS, IQ2XXS, IQ2XS, IQ2S, IQ3S, IQ1M }
+pub enum QType { F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q2_0, Q3K, Q4K, Q5K, Q6K, IQ4NL, IQ4XS, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ1M }
 
 impl QType {
     pub fn from_id(id: u32) -> Result<Self> {
@@ -25,7 +25,7 @@ impl QType {
             0 => Self::F32, 1 => Self::F16, 30 => Self::BF16, 2 => Self::Q4_0, 6 => Self::Q5_0, 8 => Self::Q8_0,
             42 => Self::Q2_0, 11 => Self::Q3K, 12 => Self::Q4K, 13 => Self::Q5K, 14 => Self::Q6K,
             20 => Self::IQ4NL, 23 => Self::IQ4XS, 16 => Self::IQ2XXS, 17 => Self::IQ2XS, 22 => Self::IQ2S,
-            21 => Self::IQ3S, 29 => Self::IQ1M,
+            18 => Self::IQ3XXS, 21 => Self::IQ3S, 29 => Self::IQ1M,
             _ => bail!("unsupported ggml type {id}"),
         })
     }
@@ -36,7 +36,7 @@ impl QType {
             Self::Q4_0 => (32, 18), Self::Q5_0 => (32, 22), Self::Q8_0 => (32, 34), Self::Q2_0 => (64, 18),
             Self::Q3K => (256, 110), Self::Q4K => (256, 144), Self::Q5K => (256, 176), Self::Q6K => (256, 210),
             Self::IQ4NL => (32, 18), Self::IQ4XS => (256, 136), Self::IQ2XXS => (256, 66), Self::IQ2XS => (256, 74),
-            Self::IQ2S => (256, 82), Self::IQ3S => (256, 110), Self::IQ1M => (256, 56),
+            Self::IQ2S => (256, 82), Self::IQ3XXS => (256, 98), Self::IQ3S => (256, 110), Self::IQ1M => (256, 56),
         }
     }
     pub fn row_bytes(self, n: usize) -> usize { let (e, b) = self.geom(); n / e * b }
@@ -133,6 +133,11 @@ pub fn dequant(t: QType, x: &[u8], y: &mut [f32]) {
                 for l in 0..4 { let idx = qs[l] as usize | (((qh[ib] as usize) << (8 - 2 * l)) & 0x300);
                     put8(y, db[l / 2], &lt.iq2s[idx], &lt.sign8[signs[l] as usize]); y = &mut y[8..]; }
                 qs = &qs[4..]; signs = &signs[4..]; } } },
+        QType::IQ3XXS => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let qs = &b[2..66]; let ss = &b[66..98]; let mut y = &mut y[i * 256..];
+            for ib in 0..8 { let a = u32::from_le_bytes([ss[4 * ib], ss[4 * ib + 1], ss[4 * ib + 2], ss[4 * ib + 3]]); let db = d * (0.5 + (a >> 28) as f32) * 0.5;
+                for l in 0..4 { let g1 = IQ3XXS_GRID[qs[8 * ib + 2 * l] as usize].to_le_bytes(); let g2 = IQ3XXS_GRID[qs[8 * ib + 2 * l + 1] as usize].to_le_bytes();
+                    let g: [f32; 8] = std::array::from_fn(|j| if j < 4 { g1[j] as f32 } else { g2[j - 4] as f32 });
+                    put8(y, db, &g, &lt.sign8[KSIGNS_IQ2XS[((a >> (7 * l)) & 127) as usize] as usize]); y = &mut y[8..]; } } } },
         QType::IQ3S => { let lt = lut(); for i in 0..nb { let b = &x[i * bs..]; let d = h2f(b, 0); let mut qs = &b[2..66]; let mut qh = &b[66..74]; let mut signs = &b[74..106]; let sc = &b[106..110];
             let mut y = &mut y[i * 256..];
             for ib in (0..8).step_by(2) {

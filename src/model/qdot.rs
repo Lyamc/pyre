@@ -33,7 +33,7 @@ pub fn supports(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QT
 
 /// Per-thread decode buffers (reused across rows: no allocation per row).
 #[derive(Default)]
-pub struct Scratch { g: Vec<u8>, s: Vec<u8>, sc: Vec<f32>, c8: Vec<f32> }
+pub struct Scratch { g: Vec<u8>, s: Vec<u8>, sc: Vec<f32>, c8: Vec<f32>, f: Vec<f32> }
 
 fn sign8() -> &'static [u64; 256] {
     static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
@@ -44,9 +44,19 @@ fn sign8() -> &'static [u64; 256] {
 
 /// sum_c W[c] * x[c] for one quantized row (`row` = the row's bytes, `a.q.len()` columns).
 pub fn row_dot(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
+    if !supports(t) { return row_dot_deq(t, row, a, sc); }
     #[cfg(target_arch = "x86_64")]
     { if avx2() { return unsafe { match t { QType::IQ2S => iq2s_avx2(row, a), QType::IQ2XXS => iq2xxs_avx2(row, a), QType::IQ1M => iq1m_avx2(row, a), QType::Q2_0 => q2_0_avx2(row, a), _ => unreachable!() } }; } }
     row_dot_generic(t, row, a, sc)
+}
+
+/// Fallback for expert types without an integer kernel (IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, K-quants, ...):
+/// expand the row to floats with the reference dequantizer and dot it with the int8 activation blocks.
+fn row_dot_deq(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
+    let n = a.q.len(); sc.f.resize(n, 0.0); super::gguf_q::dequant(t, &row[..t.row_bytes(n)], &mut sc.f);
+    let mut acc = 0f32;
+    for b in 0..n / 32 { let (w, q) = (&sc.f[b * 32..b * 32 + 32], &a.q[b * 32..b * 32 + 32]); let mut s = 0f32; for j in 0..32 { s += w[j] * q[j] as f32; } acc += s * a.d[b]; }
+    acc
 }
 
 fn avx2() -> bool { static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *A.get_or_init(|| { #[cfg(target_arch = "x86_64")] { is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && std::env::var("PYRE_QN_QDOT_GENERIC").is_err() } #[cfg(not(target_arch = "x86_64"))] { false } }) }
