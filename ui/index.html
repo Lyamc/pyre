@@ -174,10 +174,10 @@
 
           <div id="sttFilePane">
             <label class="dropzone" id="sttDrop" for="sttFile">
-              <input type="file" id="sttFile" accept="audio/*" class="sr-only">
+              <input type="file" id="sttFile" accept="audio/*,video/*,.mp4,.mkv,.mov,.webm,.m4a,.mp3,.m4v" class="sr-only">
               <span class="drop-ico" aria-hidden="true">♪</span>
-              <span class="drop-title">Drop an audio file or click to choose</span>
-              <span class="drop-meta muted small" id="sttFileMeta">MP3, WAV, M4A, FLAC, WebM…</span>
+              <span class="drop-title">Drop audio or video, or click to choose</span>
+              <span class="drop-meta muted small" id="sttFileMeta">MP3, WAV, M4A, FLAC, MP4, MOV, WebM… Video stays in the browser; only audio is uploaded.</span>
             </label>
           </div>
 
@@ -243,9 +243,16 @@
               <button id="sttModelDl" type="button" class="hidden">Download model</button>
               <input id="sttLang" placeholder="language (auto)" size="8" title="Force language code, e.g. en">
               <label><input type="checkbox" id="sttTimestamps" checked> Timestamps</label>
-              <label title="Parakeet v3, Nemotron, and long audio on the new models. Off by default."><input type="checkbox" id="sttExperimental"> Experimental models</label>
+              <label title="Parakeet v3, Nemotron, Fluid Speech Pro, and long audio on the new models. Off by default."><input type="checkbox" id="sttExperimental"> Experimental models</label>
+              <label title="Fluid Speech Pro. Drops fillers and repeated words."><input type="checkbox" id="sttClean"> Clean mode</label>
               <label><input type="checkbox" id="sttSentences"> Sentences</label>
-              <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em"></label>
+              <label title="Whisper uses a speech model that can translate. Chat model transcribes first, then the loaded LLM writes English.">Translate with
+                <select id="sttTranslateWith">
+                  <option value="whisper">Whisper</option>
+                  <option value="llm">Chat model</option>
+                </select>
+              </label>
+              <label>Beam <input id="sttBeam" type="number" min="1" max="16" value="5" style="width:3.5em" title="Fluid Speech Pro uses 1 to 4. 1 is greedy."></label>
               <label>Max tokens <input id="sttMaxTok" type="number" min="1" max="448" value="448" style="width:4.5em"></label>
             </div>
             <p class="muted small">Exact model id and decoding knobs. Settings are saved in this browser. Download format is chosen under Results.</p>

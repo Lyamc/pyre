@@ -63,6 +63,9 @@ pub struct TaskOptions {
     pub scout_model: Option<String>,
     /// Post-process segments into sentence groups for timed outputs (txt/srt/vtt/json sentences list)
     pub group_into_sentences: bool,
+    /// Fluid Speech Pro edited text (drop fillers and repeated words via the checkpoint adapter).
+    #[serde(default)]
+    pub clean_mode: bool,
 }
 
 impl Default for TaskOptions {
@@ -78,6 +81,7 @@ impl Default for TaskOptions {
             orchestrate: false,
             scout_model: Some("tiny_en".to_string()),
             group_into_sentences: false,
+            clean_mode: false,
         }
     }
 }

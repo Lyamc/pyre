@@ -205,7 +205,7 @@ fn ff(d_model: usize, inner: usize, device: &burn::tensor::Device) -> FeedForwar
     let ln = LayerNormConfig::new(d_model).init(device);
     let lin1 = LinearConfig::new(d_model, inner).with_bias(false).init(device);
     let lin2 = LinearConfig::new(inner, d_model).with_bias(false).init(device);
-    FeedForwardModule { ln, lin1, lin2 }
+    FeedForwardModule { ln, lin1, lin2, lora_lin1: None, lora_lin2: None }
 }
 
 #[derive(Module, Debug)]

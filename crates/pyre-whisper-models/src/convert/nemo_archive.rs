@@ -76,6 +76,61 @@ pub fn yaml_scalar<'a>(yaml: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FluidSpeechSpec {
+    pub insert_dim: usize,
+    pub insert_kernel: usize,
+    pub rank: usize,
+    pub alpha: f64,
+}
+
+impl FluidSpeechSpec {
+    pub fn scale(&self) -> f64 {
+        if self.rank == 0 {
+            1.0
+        } else {
+            self.alpha / self.rank as f64
+        }
+    }
+}
+
+/// The `fluid_speech:` block in a NeMo `model_config.yaml`. Other `rank` keys in the file are ignored.
+pub fn fluid_speech_spec(yaml: &str) -> Option<FluidSpeechSpec> {
+    let mut in_block = false;
+    let mut in_clean = false;
+    let mut spec = FluidSpeechSpec { insert_dim: 1024, insert_kernel: 15, rank: 32, alpha: 64.0 };
+    let mut found = false;
+    for line in yaml.lines() {
+        if !in_block {
+            if line.trim() == "fluid_speech:" || line.trim().starts_with("fluid_speech:") {
+                in_block = true;
+                found = true;
+            }
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('\t') && !line.trim().is_empty() {
+            break;
+        }
+        let trim = line.trim();
+        if trim.starts_with("clean_mode:") {
+            in_clean = true;
+            continue;
+        }
+        if let Some(v) = trim.strip_prefix("insert_dim:") {
+            spec.insert_dim = v.trim().parse().unwrap_or(spec.insert_dim);
+        } else if let Some(v) = trim.strip_prefix("insert_kernel:") {
+            spec.insert_kernel = v.trim().parse().unwrap_or(spec.insert_kernel);
+        } else if in_clean {
+            if let Some(v) = trim.strip_prefix("rank:") {
+                spec.rank = v.trim().parse().unwrap_or(spec.rank);
+            } else if let Some(v) = trim.strip_prefix("alpha:") {
+                spec.alpha = v.trim().parse().unwrap_or(spec.alpha);
+            }
+        }
+    }
+    found.then_some(spec)
+}
+
 pub fn yaml_durations(yaml: &str) -> Vec<usize> {
     if let Some(rest) = yaml_scalar(yaml, "durations") {
         if rest.starts_with('[') {
@@ -221,7 +276,19 @@ pub fn extract_nemo_to_hf(nemo: &Path, out_dir: &Path) -> anyhow::Result<()> {
             "scale_input": scale,
         }
     });
-    fs::write(out_dir.join("config.json"), serde_json::to_vec_pretty(&cfg)?)?;
+    if !out_dir.join("config.json").exists() {
+        fs::write(out_dir.join("config.json"), serde_json::to_vec_pretty(&cfg)?)?;
+    }
+    if let Some(spec) = fluid_speech_spec(&yaml) {
+        let meta = serde_json::json!({
+            "insert_dim": spec.insert_dim,
+            "insert_kernel": spec.insert_kernel,
+            "rank": spec.rank,
+            "alpha": spec.alpha,
+            "scale": spec.scale(),
+        });
+        fs::write(out_dir.join("fluid_speech.json"), serde_json::to_vec_pretty(&meta)?)?;
+    }
 
     let pieces: Vec<&str> = vocab_txt
         .lines()
@@ -244,9 +311,11 @@ pub fn extract_nemo_to_hf(nemo: &Path, out_dir: &Path) -> anyhow::Result<()> {
         "decoder": null,
         "model": { "type": "WordLevel", "vocab": map, "unk_token": unk }
     });
-    let mut tok_file = File::create(out_dir.join("tokenizer.json"))?;
-    serde_json::to_writer(&mut tok_file, &tok)?;
-    tok_file.write_all(b"\n")?;
+    if !out_dir.join("tokenizer.json").exists() {
+        let mut tok_file = File::create(out_dir.join("tokenizer.json"))?;
+        serde_json::to_writer(&mut tok_file, &tok)?;
+        tok_file.write_all(b"\n")?;
+    }
     fs::write(out_dir.join("vocab.txt"), pieces.join("\n") + "\n")?;
     tracing::info!("extracted {} tensors from {}", views_owned.len(), nemo.display());
     Ok(())
@@ -348,5 +417,10 @@ mod tests {
         assert_eq!(yaml_scalar(yaml, "d_model"), Some("1024"));
         assert_eq!(yaml_durations(yaml), vec![0, 1, 2, 3, 4]);
         assert_eq!(yaml_durations("durations: [0, 1, 2]\n"), vec![0, 1, 2]);
+        let yaml = "model:\n  rank: 8\nfluid_speech:\n  insert_dim: 1024\n  insert_kernel: 15\n  clean_mode:\n    rank: 32\n    alpha: 64.0\nencoder:\n  d_model: 1024\n";
+        let spec = fluid_speech_spec(yaml).unwrap();
+        assert_eq!(spec.rank, 32);
+        assert_eq!(spec.scale(), 2.0);
+        assert!(fluid_speech_spec("d_model: 1024\n").is_none());
     }
 }

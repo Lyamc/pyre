@@ -160,6 +160,11 @@ pub fn load_rel_pos_multihead_attention(
         pos,
         pos_bias_u: Param::from_tensor(pos_bias_u),
         pos_bias_v: Param::from_tensor(pos_bias_v),
+        lora_q: None,
+        lora_k: None,
+        lora_v: None,
+        lora_o: None,
+        lora_pos: None,
     })
 }
 
@@ -192,6 +197,8 @@ pub fn load_convolution_module(path: &str, d_model: usize, _kernel_size: usize, 
         depth_conv,
         bn,
         point_conv2,
+        lora_pw1: None,
+        lora_pw2: None,
     })
 }
 
@@ -199,7 +206,7 @@ pub fn load_feed_forward_module(path: &str, d_model: usize, device: &burn::tenso
     let ln = load_layer_norm(&format!("{}/{}", path, "ln"), d_model, device)?;
     let lin1 = load_linear(&format!("{}/{}", path, "lin1"), d_model, d_model * 4, device)?;
     let lin2 = load_linear(&format!("{}/{}", path, "lin2"), d_model * 4, d_model, device)?;
-    Ok(FeedForwardModule { ln, lin1, lin2 })
+    Ok(FeedForwardModule { ln, lin1, lin2, lora_lin1: None, lora_lin2: None })
 }
 
 pub fn load_conformer_block(path: &str, d_model: usize, _n_head: usize, kernel_size: usize, device: &burn::tensor::Device) -> Result<ConformerBlock, Box<dyn Error>> {

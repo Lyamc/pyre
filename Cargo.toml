@@ -49,7 +49,7 @@ description = "llama.cpp-server-style LLM inference server where Burn runs the m
 
 [features]
 image = ["dep:pyre-sd", "dep:image"]
-stt = ["dep:pyre-whisper-core", "dep:pyre-whisper-audio", "dep:pyre-whisper-engine", "dep:pyre-whisper-models"]
+stt = ["dep:pyre-whisper-core", "dep:pyre-whisper-audio", "dep:pyre-whisper-engine", "dep:pyre-whisper-models", "dep:ureq"]
 default = ["cuda", "wgpu", "flex", "stt", "image"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
@@ -104,6 +104,7 @@ pyre-whisper-core = { path = "crates/pyre-whisper-core", optional = true }
 pyre-whisper-audio = { path = "crates/pyre-whisper-audio", optional = true }
 pyre-whisper-engine = { path = "crates/pyre-whisper-engine", optional = true }
 pyre-whisper-models = { path = "crates/pyre-whisper-models", optional = true }
+ureq = { workspace = true, optional = true }
 # Journal, SSE terminal contract, and resume planning. No Burn dependency.
 pyre-resume = { path = "crates/pyre-resume" }
 pyre-voice-clone = { path = "crates/pyre-voice-clone" }

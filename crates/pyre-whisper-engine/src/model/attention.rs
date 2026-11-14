@@ -110,6 +110,11 @@ impl RelPosMultiHeadAttentionConfig {
             pos,
             pos_bias_u: Param::from_tensor(pos_bias_u.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
             pos_bias_v: Param::from_tensor(pos_bias_v.squeeze_dim::<3>(0).squeeze_dim::<2>(1)),
+            lora_q: None,
+            lora_k: None,
+            lora_v: None,
+            lora_o: None,
+            lora_pos: None,
         }
     }
 }
@@ -140,6 +145,16 @@ pub struct RelPosMultiHeadAttention {
     pub pos: nn::Linear,
     pub pos_bias_u: Param<Tensor<2>>,
     pub pos_bias_v: Param<Tensor<2>>,
+    #[module(skip)]
+    pub lora_q: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_k: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_v: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_o: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_pos: Option<crate::model::fluid::LoraAB>,
 }
 
 impl RelPosMultiHeadAttention {
@@ -147,12 +162,12 @@ impl RelPosMultiHeadAttention {
         let [batch, seq_len, d_model] = x.dims();
         let n_hstate = d_model / self.n_head;
 
-        let q = self.query.forward(x.clone());
-        let k = self.key.forward(x.clone());
-        let v = self.value.forward(x.clone());
+        let q = crate::model::fluid::linear_with_lora(&self.query, x.clone(), self.lora_q.as_ref());
+        let k = crate::model::fluid::linear_with_lora(&self.key, x.clone(), self.lora_k.as_ref());
+        let v = crate::model::fluid::linear_with_lora(&self.value, x.clone(), self.lora_v.as_ref());
 
         let pos_emb = self.generate_rel_pos(seq_len, &x.device());
-        let p = self.pos.forward(pos_emb);
+        let p = crate::model::fluid::linear_with_lora(&self.pos, pos_emb, self.lora_pos.as_ref());
 
         let q = q.reshape([batch, seq_len, self.n_head, n_hstate]).swap_dims(1, 2);
         let k = k.reshape([batch, seq_len, self.n_head, n_hstate]).swap_dims(1, 2);
@@ -183,7 +198,7 @@ impl RelPosMultiHeadAttention {
         let context = attn.matmul(v);
         
         let out = context.swap_dims(1, 2).reshape([batch, seq_len, d_model]);
-        self.out.forward(out)
+        crate::model::fluid::linear_with_lora(&self.out, out, self.lora_o.as_ref())
     }
 
     fn generate_rel_pos(&self, seq_len: usize, device: &burn::tensor::Device) -> Tensor<3> {

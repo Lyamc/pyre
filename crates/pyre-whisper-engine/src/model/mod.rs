@@ -6,6 +6,7 @@ pub mod encoder;
 pub mod decoder;
 pub mod whisper;
 pub mod conformer;
+pub mod fluid;
 pub mod parakeet;
 pub mod parakeet_decoder;
 pub mod nemotron;

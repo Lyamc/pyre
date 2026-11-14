@@ -11,6 +11,9 @@ pub struct ParakeetLstmLayer {
     pub weight_hh: Param<Tensor<2>>,
     pub bias_ih: Param<Tensor<1>>,
     pub bias_hh: Param<Tensor<1>>,
+    /// `weight_ih_l0 @ clean_mode.decoder_input`, added only in clean mode.
+    #[module(skip)]
+    pub clean_bias_ih: Option<Tensor<1>>,
 }
 
 impl ParakeetLstmLayer {
@@ -25,8 +28,17 @@ impl ParakeetLstmLayer {
         cell: Tensor<2>,
     ) -> (Tensor<2>, Tensor<2>) {
         // HF/PyTorch LSTM weights are [4*hidden, in]; matmul uses transposed layout.
+        let bias_ih = if crate::model::fluid::clean_on() {
+            if let Some(delta) = &self.clean_bias_ih {
+                self.bias_ih.val() + delta.clone()
+            } else {
+                self.bias_ih.val()
+            }
+        } else {
+            self.bias_ih.val()
+        };
         let gates = input.matmul(self.weight_ih.val().clone().transpose())
-            + self.bias_ih.val().clone().unsqueeze()
+            + bias_ih.unsqueeze()
             + hidden.matmul(self.weight_hh.val().clone().transpose())
             + self.bias_hh.val().clone().unsqueeze();
 
@@ -92,12 +104,14 @@ impl ParakeetDecoderConfig {
                 )),
                 bias_ih: Param::from_tensor(Tensor::zeros([4 * self.hidden_size], device)),
                 bias_hh: Param::from_tensor(Tensor::zeros([4 * self.hidden_size], device)),
+                clean_bias_ih: None,
             })
             .collect();
         ParakeetDecoder {
             embedding,
             lstm: ParakeetLstm { layers },
             projector,
+            clean_joint: None,
         }
     }
 }
@@ -107,6 +121,9 @@ pub struct ParakeetDecoder {
     pub embedding: Embedding,
     pub lstm: ParakeetLstm,
     pub projector: Linear,
+    /// `clean_mode.joint_hidden`, added to the prediction projection in clean mode.
+    #[module(skip)]
+    pub clean_joint: Option<Tensor<1>>,
 }
 
 impl ParakeetDecoder {
@@ -124,6 +141,17 @@ pub struct ParakeetDecoderCache {
     pub hidden: Vec<Tensor<2>>,
     pub cell: Vec<Tensor<2>>,
     pub initialized: bool,
+}
+
+impl Clone for ParakeetDecoderCache {
+    fn clone(&self) -> Self {
+        Self {
+            output: self.output.clone(),
+            hidden: self.hidden.clone(),
+            cell: self.cell.clone(),
+            initialized: self.initialized,
+        }
+    }
 }
 
 impl ParakeetDecoderCache {
@@ -177,7 +205,12 @@ impl ParakeetDecoder {
 
         let (lstm_out, new_hidden, new_cell) =
             self.lstm.step(input, &cache.hidden, &cache.cell);
-        let projected = self.projector.forward(lstm_out);
+        let mut projected = self.projector.forward(lstm_out);
+        if crate::model::fluid::clean_on() {
+            if let Some(delta) = &self.clean_joint {
+                projected = projected + delta.clone().unsqueeze();
+            }
+        }
 
         if update_state || !cache.initialized {
             cache.output = projected.clone();

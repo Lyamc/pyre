@@ -264,10 +264,12 @@ fn probe_audio(mss: MediaSourceStream, hint: &Hint) -> Result<ProbedAudio, Whisb
         .map_err(map_symphonia_error)?;
 
     let format = probed.format;
+    // Video containers list a video track first. An audio track is the one that reports a sample rate.
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .find(|t| t.codec_params.sample_rate.is_some() && t.codec_params.codec != CODEC_TYPE_NULL)
+        .or_else(|| format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL))
         .ok_or_else(|| WhisburnError::Audio("no audio track found".into()))?;
 
     let track_id = track.id;
