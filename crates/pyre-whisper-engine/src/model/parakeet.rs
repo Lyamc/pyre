@@ -73,6 +73,7 @@ impl ParakeetConfig {
             mean: None,
             std: None,
             n_mels: self.n_mels,
+            frame_insert: None,
         }
     }
 }
@@ -93,6 +94,9 @@ pub struct Parakeet {
     pub mean: Option<Param<Tensor<2>>>,
     pub std: Option<Param<Tensor<2>>>,
     pub n_mels: usize,
+    /// NeMo `encoder.fv_insert`. Not part of the Burn record, so v2/v3 packs still load.
+    #[module(skip)]
+    pub frame_insert: Option<crate::model::fluid::FrameInsert>,
 }
 
 impl Parakeet {
@@ -132,6 +136,12 @@ impl Parakeet {
         let x = if self.decoder.is_none() {
             let d_model = x.dims()[2] as f32;
             x.mul_scalar(d_model.sqrt())
+        } else {
+            x
+        };
+        // fluid_speech.py runs this on the subsampling module's output, before the Conformer stack.
+        let x = if let Some(insert) = &self.frame_insert {
+            insert.forward(x)
         } else {
             x
         };
@@ -189,6 +199,21 @@ impl Parakeet {
             decoder.lstm.layers.len(),
             decoder.hidden_size(),
         );
+
+        if crate::model::fluid::tdt_beam() > 1 {
+            return self.decode_tdt_beam(
+                enc,
+                valid_frames,
+                decoder,
+                blank_token_id,
+                vocab_size,
+                duration_start,
+                durations,
+                max_symbols,
+                start_token_id,
+                crate::model::fluid::tdt_beam(),
+            );
+        }
 
         let mut frame_idx = 0usize;
         // NeMo `GreedyBatchedTDTInfer` starts at blank. `predict(None)` is a zero vector,
@@ -277,6 +302,110 @@ impl Parakeet {
         (decoded, valid_frames)
     }
 
+    /// Token-and-duration beam. Each step keeps the top `beam` hypotheses by
+    /// log-softmax(token) + log-softmax(duration). This is not NeMo `malsd_batch`;
+    /// it is the cheap beam the HTTP `beam_size` field turns on for Fluid Speech Pro
+    /// (clamped to 4). Greedy stays the path when the beam is 1.
+    fn decode_tdt_beam(
+        &self,
+        enc: Tensor<3>,
+        valid_frames: usize,
+        decoder: &crate::model::parakeet_decoder::ParakeetDecoder,
+        blank_token_id: usize,
+        vocab_size: usize,
+        duration_start: usize,
+        durations: &[usize],
+        max_symbols: usize,
+        start_token_id: usize,
+        beam: usize,
+    ) -> (Vec<(usize, usize)>, usize) {
+        let beam = beam.clamp(1, 4);
+        let joint = enc.dims()[2];
+        let device = enc.device();
+        let cache = ParakeetDecoderCache::new(&device, decoder.lstm.layers.len(), decoder.hidden_size());
+        struct Hyp {
+            score: f32,
+            frame: usize,
+            symbols: usize,
+            token: usize,
+            cache: ParakeetDecoderCache,
+            decoded: Vec<(usize, usize)>,
+        }
+        let mut hyps = vec![Hyp {
+            score: 0.0,
+            frame: 0,
+            symbols: 0,
+            token: start_token_id,
+            cache,
+            decoded: Vec::new(),
+        }];
+        let max_steps = valid_frames.saturating_mul(max_symbols.max(1).saturating_add(1)).max(1);
+        for _ in 0..max_steps {
+            if hyps.iter().all(|h| h.frame >= valid_frames) {
+                break;
+            }
+            let mut next = Vec::new();
+            for h in hyps {
+                if h.frame >= valid_frames {
+                    next.push(h);
+                    continue;
+                }
+                let enc_frame = enc
+                    .clone()
+                    .slice([0..1, h.frame..h.frame + 1, 0..joint])
+                    .squeeze_dim::<2>(1);
+                let mut cache = h.cache.clone();
+                let update = h.token != blank_token_id;
+                let dec_frame = decoder.forward_step(h.token, blank_token_id, &mut cache, update);
+                let row = self.joint_step(enc_frame, dec_frame).into_data().to_vec::<f32>().unwrap_or_default();
+                let n_tok = vocab_size.min(row.len());
+                let n_dur = durations.len();
+                let d_end = (duration_start + n_dur).min(row.len());
+                if n_tok == 0 || duration_start >= d_end {
+                    next.push(h);
+                    continue;
+                }
+                let tok_lp = log_softmax(&row[..n_tok]);
+                let dur_lp = log_softmax(&row[duration_start..d_end]);
+                let mut order: Vec<usize> = (0..n_tok).collect();
+                order.sort_by(|&a, &b| tok_lp[b].partial_cmp(&tok_lp[a]).unwrap_or(std::cmp::Ordering::Equal));
+                order.truncate(beam);
+                for &tok in &order {
+                    for (di, &dlp) in dur_lp.iter().enumerate() {
+                        let is_blank = tok == blank_token_id || tok >= vocab_size;
+                        let (skip, symbols) = crate::transcribe::decode::parakeet::tdt_step(
+                            is_blank,
+                            di,
+                            durations,
+                            h.symbols,
+                            max_symbols,
+                        );
+                        let mut decoded = h.decoded.clone();
+                        if !is_blank {
+                            decoded.push((tok, h.frame));
+                        }
+                        next.push(Hyp {
+                            score: h.score + tok_lp[tok] + dlp,
+                            frame: h.frame + skip,
+                            symbols,
+                            token: if is_blank { blank_token_id } else { tok },
+                            cache: cache.clone(),
+                            decoded,
+                        });
+                    }
+                }
+            }
+            next.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            next.truncate(beam);
+            hyps = next;
+            if hyps.is_empty() {
+                break;
+            }
+        }
+        let best = hyps.into_iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        (best.map(|h| h.decoded).unwrap_or_default(), valid_frames)
+    }
+
     /// RNN-T greedy used when the joint head has no duration bins (Nemotron-style, or a
     /// Parakeet RNNT checkpoint). Advance one frame on blank or after `max_symbols` labels.
     pub fn decode_rnnt_greedy(
@@ -345,4 +474,11 @@ impl Parakeet {
     pub fn has_decoder(&self) -> bool {
         self.decoder.is_some()
     }
+}
+
+fn log_softmax(values: &[f32]) -> Vec<f32> {
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = values.iter().map(|v| (v - max).exp()).sum();
+    let log_z = max + sum.max(1e-20).ln();
+    values.iter().map(|v| v - log_z).collect()
 }

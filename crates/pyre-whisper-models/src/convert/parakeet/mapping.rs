@@ -23,6 +23,13 @@ pub fn map_hf_tensor(key: &str, is_tdt: bool, nemotron: bool) -> Option<String> 
         }
     }
 
+    if let Some(rest) = key.strip_prefix("encoder.fv_insert.") {
+        return map_fv_insert(rest);
+    }
+    if let Some(rest) = key.strip_prefix("clean_mode.") {
+        return map_clean_mode(rest);
+    }
+
     SUBSAMPLING_CONV_INDICES
         .iter()
         .find_map(|&(idx, dest)| {
@@ -39,6 +46,51 @@ pub fn map_hf_tensor(key: &str, is_tdt: bool, nemotron: bool) -> Option<String> 
                 .and_then(|rest| map_encoder_layer(rest, nemotron))
         })
         .or_else(|| map_tdt_or_ctc_head(key, is_tdt))
+}
+
+fn map_fv_insert(rest: &str) -> Option<String> {
+    let name = match rest {
+        "ln.weight" => "encoder/fv_insert/ln/gamma.npy",
+        "ln.bias" => "encoder/fv_insert/ln/beta.npy",
+        "down.weight" => "encoder/fv_insert/down/weight.npy",
+        "down.bias" => "encoder/fv_insert/down/bias.npy",
+        "up.weight" => "encoder/fv_insert/up/weight.npy",
+        "up.bias" => "encoder/fv_insert/up/bias.npy",
+        "mix.weight" => "encoder/fv_insert/mix/weight.npy",
+        "mix.bias" => "encoder/fv_insert/mix/bias.npy",
+        _ => return None,
+    };
+    Some(name.into())
+}
+
+fn map_clean_mode(rest: &str) -> Option<String> {
+    if rest == "decoder_input" {
+        return Some("clean_mode/decoder_input.npy".into());
+    }
+    if rest == "joint_hidden" {
+        return Some("clean_mode/joint_hidden.npy".into());
+    }
+    let (head, factor) = rest.rsplit_once('.')?;
+    if factor != "A" && factor != "B" {
+        return None;
+    }
+    let rest = head.strip_prefix("layers.")?;
+    let (idx, tail) = rest.split_once('.')?;
+    let slot = match tail {
+        "feed_forward1.linear1" => "ff1_lin1",
+        "feed_forward1.linear2" => "ff1_lin2",
+        "feed_forward2.linear1" => "ff2_lin1",
+        "feed_forward2.linear2" => "ff2_lin2",
+        "self_attn.linear_q" => "attn_q",
+        "self_attn.linear_k" => "attn_k",
+        "self_attn.linear_v" => "attn_v",
+        "self_attn.linear_out" => "attn_o",
+        "self_attn.linear_pos" => "attn_pos",
+        "conv.pointwise_conv1" => "conv_pw1",
+        "conv.pointwise_conv2" => "conv_pw2",
+        _ => return None,
+    };
+    Some(format!("clean_mode/block_{idx}/{slot}/{factor}.npy"))
 }
 
 fn map_tdt_or_ctc_head(key: &str, is_tdt: bool) -> Option<String> {
@@ -203,6 +255,30 @@ pub fn ln_component(tail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_the_fluid_insert_and_clean_mode_factors() {
+        assert_eq!(
+            map_hf_tensor("encoder.fv_insert.down.weight", true, false),
+            Some("encoder/fv_insert/down/weight.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("encoder.fv_insert.mix.weight", true, false),
+            Some("encoder/fv_insert/mix/weight.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("clean_mode.decoder_input", true, false),
+            Some("clean_mode/decoder_input.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("clean_mode.layers.3.self_attn.linear_q.A", true, false),
+            Some("clean_mode/block_3/attn_q/A.npy".into())
+        );
+        assert_eq!(
+            map_hf_tensor("clean_mode.layers.0.conv.pointwise_conv2.B", true, false),
+            Some("clean_mode/block_0/conv_pw2/B.npy".into())
+        );
+    }
 
     #[test]
     fn maps_subsampling_and_joint_keys() {

@@ -21,13 +21,17 @@ static NGRAM: AtomicBool = AtomicBool::new(true);
 static MTP: AtomicBool = AtomicBool::new(true);
 static ROUTE_PRIOR: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Default draft length: PYRE_SPEC, else 0 (off by default until measured faster on this model).
-pub fn draft_len() -> usize {
-    let v = DRAFT.load(Relaxed);
-    if v != usize::MAX { return v; }
-    let d = std::env::var("PYRE_SPEC").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
-    DRAFT.store(d, Relaxed); d
-}
+static MODEL_DEFAULT: AtomicUsize = AtomicUsize::new(0);
+/// Draft length in effect when a request does not set one: the explicit setting (`--spec`, config `spec`, PYRE_SPEC),
+/// else the loaded model's own default (qwen-next: 2 with the MTP drafter and multi-token verify, else 0).
+/// Read-only on purpose: it used to store its fallback 0 into DRAFT, after which `draft_len_explicit` reported that 0 as
+/// an explicit setting and overrode the model default. /api/status, its stream and /metrics all call this, so after the
+/// first poll MTP drafting never ran by default.
+pub fn draft_len() -> usize { draft_len_explicit().unwrap_or_else(|| MODEL_DEFAULT.load(Relaxed)).min(8) }
+/// Record the loaded model's default draft length and drafter name (both shown in /api/status).
+pub fn set_model_default(k: usize, drafter: &'static str) { MODEL_DEFAULT.store(k.min(8), Relaxed); *DRAFTER.lock().unwrap() = drafter; }
+/// Adaptive draft length (PYRE_SPEC_ADAPT=0 turns it off).
+pub fn adapt_on() -> bool { std::env::var("PYRE_SPEC_ADAPT").map(|v| v != "0").unwrap_or(true) }
 /// Draft length set explicitly (set_draft_len or PYRE_SPEC); None = let the model pick its default.
 pub fn draft_len_explicit() -> Option<usize> {
     let v = DRAFT.load(Relaxed);
@@ -88,7 +92,7 @@ pub static DRAFTER: std::sync::Mutex<&'static str> = std::sync::Mutex::new("none
 pub fn status() -> serde_json::Value {
     let (d, a) = (DRAFTED.load(Relaxed), ACCEPTED.load(Relaxed));
     serde_json::json!({
-        "speculative": {"enabled": draft_len() > 0, "draft_len": draft_len(), "ngram": ngram_on(), "mtp": mtp_on(),
+        "speculative": {"enabled": draft_len() > 0, "draft_len": draft_len(), "source": if draft_len_explicit().is_some() { "explicit" } else { "model" }, "adaptive": adapt_on(), "ngram": ngram_on(), "mtp": mtp_on(),
             "drafter": *DRAFTER.lock().unwrap(), "rounds": ROUNDS.load(Relaxed), "drafted": d, "accepted": a,
             "acceptance": if d > 0 { a as f64 / d as f64 } else { 0.0 }, "tokens": EMITTED.load(Relaxed),
             "last": {"draft_len": LAST_DRAFT.load(Relaxed), "acceptance": f32::from_bits(LAST_ACC.load(Relaxed)), "tok_per_s": f32::from_bits(LAST_TPS.load(Relaxed))}},
@@ -137,6 +141,16 @@ pub fn ngram_draft(h: &[u32], k: usize, min_n: usize, max_n: usize) -> Vec<u32> 
 
 pub struct Outcome { pub drafted: usize, pub accepted: usize, pub rounds: usize }
 
+/// Adaptive draft length: the k in 0..=n with the best expected tokens per second relative to plain decode, from the plain
+/// step time `ts`, the measured verify time `tv[t]` of a t-token window (unmeasured: ts (1 + 0.75 (t - 1))), the running
+/// acceptance `p` and the per-round draft cost `td`. 0 = no window is expected to beat plain steps.
+pub fn adapt_plan(n: usize, ts: f64, tv: &[f64; 10], p: f64, td: f64) -> usize {
+    let est = |t: usize| if tv[t] > 0.0 { tv[t] } else { ts * (1.0 + 0.75 * (t as f64 - 1.0)) };
+    let (mut best, mut bk) = (1.0f64, 0usize); let (mut e, mut pp) = (1.0f64, 1.0f64);
+    for kq in 1..=n.min(8) { pp *= p; e += pp; let g = e * ts / (est(kq + 1) + td); if g > best { best = g; bk = kq; } }
+    bk
+}
+
 /// Generate after `logits` (the next-token distribution following `history`). `emit(tok)` returns false
 /// to stop (EOS, stop string, length, client gone). `k` = max draft length (0 = plain decode).
 pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Vec<u32>, mut logits: Vec<f32>, k: usize, max_new: usize,
@@ -148,8 +162,10 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
     // adaptive draft length (PYRE_SPEC_ADAPT=0 turns it off): one verify pass of t tokens costs about
     // (1 + alpha (t-1)) plain steps here (CPU experts scale with the distinct experts of the window), so a
     // window only pays when its expected accepted length beats that. Timings and acceptance are tracked online.
-    let adapt = std::env::var("PYRE_SPEC_ADAPT").map(|v| v != "0").unwrap_or(true);
-    let mut ts = 0f64; let mut tv = [0f64; 10]; let mut p_acc = 0.7f64; let mut skipped = 0usize;
+    // the decision is made BEFORE drafting (expected accepted length vs measured verify + draft cost), so while windows do
+    // not pay the drafter is not run either: an unhelpful drafter then costs only the occasional probe window
+    let adapt = adapt_on();
+    let mut ts = 0f64; let mut tv = [0f64; 10]; let mut p_acc = 0.7f64; let mut skipped = 0usize; let mut td_avg = 0f64;
     let mut pending = sampler.sample(&mut logits, history);
     // PYRE_SPEC_TIME: per-phase wall time (draft, verify by window, keep, plain steps), printed at the end
     let (mut tm_d, mut tm_k, mut tm_s, mut ns_) = (0f64, 0f64, 0f64, 0usize); let (mut pos_r, mut pos_a) = ([0usize; 8], [0usize; 8]); let mut tm_v = [(0f64, 0usize); 10];
@@ -167,6 +183,13 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
         let k = if pol { env("PYRE_SPEC_POLICY_K", 3).max(1) } else if hi { env("PYRE_SPEC_HI_K", if native2() { 6 } else { 4 }).max(k) } else { k };
         DRAFT_MIN_P.store(if hi { std::env::var("PYRE_SPEC_HI_P").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.6).to_bits() } else { u32::MAX }, Relaxed);
         let kk = k.min(left.saturating_sub(1)).min(8).min(target.max_window().saturating_sub(1));
+        let mut probe = false;
+        let kk = if adapt && !pol && kk > 0 && ts > 0.0 && target.can_verify() {
+            let bk = adapt_plan(kk, ts, &tv, p_acc, td_avg);
+            // probe now and then so the estimates can recover (sooner while no window has been timed yet)
+            let every = if tv[2..].iter().all(|&v| v == 0.0) { 2 } else { 24 };
+            if bk > 0 { skipped = 0; bk } else if skipped >= every { skipped = 0; probe = true; kk.min(2) } else { skipped += 1; 0 }
+        } else { kk };
         let mut drafts: Vec<(u32, Option<Vec<(u32, f32)>>)> = vec![];
         if kk > 0 && target.can_verify() {
             // PYRE_SPEC_LOOKUP=n (opt-in): when the last n+ tokens already occurred earlier in the context, draft their
@@ -177,19 +200,18 @@ pub fn generate(target: &mut dyn Target, sampler: &mut Sampler, history: &mut Ve
                 let d = ngram_draft(history, kl, lmin, 32); if d.len() >= 2 { drafts = d.into_iter().map(|t| (t, None)).collect(); LOOKUPS.fetch_add(1, Relaxed); } }
             if pol { pol_begin(kk + 1, ts, &tv); }
             let td = std::time::Instant::now();
-            if drafts.is_empty() && mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; } }
+            if drafts.is_empty() && mtp_on() { if let Some(d) = target.draft(history, kk, if greedy { None } else { Some(&mut *sampler) }) { drafts = d; }
+                let dt = td.elapsed().as_secs_f64(); td_avg = if td_avg == 0.0 { dt } else { 0.8 * td_avg + 0.2 * dt }; }
             tm_d += td.elapsed().as_secs_f64();
             if pol { pol_draft_time(td.elapsed().as_secs_f64()); }
             if drafts.is_empty() && ng { drafts = ngram_draft(history, kk, ng_min, ng_max).into_iter().map(|t| (t, None)).collect(); }
         }
         if let Some(br) = if pol && !drafts.is_empty() { pol_rows() } else { None } {
             if br <= 1 { if skipped >= 24 { skipped = 0; drafts.truncate(2); } else { skipped += 1; drafts.clear(); } } else { skipped = 0; drafts.truncate(br - 1); }
-        } else if adapt && !drafts.is_empty() && ts > 0.0 {
-            let est = |t: usize| if tv[t] > 0.0 { tv[t] } else { ts * (1.0 + 0.75 * (t as f64 - 1.0)) };
-            let (mut best, mut bk) = (1.0f64, 0usize); let mut e = 1.0; let mut pp = 1.0;
-            for kq in 1..=drafts.len() { pp *= p_acc; e += pp; let g = e * ts / est(kq + 1); if g > best { best = g; bk = kq; } }
-            if bk == 0 && skipped >= 24 { bk = drafts.len().min(2); } // probe now and then so the estimates can recover
-            if bk == 0 { skipped += 1; drafts.clear(); } else { skipped = 0; drafts.truncate(bk); }
+        } else if adapt && !probe && !drafts.is_empty() && ts > 0.0 {
+            // the drafts are already paid for: keep the most profitable prefix of what the drafter produced
+            let bk = adapt_plan(drafts.len(), ts, &tv, p_acc, 0.0);
+            if bk == 0 { drafts.clear(); } else { drafts.truncate(bk); }
         }
         if drafts.is_empty() {
             let t0 = std::time::Instant::now();
@@ -325,6 +347,26 @@ mod tests {
         let h = [1, 2, 3, 9, 1, 2, 3, 4, 5, 7, 1, 2, 3];
         assert_eq!(ngram_draft(&h, 2, 2, 4), vec![4, 5]);
         assert_eq!(ngram_draft(&[1, 2, 3], 2, 2, 4), Vec::<u32>::new());
+    }
+    #[test]
+    fn draft_len_does_not_freeze_fallback() {
+        // reading the effective draft length (as /api/status and /metrics do) must not turn the fallback into an explicit setting
+        if std::env::var("PYRE_SPEC").is_ok() { return; }
+        set_model_default(2, "mtp");
+        assert_eq!(draft_len(), 2);
+        assert_eq!(draft_len_explicit(), None);
+        set_draft_len(0); assert_eq!(draft_len(), 0); assert_eq!(draft_len_explicit(), Some(0));
+        DRAFT.store(usize::MAX, Relaxed); set_model_default(0, "none");
+    }
+    #[test]
+    fn adapt_plan_costs() {
+        let tv = [0f64; 10];
+        // verify of 2 tokens costing 1.75 plain steps with 70% acceptance does not pay
+        assert_eq!(adapt_plan(2, 0.1, &tv, 0.7, 0.0), 0);
+        let mut tv2 = tv; tv2[2] = 0.12; tv2[3] = 0.14;
+        assert!(adapt_plan(2, 0.1, &tv2, 0.75, 0.0) >= 1);
+        // a draft cost as large as a plain step kills it again
+        assert_eq!(adapt_plan(2, 0.1, &tv2, 0.75, 0.1), 0);
     }
 }
 

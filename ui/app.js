@@ -701,10 +701,11 @@ let sttJob = null;
 let sttSumCtrl = null;
 let sttCatalog = { models: [], loaded: [] };
 let recBlob = null, rec = null;
+let extractedAudio = null;
 let stsRecBlob = null, stsRec = null, stsCtrl = null, stsReplyBlob = null, stsRecTimer = null, stsRecStarted = 0;
 
 function loadSttPrefs() {
-  const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, experimental: false, beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
+  const d = { model: "", quality: "balanced", format: "verbose_json", language: "", timestamps: true, sentences: false, diarize: false, experimental: false, clean: false, translateWith: "whisper", beam: 5, maxTok: 448, task: "transcriptions", advancedOpen: false };
   return Object.assign(d, LS.get(STT_PREF_KEY, {}));
 }
 function saveSttPrefs(p) { LS.set(STT_PREF_KEY, p); }
@@ -718,6 +719,8 @@ function sttPrefsFromUi() {
     sentences: !!( $("#sttSentences") && $("#sttSentences").checked ),
     diarize: !!( $("#sttDiar") && $("#sttDiar").checked ),
     experimental: !!( $("#sttExperimental") && $("#sttExperimental").checked ),
+    clean: !!( $("#sttClean") && $("#sttClean").checked ),
+    translateWith: ($("#sttTranslateWith") && $("#sttTranslateWith").value) || "whisper",
     beam: +(( $("#sttBeam") && $("#sttBeam").value ) || 5),
     maxTok: +(( $("#sttMaxTok") && $("#sttMaxTok").value ) || 448),
     task: ($("#sttTask") && $("#sttTask").value) || "transcriptions",
@@ -736,6 +739,8 @@ function applySttPrefs(p) {
   if ($("#sttSentences")) $("#sttSentences").checked = !!p.sentences;
   if ($("#sttDiar") && !$("#sttDiar").disabled) $("#sttDiar").checked = !!p.diarize;
   if ($("#sttExperimental")) $("#sttExperimental").checked = !!p.experimental;
+  if ($("#sttClean")) $("#sttClean").checked = !!p.clean;
+  if ($("#sttTranslateWith")) $("#sttTranslateWith").value = p.translateWith || "whisper";
   if ($("#sttBeam")) $("#sttBeam").value = p.beam || 5;
   if ($("#sttMaxTok")) $("#sttMaxTok").value = p.maxTok || 448;
   if ($("#sttTask")) $("#sttTask").value = p.task || "transcriptions";
@@ -1071,8 +1076,62 @@ function micAllowed() {
     return !!(window.isSecureContext || h === "localhost" || h === "127.0.0.1" || h === "[::1]");
   } catch { return false; }
 }
+function isVideoFile(f) {
+  if (!f) return false;
+  const type = f.type || "";
+  if (type.startsWith("video/")) return true;
+  return /\.(mp4|mkv|mov|webm|m4v|avi)$/i.test(f.name || "");
+}
+function encodeWavPcm(samples, rate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    o += 2;
+  }
+  return buf;
+}
+async function extractAudioFile(f) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) throw new Error("This browser has no AudioContext. Use pyre transcribe for this file.");
+  const ctx = new Ctx();
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(await f.arrayBuffer());
+  } catch (e) {
+    try { await ctx.close(); } catch {}
+    throw new Error("Could not decode " + (f.name || "that file") + " in the browser (" + e.message + "). MKV often needs the CLI: pyre transcribe file.mkv");
+  }
+  const rate = 16000;
+  const offline = new OfflineAudioContext(1, Math.max(1, Math.ceil(decoded.duration * rate)), rate);
+  const mono = offline.createBuffer(1, decoded.length, decoded.sampleRate);
+  const ch = mono.getChannelData(0);
+  const nch = decoded.numberOfChannels || 1;
+  for (let c = 0; c < nch; c++) {
+    const data = decoded.getChannelData(c);
+    for (let i = 0; i < data.length; i++) ch[i] += data[i] / nch;
+  }
+  const src = offline.createBufferSource();
+  src.buffer = mono;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  try { await ctx.close(); } catch {}
+  const wav = encodeWavPcm(rendered.getChannelData(0), rate);
+  const base = (f.name || "media").replace(/\.[^.]+$/, "");
+  return { blob: new Blob([wav], { type: "audio/wav" }), name: base + ".wav", original: f.size };
+}
 function currentSttAudio() {
   if (recBlob) return recBlob;
+  if (extractedAudio) return new File([extractedAudio.blob], extractedAudio.name, { type: "audio/wav" });
   const inp = $("#sttFile");
   return (inp && inp.files && inp.files[0]) || null;
 }
@@ -1112,7 +1171,7 @@ function showPreview(blobOrFile) {
   a.classList.remove("hidden");
 }
 function describeFile(f) {
-  if (!f) { if ($("#sttFileMeta")) $("#sttFileMeta").textContent = "MP3, WAV, M4A, FLAC, WebM…"; return; }
+  if (!f) { if ($("#sttFileMeta")) $("#sttFileMeta").textContent = "MP3, WAV, M4A, FLAC, MP4, MOV, WebM… Video stays in the browser; only audio is uploaded."; return; }
   const bits = [f.name || "audio"];
   if (f.size) bits.push(human(f.size));
   if ($("#sttFileMeta")) $("#sttFileMeta").textContent = bits.join(" · ");
@@ -1194,7 +1253,8 @@ if ($("#sttDrop")) {
     const dt = new DataTransfer(); dt.items.add(f);
     $("#sttFile").files = dt.files;
     recBlob = null;
-    describeFile(f); showPreview(f); updateSttRunAvail();
+    extractedAudio = null;
+    takeSttFile(f);
   });
 }
 if ($("#recBtn")) $("#recBtn").onclick = async () => {
@@ -1238,12 +1298,29 @@ if ($("#sttRecAgain")) $("#sttRecAgain").onclick = () => {
   updateSttRunAvail();
   if ($("#recBtn") && !$("#recBtn").disabled) $("#recBtn").click();
 };
+function takeSttFile(f) {
+  extractedAudio = null;
+  if (!f) { describeFile(null); updateSttRunAvail(); return; }
+  if (!isVideoFile(f)) { describeFile(f); showPreview(f); updateSttRunAvail(); return; }
+  if ($("#sttFileMeta")) $("#sttFileMeta").textContent = (f.name || "video") + " · extracting audio…";
+  extractAudioFile(f).then(ex => {
+    extractedAudio = ex;
+    const saved = Math.max(0, ex.original - ex.blob.size);
+    const bits = [ex.name, human(ex.blob.size) + " audio", "kept " + human(saved) + " of video off the server"];
+    if ($("#sttFileMeta")) $("#sttFileMeta").textContent = bits.join(" · ");
+    const drop = $("#sttDrop"); if (drop) drop.classList.add("has-file");
+    showPreview(ex.blob);
+    updateSttRunAvail();
+  }).catch(e => {
+    extractedAudio = null;
+    if ($("#sttFileMeta")) $("#sttFileMeta").textContent = e.message;
+    alert(e.message);
+    updateSttRunAvail();
+  });
+}
 if ($("#sttFile")) $("#sttFile").onchange = () => {
   recBlob = null;
-  const f = $("#sttFile").files[0];
-  if (f) { describeFile(f); showPreview(f); }
-  else { describeFile(null); }
-  updateSttRunAvail();
+  takeSttFile($("#sttFile").files && $("#sttFile").files[0]);
 };
 if ($("#sttQualitySeg")) $("#sttQualitySeg").onclick = (e) => {
   const b = e.target.closest("[data-q]"); if (!b) return;
@@ -1261,8 +1338,16 @@ if ($("#sttTaskSeg")) $("#sttTaskSeg").onclick = (e) => {
 updateMicGate();
 setSttSourceMode("file");
 updateSttRunAvail();
-if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
-if ($("#sttModel")) $("#sttModel").onchange = () => { updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi()); };
+if ($("#sttModel")) $("#sttModel").onchange = () => {
+  const id = $("#sttModel").value || "";
+  const fluid = id.indexOf("fluid-speech") >= 0;
+  if ($("#sttBeam")) {
+    $("#sttBeam").max = fluid ? "4" : "16";
+    if (fluid && $("#sttBeam").value === "5") $("#sttBeam").value = "1";
+  }
+  updateSttDlBtn();
+  saveSttPrefs(sttPrefsFromUi());
+};
 if ($("#sttQuality")) $("#sttQuality").onchange = () => {
   const p = sttPrefsFromUi();
   // sync advanced model select to the quality mapping when quality changes
@@ -1270,7 +1355,7 @@ if ($("#sttQuality")) $("#sttQuality").onchange = () => {
   if (m && $("#sttModel") && [...$("#sttModel").options].some(o => o.value === m)) $("#sttModel").value = m;
   saveSttPrefs(sttPrefsFromUi());
 };
-["sttFormat","sttLang","sttTimestamps","sttSentences","sttDiar","sttBeam","sttMaxTok","sttTask"].forEach(id => {
+["sttFormat","sttLang","sttTimestamps","sttSentences","sttDiar","sttBeam","sttMaxTok","sttTask","sttClean","sttTranslateWith","sttExperimental"].forEach(id => {
   const el = document.getElementById(id); if (el) el.addEventListener("change", () => saveSttPrefs(sttPrefsFromUi()));
 });
 if ($("#sttAdvanced")) $("#sttAdvanced").addEventListener("toggle", () => saveSttPrefs(sttPrefsFromUi()));
@@ -1304,7 +1389,10 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   if (pref.language) fd.append("language", pref.language);
   fd.append("timestamps", pref.timestamps ? "true" : "false");
   fd.append("sentences", pref.sentences ? "true" : "false");
-  fd.append("beam_size", String(pref.beam || 5));
+  const beam = (model.indexOf("fluid-speech") >= 0) ? Math.max(1, Math.min(4, pref.beam || 1)) : (pref.beam || 5);
+  fd.append("beam_size", String(beam));
+  if (pref.clean) fd.append("clean_mode", "true");
+  if (pref.task === "translations") fd.append("translate_with", pref.translateWith || "whisper");
   fd.append("max_tokens", String(pref.maxTok || 448));
   const diar = pref.diarize && $("#sttDiar") && !$("#sttDiar").disabled && pref.task === "transcriptions";
   if (diar) fd.append("diarize", "true");

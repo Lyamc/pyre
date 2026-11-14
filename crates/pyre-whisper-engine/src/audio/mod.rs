@@ -49,8 +49,11 @@ pub struct AudioProcessor {
 impl AudioProcessor {
     pub fn new(device: &burn::tensor::Device, sample_rate: f64, n_mels: usize, is_nemo: bool, model_name: &str) -> Self {
         let is_tone = model_name.contains("t-one");
-        // Nemotron Speech uses the same NeMo log-mel as Parakeet. The diarizer does not.
-        let is_parakeet = model_name.contains("parakeet") || model_name.contains("nemotron-speech");
+        // Nemotron Speech and Fluid Speech Pro (a Parakeet TDT v3 fine-tune) use the same
+        // NeMo log-mel as Parakeet. The diarizer does not.
+        let is_parakeet = model_name.contains("parakeet")
+            || model_name.contains("nemotron-speech")
+            || model_name.contains("fluid-speech");
         let is_qwen3 = model_name.contains("qwen3");
         let n_fft = if is_nemo || is_tone || is_parakeet { 512 } else { WHISPER_N_FFT };
         let win_length = 400;
@@ -180,4 +183,20 @@ pub fn max_waveform_samples(n_ctx: usize) -> usize {
 pub fn prep_audio(waveform: Tensor<2>, sample_rate: f64, n_mels: usize, is_nemo: bool, model_name: &str) -> Tensor<3> {
     let processor = AudioProcessor::new(&waveform.device(), sample_rate, n_mels, is_nemo, model_name);
     processor.prep_audio(waveform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioProcessor;
+
+    #[test]
+    fn fluid_speech_uses_the_parakeet_front_end() {
+        // Fluid Speech Pro is a Parakeet TDT v3 fine-tune. The legacy NeMo path (int16 scale,
+        // no preemphasis, no per-feature norm) made it decode only blanks.
+        let device = burn::tensor::Device::flex();
+        for name in ["fluid-speech-pro", "parakeet-tdt-0.6b-v3", "nemotron-speech-streaming-en-0.6b"] {
+            assert!(AudioProcessor::new(&device, 16_000.0, 128, true, name).is_parakeet, "{name}");
+        }
+        assert!(!AudioProcessor::new(&device, 16_000.0, 80, true, "t-one").is_parakeet);
+    }
 }

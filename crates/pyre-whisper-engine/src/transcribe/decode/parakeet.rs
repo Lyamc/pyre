@@ -86,6 +86,18 @@ mod tests {
         assert_eq!(tdt_step(false, 0, &table, 9, 10), (1, 0));
     }
 
+    #[test]
+    fn word_spans_follow_sentencepiece_boundaries() {
+        let pieces = vec!["▁Hel".into(), "lo".into(), "▁there".into()];
+        let frames = vec![1usize, 1, 4];
+        let spans = word_spans_from_pieces(&pieces, &frames, 0.0, 0.08);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].2, "Hello");
+        assert!((spans[0].0 - 0.08).abs() < 1e-6);
+        assert!((spans[1].0 - 0.32).abs() < 1e-6);
+        assert!((spans[0].1 - spans[1].0).abs() < 1e-6);
+    }
+
 }
 
 /// SentencePiece pieces that are not blank and not Whisper-style specials.
@@ -349,6 +361,42 @@ pub fn decode_nemotron(
     );
     let (text, kept) = finalize_parakeet_decode(bpe, &tokens, cfg.blank_token_id, model_name);
     with_frames(text, kept, &tokens, &frames, encoder_frames)
+}
+
+/// Group SentencePiece pieces into words and stamp them from TDT encoder frames.
+/// One frame is 80 ms: 10 ms mel hop times the 8× FastConformer subsampling.
+pub fn word_spans_from_pieces(
+    pieces: &[String],
+    frames: &[usize],
+    origin_secs: f64,
+    frame_secs: f64,
+) -> Vec<(f64, f64, String)> {
+    if pieces.len() != frames.len() || pieces.is_empty() {
+        return Vec::new();
+    }
+    let mut words: Vec<(usize, String)> = Vec::new();
+    for (piece, frame) in pieces.iter().zip(frames) {
+        if piece.starts_with('▁') {
+            words.push((*frame, piece.trim_start_matches('▁').to_string()));
+        } else if let Some(last) = words.last_mut() {
+            last.1.push_str(piece);
+        } else {
+            words.push((*frame, piece.clone()));
+        }
+    }
+    let mut out = Vec::with_capacity(words.len());
+    for (i, (frame, raw)) in words.iter().enumerate() {
+        let start = origin_secs + *frame as f64 * frame_secs;
+        let end = words
+            .get(i + 1)
+            .map(|(next, _)| (origin_secs + *next as f64 * frame_secs).max(start + 0.02))
+            .unwrap_or(start + frame_secs);
+        let text = pieces_to_text([raw.as_str()]);
+        if !text.is_empty() {
+            out.push((start, end, text));
+        }
+    }
+    out
 }
 
 pub fn decode_parakeet(

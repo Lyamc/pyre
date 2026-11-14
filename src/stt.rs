@@ -6,7 +6,7 @@
 //! already set it, and lets whisburn download + convert on first use. Refs accepted:
 //! a whisburn registry name (`tiny_en`), its HF repo id (`openai/whisper-tiny.en`), or a path to
 //! an existing whisburn bundle directory.
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{extract::Multipart, http::StatusCode, response::{IntoResponse, Response}, Json};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -134,6 +134,12 @@ pub(crate) struct Req {
     pub translate_task: bool,
     /// Request opt-in. Also honored when `PYRE_STT_EXPERIMENTAL=1`.
     pub experimental: bool,
+    /// Fluid Speech Pro edited transcript (fillers and repeated words removed).
+    pub clean_mode: bool,
+    /// `whisper` (speech translation) or `llm` (transcribe, then the loaded chat model).
+    pub translate_with: String,
+    /// Set by routing when the transcript still needs an English text translation.
+    pub llm_after: bool,
     /// Filled by `apply_route` so the client can see which model served the request.
     pub routing: Option<serde_json::Value>,
 }
@@ -154,7 +160,7 @@ fn stt_error_status(msg: &str) -> StatusCode {
 const FORMATS: &[&str] = &["json", "text", "srt", "vtt", "verbose_json", "txt", "whisburn_json"];
 
 pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
-    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false, experimental: false, routing: None };
+    let mut q = Req { file: vec![], filename: "audio.wav".into(), model: None, format: "json".into(), language: None, beam_size: None, max_tokens: None, timestamps: None, sentences: false, stream: false, diarize: false, attribution: "turns".into(), translate_task: false, experimental: false, clean_mode: false, translate_with: "whisper".into(), llm_after: false, routing: None };
     while let Some(f) = mp.next_field().await? {
         match f.name().unwrap_or("") {
             "file" => { if let Some(n) = f.file_name() { q.filename = n.to_string(); } q.file = f.bytes().await?.to_vec(); }
@@ -173,6 +179,11 @@ pub(crate) async fn parse_multipart(mut mp: Multipart) -> Result<Req> {
                 q.translate_task = matches!(v.as_str(), "translate" | "translations" | "translation");
             }
             "experimental" => q.experimental = parse_bool(&f.text().await?),
+            "clean_mode" => q.clean_mode = parse_bool(&f.text().await?),
+            "translate_with" => {
+                let v = f.text().await?.trim().to_ascii_lowercase();
+                if !v.is_empty() { q.translate_with = v; }
+            }
             _ => { let _ = f.bytes().await; } // prompt, temperature, timestamp_granularities: accepted, ignored
         }
     }
@@ -206,13 +217,24 @@ fn resolve_stt(app: &crate::registry::App, name: Option<&str>) -> Result<std::sy
     app.find(crate::registry::Kind::Stt, name)
 }
 
+fn translate_via(q: &Req) -> crate::speech_caps::TranslateWith {
+    if q.translate_with == "llm" || q.translate_with == "chat" {
+        crate::speech_caps::TranslateWith::Llm
+    } else {
+        crate::speech_caps::TranslateWith::Whisper
+    }
+}
+
 fn apply_route(app: &crate::registry::App, q: &mut Req, translate: bool) -> Result<(), String> {
     let loaded: Vec<String> = app.loaded().iter().filter(|m| m.kind == crate::registry::Kind::Stt).map(|m| m.id.clone()).collect();
     let requested = q.model.clone().or_else(|| loaded.first().cloned()).unwrap_or_else(|| "base".into());
-    match crate::speech_caps::route(&requested, &loaded, q.language.as_deref(), translate || q.translate_task) {
+    let via = translate_via(q);
+    let want_translate = translate || q.translate_task;
+    match crate::speech_caps::route_with(&requested, &loaded, q.language.as_deref(), want_translate, via) {
         Ok(d) => {
             crate::speech_caps::gate_experimental_model(&d.served, q.experimental)?;
             q.model = Some(d.served.clone());
+            q.llm_after = want_translate && via == crate::speech_caps::TranslateWith::Llm && !crate::speech_caps::profile(&d.served).translation;
             q.routing = Some(crate::speech_caps::decision_json(&d));
             if d.redirected {
                 tracing::info!("stt route: {}", d.reason);
@@ -224,10 +246,132 @@ fn apply_route(app: &crate::registry::App, q: &mut Req, translate: bool) -> Resu
 }
 
 pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bool) -> Response {
+    let q = match parse(mp).await { Ok(q) => q, Err(e) => return crate::server::err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
+    finish(app, q, translate).await
+}
+
+/// `POST /v1/audio/transcriptions/chunks`. Body is 16 kHz mono f32le PCM, or a media
+/// container (the server keeps the audio track). Intermediate chunks (`final=0`) are
+/// stored under `session` and return how much audio has arrived. The last chunk
+/// (`final=1`, the default) transcribes the accumulated audio.
+#[cfg(feature = "stt")]
+pub async fn chunks(app: Arc<crate::registry::App>, query: &str, bytes: &[u8]) -> Response {
+    match prepare_chunk(query, bytes) {
+        ChunkStep::Reply(response) => response,
+        ChunkStep::Ready(q) => {
+            let translate = q.translate_task;
+            finish(app, q, translate).await
+        }
+    }
+}
+
+#[cfg(feature = "stt")]
+enum ChunkStep {
+    Reply(Response),
+    Ready(Req),
+}
+
+#[cfg(feature = "stt")]
+fn prepare_chunk(query: &str, bytes: &[u8]) -> ChunkStep {
     use crate::server::err;
-    let mut q = match parse(mp).await { Ok(q) => q, Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")) };
+    let get = |k: &str| query_get(query, k);
+    let session = get("session").unwrap_or_else(|| format!("pcm-{}", std::process::id()));
+    let is_final = get("final").map(|v| v == "1" || v == "true" || v == "yes").unwrap_or(true);
+    let incoming = match pcm_from_upload(bytes) {
+        Ok(s) => s,
+        Err(e) => return ChunkStep::Reply(err(StatusCode::BAD_REQUEST, e)),
+    };
+    let store = chunk_store();
+    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    let buf = guard.entry(session.clone()).or_default();
+    if buf.len().saturating_add(incoming.len()) > 16_000 * 60 * 120 {
+        return ChunkStep::Reply(err(StatusCode::BAD_REQUEST, "chunk session exceeds 2 hours of 16 kHz audio"));
+    }
+    buf.extend(incoming);
+    let n = buf.len();
+    if !is_final {
+        return ChunkStep::Reply(Json(json!({
+            "session": session,
+            "received_samples": n,
+            "seconds": n as f64 / 16_000.0,
+            "final": false,
+        })).into_response());
+    }
+    let samples = guard.remove(&session).unwrap_or_default();
+    drop(guard);
+    let wav = match pyre_whisper_audio::encode_wav(&pyre_whisper_audio::Waveform::new(samples, 16_000)) {
+        Ok(w) => w,
+        Err(e) => return ChunkStep::Reply(err(StatusCode::BAD_REQUEST, format!("wav: {e}"))),
+    };
+    let q = Req {
+        file: wav,
+        filename: "chunk.wav".into(),
+        model: get("model"),
+        format: get("response_format").unwrap_or_else(|| "json".into()),
+        language: get("language").filter(|s| !s.is_empty()),
+        beam_size: get("beam_size").and_then(|s| s.parse().ok()),
+        max_tokens: get("max_tokens").and_then(|s| s.parse().ok()),
+        timestamps: get("timestamps").map(|s| s == "1" || s == "true"),
+        sentences: get("sentences").map(|s| s == "1" || s == "true").unwrap_or(false),
+        stream: false,
+        diarize: false,
+        attribution: "turns".into(),
+        translate_task: get("task").map(|s| s == "translations" || s == "translate").unwrap_or(false),
+        experimental: get("experimental").map(|s| s == "1" || s == "true").unwrap_or(false),
+        clean_mode: get("clean_mode").map(|s| s == "1" || s == "true").unwrap_or(false),
+        translate_with: get("translate_with").unwrap_or_else(|| "whisper".into()),
+        llm_after: false,
+        routing: None,
+    };
+    ChunkStep::Ready(q)
+}
+
+#[cfg(feature = "stt")]
+fn query_get(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return Some(it.next().unwrap_or("").replace('+', " "));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "stt")]
+fn pcm_from_upload(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    let container = bytes.starts_with(b"RIFF")
+        || bytes.starts_with(b"OggS")
+        || bytes.starts_with(b"fLaC")
+        || bytes.starts_with(b"ID3")
+        || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp")
+        || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]);
+    if container {
+        let ext = if bytes.starts_with(b"RIFF") { "wav" } else if bytes.starts_with(b"OggS") { "ogg" } else if bytes.starts_with(b"fLaC") { "flac" } else if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" { "mp4" } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) { "mkv" } else { "mp3" };
+        let wav = pyre_whisper_audio::decode_bytes_to_mono_pcm(bytes, ext).map_err(|e| format!("could not decode audio: {e}"))?;
+        let wav = wav.ensure_sample_rate(16_000).map_err(|e| format!("resample: {e}"))?;
+        return Ok(wav.samples);
+    }
+    if bytes.len() % 4 != 0 {
+        return Err("body must be 16 kHz mono f32le PCM, or an audio/video container".into());
+    }
+    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+#[cfg(not(feature = "stt"))]
+pub async fn chunks(_: Arc<crate::registry::App>, _: &str, _: &[u8]) -> Response {
+    crate::server::err(StatusCode::NOT_IMPLEMENTED, "built without stt")
+}
+
+#[cfg(feature = "stt")]
+fn chunk_store() -> &'static Mutex<std::collections::HashMap<String, Vec<f32>>> {
+    static STORE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<f32>>>> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn finish(app: Arc<crate::registry::App>, mut q: Req, translate: bool) -> Response {
+    use crate::server::err;
     if let Err(msg) = apply_route(&app, &mut q, translate) { return err(StatusCode::BAD_REQUEST, msg); }
-    let routing = q.routing.clone();
+    let mut routing = q.routing.clone();
     let m = match resolve_stt(&app, q.model.as_deref()) { Ok(m) => m, Err(r) => return r };
     let stt = match &m.inner { crate::registry::Inner::Stt(s) => s.clone(), _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "registry mismatch") };
     if !FORMATS.contains(&q.format.as_str()) {
@@ -241,11 +385,27 @@ pub async fn handle(app: Arc<crate::registry::App>, mp: Multipart, translate: bo
     let id = m.id.clone();
     let stream = q.stream;
     let opts = (q.timestamps, q.sentences);
+    let llm_after = q.llm_after;
     stt.queued.fetch_add(1, Ordering::SeqCst);
     let res = tokio::task::spawn_blocking(move || run(&stt, &q, translate)).await;
     match res {
-        Ok(Ok((r, dur, secs, fmt))) => {
+        Ok(Ok((mut r, dur, secs, fmt))) => {
             tracing::info!("stt {id}: {dur:.2}s audio in {secs:.2}s ({:.1}x realtime)", dur / secs.max(1e-6));
+            #[cfg(feature = "stt")]
+            if llm_after {
+                match translate_transcript(&app, &r.text).await {
+                    Ok((english, chat_id)) => {
+                        r.text = english.clone();
+                        r.segments = vec![pyre_whisper_core::TranscriptSegment::new(0.0, dur, english)];
+                        if let Some(route) = routing.as_mut() {
+                            route["chat_model"] = serde_json::json!(chat_id);
+                        }
+                    }
+                    Err(e) => return err(StatusCode::BAD_REQUEST, e),
+                }
+            }
+            #[cfg(not(feature = "stt"))]
+            let _ = llm_after;
             if stream { render_stream(&r, dur, translate, routing.as_ref()) } else { render(&r, &fmt, dur, translate, opts, routing.as_ref()) }
         }
         Ok(Err(e)) => {
@@ -295,6 +455,7 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     // Callers may turn it off (whisburn CLI default for *_en models) to get whisburn-identical text.
     o.include_timestamps = q.timestamps.unwrap_or(true);
     if let Some(b) = q.beam_size { o.beam_size = b.clamp(1, 16); }
+    o.clean_mode = q.clean_mode;
     if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
     o.group_into_sentences = q.sentences;
     let t = std::time::Instant::now();
@@ -462,16 +623,73 @@ pub(crate) fn run_job(
     let res = run(&stt, &q, translate);
     JOB_TX.with(|c| *c.borrow_mut() = None);
     drop(_prog_guard);
-    let (r, dur, secs, fmt) = res?;
+    let (mut r, dur, secs, fmt) = res?;
     if cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
+    let mut routing = q.routing.clone();
+    if q.llm_after {
+        emit("translating", json!({"message": "translating the transcript with the loaded chat model"}));
+        let (english, chat_id) = translate_transcript_blocking(&app, &r.text)?;
+        r.text = english.clone();
+        r.segments = vec![pyre_whisper_core::TranscriptSegment::new(0.0, dur, english)];
+        if let Some(route) = routing.as_mut() {
+            route["chat_model"] = json!(chat_id);
+        }
+    }
     tracing::info!("stt {}: {:.2}s audio in {:.2}s ({:.1}x realtime)", m.id, dur, secs, dur / secs.max(1e-6));
     emit("rendering", json!({"message": format!("rendering {fmt}"), "duration_s": dur, "process_s": secs}));
-    let mut body = verbose(&r, dur, translate, q.routing.as_ref());
+    let mut body = verbose(&r, dur, translate, routing.as_ref());
     body["response_format"] = json!(fmt);
     body["seconds"] = json!(secs);
     body["model"] = json!(m.id);
-    if let Some(r) = &q.routing { body["routing"] = r.clone(); }
+    if let Some(r) = &routing { body["routing"] = r.clone(); }
     Ok(body)
+}
+
+#[cfg(feature = "stt")]
+async fn translate_transcript(app: &crate::registry::App, text: &str) -> Result<(String, String), String> {
+    let text = text.trim();
+    let models = app.loaded();
+    let llm = models.iter().find(|m| m.kind == crate::registry::Kind::Llm)
+        .ok_or("translate_with=llm needs a loaded chat model")?;
+    let chat_id = llm.id.clone();
+    let inner = match &llm.inner {
+        crate::registry::Inner::Llm(l) => l.clone(),
+        _ => return Err("registry mismatch".into()),
+    };
+    if text.is_empty() { return Ok((String::new(), chat_id)); }
+    let msgs = vec![serde_json::json!({
+        "role": "user",
+        "content": format!("Translate the following transcript into English. Return only the English translation, with no notes.\n\n{text}"),
+    })];
+    let prompt = inner.template.render(&msgs, true, None).map_err(|e| e.to_string())?;
+    let ids = inner.tok.encode(prompt, false).map_err(|e| e.to_string())?.get_ids().to_vec();
+    let max_tokens = (text.chars().count().saturating_mul(2) + 64).clamp(32, 1024);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    inner.engine.submit(crate::engine::Job::Gen(crate::engine::GenRequest {
+        prompt: ids,
+        max_tokens,
+        params: crate::sampler::SamplingParams { temperature: 0.0, top_k: 1, seed: Some(1), ..Default::default() },
+        stop: vec![],
+        tx,
+        think_budget: None,
+        auto_bias: None,
+        auto_tools: false,
+    }));
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            crate::engine::Event::Done { text, .. } => return Ok((text.trim().to_string(), chat_id)),
+            crate::engine::Event::Error(m) => return Err(m),
+            _ => {}
+        }
+    }
+    Err("chat model dropped the translation".into())
+}
+
+#[cfg(feature = "stt")]
+fn translate_transcript_blocking(app: &crate::registry::App, text: &str) -> Result<(String, String)> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+        .context("translation runtime")?;
+    rt.block_on(translate_transcript(app, text)).map_err(|e| anyhow::anyhow!(e))
 }
 
 #[cfg(not(feature = "stt"))]

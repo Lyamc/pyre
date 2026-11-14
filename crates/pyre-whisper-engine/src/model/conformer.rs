@@ -143,7 +143,7 @@ impl FeedForwardModuleConfig {
         let lin2 = LinearConfig::new(self.d_model * 4, self.d_model)
             .with_bias(self.bias)
             .init(device);
-        FeedForwardModule { ln, lin1, lin2 }
+        FeedForwardModule { ln, lin1, lin2, lora_lin1: None, lora_lin2: None }
     }
 }
 
@@ -152,6 +152,10 @@ pub struct FeedForwardModule {
     pub ln: LayerNorm,
     pub lin1: Linear,
     pub lin2: Linear,
+    #[module(skip)]
+    pub lora_lin1: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_lin2: Option<crate::model::fluid::LoraAB>,
 }
 
 impl FeedForwardModule {
@@ -160,22 +164,26 @@ impl FeedForwardModule {
         
         // Burn Linear weights are [in, out] (the converter transposes nn.Linear [out, in]).
         // Manual lin1
+        let lin1_in = x.clone();
         let x = x.matmul(self.lin1.weight.val().unsqueeze::<3>());
         let x = if let Some(bias) = &self.lin1.bias {
             x + bias.val().unsqueeze::<3>()
         } else {
             x
         };
+        let x = crate::model::fluid::add_lora(x, lin1_in, self.lora_lin1.as_ref());
         
         let x = burn::tensor::activation::silu(x);
         
         // Manual lin2
+        let lin2_in = x.clone();
         let x = x.matmul(self.lin2.weight.val().unsqueeze::<3>());
-        if let Some(bias) = &self.lin2.bias {
+        let x = if let Some(bias) = &self.lin2.bias {
             x + bias.val().unsqueeze::<3>()
         } else {
             x
-        }
+        };
+        crate::model::fluid::add_lora(x, lin2_in, self.lora_lin2.as_ref())
     }
 }
 
@@ -205,7 +213,7 @@ impl ConvolutionModuleConfig {
             .with_bias(self.bias)
             .init(device);
         
-        ConvolutionModule { ln, point_conv1, depth_conv, bn, point_conv2 }
+        ConvolutionModule { ln, point_conv1, depth_conv, bn, point_conv2, lora_pw1: None, lora_pw2: None }
     }
 }
 
@@ -216,6 +224,10 @@ pub struct ConvolutionModule {
     pub depth_conv: Conv1d,
     pub bn: BatchNorm,
     pub point_conv2: Conv1d,
+    #[module(skip)]
+    pub lora_pw1: Option<crate::model::fluid::LoraAB>,
+    #[module(skip)]
+    pub lora_pw2: Option<crate::model::fluid::LoraAB>,
 }
 
 impl ConvolutionModule {
@@ -223,7 +235,9 @@ impl ConvolutionModule {
         let x = self.ln.forward(x);
         let x = x.swap_dims(1, 2);
         
+        let pw1_in = x.clone();
         let x = self.point_conv1.forward(x);
+        let x = conv_lora(x, pw1_in, self.lora_pw1.as_ref());
         let [b, d2, s] = x.dims();
         let d = d2 / 2;
         let x1 = x.clone().slice([0..b, 0..d, 0..s]);
@@ -233,10 +247,21 @@ impl ConvolutionModule {
         let x = self.depth_conv.forward(x);
         let x = self.bn.forward(x);
         let x = burn::tensor::activation::silu(x);
+        let pw2_in = x.clone();
         let x = self.point_conv2.forward(x);
+        let x = conv_lora(x, pw2_in, self.lora_pw2.as_ref());
         
         x.swap_dims(1, 2)
     }
+}
+
+fn conv_lora(y: Tensor<3>, x: Tensor<3>, lora: Option<&crate::model::fluid::LoraAB>) -> Tensor<3> {
+    if lora.is_none() || !crate::model::fluid::clean_on() {
+        return y;
+    }
+    let y_bt = y.swap_dims(1, 2);
+    let x_bt = x.swap_dims(1, 2);
+    crate::model::fluid::add_lora(y_bt, x_bt, lora).swap_dims(1, 2)
 }
 
 #[cfg(test)]

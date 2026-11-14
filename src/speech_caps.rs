@@ -48,6 +48,8 @@ pub struct SpeechProfile {
     /// Off unless `PYRE_STT_EXPERIMENTAL=1` or the request sets `experimental=true`.
     /// Parakeet v3 and Nemotron are not in the published WER range yet.
     pub experimental: bool,
+    /// Checkpoint adapter that drops fillers and repeated words (Fluid Speech Pro).
+    pub clean_mode: bool,
 }
 
 /// Single utterances at or under this length stay on for Parakeet v2.
@@ -141,12 +143,29 @@ impl SpeechProfile {
             "lookahead_frames": self.lookahead_frames,
             "license": self.license,
             "experimental": self.experimental,
+            "clean_mode": self.clean_mode,
+            "beam_max": if self.clean_mode { Some(4) } else { None::<u8> },
+            "translate_with": if self.clean_mode { vec!["whisper", "llm"] } else { Vec::<&str>::new() },
         })
     }
 }
 
 pub fn profile(id: &str) -> SpeechProfile {
     let key = model_key(id);
+    if key.contains("fluid-speech") {
+        return SpeechProfile {
+            family: "parakeet-tdt",
+            languages: LangSet::Listed(PARAKEET_V3_LANGS),
+            translation: false,
+            timestamps: true,
+            streaming: true,
+            architecture_streaming: false,
+            lookahead_frames: None,
+            license: "CC-BY-4.0",
+            experimental: true,
+            clean_mode: true,
+        };
+    }
     if key.contains("nemotron-speech") || key.contains("nemotron-3.5-asr") {
         return SpeechProfile {
             family: "nemotron-speech-rnnt",
@@ -158,6 +177,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             lookahead_frames: Some(13),
             license: "NVIDIA Open Model License",
             experimental: true,
+            clean_mode: false,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v3") {
@@ -171,6 +191,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             lookahead_frames: None,
             license: "CC-BY-4.0",
             experimental: true,
+            clean_mode: false,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v2") || key.contains("parakeet-ctc") {
@@ -184,6 +205,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             lookahead_frames: None,
             license: "CC-BY-4.0",
             experimental: false,
+            clean_mode: false,
         };
     }
     if key.contains("t-one") {
@@ -197,6 +219,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             lookahead_frames: None,
             license: "Apache-2.0",
             experimental: false,
+            clean_mode: false,
         };
     }
     if key.contains("moonshine") {
@@ -210,6 +233,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             lookahead_frames: None,
             license: "MIT",
             experimental: false,
+            clean_mode: false,
         };
     }
     if is_english_whisper(&key) {
@@ -229,6 +253,7 @@ pub fn profile(id: &str) -> SpeechProfile {
         lookahead_frames: None,
         license: "",
         experimental: false,
+        clean_mode: false,
     }
 }
 
@@ -243,6 +268,7 @@ fn whisper(english_only: bool, translation: bool) -> SpeechProfile {
         lookahead_frames: None,
         license: "Apache-2.0",
         experimental: false,
+        clean_mode: false,
     }
 }
 
@@ -315,11 +341,39 @@ pub struct RouteDecision {
 /// `loaded` is the set of STT ids already in memory. When the requested model can do the
 /// job it is returned even if it is not loaded yet (the caller downloads it). When it
 /// cannot, a loaded model that can is required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranslateWith {
+    /// Existing path: a Whisper model that can translate speech to English.
+    Whisper,
+    /// Transcribe with the requested model, then translate the text with the loaded chat model.
+    Llm,
+}
+
 pub fn route(requested: &str, loaded: &[String], language: Option<&str>, translate: bool) -> Result<RouteDecision, String> {
+    route_with(requested, loaded, language, translate, TranslateWith::Whisper)
+}
+
+pub fn route_with(
+    requested: &str,
+    loaded: &[String],
+    language: Option<&str>,
+    translate: bool,
+    via: TranslateWith,
+) -> Result<RouteDecision, String> {
     let want = profile(requested);
     let lang = language.map(normalize_lang).filter(|s| !s.is_empty());
     let lang_ok = want.supports_language(lang.as_deref());
     let tr_ok = !translate || want.supports_translation();
+    if translate && !want.supports_translation() && via == TranslateWith::Llm && lang_ok {
+        return Ok(RouteDecision {
+            requested: requested.to_string(),
+            served: requested.to_string(),
+            reason: format!(
+                "{requested} only transcribes. The transcript is then translated to English by the loaded chat model."
+            ),
+            redirected: false,
+        });
+    }
     if lang_ok && tr_ok {
         let why = match lang.as_deref() {
             Some(code) => format!("{requested} transcribes {code}"),
@@ -457,6 +511,25 @@ mod tests {
         let d = route("parakeet-tdt-0.6b-v2", &[], Some("en"), false).unwrap();
         assert!(!d.redirected);
         assert_eq!(d.served, "parakeet-tdt-0.6b-v2");
+    }
+
+    #[test]
+    fn fluid_speech_pro_lists_the_v3_languages_and_offers_llm_translation() {
+        let p = profile("fluid-speech-pro");
+        assert!(p.clean_mode);
+        assert!(p.timestamps);
+        assert!(!p.translation);
+        assert!(p.experimental);
+        assert!(p.supports_language(Some("fr")));
+        assert!(p.supports_language(Some("de")));
+        let loaded = vec!["fluid-speech-pro".into(), "small".into()];
+        let whisper = route("fluid-speech-pro", &loaded, Some("de"), true).unwrap();
+        assert_eq!(whisper.served, "small");
+        assert!(whisper.redirected);
+        let llm = route_with("fluid-speech-pro", &loaded, Some("de"), true, TranslateWith::Llm).unwrap();
+        assert_eq!(llm.served, "fluid-speech-pro");
+        assert!(llm.reason.contains("chat model"));
+        assert!(!llm.redirected);
     }
 
     #[test]

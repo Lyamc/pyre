@@ -183,6 +183,12 @@ impl InferenceRuntime {
         Self::ensure_cached(model_name, device, cache, verbose)?;
         let cache = cache.lock().expect("cache lock");
         let loaded = cache.get(model_name).expect("model inserted above");
+        let beam = if model_name.contains("fluid-speech") {
+            options.beam_size.clamp(1, 4)
+        } else {
+            1
+        };
+        let _pass = crate::model::fluid::PassGuard::new(options.clean_mode, beam);
         let (text, segments) = waveform_to_text(
             &loaded.model,
             model_name,

@@ -90,7 +90,7 @@ fn load_block(
 }
 
 fn load_ff(path: &str, d_model: usize, inner: usize, device: &burn::tensor::Device) -> Result<FeedForwardModule, Box<dyn Error>> {
-    Ok(FeedForwardModule {
+    Ok(FeedForwardModule { lora_lin1: None, lora_lin2: None,
         ln: load_layer_norm(&format!("{path}/ln"), d_model, device)?,
         lin1: load_linear(&format!("{path}/lin1"), d_model, inner, device)?,
         lin2: load_linear(&format!("{path}/lin2"), inner, d_model, device)?,
