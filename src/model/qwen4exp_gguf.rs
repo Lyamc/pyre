@@ -2274,6 +2274,7 @@ impl Model {
     /// Default draft length: 2 (MTP spec2, greedy-identical and measured faster) when the MTP drafter
     /// loaded and multi-token verify can run; otherwise 0 (plain decode).
     pub fn spec_default(&self) -> usize { if self.mtp.is_some() && self.multi_ok() { 2 } else { 0 } }
+    pub fn has_mtp(&self) -> bool { self.mtp.is_some() }
     pub fn load_mtp(&mut self) -> Result<()> {
         if !crate::spec::mtp_on() { return Ok(()); }
         let Some(p) = super::mtp::find() else { return Ok(()) };

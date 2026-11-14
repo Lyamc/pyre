@@ -281,6 +281,8 @@ fn load_qn(dir: &std::path::Path, id: &str, backend_name: &str, n_predict: usize
         let mut m = model::qwen4exp_gguf::Model::load(&f)?;
         let label = qn_attach_gpu(&mut m, &backend_name)?;
         m.load_mtp()?; m.prewarm_verify();
+        { let k = m.spec_default(); spec::set_model_default(k, if k > 0 { "mtp" } else { "none" });
+          tracing::info!("speculative: model default draft length {k} (mtp drafter {}, multi-token verify {}){}", m.has_mtp(), m.multi_ok(), spec::draft_len_explicit().map(|e| format!("; overridden by the explicit setting {e}")).unwrap_or_default()); }
         let tp = std::time::Instant::now(); let gb = m.prefault_experts(); if gb > 0.0 { tracing::info!("qwen4exp: {gb:.1} GiB of routed experts made resident in {:.1}s", tp.elapsed().as_secs_f64()); }
         tracing::info!("qwen4exp GGUF {} ({:.1} GB mapped, {} layers) ready in {:.1}s | {label}, {} threads, routed experts stay quantized on the CPU (mmap)",
             f.display(), m.g.file_bytes() as f64 / 1e9, m.cfg.n_layers, t.elapsed().as_secs_f64(), rayon::current_num_threads());
