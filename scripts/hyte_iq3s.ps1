@@ -4,21 +4,26 @@
 # Tokens: C:\AI\models\tokenizers\Qwen3.8-Flash-Next
 # Prints decode tok/s, expert-cache hit rate, and free VRAM.
 # Optional: -Port 8099 -Tokens 64 -Spec 0 (0 = the server default, which is MTP when multi_ok).
+# -Exe <path\to\pyre.exe> picks the binary (default: this checkout's release build); -NoBuild skips the build.
 param(
     [string]$Model = "C:\AI\models\models\IQ3_S",
     [string]$Tokenizer = "C:\AI\models\tokenizers\Qwen3.8-Flash-Next",
     [string]$Build = "C:\Temp\qnx\build.ps1",
     [int]$Port = 8099,
     [int]$Tokens = 64,
-    [int]$Spec = -1
+    [int]$Spec = -1,
+    [string]$Exe = "",
+    [switch]$NoBuild
 )
 $ErrorActionPreference = "Stop"
-if (Test-Path $Build) { & $Build } else { Write-Host "build script not found: $Build (using an existing pyre.exe)" }
-$exe = @(
-    "C:\Build\ai\pyre\target\x86_64-pc-windows-msvc\release\pyre.exe",
-    "C:\Temp\qnx\target\x86_64-pc-windows-msvc\release\pyre.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $exe) { throw "pyre.exe not found after build" }
+if (-not $NoBuild) { if (Test-Path $Build) { & $Build } else { Write-Host "build script not found: $Build (using an existing pyre.exe)" } }
+$repo = Split-Path -Parent $PSScriptRoot
+$exe = if ($Exe) { $Exe } else { @(
+    (Join-Path $repo "target\x86_64-pc-windows-msvc\release\pyre.exe"),
+    (Join-Path $repo "target\release\pyre.exe")
+) | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+if (-not $exe -or -not (Test-Path $exe)) { throw "pyre.exe not found (pass -Exe <path>)" }
+Write-Host "exe: $exe"
 $env:PYRE_QN_TOKENIZER = $Tokenizer
 $env:PYRE_QN_XSTAT = "1"
 $env:PYRE_VRAM_FLOOR_MB = "1024"

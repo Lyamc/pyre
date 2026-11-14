@@ -618,7 +618,15 @@ impl Model {
                 let floor_b = (crate::limits::vram_floor_mb() as usize) << 20;
                 let head = env_usize("PYRE_QN_XHEAD_MB").map(|m| m << 20).unwrap_or(if xexact() { floor_b.min(512 << 20) } else { floor_b });
                 let free_now = crate::limits::vram().map(|v| v.free as usize).unwrap_or(left);
-                let budget = left.saturating_sub(head).min(free_now.saturating_sub(floor_b)).min(cap);
+                // VRAM still allocated after this point (resident MTP drafter under PYRE_MTP_GX=2, prewarm graphs, KV/scratch) comes out of
+                // the live free VRAM too, so plan the cache from what will be left once those land (PR #15: XEXACT planned 3.52 GiB from
+                // the reserve budget, the 0.9 GB drafter then put free VRAM at 864 MiB, and an XCLASS cache cannot shrink, so startup aborted).
+                // PYRE_QN_XLATE_MB (default 1792 under XEXACT, 512 otherwise): margin for those later allocations besides the drafter (HYTE, -c 32768,
+                // XEXACT: ~1.35 GiB of prewarm graphs / KV / scratch landed after this point on top of the 0.84 GiB drafter).
+                let late = if super::mtp::gxr_on() && super::mtp::find().is_some() { super::mtp::gxr_bytes(self.cfg.d, self.cfg.ff_exp, self.cfg.n_exp) } else { 0 } + (env_usize("PYRE_QN_XLATE_MB").unwrap_or(if xexact() { 1792 } else { 512 }) << 20);
+                let keep = floor_b.max(crate::limits::reserve() as usize); // the load check (registry) also wants the --vram-reserve left free
+                let budget = left.saturating_sub(head).min(free_now.saturating_sub(keep + late)).min(cap); // both bounds: the reserve budget does not see the drafter either
+                eprintln!("gpu: expert cache plan: reserve budget {} MiB - head {} MiB, live free {} MiB - floor/reserve {} MiB - later {} MiB, cap {} MiB", left >> 20, head >> 20, free_now >> 20, keep >> 20, late >> 20, cap >> 20);
                 // PYRE_QN_XCACHE_PIN_GB (exactness checks, unset = unchanged): exactly this cache size, ignoring the XHEAD headroom,
                 // as long as it fits above the reserve + 1.5 GiB already held back (>= 1 GiB stays free); else the normal budget
                 let budget = match env_var("PYRE_QN_XCACHE_PIN_GB").ok().and_then(|v| v.parse::<f64>().ok()) { Some(p) => { let pb = ((p * (1u64 << 30) as f64) as usize).next_multiple_of(1 << 20); if pb <= left { eprintln!("gpu: expert cache pinned"); pb } else { eprintln!("gpu: expert cache pin {p} GiB does not fit ({} MiB left), normal budget", left >> 20); budget } }, None => budget };
