@@ -10,3 +10,7 @@
 	path = vendor/cubecl-pipe
 	url = https://github.com/Lyamc/cubecl-pipe.git
 	branch = pyre-hostmem
+[submodule "vendor/mediabunny"]
+	path = vendor/mediabunny
+	url = https://github.com/Lyamc/mediabunny.git
+	branch = pyre-dist
