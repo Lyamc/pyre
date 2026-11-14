@@ -701,7 +701,8 @@ let sttJob = null;
 let sttSumCtrl = null;
 let sttCatalog = { models: [], loaded: [] };
 let recBlob = null, rec = null;
-let extractedAudio = null;
+let extractedAudio = null, sttExtracting = null;
+let stsExtractedAudio = null, stsExtracting = null;
 let stsRecBlob = null, stsRec = null, stsCtrl = null, stsReplyBlob = null, stsRecTimer = null, stsRecStarted = 0;
 
 function loadSttPrefs() {
@@ -1076,12 +1077,6 @@ function micAllowed() {
     return !!(window.isSecureContext || h === "localhost" || h === "127.0.0.1" || h === "[::1]");
   } catch { return false; }
 }
-function isVideoFile(f) {
-  if (!f) return false;
-  const type = f.type || "";
-  if (type.startsWith("video/")) return true;
-  return /\.(mp4|mkv|mov|webm|m4v|avi)$/i.test(f.name || "");
-}
 function encodeWavPcm(samples, rate) {
   const n = samples.length;
   const buf = new ArrayBuffer(44 + n * 2);
@@ -1099,38 +1094,9 @@ function encodeWavPcm(samples, rate) {
   }
   return buf;
 }
-async function extractAudioFile(f) {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) throw new Error("This browser has no AudioContext. Use pyre transcribe for this file.");
-  const ctx = new Ctx();
-  let decoded;
-  try {
-    decoded = await ctx.decodeAudioData(await f.arrayBuffer());
-  } catch (e) {
-    try { await ctx.close(); } catch {}
-    throw new Error("Could not decode " + (f.name || "that file") + " in the browser (" + e.message + "). MKV often needs the CLI: pyre transcribe file.mkv");
-  }
-  const rate = 16000;
-  const offline = new OfflineAudioContext(1, Math.max(1, Math.ceil(decoded.duration * rate)), rate);
-  const mono = offline.createBuffer(1, decoded.length, decoded.sampleRate);
-  const ch = mono.getChannelData(0);
-  const nch = decoded.numberOfChannels || 1;
-  for (let c = 0; c < nch; c++) {
-    const data = decoded.getChannelData(c);
-    for (let i = 0; i < data.length; i++) ch[i] += data[i] / nch;
-  }
-  const src = offline.createBufferSource();
-  src.buffer = mono;
-  src.connect(offline.destination);
-  src.start();
-  const rendered = await offline.startRendering();
-  try { await ctx.close(); } catch {}
-  const wav = encodeWavPcm(rendered.getChannelData(0), rate);
-  const base = (f.name || "media").replace(/\.[^.]+$/, "");
-  return { blob: new Blob([wav], { type: "audio/wav" }), name: base + ".wav", original: f.size };
-}
 function currentSttAudio() {
   if (recBlob) return recBlob;
+  if (sttExtracting) return null;
   if (extractedAudio) return new File([extractedAudio.blob], extractedAudio.name, { type: "audio/wav" });
   const inp = $("#sttFile");
   return (inp && inp.files && inp.files[0]) || null;
@@ -1198,7 +1164,7 @@ function updateSttRunAvail() {
   }
   const f = currentSttAudio();
   if (!f) {
-    setAvail(btn, { enabled: false, reason_kind: "", message: "Choose or record audio first" });
+    setAvail(btn, { enabled: false, reason_kind: sttExtracting ? "busy" : "", message: sttExtracting ? "Extracting audio in the browser…" : "Choose or record audio first" });
     return;
   }
   setAvail(btn, availOk());
@@ -1268,6 +1234,8 @@ if ($("#recBtn")) $("#recBtn").onclick = async () => {
     rec.ondataavailable = e => chunks.push(e.data);
     rec.onstop = () => {
       recBlob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+      if (sttExtracting) { sttExtracting.abort(); sttExtracting = null; setSttProg(false); }
+      extractedAudio = null;
       try { s.getTracks().forEach(t => t.stop()); } catch {}
       rec = null; recStream = null;
       if (recTimer) { clearInterval(recTimer); recTimer = null; }
@@ -1299,21 +1267,44 @@ if ($("#sttRecAgain")) $("#sttRecAgain").onclick = () => {
   if ($("#recBtn") && !$("#recBtn").disabled) $("#recBtn").click();
 };
 function takeSttFile(f) {
+  if (sttExtracting) { sttExtracting.abort(); sttExtracting = null; setSttProg(false); }
   extractedAudio = null;
   if (!f) { describeFile(null); updateSttRunAvail(); return; }
-  if (!isVideoFile(f)) { describeFile(f); showPreview(f); updateSttRunAvail(); return; }
-  if ($("#sttFileMeta")) $("#sttFileMeta").textContent = (f.name || "video") + " · extracting audio…";
-  extractAudioFile(f).then(ex => {
-    extractedAudio = ex;
-    const saved = Math.max(0, ex.original - ex.blob.size);
-    const bits = [ex.name, human(ex.blob.size) + " audio", "kept " + human(saved) + " of video off the server"];
-    if ($("#sttFileMeta")) $("#sttFileMeta").textContent = bits.join(" · ");
-    const drop = $("#sttDrop"); if (drop) drop.classList.add("has-file");
-    showPreview(ex.blob);
+  if (!needsAudioExtract(f)) { describeFile(f); showPreview(f); updateSttRunAvail(); return; }
+  const ctrl = new AbortController();
+  sttExtracting = ctrl;
+  const drop = $("#sttDrop"); if (drop) drop.classList.add("has-file");
+  if ($("#sttFileMeta")) $("#sttFileMeta").textContent = (f.name || "video") + " · " + human(f.size) + " · extracting audio in the browser…";
+  resetSttBar();
+  setSttProg(true, 0, "Extracting audio in the browser (the video is not uploaded)…");
+  updateSttRunAvail();
+  extractAudioTrack(f, p => {
+    if (sttExtracting !== ctrl) return;
+    const pct = Math.round(Math.max(0, Math.min(1, p)) * 100);
+    setSttProg(true, pct, "Extracting audio in the browser… " + pct + "%");
+  }, ctrl.signal).then(ex => {
+    if (sttExtracting !== ctrl) return;
+    sttExtracting = null;
+    setSttProg(false);
+    if (ex.fallback) {
+      extractedAudio = null;
+      describeFile(f); showPreview(f);
+      if ($("#sttFileMeta")) $("#sttFileMeta").textContent = (f.name || "file") + " · " + human(f.size) + " · the browser could not extract the audio, so the whole file will be uploaded (" + ex.reason + ")";
+    } else {
+      extractedAudio = ex;
+      if ($("#sttFileMeta")) $("#sttFileMeta").textContent = describeExtract(ex);
+      showPreview(ex.blob);
+    }
     updateSttRunAvail();
   }).catch(e => {
+    if (sttExtracting !== ctrl) return;
+    sttExtracting = null;
+    setSttProg(false);
     extractedAudio = null;
+    if (e && e.name === "ExtractCancelled") { updateSttRunAvail(); return; }
+    if ($("#sttFile")) try { $("#sttFile").value = ""; } catch {}
     if ($("#sttFileMeta")) $("#sttFileMeta").textContent = e.message;
+    if (drop) drop.classList.remove("has-file");
     alert(e.message);
     updateSttRunAvail();
   });
@@ -1800,6 +1791,8 @@ function setStsSourceMode(mode) {
 }
 function currentStsAudio() {
   if (stsRecBlob) return stsRecBlob;
+  if (stsExtracting) return null;
+  if (stsExtractedAudio) return new File([stsExtractedAudio.blob], stsExtractedAudio.name, { type: "audio/wav" });
   const inp = $("#stsFile");
   return (inp && inp.files && inp.files[0]) || null;
 }
@@ -1825,19 +1818,46 @@ if ($("#stsDrop")) {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (!f) return;
     const dt = new DataTransfer(); dt.items.add(f);
     $("#stsFile").files = dt.files; stsRecBlob = null;
-    if ($("#stsFileMeta")) $("#stsFileMeta").textContent = (f.name || "audio") + (f.size ? (" · " + human(f.size)) : "");
-    dz.classList.add("has-file");
-    if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(f); $("#stsPreview").classList.remove("hidden"); }
+    takeStsFile(f);
+  });
+}
+function stsShowFile(f) {
+  if ($("#stsFileMeta")) $("#stsFileMeta").textContent = (f.name || "audio") + (f.size ? (" · " + human(f.size)) : "");
+  if ($("#stsDrop")) $("#stsDrop").classList.add("has-file");
+  if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(f); $("#stsPreview").classList.remove("hidden"); }
+}
+function takeStsFile(f) {
+  if (stsExtracting) { stsExtracting.abort(); stsExtracting = null; }
+  stsExtractedAudio = null;
+  if (!f) return;
+  if (!needsAudioExtract(f)) { stsShowFile(f); return; }
+  const ctrl = new AbortController();
+  stsExtracting = ctrl;
+  if ($("#stsDrop")) $("#stsDrop").classList.add("has-file");
+  const meta = t => { if ($("#stsFileMeta")) $("#stsFileMeta").textContent = t; };
+  meta((f.name || "video") + " · " + human(f.size) + " · extracting audio in the browser…");
+  extractAudioTrack(f, p => {
+    if (stsExtracting === ctrl) meta((f.name || "video") + " · extracting audio in the browser… " + Math.round(Math.max(0, Math.min(1, p)) * 100) + "%");
+  }, ctrl.signal).then(ex => {
+    if (stsExtracting !== ctrl) return;
+    stsExtracting = null;
+    if (ex.fallback) { stsShowFile(f); meta((f.name || "file") + " · " + human(f.size) + " · the browser could not extract the audio, so the whole file will be uploaded"); return; }
+    stsExtractedAudio = ex;
+    meta(describeExtract(ex));
+    if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(ex.blob); $("#stsPreview").classList.remove("hidden"); }
+  }).catch(e => {
+    if (stsExtracting !== ctrl) return;
+    stsExtracting = null;
+    if (e && e.name === "ExtractCancelled") return;
+    if ($("#stsFile")) try { $("#stsFile").value = ""; } catch {}
+    meta(e.message);
+    if ($("#stsDrop")) $("#stsDrop").classList.remove("has-file");
+    alert(e.message);
   });
 }
 if ($("#stsFile")) $("#stsFile").onchange = () => {
   stsRecBlob = null;
-  const f = $("#stsFile").files[0];
-  if (f) {
-    if ($("#stsFileMeta")) $("#stsFileMeta").textContent = (f.name || "audio") + (f.size ? (" · " + human(f.size)) : "");
-    if ($("#stsDrop")) $("#stsDrop").classList.add("has-file");
-    if ($("#stsPreview")) { $("#stsPreview").src = URL.createObjectURL(f); $("#stsPreview").classList.remove("hidden"); }
-  }
+  takeStsFile($("#stsFile").files[0]);
 };
 if ($("#stsQualitySeg")) $("#stsQualitySeg").onclick = (e) => {
   const b = e.target.closest("[data-sts-q]"); if (!b) return;
@@ -1857,6 +1877,8 @@ if ($("#stsRecBtn")) $("#stsRecBtn").onclick = async () => {
     stsRec.ondataavailable = e => chunks.push(e.data);
     stsRec.onstop = () => {
       stsRecBlob = new Blob(chunks, { type: stsRec.mimeType || "audio/webm" });
+      if (stsExtracting) { stsExtracting.abort(); stsExtracting = null; }
+      stsExtractedAudio = null;
       try { s.getTracks().forEach(t => t.stop()); } catch {}
       stsRec = null;
       if (stsRecTimer) { clearInterval(stsRecTimer); stsRecTimer = null; }
@@ -1900,7 +1922,7 @@ if ($("#stsToChat")) $("#stsToChat").onclick = () => {
   onTab("chat");
 };
 if ($("#stsGo")) $("#stsGo").onclick = async () => {
-  const f = currentStsAudio(); if (!f) return alert("Choose or record audio first");
+  const f = currentStsAudio(); if (!f) return alert(stsExtracting ? "Still extracting the audio from that file. Try again in a moment." : "Choose or record audio first");
   const pref = stsPrefsFromUi(); saveStsPrefs(pref);
   const model = QUALITY_MODELS[pref.quality] || "base";
   const llm = (kinds.llm && kinds.llm[0] && kinds.llm[0].id) || ($("#model") && $("#model").value) || "";

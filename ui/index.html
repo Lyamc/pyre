@@ -174,10 +174,10 @@
 
           <div id="sttFilePane">
             <label class="dropzone" id="sttDrop" for="sttFile">
-              <input type="file" id="sttFile" accept="audio/*,video/*,.mp4,.mkv,.mov,.webm,.m4a,.mp3,.m4v" class="sr-only">
+              <input type="file" id="sttFile" accept="audio/*,video/*,.mp4,.mkv,.mov,.webm,.m4a,.mp3,.m4v,.opus,.avi,.ts" class="sr-only">
               <span class="drop-ico" aria-hidden="true">♪</span>
               <span class="drop-title">Drop audio or video, or click to choose</span>
-              <span class="drop-meta muted small" id="sttFileMeta">MP3, WAV, M4A, FLAC, MP4, MOV, WebM… Video stays in the browser; only audio is uploaded.</span>
+              <span class="drop-meta muted small" id="sttFileMeta">MP3, WAV, M4A, FLAC, MP4, MOV, MKV, WebM… Video stays in the browser; only the audio track (16 kHz mono) is uploaded.</span>
             </label>
           </div>
 
@@ -335,10 +335,10 @@
             </div>
             <div id="stsFilePane">
               <label class="dropzone" id="stsDrop" for="stsFile">
-                <input type="file" id="stsFile" accept="audio/*" class="sr-only">
+                <input type="file" id="stsFile" accept="audio/*,video/*,.mp4,.mkv,.mov,.webm,.m4a,.mp3,.m4v,.opus" class="sr-only">
                 <span class="drop-ico" aria-hidden="true">♪</span>
-                <span class="drop-title">Drop an audio file or click to choose</span>
-                <span class="drop-meta muted small" id="stsFileMeta">MP3, WAV, M4A, FLAC, WebM…</span>
+                <span class="drop-title">Drop audio or video, or click to choose</span>
+                <span class="drop-meta muted small" id="stsFileMeta">MP3, WAV, M4A, FLAC, MP4, WebM… Video stays in the browser; only audio is uploaded.</span>
               </label>
             </div>
             <div id="stsRecPane" class="hidden">
