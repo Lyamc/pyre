@@ -29,7 +29,9 @@ pub fn download_parakeet_hf(
         return convert_parakeet_from_hf(dir, name, options);
     }
 
-    if name == "parakeet-tdt-0.6b-v2" {
+    if name == "fluid-speech-pro" {
+        download_fluid(&repo, source, dir, options)?;
+    } else if name == "parakeet-tdt-0.6b-v2" {
         download_parakeet_v2(&repo, source, dir, options)?;
     } else {
         for file in PARAKEET_FILES {
@@ -84,6 +86,26 @@ fn download_parakeet_v2(
     }
 
     extract_nemo_archive(dir, options)
+}
+
+fn download_fluid(
+    repo: &hf_hub::api::sync::ApiRepo,
+    source: &DownloadSource,
+    dir: &Path,
+    options: &DownloadOptions,
+) -> anyhow::Result<()> {
+    // The NeMo archive is the reference: it holds `encoder.fv_insert` and the clean-mode
+    // factors. The Transformers safetensors omit that block.
+    const NEMO: &str = "fluid-speech-pro.nemo";
+    fetch_required_hf_file(repo, source.repo_id(), NEMO, dir, options)?;
+    for file in ["tokenizer.json", "tokenizer_config.json", "generation_config.json", "config.json"] {
+        let _ = fetch_optional_hf_file(repo, source.repo_id(), file, dir, options)?;
+    }
+    if options.verbose {
+        tracing::info!("extracting {NEMO} in Rust (frame insert + clean mode)");
+    }
+    extract_nemo_to_hf(&dir.join(NEMO), dir)?;
+    Ok(())
 }
 
 fn extract_nemo_archive(dir: &Path, options: &DownloadOptions) -> anyhow::Result<()> {

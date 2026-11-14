@@ -32,10 +32,11 @@ pub fn experimental_gate(model_name: &str, n_samples: usize, sample_rate: usize)
     }
     let key = model_name.to_ascii_lowercase();
     let v3 = key.contains("parakeet-tdt-0.6b-v3");
+    let fluid = key.contains("fluid-speech");
     let nemotron = key.contains("nemotron-speech") || key.contains("nemotron-3.5-asr");
-    let new_model = v3 || nemotron || key.contains("parakeet");
+    let new_model = v3 || fluid || nemotron || key.contains("parakeet");
     let secs = n_samples as f64 / sample_rate.max(1) as f64;
-    if v3 || nemotron {
+    if v3 || fluid || nemotron {
         return Err(format!(
             "{model_name} is experimental and off by default. Set PYRE_STT_EXPERIMENTAL=1 to transcribe with it."
         ));
@@ -373,7 +374,38 @@ pub fn waveform_to_text(
         }
 
         let chunk_offset = i as f64 * shift_duration;
-        if include_timestamps {
+        if include_timestamps && use_frames && !recovered {
+            let min_frame = if i == 0 {
+                0
+            } else {
+                overlap.saturating_mul(encoder_frames) / end.saturating_sub(start).max(1)
+            };
+            let kept: Vec<(usize, usize)> = new_tokens
+                .iter()
+                .zip(token_frames.iter())
+                .filter(|(_, frame)| **frame >= min_frame)
+                .map(|(id, frame)| (*id, *frame))
+                .collect();
+            let ids: Vec<usize> = kept.iter().map(|(id, _)| *id).collect();
+            let frames: Vec<usize> = kept.iter().map(|(_, frame)| *frame).collect();
+            let pieces: Vec<String> = ids.iter().filter_map(|&id| bpe.id_to_token(id as u32)).collect();
+            let origin = start as f64 / sample_rate.max(1) as f64;
+            if pieces.len() == frames.len() {
+                for (w_start, w_end, text) in decode::parakeet::word_spans_from_pieces(&pieces, &frames, origin, 0.08) {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    segments.push(TranscriptSegment {
+                        start: w_start,
+                        end: w_end,
+                        text,
+                        diarization: None,
+                        location: None,
+                    });
+                    global_last_end = w_end;
+                }
+            }
+        } else if include_timestamps {
             let mut current_start = chunk_offset.max(global_last_end);
             let mut current_text_tokens = Vec::new();
             for &token in &new_tokens {

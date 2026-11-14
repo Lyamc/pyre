@@ -7,6 +7,8 @@ mod api;
 mod logbuf;
 mod registry;
 mod stt;
+#[cfg(feature = "stt")]
+mod transcribe_cli;
 mod audio_jobs;
 mod activity;
 mod diar;
@@ -93,6 +95,9 @@ pub enum Cmd {
         #[arg(long)] logits: Option<PathBuf> },
     /// Tag images (or folders of images) with an EVA02 Danbooru tagger (default Redstonexs/kagami-24k)
     Tag(tagger::TagArgs),
+    /// Demux a media file locally and send 16 kHz mono audio to a running pyre server.
+    #[cfg(feature = "stt")]
+    Transcribe(transcribe_cli::TranscribeArgs),
     /// Companion apps that use pyre (peal, cabin, ...): list | install (add) | update | remove | run | info
     App {
         #[command(subcommand)]
@@ -212,6 +217,8 @@ fn main() -> Result<()> {
         Cmd::QwenNext(a) => qn_cli::run(a),
         Cmd::Diarize { file, model, backend, logits } => diar::cli(&ctx.hf_cache, &file, &model, &backend, logits.as_deref()),
         Cmd::Tag(a) => tagger::run_cli(&ctx, a),
+        #[cfg(feature = "stt")]
+        Cmd::Transcribe(a) => transcribe_cli::run(a),
         Cmd::App { cmd } => apps::run_cli(&ctx, cmd),
     }
 }

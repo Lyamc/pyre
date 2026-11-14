@@ -202,7 +202,13 @@ pub fn load_model(
         }
     };
     pb.set_message("Moving model to device...");
-    let model = model.to_device(device);
+    let mut model = model.to_device(device);
+    if dir.join("fluid").exists() {
+        if let Model::Parakeet(ref mut parakeet) = model {
+            crate::model::fluid::attach_sidecars(parakeet, &dir)
+                .map_err(|e| format!("fluid-speech sidecars in {}: {e}", dir.display()))?;
+        }
+    }
 
     pb.finish_with_message(format!("Model '{}' loaded successfully.", model_name));
     tracing::info!(model = model_name, "model loaded onto device");

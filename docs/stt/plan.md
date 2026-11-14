@@ -6,8 +6,8 @@ Lyam’s HYTE tree is `C:\Temp\qnx\stt13` (`results.csv`, `run6.ps1`, `score6.py
 
 The gate that has to stay until the criteria at the bottom are met:
 
-- `src/speech_caps.rs`: `gate_experimental_model` and `gate_long_audio`. Parakeet TDT v3 and Nemotron Speech Streaming are `experimental: true`. `SHORT_CLIP_SECS` is 60.
-- `crates/pyre-whisper-engine/src/transcribe/mod.rs`: `experimental_gate` for the CLI. v3 and Nemotron are refused unless `PYRE_STT_EXPERIMENTAL` is `1`, `true`, `yes`, or `on`. Other Parakeet ids refuse audio longer than 60 s on that same switch.
+- `src/speech_caps.rs`: `gate_experimental_model` and `gate_long_audio`. Parakeet TDT v3, Nemotron Speech Streaming, and Fluid Speech Pro are `experimental: true`. `SHORT_CLIP_SECS` is 60.
+- `crates/pyre-whisper-engine/src/transcribe/mod.rs`: `experimental_gate` for the CLI. v3, Nemotron, and Fluid Speech Pro are refused unless `PYRE_STT_EXPERIMENTAL` is `1`, `true`, `yes`, or `on`. Other Parakeet ids refuse audio longer than 60 s on that same switch.
 - Opt-in is also `experimental=true` on the HTTP request (`speech_caps::experimental_opt_in`).
 
 ## Reported symptoms
@@ -36,6 +36,7 @@ Code to read before changing anything:
 
 Checks:
 
+- [x] 2026-11-14: the shared TDT decoder (`parakeet_decoder.rs`) already starts blank as a zero vector, not `embedding[blank]`. A comment there says feeding the embedding made v3 emit blank plus a long duration and an empty utterance. Fluid Speech Pro uses that same decoder and the v3 tokenizer. This environment did not re-score French and did not run NeMo. The empty-output checkboxes below stay open.
 - [ ] On one French clip from `stt13`, log token ids, blank steps, duration indices, and the string after detokenize. Separate “decoder emitted nothing” from “decoder emitted control or byte pieces that became an empty string”.
 - [ ] Compare those token ids to a NeMo `GreedyBatchedTDTInfer` run on the same waveform and the same checkpoint. Record both transcripts. That is the parity check.
 - [ ] Confirm the SentencePiece model is the v3 vocab, not the v2 vocab (vocab size, blank id, pad id, byte pieces). `ParakeetDecodeConfig` defaults pad to 2 and, when `decoder_start_token_id` is missing, starts at blank. Check the v3 decode JSON on disk against that.
@@ -97,6 +98,7 @@ Code: `crates/pyre-whisper-engine/src/model/load/helpers.rs` loads `NpyData::<f3
 
 Checks:
 
+- [x] 2026-11-14: `decode_npy_f32` in `helpers.rs` widens float16 and bfloat16 npy to f32 while loading. The conformer and LSTM graph stay f32, and the served `model.bpk` is still f32 (about 2.4 GB). This VM has no NVIDIA GPU, so half matmul and a VRAM figure were not measured. STT stays on CPU, which leaves the HYTE 12 GB card for the Qwen weights.
 - [ ] Store or convert weights as f16 or bf16 and cast per op, or keep them packed if Burn on this fork can run the matmul. Follow the TripoSR pattern (f16 on device, f32 math) only if the conformer and LSTM match that. Quantized load is acceptable if it is the same packing pyre already uses for GGUF, and only with a measured WER.
 - [ ] Conversion stays in Rust. No Python at runtime.
 - [ ] GPU test: load v3 and Nemotron in the new dtype on a CUDA device, transcribe one clip from `stt13`, and compare the text to the f32 run of the same clip. Record peak memory if the tool prints it. If no GPU is available, say so and do not claim a memory number.
@@ -131,7 +133,7 @@ Remove `experimental: true` for a model only after a fix PR pastes a new `score6
 - [ ] PR — item 2 (Nemotron edges).
 - [ ] PR — item 4 (Whisper stitch) with the string regression.
 - [ ] PR — item 5 for whichever of the three tests are not Parakeet.
-- [ ] PR — item 6 (dtype), after a GPU or an explicit “no GPU” note.
+- [ ] PR — item 6 (dtype), after a GPU or an explicit “no GPU” note. The fluid-speech-pro PR records the no-GPU note and the f32-widening loader. It does not close this item.
 - [ ] PR — item 7, then a one-line change to the long-audio gate once the score exists.
 - [ ] PR — item 8, only a flag change plus the pasted scores. No drive-by decode edits.
 
@@ -143,3 +145,13 @@ Keep these off the 3D branches. No force-push.
 - [ ] What are the three failing test names on HYTE?
 - [ ] Is the NeMo reference already scripted in `run6.ps1`, or does the fix PR have to add that comparison?
 - [ ] Which published WER (model card vs. an internal set) is the bar for item 8?
+
+## Fluid Speech Pro (added on qwen-int, not a scored fix)
+
+The model id is `fluid-speech-pro` (`FluidVoice-Labs/fluid-speech-pro`, CC-BY-4.0). It is Parakeet TDT v3 plus the NeMo `encoder.fv_insert` block and a clean-mode LoRA. The Hugging Face safetensors omit that block, so conversion reads `fluid-speech-pro.nemo`.
+
+- [x] Extra block and clean mode live on `#[module(skip)]` fields so an existing v2/v3 `model.bpk` still loads. Sidecars sit under `fluid/` next to the pack.
+- [x] Clean mode is a request flag (`clean_mode`), not a second set of weights. Beam 1..=4 is only applied when the model id contains `fluid-speech`.
+- [x] Word spans come from TDT frame indices at 80 ms, grouped on SentencePiece `▁`.
+- [ ] WER against LibriSpeech or FLEURS, including French and German, side by side with v2 and v3. This environment had no GPU and did not run the 2.6 GB checkpoint, so there is no table. The model card’s Open ASR average (Fluid 6.06, v2 6.93, v3 7.04) is the card’s number, not a pyre measurement. The experimental gate stays on until a HYTE score exists.
+- [ ] Logit parity against NeMo on a short clip. Unit tests cover the LoRA delta, the bias fold, and the frame-insert residual against the published formula. They are not a transcript fixture.

@@ -54,8 +54,7 @@ pub fn load_tensor<const D: usize>(
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
 
-    let npy = NpyData::<f32>::from_bytes(&buf)?;
-    let data: Vec<f32> = npy.to_vec();
+    let data = decode_npy_f32(&buf)?;
 
     let rel_path = tensor_path.replace("\\", "/");
     let mut shape_vec = Vec::new();
@@ -104,6 +103,54 @@ pub fn load_tensor<const D: usize>(
     Ok(tensor)
 }
 
+/// Read an `.npy` vector as f32. `<f4` is native. `<f2` is IEEE f16 and a header that
+/// names bfloat16 is bf16. Both half formats are widened here; the Conformer graph stays f32.
+pub fn decode_npy_f32(buf: &[u8]) -> Result<Vec<f32>, Box<dyn Error>> {
+    if buf.len() < 10 || buf[0] != 0x93 || &buf[1..6] != b"NUMPY" {
+        return Err("not an npy file".into());
+    }
+    let major = buf[6];
+    let (header, data) = if major == 1 {
+        let n = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+        let start = 10;
+        if buf.len() < start + n {
+            return Err("truncated npy header".into());
+        }
+        (std::str::from_utf8(&buf[start..start + n])?, &buf[start + n..])
+    } else {
+        if buf.len() < 12 {
+            return Err("truncated npy header".into());
+        }
+        let n = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        let start = 12;
+        if buf.len() < start + n {
+            return Err("truncated npy header".into());
+        }
+        (std::str::from_utf8(&buf[start..start + n])?, &buf[start + n..])
+    };
+    let header_l = header.to_ascii_lowercase();
+    if header_l.contains("bfloat16") || header_l.contains("bf16") {
+        return Ok(data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect());
+    }
+    if header_l.contains("<f2") || header_l.contains("|f2") || header_l.contains("float16") {
+        return Ok(data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect());
+    }
+    if header_l.contains("<f4") || header_l.contains("|f4") || header_l.contains("float32") {
+        return Ok(data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect());
+    }
+    let npy = NpyData::<f32>::from_bytes(buf)?;
+    Ok(npy.to_vec())
+}
+
 pub fn load_usize(name: &str, path: &str, device: &burn::tensor::Device) -> Result<usize, Box<dyn Error>> {
     let tensor = load_tensor::<1>(name, path, device)?;
     let data = tensor.into_data();
@@ -150,5 +197,35 @@ mod tests {
             .map(|(_, v)| v.clone());
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(shape, Some(vec![640, 8198]));
+    }
+
+    #[test]
+    fn f16_and_bf16_npy_widen_to_f32() {
+        let f16 = half::f16::from_f32(1.5).to_le_bytes();
+        let mut buf = npy_header("<f2", 1);
+        buf.extend_from_slice(&f16);
+        let v = super::decode_npy_f32(&buf).unwrap();
+        assert!((v[0] - 1.5).abs() < 1e-3);
+
+        let bf = half::bf16::from_f32(-2.0).to_le_bytes();
+        let mut buf = npy_header("bfloat16", 1);
+        buf.extend_from_slice(&bf);
+        let v = super::decode_npy_f32(&buf).unwrap();
+        assert!((v[0] + 2.0).abs() < 1e-2);
+    }
+
+    fn npy_header(descr: &str, n: usize) -> Vec<u8> {
+        let header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}");
+        let mut header_bytes = header.into_bytes();
+        while (header_bytes.len() + 10 + 1) % 16 != 0 {
+            header_bytes.push(b' ');
+        }
+        header_bytes.push(b'\n');
+        let mut out = vec![0x93];
+        out.extend_from_slice(b"NUMPY");
+        out.extend_from_slice(&[1, 0]);
+        out.extend_from_slice(&(header_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out
     }
 }

@@ -10,6 +10,8 @@ pub fn layout_tensor(rel: &str, data: &[f32], shape: &[usize]) -> (Vec<f32>, Vec
             || rel.contains("final_proj")
             || rel.contains("decoder/projector")
             || rel.contains("ctc_linear")
+            || rel.contains("fv_insert/down/")
+            || rel.contains("fv_insert/up/")
             // Conformer FF weights are nn.Linear [out, in] like the rest; Burn wants [in, out].
             || is_conformer_ff);
 

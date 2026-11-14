@@ -38,6 +38,7 @@ pub(crate) fn load_parakeet_decoder(
             weight_hh: Param::from_tensor(weight_hh),
             bias_ih: Param::from_tensor(bias_ih),
             bias_hh: Param::from_tensor(bias_hh),
+            clean_bias_ih: None,
         });
     }
 
@@ -53,6 +54,7 @@ pub(crate) fn load_parakeet_decoder(
         embedding,
         lstm: ParakeetLstm { layers: lstm_layers },
         projector,
+        clean_joint: None,
     }))
 }
 
@@ -186,6 +188,7 @@ let std = if Path::new(&format!("{}/std.npy", path)).exists() {
         mean,
         std,
         n_mels,
+        frame_insert: None,
     })
 }
 

@@ -144,6 +144,7 @@ pub fn convert_parakeet_from_hf(
     }
 
     super::burn_mpk::save_model_from_npy(model_name, options)?;
+    preserve_fluid_sidecars(model_dir)?;
     cleanup_parakeet_npy_artifacts(model_dir, options.verbose)?;
 
     fs::write(model_dir.join(".burn_version"), BURN_VERSION)?;
@@ -162,7 +163,44 @@ pub fn is_parakeet_model(name: &str) -> bool {
             | "parakeet-tdt-0.6b-v2"
             | "parakeet-ctc-0.6b"
             | "parakeet-ctc-1.1b"
+            | "fluid-speech-pro"
     )
+}
+
+/// Keep the frame-insert block and clean-mode factors. The Burn pack does not record
+/// `#[module(skip)]` tensors, so inference loads these npy files beside `model.bpk`.
+fn preserve_fluid_sidecars(model_dir: &Path) -> anyhow::Result<()> {
+    let shapes_path = model_dir.join("shapes.json");
+    if !shapes_path.exists() {
+        return Ok(());
+    }
+    let shapes: std::collections::HashMap<String, Vec<usize>> =
+        serde_json::from_str(&fs::read_to_string(&shapes_path)?)?;
+    let mut kept = std::collections::HashMap::new();
+    for (key, shape) in shapes {
+        let rel = if let Some(rest) = key.strip_prefix("encoder/fv_insert/") {
+            format!("fluid/fv_insert/{rest}")
+        } else if let Some(rest) = key.strip_prefix("clean_mode/") {
+            format!("fluid/clean/{rest}")
+        } else {
+            continue;
+        };
+        let src = model_dir.join(&key);
+        if !src.exists() {
+            continue;
+        }
+        let dest = model_dir.join(&rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&src, &dest)?;
+        kept.insert(rel, shape);
+    }
+    if kept.is_empty() {
+        return Ok(());
+    }
+    fs::write(model_dir.join("fluid").join("shapes.json"), serde_json::to_string_pretty(&kept)?)?;
+    Ok(())
 }
 
 pub fn is_nemotron_asr_model(name: &str) -> bool {
@@ -172,6 +210,6 @@ pub fn is_nemotron_asr_model(name: &str) -> bool {
 pub fn is_parakeet_burn_ready(name: &str) -> bool {
     matches!(
         name,
-        "parakeet-tdt-0.6b-v3" | "parakeet-tdt-0.6b-v2" | "parakeet-ctc-0.6b" | "parakeet-ctc-1.1b"
+        "parakeet-tdt-0.6b-v3" | "parakeet-tdt-0.6b-v2" | "parakeet-ctc-0.6b" | "parakeet-ctc-1.1b" | "fluid-speech-pro"
     )
 }

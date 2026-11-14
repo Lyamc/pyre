@@ -44,6 +44,7 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/v1/images/edits", post(images).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/sdapi/v1/img2img", post(txt2img))
         .route("/v1/audio/transcriptions", post(transcriptions).layer(axum::extract::DefaultBodyLimit::max(128 << 20)))
+        .route("/v1/audio/transcriptions/chunks", post(transcription_chunks).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/v1/audio/translations", post(translations).layer(axum::extract::DefaultBodyLimit::max(128 << 20)))
         .route("/v1/audio/diarize", post(crate::diar::handle).layer(axum::extract::DefaultBodyLimit::max(128 << 20)))
         .route("/api/diarizer", get(crate::diar::status))
@@ -489,6 +490,9 @@ async fn txt2img(State(app): S, Json(b): Json<Value>) -> Response {
 }
 
 async fn transcriptions(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, false).await }
+async fn transcription_chunks(State(app): S, axum::extract::RawQuery(q): axum::extract::RawQuery, body: axum::body::Bytes) -> Response {
+    crate::stt::chunks(app, q.as_deref().unwrap_or(""), &body).await
+}
 async fn translations(State(app): S, mp: Multipart) -> Response { crate::stt::handle(app, mp, true).await }
 
 /// `POST /v1/images/tags`: tag one or more images with the loaded tagger.
