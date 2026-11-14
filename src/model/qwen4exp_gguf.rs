@@ -71,7 +71,8 @@ impl XCache {
     fn up(&self, cb: &super::qn_cube::Cube, sl: usize, v: &burn_cubecl::cubecl::bytes::Bytes, uo: usize, dof: usize) -> super::qn_cube::XEnt { let (a, b, c) = self.loc(sl); cb.xupload_at(&self.arena[a], self.ar_bytes, b, c, v, uo, dof) }
 }
 /// PYRE_QN_XCLASS=1 (opt-in): cache slots sized per expert-size class (equal slots per layer), instead of every slot the largest expert
-fn xclass() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCLASS").map(|v| v == "1").unwrap_or(false)) }
+/// Per-size expert slots (default on: a uniform slot is the largest expert and wastes the rest). PYRE_QN_XCLASS=0 restores one size.
+fn xclass() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_XCLASS").map(|v| v != "0").unwrap_or(true)) }
 
 /// Expert-ranking profile (PYRE_QN_XPROFILE=<file>): per-layer routing counts saved from earlier runs
 /// (PYRE_QN_XPROFILE_SAVE=<file>; u32 n_layers, u32 n_exp, then n_layers*n_exp u32 counts, little endian).
@@ -565,7 +566,7 @@ impl Model {
             if let Ok(cb) = super::qn_cube::Cube::new() {
                 use super::qn_cube::{CHc, CLayer};
                 let cb0 = cb.budget.load(std::sync::atomic::Ordering::Relaxed);
-                let chc = |h: &Hc| -> Option<CHc> { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } Some(CHc { norm: cb.buf(&h.norm), di: cb.upload(&a, &[])?, up: cb.upload(&[&h.up], &[])? }) };
+                let chc = |h: &Hc| -> Option<CHc> { let mut a = vec![&h.down]; if let Some(i) = &h.inject { a.push(i); } Some(CHc { norm: cb.buf(&h.norm), di: cb.upload_mix(&a, &[])?, up: cb.upload(&[&h.up], &[])? }) };
                 let mut cl = vec![];
                 for l in &self.layers {
                     let min = match &l.mix { Mixer::Attn { q, k, v, idx, .. } => { let mut a = vec![q, k, v]; if let Some((iq, ik, _, _)) = idx { a.push(iq); a.push(ik); } a }, Mixer::Lin { qkv, z, beta, alpha, .. } => vec![qkv, z, beta, alpha] };
@@ -612,7 +613,12 @@ impl Model {
                 // PYRE_MTP_GX=2 (resident drafter, ~0.9 GB): the default cache gives up what the drafter needs beyond PYRE_MTP_GXR_SLACK_MB (default 300; g7: 512 left 1011 MiB free at the 1024 floor, 4.9 GiB left 1482) of the
                 // headroom, so the 1 GB floor holds (XEXACT output is the same for any cache size); an explicit PYRE_QN_XCACHE_GB wins
                 let cap = if super::mtp::gxr_on() && env_var("PYRE_QN_XCACHE_GB").is_err() && super::mtp::find().is_some() { let need = super::mtp::gxr_bytes(self.cfg.d, self.cfg.ff_exp, self.cfg.n_exp).saturating_sub(env_usize("PYRE_MTP_GXR_SLACK_MB").unwrap_or(300) << 20); eprintln!("gpu: resident drafter: expert cache cap -{:.2} GiB", need as f64 / (1u64 << 30) as f64); cap.saturating_sub(need) } else { cap };
-                let budget = left.saturating_sub(env_usize("PYRE_QN_XHEAD_MB").unwrap_or(if xexact() { 512 } else { 2048 }) << 20).min(cap); // 2 GiB more headroom: past that, WDDM starts paging
+                // Headroom is the VRAM floor (PYRE_VRAM_FLOOR_MB, default 1100) unless PYRE_QN_XHEAD_MB is set.
+                // Also never plan a cache that would put live free VRAM under that floor.
+                let floor_b = (crate::limits::vram_floor_mb() as usize) << 20;
+                let head = env_usize("PYRE_QN_XHEAD_MB").map(|m| m << 20).unwrap_or(if xexact() { floor_b.min(512 << 20) } else { floor_b });
+                let free_now = crate::limits::vram().map(|v| v.free as usize).unwrap_or(left);
+                let budget = left.saturating_sub(head).min(free_now.saturating_sub(floor_b)).min(cap);
                 // PYRE_QN_XCACHE_PIN_GB (exactness checks, unset = unchanged): exactly this cache size, ignoring the XHEAD headroom,
                 // as long as it fits above the reserve + 1.5 GiB already held back (>= 1 GiB stays free); else the normal budget
                 let budget = match env_var("PYRE_QN_XCACHE_PIN_GB").ok().and_then(|v| v.parse::<f64>().ok()) { Some(p) => { let pb = ((p * (1u64 << 30) as f64) as usize).next_multiple_of(1 << 20); if pb <= left { eprintln!("gpu: expert cache pinned"); pb } else { eprintln!("gpu: expert cache pin {p} GiB does not fit ({} MiB left), normal budget", left >> 20); budget } }, None => budget };

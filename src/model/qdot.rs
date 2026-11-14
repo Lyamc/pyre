@@ -29,7 +29,7 @@ pub fn quantize_into(x: &[f32], a: &mut Q8Act) {
     }
 }
 
-pub fn supports(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M | QType::Q2_0) }
+pub fn supports(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M | QType::Q2_0 | QType::IQ3XXS | QType::IQ3S | QType::IQ4NL | QType::IQ4XS) }
 
 /// Per-thread decode buffers (reused across rows: no allocation per row).
 #[derive(Default)]
@@ -46,11 +46,14 @@ fn sign8() -> &'static [u64; 256] {
 pub fn row_dot(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
     if !supports(t) { return row_dot_deq(t, row, a, sc); }
     #[cfg(target_arch = "x86_64")]
-    { if avx2() { return unsafe { match t { QType::IQ2S => iq2s_avx2(row, a), QType::IQ2XXS => iq2xxs_avx2(row, a), QType::IQ1M => iq1m_avx2(row, a), QType::Q2_0 => q2_0_avx2(row, a), _ => unreachable!() } }; } }
+    { if avx2() { return unsafe { match t {
+        QType::IQ2S => iq2s_avx2(row, a), QType::IQ2XXS => iq2xxs_avx2(row, a), QType::IQ1M => iq1m_avx2(row, a), QType::Q2_0 => q2_0_avx2(row, a),
+        QType::IQ3XXS => iq3xxs_avx2(row, a), QType::IQ3S => iq3s_avx2(row, a), QType::IQ4NL => iq4nl_avx2(row, a), QType::IQ4XS => iq4xs_avx2(row, a),
+        _ => unreachable!() } }; } }
     row_dot_generic(t, row, a, sc)
 }
 
-/// Fallback for expert types without an integer kernel (IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, K-quants, ...):
+/// Fallback for expert types without an integer kernel (K-quants and the rest):
 /// expand the row to floats with the reference dequantizer and dot it with the int8 activation blocks.
 fn row_dot_deq(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 {
     let n = a.q.len(); sc.f.resize(n, 0.0); super::gguf_q::dequant(t, &row[..t.row_bytes(n)], &mut sc.f);
@@ -145,6 +148,82 @@ unsafe fn q2_0_avx2(row: &[u8], a: &Q8Act) -> f32 {
     corr + k::hsum(acc)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq3xxs_avx2(row: &[u8], a: &Q8Act) -> f32 {
+    use std::arch::x86_64::*;
+    let s8 = sign8(); let mut acc = _mm256_setzero_ps(); let n = a.q.len();
+    for i in 0..n / 256 { let b = &row[i * 98..i * 98 + 98]; let d = h2f(b, 0) * 0.5; let (qs, ss) = (&b[2..66], &b[66..98]);
+        for ib in 0..8 { let o = i * 256 + ib * 32; let a1 = u32::from_le_bytes([ss[4 * ib], ss[4 * ib + 1], ss[4 * ib + 2], ss[4 * ib + 3]]);
+            let g8 = |l: usize| { let p = 8 * ib + 2 * l; (IQ3XXS_GRID[qs[p] as usize] as u64) | ((IQ3XXS_GRID[qs[p + 1] as usize] as u64) << 32) };
+            let g = _mm256_set_epi64x(g8(3) as i64, g8(2) as i64, g8(1) as i64, g8(0) as i64);
+            let sl = |l: u32| s8[KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize] as usize] as i64;
+            let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+            let db = d * (0.5 + (a1 >> 28) as f32) * *a.d.get_unchecked(o / 32);
+            acc = k::step(acc, g, s, a.q.as_ptr().add(o), db, db); } }
+    k::hsum(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq3s_avx2(row: &[u8], a: &Q8Act) -> f32 {
+    use std::arch::x86_64::*;
+    let s8 = sign8(); let mut acc = _mm256_setzero_ps(); let n = a.q.len();
+    for i in 0..n / 256 { let b = row.as_ptr().add(i * 110); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32();
+        let (qs, qh, sg, sc) = (b.add(2), b.add(66), b.add(74), b.add(106));
+        for sb in 0..8 { let o = i * 256 + sb * 32; let half = sb % 2; let qhb = *qh.add((sb / 2) * 2 + half); let scb = *sc.add(sb / 2);
+            let nib = if half == 0 { scb & 0xF } else { scb >> 4 }; let db = d * (1 + 2 * nib) as f32 * *a.d.get_unchecked(o / 32);
+            let g8 = |l: usize| { let q0 = *qs.add(sb * 8 + 2 * l) as usize; let q1 = *qs.add(sb * 8 + 2 * l + 1) as usize;
+                let i1 = q0 | (((qhb as usize) << (8 - 2 * l)) & 256); let i2 = q1 | (((qhb as usize) << (7 - 2 * l)) & 256);
+                IQ3S_GRID[i1] as u64 | ((IQ3S_GRID[i2] as u64) << 32) };
+            let g = _mm256_set_epi64x(g8(3) as i64, g8(2) as i64, g8(1) as i64, g8(0) as i64);
+            let sl = |l: usize| s8[*sg.add(sb * 4 + l) as usize] as i64;
+            let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+            acc = k::step(acc, g, s, a.q.as_ptr().add(o), db, db); } }
+    k::hsum(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq4nl_avx2(row: &[u8], a: &Q8Act) -> f32 {
+    use std::arch::x86_64::*;
+    let tab = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let mask = _mm_set1_epi8(0x0f); let mut acc = 0f32; let n = a.q.len();
+    for i in 0..n / 32 { let b = row.as_ptr().add(i * 18); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * *a.d.get_unchecked(i);
+        let q = _mm_loadu_si128(b.add(2) as *const __m128i);
+        let lo = _mm_shuffle_epi8(tab, _mm_and_si128(q, mask));
+        let hi = _mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(q, 4), mask));
+        let x = a.q.as_ptr().add(i * 32);
+        let xl = _mm256_cvtepi8_epi16(_mm_loadu_si128(x as *const __m128i));
+        let xh = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.add(16) as *const __m128i));
+        let pl = _mm256_madd_epi16(_mm256_cvtepi8_epi16(lo), xl);
+        let ph = _mm256_madd_epi16(_mm256_cvtepi8_epi16(hi), xh);
+        let mut s = [0i32; 8]; _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(pl, ph));
+        acc += s.iter().sum::<i32>() as f32 * d; }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq4xs_avx2(row: &[u8], a: &Q8Act) -> f32 {
+    use std::arch::x86_64::*;
+    let tab = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let mask = _mm_set1_epi8(0x0f); let mut acc = 0f32; let n = a.q.len();
+    for i in 0..n / 256 { let b = row.as_ptr().add(i * 136); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32();
+        let sh = u16::from_le_bytes([*b.add(2), *b.add(3)]); let sl = u32::from_le_bytes([*b.add(4), *b.add(5), *b.add(6), *b.add(7)]);
+        for ib in 0..8 { let ls = ((sl >> (4 * ib)) & 15) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4); let dl = d * (ls - 32) as f32 * *a.d.get_unchecked(i * 8 + ib);
+            let q = _mm_loadu_si128(b.add(8 + ib * 16) as *const __m128i);
+            let lo = _mm_shuffle_epi8(tab, _mm_and_si128(q, mask));
+            let hi = _mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(q, 4), mask));
+            let x = a.q.as_ptr().add(i * 256 + ib * 32);
+            let xl = _mm256_cvtepi8_epi16(_mm_loadu_si128(x as *const __m128i));
+            let xh = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.add(16) as *const __m128i));
+            let p = _mm256_add_epi32(_mm256_madd_epi16(_mm256_cvtepi8_epi16(lo), xl), _mm256_madd_epi16(_mm256_cvtepi8_epi16(hi), xh));
+            let mut s = [0i32; 8]; _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, p);
+            acc += s.iter().sum::<i32>() as f32 * dl; } }
+    acc
+}
+
 fn row_dot_generic(t: QType, row: &[u8], a: &Q8Act, sc: &mut Scratch) -> f32 { decode(t, row, a.q.len(), sc); dot_decoded(sc, a) }
 
 /// One decoded row against an activation (prefill: decode once, dot against every token).
@@ -190,6 +269,33 @@ pub fn decode(t: QType, row: &[u8], n: usize, sc: &mut Scratch) {
             s[o..o + 64].fill(1);
             // value = q - 1: subtract d * sum(x) over the block
             c8[o / 8..o / 8 + 8].fill(-d); },
+        QType::IQ3XXS => for i in 0..n / 256 { let b = &row[i * 98..]; let d = h2f(b, 0); let qs = &b[2..66]; let ss = &b[66..98];
+            for ib in 0..8 { let a1 = u32::from_le_bytes([ss[4 * ib], ss[4 * ib + 1], ss[4 * ib + 2], ss[4 * ib + 3]]);
+                let db = d * (0.5 + (a1 >> 28) as f32) * 0.5; let o = i * 256 + ib * 32;
+                scl[o / 16] = db; scl[o / 16 + 1] = db;
+                for l in 0..4 { let g1 = IQ3XXS_GRID[qs[8 * ib + 2 * l] as usize] as u64; let g2 = IQ3XXS_GRID[qs[8 * ib + 2 * l + 1] as usize] as u64;
+                    put(g, o + 8 * l, g1 | (g2 << 32)); put(s, o + 8 * l, s8t[KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize] as usize]); } } },
+        QType::IQ3S => for i in 0..n / 256 { let b = &row[i * 110..]; let d = h2f(b, 0); let scb = &b[106..110];
+            let (mut qs_o, mut qh_o, mut sg_o) = (2usize, 66usize, 74usize);
+            for ib in (0..8).step_by(2) { for half in 0..2 { let sb = scb[ib / 2]; let nib = if half == 0 { sb & 0xF } else { sb >> 4 };
+                let db = d * (1 + 2 * nib) as f32; let o = i * 256 + (ib + half) * 32; let qh = b[qh_o + half];
+                scl[o / 16] = db; scl[o / 16 + 1] = db;
+                for l in 0..4 { let i1 = b[qs_o + 2 * l] as usize | (((qh as usize) << (8 - 2 * l)) & 256);
+                    let i2 = b[qs_o + 2 * l + 1] as usize | (((qh as usize) << (7 - 2 * l)) & 256);
+                    put(g, o + 8 * l, IQ3S_GRID[i1] as u64 | ((IQ3S_GRID[i2] as u64) << 32)); put(s, o + 8 * l, s8t[b[sg_o + l] as usize]); }
+                qs_o += 8; sg_o += 4; } qh_o += 2; } },
+        QType::IQ4NL => for i in 0..n / 32 { let b = &row[i * 18..]; let d = h2f(b, 0); let o = i * 32; scl[o / 16] = d; scl[o / 16 + 1] = d;
+            for j in 0..16 { let q = b[2 + j]; let (lo, hi) = (KVALUES_IQ4NL[(q & 0xF) as usize], KVALUES_IQ4NL[(q >> 4) as usize]);
+                let putk = |g: &mut [u8], s: &mut [u8], k: i8, dst: usize| { g[dst] = k.unsigned_abs(); s[dst] = if k < 0 { 0xFF } else { 1 }; };
+                putk(g, s, lo, o + j); putk(g, s, hi, o + 16 + j); } },
+        QType::IQ4XS => for i in 0..n / 256 { let b = &row[i * 136..]; let d = h2f(b, 0); let sh = u16::from_le_bytes([b[2], b[3]]); let sl = &b[4..8]; let qs = &b[8..];
+            for ib in 0..8 { let ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4);
+                let dl = d * (ls - 32) as f32; let o = i * 256 + ib * 32; let neg = dl < 0.0; let ad = dl.abs();
+                scl[o / 16] = ad; scl[o / 16 + 1] = ad;
+                for j in 0..16 { let q = qs[ib * 16 + j]; let (mut lo, mut hi) = (KVALUES_IQ4NL[(q & 0xF) as usize], KVALUES_IQ4NL[(q >> 4) as usize]);
+                    if neg { lo = lo.saturating_neg(); hi = hi.saturating_neg(); }
+                    let putk = |g: &mut [u8], s: &mut [u8], k: i8, dst: usize| { g[dst] = k.unsigned_abs(); s[dst] = if k < 0 { 0xFF } else { 1 }; };
+                    putk(g, s, lo, o + j); putk(g, s, hi, o + 16 + j); } } },
         _ => unreachable!("qdot: unsupported {t:?}"),
     }
 }
@@ -369,7 +475,7 @@ fn pcore_here() -> bool {
     #[allow(unreachable_code)] false
 }
 pub fn vnni() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| { #[cfg(target_arch = "x86_64")] { std::env::var("PYRE_QN_VNNI").map(|v| v != "0").unwrap_or(true) && is_x86_feature_detected!("avxvnni") && is_x86_feature_detected!("avx2") } #[cfg(not(target_arch = "x86_64"))] { false } }) }
-pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M) }
+pub fn supports_k(t: QType) -> bool { matches!(t, QType::IQ2XXS | QType::IQ2S | QType::IQ1M | QType::IQ3XXS | QType::IQ3S | QType::IQ4XS) }
 // ---- gate+up pair: one IQ2 super-block of each row per step, sharing the activation; each row's own
 // operations are the same, in the same order, as iq2s_k_b / iq2xxs_k_b (bit-identical results)
 #[cfg(target_arch = "x86_64")]
@@ -436,8 +542,12 @@ pub fn isplit() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceL
 
 pub fn row_dot_k(t: QType, row: &[u8], a: &Q8K) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    { if vnni() { return unsafe { match t { QType::IQ2S => iq2s_k_v(row, a), QType::IQ2XXS => iq2xxs_k_v(row, a), QType::IQ1M => iq1m_k_v(row, a), _ => unreachable!() } }; }
-      if avx2() { return unsafe { match t { QType::IQ2S => iq2s_k(row, a), QType::IQ2XXS => iq2xxs_k(row, a), QType::IQ1M => iq1m_k(row, a), _ => unreachable!() } }; } }
+    { if vnni() { return unsafe { match t {
+        QType::IQ2S => iq2s_k_v(row, a), QType::IQ2XXS => iq2xxs_k_v(row, a), QType::IQ1M => iq1m_k_v(row, a),
+        QType::IQ3XXS => iq3xxs_k_v(row, a), QType::IQ3S => iq3s_k_v(row, a), QType::IQ4XS => iq4xs_k_v(row, a), _ => unreachable!() } }; }
+      if avx2() { return unsafe { match t {
+        QType::IQ2S => iq2s_k(row, a), QType::IQ2XXS => iq2xxs_k(row, a), QType::IQ1M => iq1m_k(row, a),
+        QType::IQ3XXS => iq3xxs_k(row, a), QType::IQ3S => iq3s_k(row, a), QType::IQ4XS => iq4xs_k(row, a), _ => unreachable!() } }; } }
     // scalar fallback through the float decoder
     let mut v = vec![0f32; a.q.len()]; super::gguf_q::dequant(t, row, &mut v);
     let mut s = 0f32; for b in 0..a.d.len() { let mut si = 0f32; for j in 0..256 { si += v[b * 256 + j] * a.q[b * 256 + j] as f32; } s += si * a.d[b]; } s
@@ -567,6 +677,86 @@ unsafe fn iq1m_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
         let mut l = [0i32; 8]; _mm256_storeu_si256(l.as_mut_ptr() as *mut __m256i, ia);
         tot += d * (l.iter().sum::<i32>() as f32 + 0.125 * corr as f32); }
     tot
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq3xxs_k(row: &[u8], a: &Q8K) -> f32 { iq3xxs_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq3xxs_k_v(row: &[u8], a: &Q8K) -> f32 { iq3xxs_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq3xxs_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
+    use std::arch::x86_64::*;
+    let s8 = sign8(); let (es, eo) = (esigns(), esign_on()); let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
+    for i in 0..n / 256 { let b = rp.add(i * 98); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * 0.25 * *a.d.get_unchecked(i);
+        let (qs, ss) = (b.add(2), b.add(66)); let mut ia = _mm256_setzero_si256();
+        for ib in 0..8 { let a1 = (ss.add(4 * ib) as *const u32).read_unaligned();
+            let g8 = |l: usize| { let p = 8 * ib + 2 * l; (*IQ3XXS_GRID.get_unchecked(*qs.add(p) as usize) as u64) | ((*IQ3XXS_GRID.get_unchecked(*qs.add(p + 1) as usize) as u64) << 32) };
+            let g = _mm256_set_epi64x(g8(3) as i64, g8(2) as i64, g8(1) as i64, g8(0) as i64);
+            let sl = |l: u32| if eo { *es.get_unchecked(((a1 >> (7 * l)) & 127) as usize) as i64 } else { *s8.get_unchecked(*KSIGNS_IQ2XS.get_unchecked(((a1 >> (7 * l)) & 127) as usize) as usize) as i64 };
+            let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+            let sc = 2 * (a1 >> 28) as i32 + 1;
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + ib * 32), kk::sc2(sc, sc)); }
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc); }
+    k::hsum(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq3s_k(row: &[u8], a: &Q8K) -> f32 { iq3s_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq3s_k_v(row: &[u8], a: &Q8K) -> f32 { iq3s_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq3s_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
+    use std::arch::x86_64::*;
+    let s8 = sign8(); let mut acc = _mm256_setzero_ps(); let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
+    for i in 0..n / 256 { let b = rp.add(i * 110); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * *a.d.get_unchecked(i);
+        let (qs, qh, sg, sc) = (b.add(2), b.add(66), b.add(74), b.add(106)); let mut ia = _mm256_setzero_si256();
+        for sb in 0..8 { let half = sb % 2; let qhb = *qh.add((sb / 2) * 2 + half) as usize; let scb = *sc.add(sb / 2);
+            let nib = if half == 0 { scb & 0xF } else { scb >> 4 }; let isc = 1 + 2 * nib as i32;
+            let g8 = |l: usize| { let q0 = *qs.add(sb * 8 + 2 * l) as usize; let q1 = *qs.add(sb * 8 + 2 * l + 1) as usize;
+                let i1 = q0 | ((qhb << (8 - 2 * l)) & 256); let i2 = q1 | ((qhb << (7 - 2 * l)) & 256);
+                *IQ3S_GRID.get_unchecked(i1) as u64 | ((*IQ3S_GRID.get_unchecked(i2) as u64) << 32) };
+            let g = _mm256_set_epi64x(g8(3) as i64, g8(2) as i64, g8(1) as i64, g8(0) as i64);
+            let sl = |l: usize| *s8.get_unchecked(*sg.add(sb * 4 + l) as usize) as i64;
+            let s = _mm256_set_epi64x(sl(3), sl(2), sl(1), sl(0));
+            ia = kk::istep::<V>(ia, g, s, xq.add(i * 256 + sb * 32), kk::sc2(isc, isc)); }
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_set1_ps(d), acc); }
+    k::hsum(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn iq4xs_k(row: &[u8], a: &Q8K) -> f32 { iq4xs_k_b::<false>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avxvnni")]
+unsafe fn iq4xs_k_v(row: &[u8], a: &Q8K) -> f32 { iq4xs_k_b::<true>(row, a) }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn iq4xs_k_b<const V: bool>(row: &[u8], a: &Q8K) -> f32 {
+    use std::arch::x86_64::*;
+    let _ = V;
+    let tab = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let mask = _mm_set1_epi8(0x0f); let mut acc = 0f32; let n = a.q.len(); let rp = row.as_ptr(); let xq = a.q.as_ptr();
+    for i in 0..n / 256 { let b = rp.add(i * 136); let d = f16::from_bits(u16::from_le_bytes([*b, *b.add(1)])).to_f32() * *a.d.get_unchecked(i);
+        let sh = u16::from_le_bytes([*b.add(2), *b.add(3)]); let sl = u32::from_le_bytes([*b.add(4), *b.add(5), *b.add(6), *b.add(7)]);
+        let mut ia = 0i32;
+        for ib in 0..8 { let ls = (((sl >> (4 * ib)) & 15) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4)) - 32;
+            let q = _mm_loadu_si128(b.add(8 + ib * 16) as *const __m128i);
+            let lo = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(tab, _mm_and_si128(q, mask)));
+            let hi = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(q, 4), mask)));
+            let x = xq.add(i * 256 + ib * 32);
+            let xl = _mm256_cvtepi8_epi16(_mm_loadu_si128(x as *const __m128i));
+            let xh = _mm256_cvtepi8_epi16(_mm_loadu_si128(x.add(16) as *const __m128i));
+            let prod = _mm256_add_epi32(_mm256_madd_epi16(lo, xl), _mm256_madd_epi16(hi, xh));
+            let mut s = [0i32; 8]; _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, prod);
+            ia += s.iter().sum::<i32>() * ls; }
+        acc += ia as f32 * d; }
+    acc
 }
 
 // ---- Q2_0 with activations quantized per 64 (the weight block) and permuted to the weight's
@@ -834,3 +1024,57 @@ pub static HI2S: [u64; 256] = { let mut t = [0u64; 256]; let mut h = 0; while h 
 pub fn gidx() -> bool { static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_GIDX").map(|v| v != "0").unwrap_or(true)) }
 /// PYRE_QN_PFB: IQ2 super-block prefetch distance in bytes, default 2048 like Strata (0 = off)
 pub fn pfb() -> usize { static P: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *P.get_or_init(|| std::env::var("PYRE_QN_PFB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::gguf_q::{dequant, QType};
+
+    fn block(ty: QType, seed: u64) -> Vec<u8> {
+        let n = ty.row_bytes(match ty { QType::IQ4NL | QType::Q2_0 => 32, _ => 256 }.max(ty.geom().0));
+        let mut v = vec![0u8; n * 2];
+        let mut s = seed;
+        for b in &mut v { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); *b = (s >> 33) as u8; }
+        // sane f16 scales (about 0.02 .. 0.5) so the dots are not dominated by inf/nan
+        let d = f16::from_f32(0.05 + ((seed % 17) as f32) * 0.01);
+        let db = d.to_le_bytes();
+        match ty {
+            QType::IQ4NL | QType::Q2_0 => { for i in 0..2 { v[i * 18] = db[0]; v[i * 18 + 1] = db[1]; } }
+            QType::IQ1M => {}
+            _ => { v[0] = db[0]; v[1] = db[1]; let rb = ty.row_bytes(256); v[rb] = db[0]; v[rb + 1] = db[1]; }
+        }
+        v
+    }
+    fn q8_dot(ty: QType, row: &[u8], x: &[f32]) -> f32 {
+        let mut y = vec![0f32; x.len()];
+        dequant(ty, &row[..ty.row_bytes(x.len())], &mut y);
+        let a = quantize(x);
+        let mut acc = 0f32;
+        for b in 0..x.len() / 32 { let mut s = 0f32; for j in 0..32 { s += y[b * 32 + j] * a.q[b * 32 + j] as f32; } acc += s * a.d[b]; }
+        acc
+    }
+    fn check(ty: QType, n: usize) {
+        let row = block(ty, 0xC0FFEE ^ n as u64);
+        let x: Vec<f32> = (0..n).map(|i| ((i * 17 + 3) % 11) as f32 / 5.0 - 1.0).collect();
+        let a = quantize(&x);
+        let mut sc = Scratch::default();
+        let got = row_dot(ty, &row, &a, &mut sc);
+        let exp = q8_dot(ty, &row, &x);
+        let rel = (got - exp).abs() / exp.abs().max(1e-3);
+        assert!(rel < 2e-3, "{ty:?} row_dot {got} vs dequant {exp} rel {rel}");
+        if supports_k(ty) && n % 256 == 0 {
+            let mut ak = Q8K::default(); quantize_k_into(&x, &mut ak);
+            let gk = row_dot_k(ty, &row, &ak);
+            let mut y = vec![0f32; n]; dequant(ty, &row[..ty.row_bytes(n)], &mut y);
+            let mut ek = 0f32; for b in 0..n / 256 { let mut s = 0f32; for j in 0..256 { s += y[b * 256 + j] * ak.q[b * 256 + j] as f32; } ek += s * ak.d[b]; }
+            let relk = (gk - ek).abs() / ek.abs().max(1e-3);
+            assert!(relk < 2e-3, "{ty:?} row_dot_k {gk} vs dequant {ek} rel {relk}");
+        }
+    }
+    #[test]
+    fn iq3_iq4_match_dequant() {
+        for ty in [QType::IQ3XXS, QType::IQ3S, QType::IQ4NL, QType::IQ4XS] { check(ty, if ty == QType::IQ4NL { 64 } else { 512 }); }
+        // existing types still match
+        for ty in [QType::IQ2S, QType::IQ2XXS, QType::Q2_0] { check(ty, if ty == QType::Q2_0 { 128 } else { 256 }); }
+    }
+}
