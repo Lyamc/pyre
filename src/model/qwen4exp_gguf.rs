@@ -3293,12 +3293,36 @@ pub static BPF_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// (grouped GEMM over the tokens routed to it). Changes prompt numerics vs the exact f32 prefill -> opt-in.
 pub fn bpf() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPF").map(|v| v == "1").unwrap_or(BPF_DEFAULT.load(std::sync::atomic::Ordering::Relaxed))) }
 #[derive(Clone)]
-pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
+pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Chunked>, v: Vec<Chunked>, ik: Vec<Chunked>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
 /// On-disk form of a prefix-cache snapshot (engine_qn PYRE_QN_PCACHE_DIR): "PYSNAP01", key u64, tokens, the seven state
 /// groups and the MTP residual window as length-prefixed little-endian f32 runs, then "END!". Written to .tmp + rename.
 fn snap_wu(w: &mut impl std::io::Write, n: usize) -> std::io::Result<()> { w.write_all(&(n as u64).to_le_bytes()) }
 fn snap_wf(w: &mut impl std::io::Write, x: &[f32]) -> std::io::Result<()> { snap_wu(w, x.len())?; w.write_all(unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) }) }
 fn snap_ru(r: &mut impl std::io::Read) -> std::io::Result<usize> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; let n = u64::from_le_bytes(b); if n > 1 << 33 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot length out of range")); } Ok(n as usize) }
+/// One layer's host K/V (or indexer K) rows in a prefix-cache snapshot, cut into SNAP_CH-position chunks behind Arcs:
+/// a snapshot whose tokens share a prefix with an earlier one reuses that one's chunks inside the prefix and copies only
+/// the tail, and the clone for the background disk save is a pointer copy (int77).
+#[derive(Clone, Default)]
+pub struct Chunked { len: usize, ch: Vec<std::sync::Arc<Vec<f32>>> }
+const SNAP_CH: usize = 1024;
+impl Chunked {
+    /// `src` holds `npos` positions of `row` floats; chunk i comes from `prev` when all its positions are among the
+    /// first `share` tokens both states have in common and `prev` is chunked the same way.
+    fn new(src: &[f32], npos: usize, row: usize, prev: Option<&Chunked>, share: usize) -> Chunked {
+        if row == 0 || npos == 0 || src.len() != npos * row { return Chunked::from_vec(src.to_vec()); }
+        let cf = SNAP_CH * row; let mut ch = Vec::with_capacity(src.len().div_ceil(cf));
+        let mut i = 0;
+        while i * cf < src.len() {
+            let e = ((i + 1) * cf).min(src.len());
+            let reuse = if (i + 1) * SNAP_CH <= share { prev.filter(|p| p.ch.len() > i && p.ch[..=i].iter().all(|c| c.len() == cf)).map(|p| p.ch[i].clone()) } else { None };
+            ch.push(reuse.unwrap_or_else(|| std::sync::Arc::new(src[i * cf..e].to_vec()))); i += 1;
+        }
+        Chunked { len: src.len(), ch }
+    }
+    fn from_vec(v: Vec<f32>) -> Chunked { Chunked { len: v.len(), ch: if v.is_empty() { vec![] } else { vec![std::sync::Arc::new(v)] } } }
+    fn to_vec(&self) -> Vec<f32> { let mut v = Vec::with_capacity(self.len); for c in &self.ch { v.extend_from_slice(c); } v }
+    fn write(&self, w: &mut impl std::io::Write) -> std::io::Result<()> { snap_wu(w, self.len)?; for c in &self.ch { w.write_all(unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u8, c.len() * 4) })?; } Ok(()) }
+}
 fn snap_rf(r: &mut impl std::io::Read) -> std::io::Result<Vec<f32>> { let n = snap_ru(r)?; let mut x = vec![0f32; n]; r.read_exact(unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut u8, n * 4) })?; Ok(x) }
 impl Snap {
     pub fn save(&self, path: &std::path::Path, key: u64) -> std::io::Result<()> {
@@ -3308,7 +3332,9 @@ impl Snap {
             let mut w = std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(&tmp)?);
             w.write_all(b"PYSNAP01")?; w.write_all(&key.to_le_bytes())?;
             snap_wu(&mut w, self.tokens.len())?; for t in &self.tokens { w.write_all(&t.to_le_bytes())?; }
-            for g in [&self.conv, &self.ssm, &self.k, &self.v, &self.ik, &self.ib, &self.ple_hist] { snap_wu(&mut w, g.len())?; for x in g.iter() { snap_wf(&mut w, x)?; } }
+            for g in [&self.conv, &self.ssm] { snap_wu(&mut w, g.len())?; for x in g.iter() { snap_wf(&mut w, x)?; } }
+            for g in [&self.k, &self.v, &self.ik] { snap_wu(&mut w, g.len())?; for x in g.iter() { x.write(&mut w)?; } }
+            for g in [&self.ib, &self.ple_hist] { snap_wu(&mut w, g.len())?; for x in g.iter() { snap_wf(&mut w, x)?; } }
             snap_wu(&mut w, self.mtp_r.len())?; for (p, x) in &self.mtp_r { snap_wu(&mut w, *p)?; snap_wf(&mut w, x)?; }
             w.write_all(b"END!")?; w.flush()?;
         }
@@ -3328,23 +3354,43 @@ impl Snap {
         let nm = snap_ru(&mut r)?; let mut mtp_r = std::collections::VecDeque::new();
         for _ in 0..nm { let p = snap_ru(&mut r)?; mtp_r.push_back((p, snap_rf(&mut r)?)); }
         let mut e = [0u8; 4]; r.read_exact(&mut e)?; if &e != b"END!" { return Err(bad("truncated")); }
-        let mut it = gs.into_iter();
-        let mut s = Snap { tokens, conv: it.next().unwrap(), ssm: it.next().unwrap(), k: it.next().unwrap(), v: it.next().unwrap(), ik: it.next().unwrap(), ib: it.next().unwrap(), ple_hist: it.next().unwrap(), mtp_r, bytes: 0 };
-        let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
-        s.bytes = sz(&s.conv) + sz(&s.ssm) + sz(&s.k) + sz(&s.v) + sz(&s.ik) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
+        let mut it = gs.into_iter(); let ch = |g: Vec<Vec<f32>>| g.into_iter().map(Chunked::from_vec).collect::<Vec<_>>();
+        let mut s = Snap { tokens, conv: it.next().unwrap(), ssm: it.next().unwrap(), k: ch(it.next().unwrap()), v: ch(it.next().unwrap()), ik: ch(it.next().unwrap()), ib: it.next().unwrap(), ple_hist: it.next().unwrap(), mtp_r, bytes: 0 };
+        s.bytes = s.logical_bytes();
         Ok(s)
+    }
+    /// Size of the full (unshared) state: what save() writes.
+    fn logical_bytes(&self) -> usize {
+        let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>(); let szc = |v: &Vec<Chunked>| v.iter().map(|x| x.len * 4).sum::<usize>();
+        sz(&self.conv) + sz(&self.ssm) + szc(&self.k) + szc(&self.v) + szc(&self.ik) + sz(&self.ib) + sz(&self.ple_hist) + self.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>()
+    }
+    /// RAM held by a set of snapshots, counting each shared K/V chunk once.
+    pub fn ram_bytes(pc: &[Snap]) -> usize {
+        let mut seen = std::collections::HashSet::new(); let mut t = 0usize;
+        for s in pc {
+            let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
+            t += sz(&s.conv) + sz(&s.ssm) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
+            for g in [&s.k, &s.v, &s.ik] { for x in g { for c in &x.ch { if seen.insert(std::sync::Arc::as_ptr(c) as usize) { t += c.len() * 4; } } } }
+        }
+        t
     }
 }
 impl Model {
     /// Snapshot of `st` (None when the GPU holds attention rows the host copy lacks, i.e. after decode steps).
-    pub fn snapshot(&self, st: &mut State) -> Option<Snap> {
+    pub fn snapshot(&self, st: &mut State) -> Option<Snap> { self.snapshot_with(st, &[]) }
+    /// snapshot() that shares K/V chunks with whichever of `prev` has the longest common token prefix with `st`.
+    pub fn snapshot_with(&self, st: &mut State, prev: &[Snap]) -> Option<Snap> {
         let row = self.cfg.n_kv * self.cfg.hd;
         for ai in 0..st.k.len() { self.kv_pull(ai, st); }
         for (ai, g) in st.kvg.iter().enumerate() { if let Some(g) = g { if g.len * row > st.k.get(ai).map_or(0, |k| k.len()) { return None; } } }
         let (conv, ssm) = if st.gdn_gpu { let cb = self.cube.as_ref()?; (st.gdn.iter().map(|(a, _)| cb.read(a)).collect::<Vec<_>>(), st.gdn.iter().map(|(_, b)| cb.read(b)).collect::<Vec<_>>()) } else { (st.conv.clone(), st.ssm.clone()) };
-        let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
-        let mut s = Snap { tokens: st.tokens.clone(), conv, ssm, k: st.k.clone(), v: st.v.clone(), ik: st.ik.clone(), ib: st.ib.clone(), ple_hist: st.ple_hist.clone(), mtp_r: st.mtp_r.clone(), bytes: 0 };
-        s.bytes = sz(&s.conv) + sz(&s.ssm) + sz(&s.k) + sz(&s.v) + sz(&s.ik) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
+        let lcp = |p: &Snap| p.tokens.iter().zip(st.tokens.iter()).take_while(|(a, b)| a == b).count();
+        let (best, share) = prev.iter().map(|p| (Some(p), lcp(p))).max_by_key(|x| x.1).unwrap_or((None, 0));
+        let npos = st.tokens.len(); let ih = self.cfg.idx_hd;
+        let cg = |g: &Vec<Vec<f32>>, pg: Option<&Vec<Chunked>>, r: usize| g.iter().enumerate().map(|(ai, x)| Chunked::new(x, npos, r, pg.and_then(|pg| pg.get(ai)), share)).collect::<Vec<_>>();
+        let (k, v, ik) = (cg(&st.k, best.map(|b| &b.k), row), cg(&st.v, best.map(|b| &b.v), row), cg(&st.ik, best.map(|b| &b.ik), ih));
+        let mut s = Snap { tokens: st.tokens.clone(), conv, ssm, k, v, ik, ib: st.ib.clone(), ple_hist: st.ple_hist.clone(), mtp_r: st.mtp_r.clone(), bytes: 0 };
+        s.bytes = s.logical_bytes();
         Some(s)
     }
     /// Prompt window of the verify-path prefill (PYRE_QN_PF_MULTI, else the serve default PF_MULTI_DEFAULT; 0 = f32 CPU prefill).
@@ -3353,7 +3399,7 @@ impl Model {
     /// A fresh State equal to the snapshot (GPU mirrors are rebuilt on demand; the MTP drafter K/V catches up from the residual window).
     pub fn restore(&self, s: &Snap) -> State {
         let mut st = self.new_state();
-        st.tokens = s.tokens.clone(); st.conv = s.conv.clone(); st.ssm = s.ssm.clone(); st.k = s.k.clone(); st.v = s.v.clone(); st.ik = s.ik.clone(); st.ib = s.ib.clone(); st.ple_hist = s.ple_hist.clone(); st.mtp_r = s.mtp_r.clone();
+        st.tokens = s.tokens.clone(); st.conv = s.conv.clone(); st.ssm = s.ssm.clone(); st.k = s.k.iter().map(Chunked::to_vec).collect(); st.v = s.v.iter().map(Chunked::to_vec).collect(); st.ik = s.ik.iter().map(Chunked::to_vec).collect(); st.ib = s.ib.clone(); st.ple_hist = s.ple_hist.clone(); st.mtp_r = s.mtp_r.clone();
         st
     }
 }
