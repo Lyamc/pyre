@@ -245,6 +245,8 @@ pub fn xc_register(bytes: u64) { XC_CFG.store(bytes, Ordering::Relaxed); XC_TGT.
 /// Target expert-cache bytes (the model resizes when this differs from what it applied; then calls xc_applied).
 pub fn xc_target() -> u64 { XC_TGT.load(Ordering::Relaxed) }
 pub fn xc_applied(bytes: u64) { XC_CUR.store(bytes, Ordering::Relaxed); }
+/// Expert-cache bytes the model last applied (register or resize).
+pub fn xc_current() -> u64 { XC_CUR.load(Ordering::Relaxed) }
 /// PYRE_VRAM_ADAPT (default 1, 0 = off): adaptive expert cache (dedicated, returnable arenas).
 /// Below the floor: cut the expert-cache target so free returns to floor + 768 MiB (applied at the next step). false = nothing to shrink.
 fn emergency_shrink(free: u64) -> bool {
