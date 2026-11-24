@@ -1,7 +1,7 @@
 # pyre handoff: state as of 2026-11-24 12:00 (America/Edmonton, UTC-6)
 
 ## Project
-- Repo: https://github.com/Lyamc/pyre, default branch `qwen-int` (this doc is a docs-only commit on top of `90dd7a5`, the PR #24 merge). `master` is fast-forwarded to the same head; `qwen-int` stays the default branch.
+- Repo: https://github.com/Lyamc/pyre, default branch `qwen-int` (this doc is a docs-only commit on top of `377ae13`, the PR #25 merge). `master` is fast-forwarded to the same head; `qwen-int` stays the default branch.
 - pyre is a native Rust/Burn/CubeCL inference server. It covers LLM chat (Qwen3.8-Flash-Next MoE), STT, TTS, diarization, image/"cabin" workflows and planned 3D tooling, with a web UI.
 - Host machine: **HYTE** (Windows, RTX 3060 12 GB, machineId `39c6a724-91a3-4133-b282-7864b570787c`). Model: Qwen-Next IQ3_S GGUF mix at `C:\AI\models\models\IQ3_S` (`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`). MTP drafter weights are at `C:\AI\models\mtp\mtp.safetensors`. STT weights live under `C:\AI\models\stt` (`WHISBURN_MODELS_DIR`).
 
@@ -17,9 +17,9 @@
 - Expose model capabilities (text/image input, etc.) via the API.
 - The owner prefers quick checks over extensive tests.
 
-## Production (live now): int76
-- `C:\Temp\qnx\int\pyre_int76.exe`, built from local branch `test/int75` (= PRs #19-#24). **Its tree is identical to qwen-int `90dd7a5`** (checked with `git rev-parse <ref>^{tree}`). Server PID 5652, watchdog PID 6792, started 11:10 AM America/Edmonton on 2026-11-24, `0.0.0.0:8099`. pyre_nano PID 23936 on `0.0.0.0:8102`. Lyam's llama-server (127.0.0.1:8081) also runs on this GPU; leave it alone.
-- Launch: `restore_prod.ps1` / `Start-Pyre.ps1` -> `srv.ps1 -exe pyre_int76.exe -tag int76`, same model/audio args as int69 (IQ3_S on CUDA, MTP drafter, Whisper base + Parakeet v2 + Fluid Speech Pro on CPU). `srv.ps1` now keeps the previous run's `C:\Temp\qnx\server_<tag>.log/.err.log` as `*.prev` (a shutdown cause was lost once when a guard restart overwrote them).
+## Production (live now): int77
+- `C:\Temp\qnx\int\pyre_int77.exe`, built from `perf/pcache-shared-chunks` `ddbddc8` (= qwen-int `90dd7a5` + docs + PR #25; source tree equals the `377ae13` merge). Server PID 25644, watchdog PID 40652, started 12:08 PM America/Edmonton on 2026-11-24, `0.0.0.0:8099`. pyre_nano PID 23936 on `0.0.0.0:8102`. Lyam's llama-server (127.0.0.1:8081) also runs on this GPU; leave it alone.
+- Launch: `restore_prod.ps1` / `Start-Pyre.ps1` -> `srv.ps1 -exe pyre_int77.exe -tag int77`, same model/audio args as int69 (IQ3_S on CUDA, MTP drafter, Whisper base + Parakeet v2 + Fluid Speech Pro on CPU). `srv.ps1` now keeps the previous run's `C:\Temp\qnx\server_<tag>.log/.err.log` as `*.prev` (a shutdown cause was lost once when a guard restart overwrote them).
 - Env (set via `-e @{...}` in `restore_prod.ps1` / `Start-Pyre.ps1`; `srv.ps1` sets `PYRE_VRAM_FLOOR_MB=1024`, `PYRE_MTP`, `PYRE_QN_TOKENIZER`):
 
   | Var | Value | From | Effect |
@@ -32,10 +32,11 @@
 
 - New tunables (defaults unless noted): `PYRE_QN_ATTN_SC_MB` (256), `PYRE_QN_PCACHE_ALL` (0) [#19]; `PYRE_QN_PCACHE_DISK_N` (2), `PYRE_QN_PCACHE_MIN_FREE_GB` (10), `PYRE_QN_PCACHE_SAVE_S` (900; each save writes the whole snapshot, ~1-3 GB, so mind SSD wear) [#22]; `PYRE_XC_SHRINK_BELOW_MB` (512), `PYRE_XC_GROW_STEP_MB` (256), `PYRE_XC_MIN_MB` (128), `PYRE_XC_HOLD_S` (600) [#23]; `PYRE_QN_LOCK_EXPERTS` (0; 1 = VirtualLock ~47 GiB, dedicated box only) [#24].
 - Live numbers (agent workload, ~15-30k-token contexts): decode 16.8-17.1 tok/s (int72 16.2-16.5), prefill ~40-47 tok/s, VRAM 1.7-2.2 GB free, expert cache 0.5-1.1 GB, recent hit rate 0.33-0.46. Decode is bound by CPU expert compute / memory bandwidth (24 pinned expert workers, AVX2+FMA), not by the GPU cache size or paging.
-- **Rollback:** in `C:\Temp\qnx\int`, copy `srv_int72b_backup.ps1`, `restore_prod_int72b_backup.ps1`, `Start-Pyre_int72b_backup.ps1` over `srv.ps1` / `restore_prod.ps1` / `Start-Pyre.ps1` (int72 = #19-#21), then `C:\Temp\qnx\stopgrace.ps1 -id <pid>` and `restore_prod.ps1`. Older: `*_int75_backup.ps1` (int75), `*_int71_backup.ps1` (#19+#20), `*_int70_backup.ps1` (#19), `*_int69_backup.ps1` (pre-Nov-24). Exes `pyre_int69..int76.exe` are all kept (int73 = #22 only, int74 = #23 only; neither ever ran in prod).
+- **Rollback to int76** (#19-#24): copy `srv_int76_backup.ps1`, `restore_prod_int76_backup.ps1`, `Start-Pyre_int76_backup.ps1` over the live scripts, then stopgrace + `restore_prod.ps1`.
+- **Older rollback:** in `C:\Temp\qnx\int`, copy `srv_int72b_backup.ps1`, `restore_prod_int72b_backup.ps1`, `Start-Pyre_int72b_backup.ps1` over `srv.ps1` / `restore_prod.ps1` / `Start-Pyre.ps1` (int72 = #19-#21), then `C:\Temp\qnx\stopgrace.ps1 -id <pid>` and `restore_prod.ps1`. Older: `*_int75_backup.ps1` (int75), `*_int71_backup.ps1` (#19+#20), `*_int70_backup.ps1` (#19), `*_int69_backup.ps1` (pre-Nov-24). Exes `pyre_int69..int77.exe` are all kept (int73 = #22 only, int74 = #23 only; neither ever ran in prod).
 - Watchdog `C:\Temp\qnx\server_watchdog.ps1` stops pyre when free VRAM < 1024 MiB. `C:\Temp\qnx\bendrun\pyre_guard.ps1` (bendrun harness) runs `restore_prod.ps1` if :8099 is down 3+ min and restarts nano.
 
-## Nov 24 merges (PRs #19-#24, all merged into qwen-int)
+## Nov 24 merges (PRs #19-#25, all merged into qwen-int)
 | PR | Merge | What |
 |---|---|---|
 | [#19](https://github.com/Lyamc/pyre/pull/19) perf/prefill-batch | `0b22b5b` | 1024-token prefill chunks by default; attention score scratch sub-batched (`PYRE_QN_ATTN_SC_MB`); prefix snapshots only at the cut + last grid boundary |
@@ -44,8 +45,9 @@
 | [#22](https://github.com/Lyamc/pyre/pull/22) feat/pcache-disk | `881315a` | prefix-cache snapshots persisted to disk, loaded at start; idle + periodic background saves; free-space guard |
 | [#23](https://github.com/Lyamc/pyre/pull/23) fix/xcache-governor-tune | `c2eaaf1` | env-tunable cache gates; no-op at min target (int72 logged 1784 fake shrinks); hold shrinks that free no VRAM |
 | [#24](https://github.com/Lyamc/pyre/pull/24) perf/expert-residency | `90dd7a5` | opt-in soft min working set / VirtualLock for routed experts |
+| [#25](https://github.com/Lyamc/pyre/pull/25) perf/pcache-shared-chunks | `377ae13` | prefix-cache snapshots share 1024-position Arc K/V chunks inside the LCP; RAM cap counts unique chunks; disk format unchanged (int77: snapshot 0.4-1.1 s -> ~0.3-0.4 s, 5 snapshots 2.96 GB with 3.4 GB shared) |
 
-Next ideas: shared-chunk prefix snapshots (k/v/ik are append-only; reuse the previous snapshot's chunks inside the LCP and copy only the tail, to cut ~0.5-1 s/turn and ~1.5 GB RAM churn); GPU expert streaming for large prefill chunks; dropping cache slots without a full rebuild.
+Next ideas: snapshot time is now mostly GPU GDN-state reads + kv_pull + the <1024-token tail (skip re-reading unchanged GDN state); GPU expert streaming for large prefill chunks; dropping cache slots without a full rebuild.
 ## Client audio extraction (PR #18)
 - Merged into qwen-int as `604938522ebb69a340c7846afbda5d19794cfaf0` ([PR #18](https://github.com/Lyamc/pyre/pull/18), head `93ccccb`). Production int69 already runs this code; nothing was redeployed after the merge.
 - Uploading a video (e.g. `.mp4`) in the Audio tab extracts **16 kHz mono WAV on the client** and sends only that audio to the server. A 5.8 MB test video became a 450 KB upload and transcribed correctly.
@@ -75,6 +77,7 @@ These were the original gaps versus Strata (30–50 tok/s on the same model). PR
 | Worktree / leftover cleanup | Listed below; not deleted | Ask before deleting anything. |
 
 ## Recently done
+- **Nov 24 12:08: int77 in production**: PR #25 shared-chunk prefix snapshots merged (`377ae13`); master fast-forwarded.
 - **Nov 24: int76 in production**: PRs #19-#24 merged (table above); master fast-forwarded to qwen-int. C: build dirs cleaned (deps/incremental, 62.9 GB freed, approved by Lyam). bendrun harness (C:\Temp\qnx\bendrun) drives pyre as a coding agent writing a Bend SDF UI library in C:\Build\ui\bend-sdf-ui; see CHECKUP.md there.
 - **int69 in production** (this afternoon): Fluid Speech Pro added to `srv.ps1` / `restore_prod.ps1` / `Start-Pyre.ps1`; browser audio extraction from PR #18 shipped in the same binary. Restarted via the production scripts; nano on :8102 was left running; no rollback.
 - PR #18 (merged `6049385`): browser-side audio extraction with Mediabunny and a WebAudio fallback, so video uploads send only 16 kHz mono WAV. Submodule `vendor/mediabunny` from [Lyamc/mediabunny](https://github.com/Lyamc/mediabunny) branch `pyre-dist` (`4d5270b`).
