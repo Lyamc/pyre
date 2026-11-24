@@ -446,7 +446,10 @@ type Transcript = pyre_whisper_core::TranscriptResult;
 /// request `timestamps=true` explicitly.
 pub(crate) fn default_include_timestamps(model: &str) -> bool {
     // Keep the request default in sync with the capability the UI displays.
-    crate::speech_caps::profile(model).timestamps
+    // Fluid Speech Pro can give TDT word timestamps (clean_mode profile) but they stay opt-in,
+    // like the other Parakeet checkpoints.
+    let p = crate::speech_caps::profile(model);
+    p.timestamps && !p.clean_mode
 }
 
 /// Beam size that gives the best measured latency at unchanged WER for each Whisper size.
