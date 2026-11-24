@@ -322,6 +322,7 @@ pub fn governor_start() {
         let _ = std::thread::Builder::new().name("pyre-governor".into()).spawn(move || {
             let dev = nvml().and_then(|n| n.device_by_index(0).ok());
             let (mut ema, mut sat_since, mut calm_since, mut last_adj, mut last_grow, mut others_until) = (0.0f64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut grow_cd: u64 = 120_000; // expert-cache grow cooldown (ms), doubles after a shrink that follows a grow
             let mut r = 0.0f64; let mut high_since = 0u64; let mut low_n = 0u32;
             let grace = std::env::var("PYRE_STOP_GRACE_S").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10) * 1000;
             loop {
@@ -370,17 +371,23 @@ pub fn governor_start() {
                         if free < fl + (512 << 20) { low_n += 1; } else { low_n = 0; }
                         if free < fl + (512 << 20) && low_n >= 3 && seen && applied && tgt > 0 { low_n = 0;
                             let deficit = (fl + (768 << 20)).saturating_sub(free).next_multiple_of(256 << 20);
-                            let nt = tgt.saturating_sub(deficit);
+                            // never 0: a zero target is skipped by the model hooks, so it was never applied and the governor stalled (applied stayed false)
+                            let nt = tgt.saturating_sub(deficit).max(128 << 20);
+                            // a shrink soon after a grow means the grow was too eager: double the grow cooldown (2 min .. 30 min)
+                            grow_cd = if t - last_grow < 600_000 { (grow_cd * 2).min(1_800_000) } else { grow_cd.max(120_000) };
                             XC_TGT.store(nt, Ordering::Relaxed); XC_SHRINKS.fetch_add(1, Ordering::Relaxed); crate::metrics::warning(); high_since = 0; last_grow = t;
                             crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "shrink_expert_cache", "free_mib": free >> 20, "floor_mib": fl >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20}));
-                        } else if free > fl + (832 << 20) && applied && tgt < cfg && LEASES.load(Ordering::SeqCst) == 0 {
+                        // grow only with real headroom (free > floor + 1280 MiB), after grow_cd of calm, by <= 256 MiB, leaving >= floor + 1024 MiB
+                        // free: growing into the shrink band (old: > floor + 832 after 30 s, up to 512 MiB) made the cache resize every few
+                        // minutes as the KV grew (16 full cache rebuilds in 35 min on HYTE at a 30k-token agent context)
+                        } else if free > fl + (1280 << 20) && applied && tgt < cfg && LEASES.load(Ordering::SeqCst) == 0 {
                             if high_since == 0 { high_since = t; }
-                            if t - high_since > 30_000 && t - last_grow > 30_000 {
-                                let room = free - (fl + (768 << 20)); let step = room.min(512 << 20).min(cfg - tgt) & !((64u64 << 20) - 1);
+                            if t - high_since > grow_cd && t - last_grow > grow_cd {
+                                let room = free - (fl + (1024 << 20)); let step = room.min(256 << 20).min(cfg - tgt) & !((64u64 << 20) - 1);
                                 if step > 0 { let nt = tgt + step; XC_TGT.store(nt, Ordering::Relaxed); XC_GROWS.fetch_add(1, Ordering::Relaxed); last_grow = t; high_since = t;
                                     crate::logbuf::event("vram_pressure", "INFO", serde_json::json!({"action": "grow_expert_cache", "free_mib": free >> 20, "from_mib": tgt >> 20, "to_mib": nt >> 20})); }
                             }
-                        } else if free <= fl + (832 << 20) { high_since = 0; }
+                        } else if free <= fl + (1280 << 20) { high_since = 0; }
                     }
                 }
             }
