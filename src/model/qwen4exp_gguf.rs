@@ -641,7 +641,7 @@ impl Model {
                     if xexact() && nslot > 2 * maxper { eprintln!("gpu: XEXACT expert cache capped at {} slots (2 arenas of {} MiB; the exact kernels take at most 2)", 2 * maxper, (maxper * slot) >> 20); nslot = 2 * maxper; }
                     let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot; // even arenas, each <= 2.5 GiB (one buffer > ~3.1 GB fails to allocate)
                     self.xc = Some(std::sync::Mutex::new(XCache { tabs: cb.xtabs(), arena: (0..narena).map(|_| if crate::limits::vram_adapt_on() { cb.client.memory_dedicated_allocation((), |_| cb.xarena(ar_bytes)) } else if xarena_persist() { cb.client.memory_persistent_allocation((), |_| cb.xarena(ar_bytes)) } else { cb.xarena(ar_bytes) }).collect(), ar_bytes, per, slot, free: (0..nslot).rev().collect(), map: Default::default(), cnt: vec![vec![0; self.cfg.n_exp]; self.layers.len()], stream: vec![], used: 0, budget, calls: 0, hits: 0, total: 0, scr: cb.xscratch(self.cfg.d, self.cfg.ff_exp, self.cfg.top_k), sloc: vec![], bg: None }));
-                    if !xclass() { crate::limits::xc_register(budget as u64); }
+                    crate::limits::xc_register(budget as u64); // XCLASS caches resize too (xc_resize -> xclass_fill)
                     xtr(|| format!("C {nslot} {slot} {} {} {}", self.layers.len(), self.cfg.n_exp, self.cfg.top_k)); for (il, l) in self.layers.iter().enumerate() { let t3 = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)); let el = matches!(t3, (Some(_), Some(_), Some(_))) && (!xexact() || xexact_types(l)); let b = if let (Some(a), Some(b2), Some(c2)) = t3 { let w = super::qn_cube::xwords((a, b2, c2), self.cfg.d, self.cfg.ff_exp); 4 * (w.0 + w.1 + w.2) } else { 0 }; xtr(|| format!("S {il} {b} {}", el as u8)); }
                     if xclass() { let xm = self.xc.as_ref().unwrap(); let mut x = xm.lock().unwrap();
                         // classes: expert bytes (256-aligned) -> layer count; each layer gets q slots of its class, largest first
@@ -2025,12 +2025,25 @@ impl Model {
         crate::limits::gpu_pace();
         let Some(cb) = &self.cube else { return };
         if crate::limits::stop_requested() { let t = cb.empty(1); let _ = cb.read(&t); crate::limits::stop_now(); }
-        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 { let mut x = xm.lock().unwrap(); if tgt != x.budget && x.sloc.is_empty() { self.xc_resize(cb, &mut x, tgt); } } }
+        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 && tgt as u64 != crate::limits::xc_current() { let mut x = xm.lock().unwrap(); self.xc_resize(cb, &mut x, tgt); } }
     }
     /// Called by the serve worker while idle: apply a changed expert-cache target (VRAM leases) without a request.
     pub fn idle_hook(&self) {
         let Some(cb) = &self.cube else { return };
-        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 { let mut x = xm.lock().unwrap(); if tgt != x.budget && x.sloc.is_empty() { self.xc_resize(cb, &mut x, tgt); } } }
+        if let Some(xm) = &self.xc { let tgt = crate::limits::xc_target() as usize; if tgt > 0 && tgt as u64 != crate::limits::xc_current() { let mut x = xm.lock().unwrap(); self.xc_resize(cb, &mut x, tgt); } }
+    }
+    /// XCLASS slot table for the arenas `x` holds now: expert-size classes (256-aligned bytes -> layer count), q slots per
+    /// layer of each class, largest first (same layout as at load).
+    fn xclass_fill(&self, x: &mut XCache) {
+        let mut cls: std::collections::BTreeMap<usize, usize> = Default::default();
+        for l in &self.layers { if let (Some(a), Some(b), Some(c2)) = (super::qn_cube::xtype(l.gate_e.ty), super::qn_cube::xtype(l.up_e.ty), super::qn_cube::xtype(l.down_e.ty)) { let w = super::qn_cube::xwords((a, b, c2), self.cfg.d, self.cfg.ff_exp); *cls.entry((4 * (w.0 + w.1 + w.2)).next_multiple_of(256)).or_default() += 1; } }
+        let ar_bytes = x.ar_bytes; let tot: usize = x.arena.len() * ar_bytes; let per_q: usize = cls.iter().map(|(s, n)| s * n).sum::<usize>().max(1);
+        let mut q = tot / per_q; let mut sloc = vec![];
+        loop { sloc.clear(); let (mut ai, mut off) = (0usize, 0usize); let mut ok = true;
+            for (&sz, &n) in cls.iter().rev() { for _ in 0..n * q { if off + sz > ar_bytes { ai += 1; off = 0; } if ai >= x.arena.len() { ok = false; break; } sloc.push((ai, off, sz)); off += sz; } if !ok { break; } }
+            if ok || q == 0 { break; } q -= 1; }
+        x.free = (0..sloc.len()).rev().collect(); x.budget = sloc.iter().map(|v| v.2).sum(); x.sloc = sloc;
+        eprintln!("xcache: XCLASS resized: {} slots ({} per layer), {} MiB", x.free.len(), q, x.budget >> 20);
     }
     fn xc_resize(&self, cb: &super::qn_cube::Cube, x: &mut XCache, tgt: usize) {
         let t0 = std::time::Instant::now(); let old = x.budget;
@@ -2043,6 +2056,10 @@ impl Model {
         let narena = nslot.div_ceil(maxper.max(1)).max(1); let per = nslot.div_ceil(narena).max(1); let ar_bytes = per * slot;
         x.arena = (0..narena).map(|_| cb.client.memory_dedicated_allocation((), |_| cb.xarena(ar_bytes))).collect();
         x.ar_bytes = ar_bytes; x.per = per; x.free = (0..narena * per).rev().collect(); x.budget = tgt;
+        // XCLASS (default): lay the per-class slots out again in the new arenas (before this, an XCLASS cache never resized, so
+        // VRAM pressure could only end in the 1 GiB watchdog stopping pyre)
+        if !x.sloc.is_empty() || xclass() { self.xclass_fill(x); }
+        { let k = xstream().min(x.free.len()); for _ in 0..k { let mx = x.free.iter().map(|&s| x.cap(s)).max().unwrap_or(0); let i = x.free.iter().position(|&s| x.cap(s) == mx).unwrap_or(0); let sl = x.free.remove(i); let cp = x.cap(sl); x.stream.push(sl); x.budget = x.budget.saturating_sub(cp); } }
         crate::limits::xc_applied(tgt as u64); crate::metrics::xcache_slots(0, narena * per, slot);
         let fr = crate::limits::vram().map(|v| v.free >> 20).unwrap_or(0);
         crate::logbuf::event("xcache_resize", if tgt < old { "WARN" } else { "INFO" }, serde_json::json!({"from_mib": old >> 20, "to_mib": tgt >> 20, "slots": narena * per, "ms": t0.elapsed().as_millis() as u64, "free_mib_after": fr}));
