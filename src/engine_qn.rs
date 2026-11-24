@@ -208,11 +208,11 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         logits = m.forward(&prompt[pos..end], &mut st); pos = end;
         if pcache_on() && (end == cut || end % chunk == 0 && (pcache_all() || end + chunk >= prompt.len())) && end < prompt.len() && !pc.iter().any(|s| s.tokens.len() == end && s.tokens[..] == prompt[..end]) {
             let ts = Instant::now();
-            if let Some(s) = m.snapshot(&mut st) { pc.push(s); let cap = pcache_mb() << 20; while pc.len() > 1 && pc.iter().map(|s| s.bytes).sum::<usize>() > cap { pc.remove(0); } }
+            if let Some(s) = m.snapshot_with(&mut st, &pc) { pc.push(s); let cap = pcache_mb() << 20; while pc.len() > 1 && Snap::ram_bytes(&pc) > cap { pc.remove(0); } }
             snap_ms += ts.elapsed().as_secs_f64() * 1e3;
         }
     }
-    if pcache_on() { tracing::info!("prefix cache: resumed at {cached} (restore {restore_ms:.0} ms), {} snapshots {:.0} MB, snapshot time {snap_ms:.0} ms", pc.len(), pc.iter().map(|s| s.bytes).sum::<usize>() as f64 / 1048576.0); }
+    if pcache_on() { tracing::info!("prefix cache: resumed at {cached} (restore {restore_ms:.0} ms), {} snapshots {:.0} MB ({:.0} MB shared), snapshot time {snap_ms:.0} ms", pc.len(), Snap::ram_bytes(&pc) as f64 / 1048576.0, (pc.iter().map(|s| s.bytes).sum::<usize>().saturating_sub(Snap::ram_bytes(&pc))) as f64 / 1048576.0); }
     tm.prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
     tm.prompt_per_second = tm.prompt_n as f64 / (tm.prompt_ms / 1e3);
     // PYRE_QN_TF_FILE=<path> (diagnostic, off by default): if <path> holds token ids (one line, comma separated), the
@@ -247,7 +247,7 @@ fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenReque
         let dig: Vec<Option<u32>> = (0..5).map(|d| tok.token_to_id(&d.to_string())).collect();
         let mut rating: Option<(f32, f32)> = None;
         if !probes.is_empty() && dig.iter().all(|d| d.is_some()) && prompt.len() + probes.iter().map(|p| p.len()).max().unwrap_or(0) < ctx {
-            if let Some(sn) = m.snapshot(&mut st) {
+            if let Some(sn) = m.snapshot_with(&mut st, &pc) {
                 let dg: Vec<u32> = dig.iter().map(|d| d.unwrap()).collect(); let (mut se, mut sm) = (0f32, 0f32);
                 for p in &probes { let pl = m.forward(p, &mut st); st = m.restore(&sn); let (e, ms) = crate::effort::rating(&pl, &dg); se += e; sm += ms; }
                 let n = probes.len() as f32; rating = Some((se / n, sm / n));
