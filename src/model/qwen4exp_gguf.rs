@@ -547,6 +547,7 @@ impl Model {
         }
         let sum: u64 = mats.par_iter().map(|m| m.bytes().par_chunks(1 << 22).map(|c| { let mut a = 0u64; let mut i = 0; while i < c.len() { a = a.wrapping_add(unsafe { std::ptr::read_volatile(c.as_ptr().add(i)) } as u64); i += 4096; } a }).sum::<u64>()).sum();
         std::hint::black_box(sum);
+        pin_experts_ws(&mats, total);
         total as f64 / (1u64 << 30) as f64
     }
 
@@ -3427,3 +3428,47 @@ pub fn kv8_new_conversation() {
     if free >= fl + h { KV8_ENGAGED.store(false, Relaxed); KV8_DISENGAGES.fetch_add(1, Relaxed);
         crate::logbuf::event("kv8_auto_off", "INFO", serde_json::json!({"free_mib": free, "floor_mib": fl})); }
 }
+
+/// Keep the prefaulted routed experts in the working set (Windows; opt-in). On HYTE (96 GB RAM, 83.6 GB mapped, ~21 GB
+/// private) the memory manager trims expert pages to the standby list during decode and they fault back: ~10k page
+/// faults/s, ~2.1k pages/s (~9 MB/s) read from disk, each a synchronous stall on an expert worker.
+/// - `PYRE_QN_WS_MIN_GB=<n>|auto`: soft minimum working set (auto = experts + 24 GiB); Windows keeps at least that much
+///   resident while memory allows, and still trims below it under real pressure (QUOTA_LIMITS_HARDWS_MIN_DISABLE).
+/// - `PYRE_QN_LOCK_EXPERTS=1`: also VirtualLock every expert tensor (hard; the min working set is raised to cover it). Only
+///   with enough RAM headroom: it takes ~47 GiB away from other apps for the server's lifetime.
+#[cfg(windows)]
+fn pin_experts_ws(mats: &[&QMat], total: usize) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessWorkingSetSizeEx(h: isize, min: usize, max: usize, flags: u32) -> i32;
+        fn VirtualLock(p: *const core::ffi::c_void, n: usize) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const MIN_DISABLE: u32 = 0x2; const MIN_ENABLE: u32 = 0x1; const MAX_DISABLE: u32 = 0x8;
+    let lock = env_var("PYRE_QN_LOCK_EXPERTS").map(|v| v == "1").unwrap_or(false);
+    let min = match env_var("PYRE_QN_WS_MIN_GB").ok().map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "auto" => Some(total + (24usize << 30)),
+        Some(v) => v.parse::<usize>().ok().filter(|g| *g > 0).map(|g| g << 30),
+        None => if lock { Some(total + (24usize << 30)) } else { None },
+    };
+    let Some(min) = min else { return };
+    let mut sys = sysinfo::System::new(); sys.refresh_memory();
+    let max = (sys.total_memory() as usize).max(min + (1usize << 30));
+    let h = unsafe { GetCurrentProcess() };
+    let flags = MAX_DISABLE | if lock { MIN_ENABLE } else { MIN_DISABLE };
+    if unsafe { SetProcessWorkingSetSizeEx(h, min, max, flags) } == 0 {
+        tracing::warn!("qwen4exp: SetProcessWorkingSetSizeEx(min {:.1} GiB) failed: error {}", min as f64 / (1u64 << 30) as f64, unsafe { GetLastError() });
+        return;
+    }
+    tracing::info!("qwen4exp: working-set minimum {:.1} GiB ({})", min as f64 / (1u64 << 30) as f64, if lock { "hard" } else { "soft" });
+    if lock {
+        let (mut ok, mut bad, mut err) = (0usize, 0usize, 0u32);
+        for m in mats { let b = m.bytes(); if b.is_empty() { continue; }
+            if unsafe { VirtualLock(b.as_ptr() as *const _, b.len()) } != 0 { ok += b.len(); } else { bad += b.len(); err = unsafe { GetLastError() }; } }
+        if bad > 0 { tracing::warn!("qwen4exp: VirtualLock: {:.1} GiB locked, {:.1} GiB failed (last error {err})", ok as f64 / (1u64 << 30) as f64, bad as f64 / (1u64 << 30) as f64); }
+        else { tracing::info!("qwen4exp: VirtualLock: {:.1} GiB of routed experts locked", ok as f64 / (1u64 << 30) as f64); }
+    }
+}
+#[cfg(not(windows))]
+fn pin_experts_ws(_mats: &[&QMat], _total: usize) {}
