@@ -17,7 +17,10 @@ pub fn decode_qwen3(
     let runtime = load_qwen3_runtime(model_name);
     let mel_frames = mel.dims()[2];
     let prompt = build_asr_prompt(&runtime, mel_frames, "", forced_language);
+    let profile = std::env::var("PYRE_STT_PROFILE").ok().as_deref() == Some("1");
+    let ta = std::time::Instant::now();
     let audio_features = model.encode_audio(mel);
+    if profile { eprintln!("profile qwen encode={:.3}s", ta.elapsed().as_secs_f64()); }
     let [_, tokens, hidden] = audio_features.dims();
 
     if verbose {
@@ -63,6 +66,7 @@ pub fn decode_qwen3(
             Vec::new(),
         );
     }
+    let tg = std::time::Instant::now();
     let generated = model.thinker.generate_greedy(
         &input_ids,
         audio_features,
@@ -71,6 +75,7 @@ pub fn decode_qwen3(
         max_new_tokens.max(1),
         &device,
     );
+    if profile { eprintln!("profile qwen decode={:.3}s tokens={}", tg.elapsed().as_secs_f64(), generated.len()); }
 
     let raw = bpe.decode(&generated, true).unwrap_or_default();
     let text = parse_qwen3_asr_output_with_forced(&raw, forced_language);

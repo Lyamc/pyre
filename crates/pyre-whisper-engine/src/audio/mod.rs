@@ -50,9 +50,11 @@ impl AudioProcessor {
     pub fn new(device: &burn::tensor::Device, sample_rate: f64, n_mels: usize, is_nemo: bool, model_name: &str) -> Self {
         let is_tone = model_name.contains("t-one");
         // Nemotron Speech and Fluid Speech Pro (a Parakeet TDT v3 fine-tune) use the same
-        // NeMo log-mel as Parakeet. The diarizer does not.
+        // NeMo log-mel as Parakeet: 128-bin Slaney mel, symmetric window and preemphasis.
+        // The diarizer does not.
         let is_parakeet = model_name.contains("parakeet")
             || model_name.contains("nemotron-speech")
+            || model_name.contains("nemotron-3.5")
             || model_name.contains("fluid-speech");
         let is_qwen3 = model_name.contains("qwen3");
         let n_fft = if is_nemo || is_tone || is_parakeet { 512 } else { WHISPER_N_FFT };
@@ -198,5 +200,17 @@ mod tests {
             assert!(AudioProcessor::new(&device, 16_000.0, 128, true, name).is_parakeet, "{name}");
         }
         assert!(!AudioProcessor::new(&device, 16_000.0, 80, true, "t-one").is_parakeet);
+    }
+
+    #[test]
+    fn fluid_speech_uses_the_parakeet_mel_path() {
+        let device = burn::tensor::Device::flex();
+        let fluid = AudioProcessor::new(&device, 16_000.0, 128, false, "fluid-speech-pro");
+        assert!(fluid.is_parakeet);
+        assert_eq!(fluid.n_fft, 512);
+
+        let parakeet = AudioProcessor::new(&device, 16_000.0, 128, false, "parakeet-tdt-0.6b-v3");
+        assert_eq!(fluid.n_fft, parakeet.n_fft);
+        assert!(parakeet.is_parakeet);
     }
 }

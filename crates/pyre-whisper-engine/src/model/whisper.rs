@@ -74,4 +74,17 @@ impl Whisper {
     pub fn decoder_ctx_size(&self) -> usize {
         self.decoder.ctx_size()
     }
+
+    /// Pack each attention's q/k/v weights into one Linear after the bundle is loaded.
+    /// Existing burnpack files store the three projections under their old names, so the
+    /// fused copy is built once at load time rather than changing the serialized format.
+    pub fn fuse_qkv(&mut self, device: &burn::tensor::Device) {
+        for block in &mut self.encoder.blocks {
+            block.attn.fuse_qkv(device);
+        }
+        for block in &mut self.decoder.blocks {
+            block.attn.fuse_qkv(device);
+            block.cross_attn.fuse_qkv(device);
+        }
+    }
 }

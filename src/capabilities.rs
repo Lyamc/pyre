@@ -30,11 +30,14 @@ pub struct Capabilities {
     pub embeddings: bool,
     /// Speaker turns from audio (`/v1/audio/diarize`), not a transcript.
     pub diarization: bool,
+    /// 3D mesh input/output (purely geometric, no neural net).
+    pub mesh_input: bool,
+    pub mesh_output: bool,
 }
 
 impl Capabilities {
     pub const fn none() -> Self {
-        Self { text_input: false, text_output: false, image_input: false, image_output: false, audio_input: false, audio_output: false, tools: false, embeddings: false, diarization: false }
+        Self { text_input: false, text_output: false, image_input: false, image_output: false, audio_input: false, audio_output: false, tools: false, embeddings: false, diarization: false, mesh_input: false, mesh_output: false }
     }
 
     /// Text LLM. `embeddings` is true only for the safetensors Llama worker (`engine`), which
@@ -77,6 +80,7 @@ impl Capabilities {
             Kind::Stt => Self::stt(),
             Kind::Tts => Self::tts(),
             Kind::Tagger => Self::tagger(),
+            Kind::Mesh => Self { mesh_input: true, mesh_output: true, ..Self::none() },
             Kind::Unknown if crate::qn_find::is_qwen4exp(dir) => Self::text_llm(false),
             Kind::Unknown if diarizer_dir(dir) => Self::diarizer(),
             Kind::Unknown => Self::none(),
@@ -88,6 +92,7 @@ impl Capabilities {
         if self.text_input { v.push("text"); }
         if self.image_input { v.push("image"); }
         if self.audio_input { v.push("audio"); }
+        if self.mesh_input { v.push("mesh"); }
         v
     }
 
@@ -97,6 +102,7 @@ impl Capabilities {
         if self.image_output { v.push("image"); }
         if self.audio_output { v.push("audio"); }
         if self.diarization { v.push("diarization"); }
+        if self.mesh_output { v.push("mesh"); }
         v
     }
 
@@ -112,6 +118,7 @@ impl Capabilities {
         io("text", self.text_input, self.text_output);
         io("image", self.image_input, self.image_output);
         io("audio", self.audio_input, self.audio_output);
+        io("mesh", self.mesh_input, self.mesh_output);
         if self.tools { bits.push("tools".into()); }
         if self.embeddings { bits.push("embeddings".into()); }
         if self.diarization { bits.push("diarization".into()); }
@@ -129,6 +136,8 @@ impl Capabilities {
             "tools": self.tools,
             "embeddings": self.embeddings,
             "diarization": self.diarization,
+            "mesh_input": self.mesh_input,
+            "mesh_output": self.mesh_output,
             "input_modalities": self.input_modalities(),
             "output_modalities": self.output_modalities(),
             "summary": self.summary(),
@@ -142,6 +151,17 @@ impl Capabilities {
             let speech = crate::speech_caps::profile(id);
             v["speech"] = speech.to_json();
             v["summary"] = json!(format!("{}, {}", self.summary(), speech.brief()));
+        }
+        // Add three_d object for mesh-capable models
+        if self.mesh_input || self.mesh_output {
+            v["three_d"] = json!({
+                "tasks": ["image-to-3d", "mesh-to-mesh", "mesh-to-sdf"],
+                "ops": ["stats", "normals", "smooth", "recolour", "center", "scale", "decimate", "remesh", "repair", "uv", "convert", "sdf"],
+                "uv": ["box", "lscm"],
+                "neural": false,
+                "license": "MIT",
+                "vram_note": "cpu, no lease"
+            });
         }
         v
     }

@@ -89,19 +89,16 @@ impl Qwen3ThinkerLayerConfig {
                 n_heads: self.n_heads,
                 n_kv_heads: self.n_kv_heads,
                 head_dim: self.head_dim,
-                q_proj: LinearConfig::new(self.hidden_size, q_out).with_bias(false).init(device),
-                k_proj: LinearConfig::new(self.hidden_size, kv_out).with_bias(false).init(device),
-                v_proj: LinearConfig::new(self.hidden_size, kv_out).with_bias(false).init(device),
+                qkv: LinearConfig::new(self.hidden_size, q_out + 2 * kv_out)
+                    .with_bias(false)
+                    .init(device),
                 o_proj: LinearConfig::new(q_out, self.hidden_size).with_bias(false).init(device),
                 q_norm: RMSNorm::with_eps(self.head_dim, self.rms_norm_eps, device),
                 k_norm: RMSNorm::with_eps(self.head_dim, self.rms_norm_eps, device),
             },
             post_attention_layernorm: RMSNorm::with_eps(self.hidden_size, self.rms_norm_eps, device),
             mlp: Qwen3ThinkerMlp {
-                gate_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
-                    .with_bias(false)
-                    .init(device),
-                up_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                gate_up: LinearConfig::new(self.hidden_size, 2 * self.intermediate_size)
                     .with_bias(false)
                     .init(device),
                 down_proj: LinearConfig::new(self.intermediate_size, self.hidden_size)
@@ -120,9 +117,8 @@ pub(crate) struct Qwen3ThinkerAttention {
     n_kv_heads: usize,
     #[module(skip)]
     head_dim: usize,
-    pub(crate) q_proj: Linear,
-    pub(crate) k_proj: Linear,
-    pub(crate) v_proj: Linear,
+    /// q/k/v projections packed into one matmul: [q | k | v] on the output axis.
+    pub(crate) qkv: Linear,
     pub(crate) o_proj: Linear,
     pub(crate) q_norm: RMSNorm,
     pub(crate) k_norm: RMSNorm,
@@ -143,13 +139,18 @@ impl Qwen3ThinkerAttention {
         let scale = (self.head_dim as f64).powf(-0.5);
         let n_rep = self.n_heads / self.n_kv_heads;
 
+        let q_out = self.n_heads * self.head_dim;
+        let kv_out = self.n_kv_heads * self.head_dim;
+        let packed = self.qkv.forward(x);
         let q = self
             .q_norm
-            .forward(self.q_proj.forward(x.clone()).reshape([batch, seq, self.n_heads, self.head_dim]));
+            .forward(packed.clone().slice([0..batch, 0..seq, 0..q_out]).reshape([batch, seq, self.n_heads, self.head_dim]));
         let k = self
             .k_norm
-            .forward(self.k_proj.forward(x.clone()).reshape([batch, seq, self.n_kv_heads, self.head_dim]));
-        let v = self.v_proj.forward(x).reshape([batch, seq, self.n_kv_heads, self.head_dim]);
+            .forward(packed.clone().slice([0..batch, 0..seq, q_out..q_out + kv_out]).reshape([batch, seq, self.n_kv_heads, self.head_dim]));
+        let v = packed
+            .slice([0..batch, 0..seq, q_out + kv_out..q_out + 2 * kv_out])
+            .reshape([batch, seq, self.n_kv_heads, self.head_dim]);
 
         let q = apply_rope(q.swap_dims(1, 2), cos, sin);
         let k_new = apply_rope(k.swap_dims(1, 2), cos, sin);
@@ -176,15 +177,19 @@ impl Qwen3ThinkerAttention {
 
 #[derive(Module, Debug)]
 pub(crate) struct Qwen3ThinkerMlp {
-    pub(crate) gate_proj: Linear,
-    pub(crate) up_proj: Linear,
+    /// gate and up projections packed into one matmul: [gate | up].
+    pub(crate) gate_up: Linear,
     pub(crate) down_proj: Linear,
 }
 
 impl Qwen3ThinkerMlp {
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let gate = silu(self.gate_proj.forward(x.clone()));
-        self.down_proj.forward(gate * self.up_proj.forward(x))
+        let [batch, seq, _] = x.dims();
+        let d = self.gate_up.weight.dims()[1] / 2; // intermediate size
+        let packed = self.gate_up.forward(x);
+        let gate = silu(packed.clone().slice([0..batch, 0..seq, 0..d]));
+        let up = packed.slice([0..batch, 0..seq, d..2 * d]);
+        self.down_proj.forward(gate * up)
     }
 }
 

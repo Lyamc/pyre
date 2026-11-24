@@ -214,6 +214,11 @@ pub fn waveform_to_text(
         overlap,
         pass::current().windows,
     );
+    let starts = if matches!(model, Model::Whisper(_)) {
+        silence_aligned_starts(&waveform, sample_rate, &starts, n_waveform_samples_per_window)
+    } else {
+        starts
+    };
     let mut processor = crate::audio::AudioProcessor::new(&device, sample_rate as f64, n_mels, is_nemo, model_name);
     if is_nemo {
         let dir = pyre_whisper_core::resolve_model_dir(model_name);
@@ -254,8 +259,6 @@ pub fn waveform_to_text(
     };
 
     let chunk_duration = n_waveform_samples_per_window as f64 / sample_rate as f64;
-    let chunk_overlap = overlap_secs as f64;
-    let shift_duration = chunk_duration - chunk_overlap;
 
     let mut global_last_end = 0.0;
     let mut recent_texts: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(10);
@@ -279,7 +282,7 @@ pub fn waveform_to_text(
 
         let (new_text, new_tokens, token_frames, encoder_frames) = match model {
             Model::Whisper(m) => {
-                let (text, tokens) = decode_whisper(
+                let (text, tokens, frames) = decode_whisper(
                     m,
                     bpe,
                     lang,
@@ -292,14 +295,22 @@ pub fn waveform_to_text(
                     decode_task,
                     model_name,
                 )?;
-                (text, tokens, Vec::new(), 0)
+                // Whisper timestamp tokens count 20 ms frames. Compute the scale the stitcher
+                // expects so `overlap * encoder_frames / window_samples` lands on the overlap
+                // in 20 ms frames, whatever the window length.
+                let encoder_frames = if frames.iter().any(|&f| f > 0) {
+                    (n_waveform_samples_per_window as f64 / sample_rate as f64 * 50.0) as usize
+                } else {
+                    0
+                };
+                (text, tokens, frames, encoder_frames)
             }
             Model::Parakeet(m) => {
                 let chunk = decode_parakeet(m, bpe, mel, model_name, verbose);
                 (chunk.text, chunk.tokens, chunk.frames, chunk.encoder_frames)
             }
             Model::Nemotron(m) => {
-                let chunk = decode_nemotron(m, bpe, mel, model_name, verbose);
+                let chunk = decode_nemotron(m, bpe, mel, model_name, Some(language_code), verbose);
                 (chunk.text, chunk.tokens, chunk.frames, chunk.encoder_frames)
             }
             Model::TONE(_) => unreachable!("t-one handled before mel loop"),
@@ -322,9 +333,20 @@ pub fn waveform_to_text(
         };
         // v2 timestamped one whole window inside the 8 s overlap, and the frame
         // drop deleted it (151 consecutive words). Fall back to the word stitch.
-        let collapsed = i > 0 && use_frames && timestamps_collapsed(&frame_ids, &new_tokens);
+        // Whisper's 20 ms timestamp tokens are reliable, so a frame drop that removes many
+        // tokens still means "this audio was already covered". The word stitch is only a
+        // fallback for models whose frame ids collapse. An empty frame slice simply adds no
+        // new text, which is correct for a short tail window made almost entirely of overlap.
+        let collapsed = i > 0
+            && use_frames
+            && !matches!(model, Model::Whisper(_))
+            && timestamps_collapsed(&frame_ids, &new_tokens);
         let mut cleaned = if use_frames && !collapsed {
-            clean_text(&parakeet_tokens_to_text(bpe, &frame_ids))
+            let ids = match model {
+                Model::Whisper(_) => bpe.decode(&frame_ids, true).unwrap_or_default(),
+                _ => parakeet_tokens_to_text(bpe, &frame_ids),
+            };
+            clean_text(&ids)
         } else {
             clean_text(&new_text)
         };
@@ -373,7 +395,7 @@ pub fn waveform_to_text(
             append_without_word_overlap(&mut accumulated_text, &cleaned);
         }
 
-        let chunk_offset = i as f64 * shift_duration;
+        let chunk_offset = start as f64 / sample_rate as f64;
         if include_timestamps && use_frames && !recovered {
             let min_frame = if i == 0 {
                 0
@@ -504,6 +526,75 @@ pub fn waveform_to_text(
     }
 
     Ok((final_text, segments))
+}
+
+/// Move fixed-interval window starts onto nearby silent gaps so a phrase is not cut
+/// at a seam. Each gap is found from the waveform RMS (no VAD model on the runtime path).
+fn silence_aligned_starts(
+    waveform: &[f32],
+    sample_rate: usize,
+    nominal: &[usize],
+    window: usize,
+) -> Vec<usize> {
+    if nominal.len() < 2 || waveform.is_empty() {
+        return nominal.to_vec();
+    }
+    let frame = (sample_rate / 50).max(1); // 20 ms
+    let n_frames = waveform.len() / frame;
+    if n_frames < 8 {
+        return nominal.to_vec();
+    }
+    let mut rms = Vec::with_capacity(n_frames);
+    let mut peak = 0.0f32;
+    for chunk in waveform[..n_frames * frame].chunks_exact(frame) {
+        let energy = (chunk.iter().map(|v| v * v).sum::<f32>() / frame as f32).sqrt();
+        peak = peak.max(energy);
+        rms.push(energy);
+    }
+    if peak <= 1e-6 {
+        return nominal.to_vec();
+    }
+    let quiet = peak * 0.03;
+    let min_gap = ((sample_rate as f64 * 0.15) / frame as f64).ceil() as usize;
+    let mut gaps = Vec::new();
+    let mut i = 0;
+    while i < rms.len() {
+        if rms[i] < quiet {
+            let begin = i;
+            while i < rms.len() && rms[i] < quiet {
+                i += 1;
+            }
+            if i - begin >= min_gap {
+                gaps.push(((begin + i) / 2) * frame);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if gaps.is_empty() {
+        return nominal.to_vec();
+    }
+
+    let search = (window / 4).max(frame);
+    let mut out = Vec::with_capacity(nominal.len());
+    let mut prev = 0usize;
+    for &start in nominal {
+        if start == 0 {
+            out.push(0);
+            continue;
+        }
+        let aligned = gaps
+            .iter()
+            .filter(|&&g| g > prev && g < waveform.len())
+            .min_by_key(|&&g| g.abs_diff(start))
+            .filter(|&&g| g.abs_diff(start) <= search)
+            .copied()
+            .unwrap_or(start)
+            .max(prev + frame);
+        out.push(aligned);
+        prev = aligned;
+    }
+    out
 }
 
 fn window_starts(len: usize, window: usize, overlap: usize, mode: pass::Windowing) -> (Vec<usize>, usize) {

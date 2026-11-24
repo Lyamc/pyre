@@ -45,6 +45,14 @@ pub fn map_hf_tensor(key: &str, is_tdt: bool, nemotron: bool) -> Option<String> 
             key.strip_prefix("encoder.layers.")
                 .and_then(|rest| map_encoder_layer(rest, nemotron))
         })
+        .or_else(|| {
+            key.strip_prefix("prompt_projector.linear_1.")
+                .map(|rest| format!("prompt_projector/linear1/{rest}.npy"))
+        })
+        .or_else(|| {
+            key.strip_prefix("prompt_projector.linear_2.")
+                .map(|rest| format!("prompt_projector/linear2/{rest}.npy"))
+        })
         .or_else(|| map_tdt_or_ctc_head(key, is_tdt))
 }
 

@@ -7,7 +7,7 @@ use crate::model::*;
 use crate::token::{self, *};
 use burn::tensor::{
     activation::log_softmax,
-    ElementConversion, Int, Tensor, TensorData,
+    ElementConversion, FloatDType, Int, Tensor, TensorData,
 };
 use std::iter;
 
@@ -79,6 +79,9 @@ pub fn mels_to_text(
             2,
         )
     };
+    // Weights can be cast to f16 at load time (PYRE_STT_F16=1); match the mel dtype to them.
+    let dtype = FloatDType::from(whisper.encoder.conv1.weight.val().dtype());
+    let mels = if mels.dtype() == dtype.into() { mels } else { mels.cast(dtype) };
 
     let encode_started = std::time::Instant::now();
     let encoder_output = match crate::model::whisper_host::try_encode(&whisper.encoder, mels.clone()) {
@@ -98,6 +101,20 @@ pub fn mels_to_text(
     let vocab_size = whisper.decoder.n_vocab;
     let special_tokens_maskout = special_tokens_maskout(bpe, vocab_size, end_token, include_timestamps);
     let decode_cfg = load_whisper_decode_config(model_name);
+    // The mask only has two variants (before/after the first generated token). Build both
+    // once on the device instead of rebuilding and uploading the full vocab every step.
+    let masks = DecodeMasks {
+        start: Tensor::<1>::from_floats(
+            build_logit_mask(vocab_size, &special_tokens_maskout, &decode_cfg, true, end_token).as_slice(),
+            &device,
+        )
+        .cast(dtype),
+        later: Tensor::<1>::from_floats(
+            build_logit_mask(vocab_size, &special_tokens_maskout, &decode_cfg, false, end_token).as_slice(),
+            &device,
+        )
+        .cast(dtype),
+    };
 
     let max_depth = max_depth.min(whisper.decoder_ctx_size() - initial_seq.len());
     let finished = |toks: &[BeamSearchToken]| beamsearch_is_finished(toks, end_token);
@@ -107,6 +124,7 @@ pub fn mels_to_text(
             whisper,
             &encoder_output,
             &device,
+            dtype,
             initial_seq,
             prompt_len,
             vocab_size,
@@ -123,9 +141,7 @@ pub fn mels_to_text(
             initial_seq,
             prompt_len,
             vocab_size,
-            &special_tokens_maskout,
-            &decode_cfg,
-            end_token,
+            &masks,
             &finished,
             beam_size,
             max_depth,
@@ -165,6 +181,7 @@ fn eager_beam(
     whisper: &Whisper,
     encoder_output: &Tensor<3>,
     device: &burn::tensor::Device,
+    dtype: FloatDType,
     initial_seq: Vec<BeamSearchToken>,
     prompt_len: usize,
     vocab_size: usize,
@@ -203,12 +220,12 @@ fn eager_beam(
                 at_generation_start(max_seq_len, prompt_len),
                 end_token,
             );
-            let mask = Tensor::<1>::from_floats(mask_vec.as_slice(), device);
+            let mask = Tensor::<1>::from_floats(mask_vec.as_slice(), device).cast(dtype);
             logits + mask.unsqueeze::<3>()
         } else {
             logits
         };
-        let log_probs = log_softmax(logits, 2);
+        let log_probs = log_softmax(logits, 2).cast(FloatDType::F32);
         beams
             .iter()
             .enumerate()
@@ -251,6 +268,12 @@ struct Hyp {
     kv: Option<DecoderKv>,
 }
 
+/// The two logit masks a Whisper decode can use, resident on the inference device.
+struct DecodeMasks {
+    start: Tensor<1>,
+    later: Tensor<1>,
+}
+
 /// Beam search that reuses decoder self-attention and encoder cross-attention
 /// state. Finished hypotheses are not forwarded again. Scoring matches the
 /// previous full-sequence decode: the next-token distribution is the last
@@ -262,9 +285,7 @@ fn beam_decode(
     initial_seq: Vec<BeamSearchToken>,
     prompt_len: usize,
     vocab_size: usize,
-    special_tokens_maskout: &[f32],
-    decode_cfg: &super::whisper_config::WhisperDecodeConfig,
-    end_token: usize,
+    masks: &DecodeMasks,
     is_finished: &dyn Fn(&[BeamSearchToken]) -> bool,
     beam_size: usize,
     max_depth: usize,
@@ -297,9 +318,8 @@ fn beam_decode(
             &mut hyps,
             prompt_len,
             vocab_size,
-            special_tokens_maskout,
-            decode_cfg,
-            end_token,
+            masks,
+            beam_size,
             is_finished,
         );
         hyps = expand(hyps, dists, is_finished, beam_size);
@@ -361,9 +381,8 @@ fn score_open(
     hyps: &mut [Hyp],
     prompt_len: usize,
     vocab_size: usize,
-    special_tokens_maskout: &[f32],
-    decode_cfg: &super::whisper_config::WhisperDecodeConfig,
-    end_token: usize,
+    masks: &DecodeMasks,
+    beam_size: usize,
     is_finished: &dyn Fn(&[BeamSearchToken]) -> bool,
 ) -> Vec<Vec<(BeamSearchToken, f64)>> {
     let mut dists = vec![Vec::new(); hyps.len()];
@@ -398,39 +417,42 @@ fn score_open(
     };
 
     let (logits, new_kv) = whisper.forward_decoder_cached(token_tensor, encoder_output.clone(), past);
-    let seq_for_mask = if prefill { hyps[open[0]].seq.len() } else { hyps[open[0]].seq.len() };
+    let seq_for_mask = hyps[open[0]].seq.len();
     let logits = if seq_for_mask >= prompt_len {
-        let mask_vec = build_logit_mask(
-            vocab_size,
-            special_tokens_maskout,
-            decode_cfg,
-            at_generation_start(seq_for_mask, prompt_len),
-            end_token,
-        );
-        let mask = Tensor::<1>::from_floats(mask_vec.as_slice(), device);
-        logits + mask.unsqueeze::<3>()
+        let mask = if at_generation_start(seq_for_mask, prompt_len) {
+            &masks.start
+        } else {
+            &masks.later
+        };
+        logits + mask.clone().unsqueeze::<3>()
     } else {
         logits
     };
     let log_probs = log_softmax(logits, 2);
-    let [rows, _, vocab] = log_probs.dims();
-    let flat = log_probs.into_data().to_vec::<f32>().expect("whisper logprobs");
+    // Keep the reduction and host transfer in f32 even when the model runs in f16.
+    let log_probs = log_probs.cast(FloatDType::F32);
+    let [rows, _, _] = log_probs.dims();
+    // Only the top `beam_size` candidates can survive `expand`. Selecting them on device
+    // avoids copying and scanning the whole vocabulary on the host for every token.
+    let k = beam_size.min(vocab_size);
+    let (values, indices) = log_probs.topk_with_indices(k, 2);
+    let vals = values.into_data().try_to_vec::<f32>().expect("whisper topk values");
+    let id_data = indices.into_data();
+    let ids: Vec<usize> = if let Ok(v) = id_data.clone().try_to_vec::<i32>() {
+        v.into_iter().map(|i| i as usize).collect()
+    } else {
+        id_data.try_to_vec::<i64>().expect("whisper topk indices").into_iter().map(|i| i as usize).collect()
+    };
     let parts = new_kv.split_batch();
     let scored = if prefill { 1 } else { open.len() };
     let rows = rows.min(scored).min(parts.len());
     for batch_i in 0..rows {
         let idx = if prefill { open[0] } else { open[batch_i] };
-        let start = batch_i * vocab;
-        let row = &flat[start..start + vocab];
-        dists[idx] = row
-            .iter()
-            .enumerate()
-            .map(|(token, lp)| {
-                let log_prob = lp.elem::<f64>();
-                (
-                    BeamSearchToken { token, log_prob },
-                    hyps[idx].log_prob + log_prob,
-                )
+        dists[idx] = (0..k)
+            .map(|j| {
+                let token = ids[batch_i * k + j];
+                let log_prob = vals[batch_i * k + j].elem::<f64>();
+                (BeamSearchToken { token, log_prob }, hyps[idx].log_prob + log_prob)
             })
             .collect();
         hyps[idx].kv = Some(parts[batch_i].clone());

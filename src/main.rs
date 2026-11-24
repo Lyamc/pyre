@@ -21,6 +21,8 @@ mod lcm;
 mod rife;
 mod triposr;
 mod mc_tables;
+mod mesh;
+mod rig;
 mod tts;
 mod tts_markup;
 mod voices;

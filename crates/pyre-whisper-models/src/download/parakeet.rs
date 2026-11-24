@@ -45,6 +45,8 @@ pub fn download_parakeet_hf(
             options,
         )?;
         let _ = fetch_optional_hf_file(&repo, source.repo_id(), "generation_config.json", dir, options)?;
+        // Nemotron 3.5 resolves `language` to a prompt id from this table.
+        let _ = fetch_optional_hf_file(&repo, source.repo_id(), "processor_config.json", dir, options)?;
     }
 
     convert_parakeet_from_hf(dir, name, options)

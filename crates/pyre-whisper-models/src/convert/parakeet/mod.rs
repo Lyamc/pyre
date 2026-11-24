@@ -84,6 +84,20 @@ pub fn convert_parakeet_from_hf(
         dump.write_scalar("encoder/decoder_layers.npy", config.num_decoder_layers.unwrap_or(2) as f32)?;
         dump.write_scalar("encoder/max_symbols.npy", config.max_symbols_per_step.unwrap_or(10) as f32)?;
         dump.write_scalar("encoder/blank_id.npy", config.blank_id() as f32)?;
+        dump.write_scalar("encoder/num_prompts.npy", config.num_prompts as f32)?;
+        dump.write_scalar("encoder/prompt_intermediate.npy", config.prompt_intermediate_size as f32)?;
+        dump.write_scalar("encoder/default_prompt_id.npy", config.default_prompt_id as f32)?;
+        // Keep the language -> prompt-id table for request-time language conditioning.
+        if let Ok(text) = fs::read_to_string(model_dir.join("processor_config.json")) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(d) = v.get("prompt_dictionary") {
+                    fs::write(
+                        model_dir.join("nemotron_prompts.json"),
+                        serde_json::to_string_pretty(d)?,
+                    )?;
+                }
+            }
+        }
     }
 
     let num_durations = config.durations.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -159,7 +173,8 @@ pub fn convert_parakeet_from_hf(
 pub fn is_parakeet_model(name: &str) -> bool {
     matches!(
         name,
-        "parakeet-tdt-0.6b-v3"
+        "fluid-speech-pro"
+            | "parakeet-tdt-0.6b-v3"
             | "parakeet-tdt-0.6b-v2"
             | "parakeet-ctc-0.6b"
             | "parakeet-ctc-1.1b"
@@ -204,12 +219,12 @@ fn preserve_fluid_sidecars(model_dir: &Path) -> anyhow::Result<()> {
 }
 
 pub fn is_nemotron_asr_model(name: &str) -> bool {
-    name == "nemotron-speech-streaming-en-0.6b"
+    matches!(name, "nemotron-speech-streaming-en-0.6b" | "nemotron-3.5-asr-streaming-0.6b")
 }
 
 pub fn is_parakeet_burn_ready(name: &str) -> bool {
     matches!(
         name,
-        "parakeet-tdt-0.6b-v3" | "parakeet-tdt-0.6b-v2" | "parakeet-ctc-0.6b" | "parakeet-ctc-1.1b" | "fluid-speech-pro"
+        "fluid-speech-pro" | "parakeet-tdt-0.6b-v3" | "parakeet-tdt-0.6b-v2" | "parakeet-ctc-0.6b" | "parakeet-ctc-1.1b"
     )
 }

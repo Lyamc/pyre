@@ -225,10 +225,26 @@ const CARDS = [
   { id: "layers", title: "Separate layers", icon: "≣", desc: "Subject / background layers (zip of PNGs)" },
   { id: "animate", title: "Animate between images", icon: "▶", desc: "Keyframe interpolation → GIF/video" },
   { id: "to3d", title: "2D → 3D model", icon: "⬡", desc: "Image to GLB mesh + viewer" },
+  { id: "mesh", title: "Mesh tools", icon: "◈", desc: "GLB/OBJ/PLY/STL: stats, repair, decimate, remesh, SDF" },
+  { id: "rig", title: "Auto rig", icon: "⋔", desc: "Fit a skeleton + skin weights onto a mesh" },
+  { id: "refine", title: "Refine mesh", icon: "✦", desc: "Smooth geometry or repaint vertex colours" },
   { id: "clothes", title: "Swap clothes", icon: "👕", desc: "Change outfit from text or a garment image" },
   { id: "pose", title: "Reposition character", icon: "🤸", desc: "Change pose with a pose editor" },
 ];
 const BUILD = {};
+// Last GLB produced by 2D → 3D, so the mesh tools can consume it without a download.
+let LAST_GLB = null;
+function b64buf(buf) {
+  const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function downloadB64(b64, name, type) {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const url = URL.createObjectURL(new Blob([bin], { type }));
+  return el("a", { href: url, download: name, class: "btnlink" }, `Download ${name.split(".").pop().toUpperCase()} (${(bin.length / 1048576).toFixed(1)} MB)`);
+}
 // --- text to image
 BUILD.txt2img = (f, res) => {
   const p = el("textarea", { rows: 3, placeholder: "a cozy cabin in a snowy forest at dusk" }); const n = el("input", { placeholder: "negative (optional)" });
@@ -519,7 +535,20 @@ function parseGlb(buf) {
   const bo = 20 + jl + 8; const pr = js.meshes[0].primitives[0];
   const acc = i => { const a = js.accessors[i], v = js.bufferViews[a.bufferView], off = bo + (v.byteOffset || 0) + (a.byteOffset || 0); const n = a.count * { SCALAR: 1, VEC3: 3, VEC4: 4 }[a.type];
     return a.componentType === 5126 ? new Float32Array(buf.slice(off, off + n * 4)) : a.componentType === 5125 ? new Uint32Array(buf.slice(off, off + n * 4)) : new Uint8Array(buf.slice(off, off + n)); };
-  return { pos: acc(pr.attributes.POSITION), nor: acc(pr.attributes.NORMAL), col: acc(pr.attributes.COLOR_0), idx: acc(pr.indices), min: js.accessors[pr.attributes.POSITION].min, max: js.accessors[pr.attributes.POSITION].max };
+  const count = js.accessors[pr.attributes.POSITION].count;
+  const col = pr.attributes.COLOR_0 !== undefined ? acc(pr.attributes.COLOR_0) : new Uint8Array(count * 4).fill(255);
+  let bones = null, joints = [];
+  const skin = js.skins && js.skins[0];
+  if (skin) {
+    const nodes = js.nodes || []; const parent = new Array(nodes.length).fill(-1);
+    nodes.forEach((n, i) => (n.children || []).forEach(c => parent[c] = i));
+    const world = i => { const p = [0, 0, 0]; let k = i, guard = 0; while (k >= 0 && guard++ < 4096) { const t = nodes[k].translation || [0, 0, 0]; p[0] += t[0]; p[1] += t[1]; p[2] += t[2]; k = parent[k]; } return p; };
+    const seg = [];
+    skin.joints.forEach(j => (nodes[j].children || []).forEach(c => seg.push(...world(j), ...world(c))));
+    if (seg.length) bones = new Float32Array(seg);
+    joints = skin.joints.map(j => ({ name: nodes[j].name || ("joint " + j), pos: world(j) }));
+  }
+  return { pos: acc(pr.attributes.POSITION), nor: acc(pr.attributes.NORMAL), col, idx: acc(pr.indices), min: js.accessors[pr.attributes.POSITION].min, max: js.accessors[pr.attributes.POSITION].max, bones, joints };
 }
 function meshViewer(m) {
   const c = el("canvas", { width: 640, height: 640, class: "glview", title: "drag: orbit · right-drag / shift-drag: pan · wheel: zoom · double-click: reset" });
@@ -530,14 +559,22 @@ function meshViewer(m) {
   gl.attachShader(p, sh(gl.VERTEX_SHADER, "attribute vec3 a_p,a_n;attribute vec4 a_c;uniform mat4 u_mv,u_pr;varying vec3 v_n;varying vec4 v_c;void main(){v_n=mat3(u_mv)*a_n;v_c=a_c;gl_Position=u_pr*u_mv*vec4(a_p,1.0);}"));
   gl.attachShader(p, sh(gl.FRAGMENT_SHADER, "precision mediump float;varying vec3 v_n;varying vec4 v_c;uniform float u_lit;void main(){vec3 n=normalize(v_n);float d=abs(n.z)*0.6+max(dot(n,normalize(vec3(0.4,0.6,0.7))),0.0)*0.25+0.3;gl_FragColor=vec4(v_c.rgb*mix(1.0,d,u_lit),1.0);}"));
   gl.linkProgram(p); gl.useProgram(p);
+  const lp = gl.createProgram();
+  gl.attachShader(lp, sh(gl.VERTEX_SHADER, "attribute vec3 a_p;uniform mat4 u_mv,u_pr;void main(){gl_Position=u_pr*u_mv*vec4(a_p,1.0);}"));
+  gl.attachShader(lp, sh(gl.FRAGMENT_SHADER, "precision mediump float;uniform vec4 u_c;void main(){gl_FragColor=u_c;}"));
+  gl.bindAttribLocation(lp, 3, "a_p");
+  gl.linkProgram(lp);
   const buf = (data, loc, n, type, norm) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); const l = gl.getAttribLocation(p, loc); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, n, type, norm, 0, 0); };
   buf(m.pos, "a_p", 3, gl.FLOAT, false); buf(m.nor, "a_n", 3, gl.FLOAT, false); buf(m.col, "a_c", 4, gl.UNSIGNED_BYTE, true);
   const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+  let boneBuf = null;
+  if (m.bones && m.bones.length) { boneBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, boneBuf); gl.bufferData(gl.ARRAY_BUFFER, m.bones, gl.STATIC_DRAW); }
   const ctr = [0, 1, 2].map(i => (m.min[i] + m.max[i]) / 2), rad = Math.max(...[0, 1, 2].map(i => m.max[i] - m.min[i])) * 0.75 || 1;
-  const st = { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0], lit: 1 }; const reset = () => Object.assign(st, { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0] });
+  const st = { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0], lit: 1, bones: true }; const reset = () => Object.assign(st, { yaw: 0, pitch: 0.15, dist: rad * 1.8, pan: [0, 0] });
   const mul = (a, b) => { const o = new Float32Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k]; o[i * 4 + j] = s; } return o; };
   const draw = () => {
     gl.viewport(0, 0, c.width, c.height); gl.clearColor(0.13, 0.14, 0.16, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(p);
     const cy = Math.cos(st.yaw), sy = Math.sin(st.yaw), cp = Math.cos(st.pitch), sp = Math.sin(st.pitch);
     const T = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -ctr[0], -ctr[1], -ctr[2], 1]);
     const Ry = new Float32Array([cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1]);
@@ -548,6 +585,13 @@ function meshViewer(m) {
     const pr = new Float32Array([f, 0, 0, 0, 0, f, 0, 0, 0, 0, (fr + nr) / (nr - fr), -1, 0, 0, 2 * fr * nr / (nr - fr), 0]);
     gl.uniformMatrix4fv(gl.getUniformLocation(p, "u_mv"), false, mv); gl.uniformMatrix4fv(gl.getUniformLocation(p, "u_pr"), false, pr); gl.uniform1f(gl.getUniformLocation(p, "u_lit"), st.lit);
     gl.drawElements(gl.TRIANGLES, m.idx.length, gl.UNSIGNED_INT, 0);
+    if (boneBuf && st.bones) {
+      gl.useProgram(lp);
+      gl.uniformMatrix4fv(gl.getUniformLocation(lp, "u_mv"), false, mv); gl.uniformMatrix4fv(gl.getUniformLocation(lp, "u_pr"), false, pr);
+      gl.uniform4f(gl.getUniformLocation(lp, "u_c"), 1.0, 0.62, 0.18, 1.0);
+      const l = gl.getAttribLocation(lp, "a_p"); gl.bindBuffer(gl.ARRAY_BUFFER, boneBuf); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, 3, gl.FLOAT, false, 0, 0);
+      gl.disable(gl.DEPTH_TEST); gl.drawArrays(gl.LINES, 0, m.bones.length / 3); gl.enable(gl.DEPTH_TEST);
+    }
   };
   let drag = null;
   c.addEventListener("contextmenu", e => e.preventDefault());
@@ -557,7 +601,7 @@ function meshViewer(m) {
   c.addEventListener("pointerup", () => drag = null);
   c.addEventListener("wheel", e => { e.preventDefault(); st.dist *= Math.exp(e.deltaY * 0.001); draw(); }, { passive: false });
   c.addEventListener("dblclick", () => { reset(); draw(); });
-  const w = el("div", { class: "glwrap" }, c); w.view = (yaw, pitch) => { st.yaw = yaw; st.pitch = pitch; draw(); }; w.setLit = v => { st.lit = v; draw(); };
+  const w = el("div", { class: "glwrap" }, c); w.view = (yaw, pitch) => { st.yaw = yaw; st.pitch = pitch; draw(); }; w.setLit = v => { st.lit = v; draw(); }; w.setBones = v => { st.bones = v; draw(); };
   draw(); return w;
 }
 BUILD.to3d = (f, res, input) => {
@@ -569,13 +613,128 @@ BUILD.to3d = (f, res, input) => {
   return async () => {
     if (!src.url) throw new Error("choose an image"); res.busy("cutting out the subject and building the 3D model…");
     const j = await api("/api/cabin/to3d", { image: await prep(src.url, 1536, 16), model: model.value, resolution: +reso.value, threshold: +thr.input.value, ratio: +ratio.input.value });
-    const bin = Uint8Array.from(atob(j.glb), ch => ch.charCodeAt(0)); const url = URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" }));
+    const bin = Uint8Array.from(atob(j.glb), ch => ch.charCodeAt(0)); LAST_GLB = bin; const url = URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" }));
     const v = meshViewer(parseGlb(bin.buffer)); res.innerHTML = ""; res.viewer = v;
     const lit = el("input", { type: "checkbox", checked: true }); lit.onchange = () => v.setLit(lit.checked ? 1 : 0);
     res.append(v, el("div", { class: "row" }, el("a", { href: url, download: "model_" + Date.now() + ".glb", class: "btnlink" }, `Download GLB (${(j.glb_bytes / 1048576).toFixed(1)} MB)`),
       el("button", { type: "button", onclick: () => v.view(0, 0.15) }, "Front"), el("button", { type: "button", onclick: () => v.view(Math.PI / 2, 0.15) }, "Side"), el("button", { type: "button", onclick: () => v.view(Math.PI, 0.15) }, "Back"),
       el("label", { class: "inl" }, lit, "shading"), el("small", {}, `${j.vertices} vertices · ${j.triangles} triangles · ${j.seconds.toFixed(1)} s · ${j.info}`)),
       el("div", { class: "side" }, el("figure", {}, el("img", { src: j.cutout.startsWith("data:") ? j.cutout : "data:image/png;base64," + j.cutout }), el("figcaption", {}, "cut-out")), el("figure", {}, el("img", { src: j.input.startsWith("data:") ? j.input : "data:image/png;base64," + j.input }), el("figcaption", {}, "TripoSR input"))));
+  };
+};
+BUILD.mesh = (f, res) => {
+  const file = el("input", { type: "file", accept: ".glb,.gltf,.obj,.ply,.stl" });
+  const note = el("small", {}, "GLB, OBJ, PLY or STL. Nothing leaves the machine.");
+  const last = el("button", { type: "button", onclick: () => { if (!LAST_GLB) { note.textContent = "No 3D model yet: run 2D → 3D on this page first."; return; } last.__buf = LAST_GLB.slice(); note.textContent = "Using the last 3D model from this page."; } }, "Use last 3D model");
+  const op = sel([["stats", "Stats"], ["normals", "Recalculate normals"], ["center", "Center"], ["scale", "Scale"], ["decimate", "Decimate"], ["remesh", "Remesh (voxel)"], ["repair", "Repair"], ["uv", "Box UVs"], ["uv-lscm", "LSCM UV unwrap"], ["convert", "Convert"], ["sdf", "Mesh → SDF"]], "stats");
+  const target = num(2000, 4, 2000000), reso = num(64, 8, 128), extent = num(1, 0.001, 1000, 0.1), edge = num(0, 0, 100, 0.01);
+  const fmt = sel([["glb", "GLB"], ["obj", "OBJ"], ["ply", "PLY"], ["stl", "STL"]], "glb");
+  f.append(field("Mesh", el("div", {}, file, last, note)), field("Operation", op),
+    advanced(el("div", { class: "row" }, field("Target faces", target), field("SDF / remesh resolution", reso), field("Scale extent", extent), field("Remesh edge (0 = auto)", edge), field("Output format", fmt))));
+  return async () => {
+    let buf = null;
+    if (file.files && file.files[0]) buf = await file.files[0].arrayBuffer();
+    else if (last.__buf) buf = last.__buf.buffer;
+    if (!buf) throw new Error("choose a mesh file or use the last 3D model");
+    const params = {};
+    if (op.value === "decimate") params.target_faces = +target.value;
+    if (op.value === "sdf" || op.value === "remesh") params.resolution = +reso.value;
+    if (op.value === "scale") params.scale = +extent.value;
+    if (op.value === "remesh") params.target_edge = +edge.value;
+    if (op.value === "convert") params.format = fmt.value;
+    const runOp = op.value === "uv-lscm" ? "uv" : op.value;
+    if (op.value === "uv-lscm") { params.projection = "lscm"; params.iterations = +reso.value; }
+    res.busy(op.value + "…");
+    const j = await api("/api/cabin/mesh", { mesh: b64buf(buf), op: runOp, params });
+    res.innerHTML = "";
+    const preview = j.sdf?.isosurface?.glb || j.glb;
+    const bin = Uint8Array.from(atob(preview), c => c.charCodeAt(0));
+    const v = meshViewer(parseGlb(bin.buffer)); res.viewer = v;
+    const links = [el("a", { href: URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" })), download: `mesh_${op.value}_${Date.now()}.glb`, class: "btnlink" }, `Download GLB (${(bin.length / 1048576).toFixed(1)} MB)`)];
+    if (j.data && j.filename) links.push(downloadB64(j.data, j.filename, "application/octet-stream"));
+    if (j.sdf) {
+      links.push(downloadB64(j.sdf.grid, `sdf_${j.sdf.dimensions.join("x")}.f32`, "application/octet-stream"));
+      const hj = JSON.stringify(j.sdf.header, null, 2);
+      links.push(el("a", { href: URL.createObjectURL(new Blob([hj], { type: "application/json" })), download: "sdf_header.json", class: "btnlink" }, "Download SDF header (JSON)"));
+    }
+    const s = j.stats;
+    const bits = [`${j.op}`, `${s.vertices} vertices`, `${s.triangles} triangles`, `watertight ${s.watertight}`, `area ${s.area.toFixed(3)}`];
+    if (j.decimate) bits.push(`${j.decimate.before} → ${j.decimate.after} faces${j.decimate.uv_seams_preserved ? "" : " (UV seams not split)"}`);
+    if (j.repair) bits.push(`welded ${j.repair.welded_vertices}, filled ${j.repair.holes_filled}, non-manifold edges ${j.repair.non_manifold_edges}`);
+    if (j.sdf) bits.push(`SDF ${j.sdf.dimensions.join("×")} (${j.sdf.method}), grid ${(j.sdf.grid_bytes / 1048576).toFixed(1)} MB`);
+    if (j.uv && j.uv.projection === "lscm") bits.push(`LSCM ${j.uv.charts} chart(s), ${j.uv.iterations} iters, max Δ ${j.uv.max_error.toExponential(1)}`);
+    res.append(v, el("div", { class: "row" }, ...links),
+      el("small", {}, bits.join(" · ")),
+      ...(j.sdf ? [el("small", {}, "Raw little-endian float32 grid with a JSON header; negative is inside.")] : []));
+  };
+};
+BUILD.rig = (f, res) => {
+  const file = el("input", { type: "file", accept: ".glb,.gltf,.obj,.ply,.stl" });
+  const note = el("small", {}, "GLB, OBJ, PLY or STL. The subject is assumed upright along +Y, facing +Z. Geometric fit, not a learned rigger.");
+  const last = el("button", { type: "button", onclick: () => { if (!LAST_GLB) { note.textContent = "No 3D model yet: run 2D → 3D on this page first."; return; } last.__buf = LAST_GLB.slice(); note.textContent = "Using the last 3D model from this page."; } }, "Use last 3D model");
+  const tpl = sel([["humanoid", "Humanoid (19 joints)"], ["character", "Character (8 joints)"]], "humanoid");
+  f.append(field("Mesh", el("div", {}, file, last, note)), field("Template", tpl, "hips/spine/chest/head + arms and legs; weights are inverse-distance, max 4 per vertex"));
+  return async () => {
+    let buf = null;
+    if (file.files && file.files[0]) buf = await file.files[0].arrayBuffer();
+    else if (last.__buf) buf = last.__buf.buffer;
+    if (!buf) throw new Error("choose a mesh file or use the last 3D model");
+    res.busy("fitting the skeleton and skin weights…");
+    const j = await api("/api/cabin/rig", { mesh: b64buf(buf), template: tpl.value });
+    const bin = Uint8Array.from(atob(j.glb), c => c.charCodeAt(0)); LAST_GLB = bin;
+    const url = URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" }));
+    const v = meshViewer(parseGlb(bin.buffer)); res.innerHTML = ""; res.viewer = v;
+    const bones = el("input", { type: "checkbox", checked: true }); bones.onchange = () => v.setBones(bones.checked);
+    const lit = el("input", { type: "checkbox", checked: true }); lit.onchange = () => v.setLit(lit.checked ? 1 : 0);
+    res.append(v, el("div", { class: "row" },
+      el("a", { href: url, download: `rig_${j.template}_${Date.now()}.glb`, class: "btnlink" }, `Download skinned GLB (${(j.glb_bytes / 1048576).toFixed(1)} MB)`),
+      el("label", { class: "inl" }, bones, "bones"), el("label", { class: "inl" }, lit, "shading")),
+      el("small", {}, `${j.template}: ${j.joint_count} joints · ${j.bone_count} bones · ${j.vertices} vertices · ${j.skin.method}`),
+      el("small", {}, `joints ${j.joints.map(x => x.name).join(", ")}`));
+  };
+};
+BUILD.refine = (f, res) => {
+  const file = el("input", { type: "file", accept: ".glb,.gltf,.obj,.ply,.stl" });
+  const note = el("small", {}, "GLB, OBJ, PLY or STL. Geometry and colour only, CPU.");
+  const last = el("button", { type: "button", onclick: () => { if (!LAST_GLB) { note.textContent = "No 3D model yet: run 2D → 3D on this page first."; return; } last.__buf = LAST_GLB.slice(); note.textContent = "Using the last 3D model from this page."; } }, "Use last 3D model");
+  const op = sel([["smooth", "Smooth (Taubin)"], ["recolour-mesh", "Recolour from another mesh"], ["recolour-image", "Recolour from an image"]], "smooth");
+  const iters = num(2, 1, 50), lambda = num(0.5, 0, 1, 0.05), mu = num(-0.53, -1, 0, 0.05);
+  const srcMesh = el("input", { type: "file", accept: ".glb,.gltf,.obj,.ply,.stl" });
+  const srcImage = el("input", { type: "file", accept: "image/*" });
+  f.append(field("Mesh", el("div", {}, file, last, note)), field("Operation", op),
+    advanced(el("div", { class: "row" }, field("Smooth iterations", iters), field("Lambda", lambda), field("Mu", mu))),
+    field("Source mesh (recolour from mesh)", srcMesh, "must carry COLOR_0; colours are projected from the nearest surface point"),
+    field("Source image (recolour from image)", srcImage, "front orthographic projection over the mesh bbox, unless the API request states a camera"));
+  return async () => {
+    let buf = null;
+    if (file.files && file.files[0]) buf = await file.files[0].arrayBuffer();
+    else if (last.__buf) buf = last.__buf.buffer;
+    if (!buf) throw new Error("choose a mesh file or use the last 3D model");
+    const params = {};
+    if (op.value === "smooth") Object.assign(params, { iterations: +iters.value, lambda: +lambda.value, mu: +mu.value });
+    if (op.value === "recolour-mesh") {
+      const sf = srcMesh.files && srcMesh.files[0];
+      if (!sf) throw new Error("choose the source mesh to project colours from");
+      params.source = "mesh"; params.mesh = b64buf(await sf.arrayBuffer());
+    }
+    if (op.value === "recolour-image") {
+      const sf = srcImage.files && srcImage.files[0];
+      if (!sf) throw new Error("choose the image to project colours from");
+      params.source = "image"; params.image = b64buf(await sf.arrayBuffer());
+    }
+    res.busy(op.value + "…");
+    const j = await api("/api/cabin/mesh", { mesh: b64buf(buf), op: op.value === "smooth" ? "smooth" : "recolour", params });
+    res.innerHTML = "";
+    const before = meshViewer(parseGlb(buf));
+    const bin = Uint8Array.from(atob(j.glb), c => c.charCodeAt(0));
+    const after = meshViewer(parseGlb(bin.buffer)); res.viewer = after;
+    const url = URL.createObjectURL(new Blob([bin], { type: "model/gltf-binary" }));
+    const bits = [`${j.vertices} vertices`, `${j.triangles} triangles`];
+    if (j.smooth) bits.push(`Taubin ${j.smooth.iterations}× (λ ${j.smooth.lambda}, μ ${j.smooth.mu})`);
+    if (j.recolour) bits.push(`recoloured from ${j.recolour.source} · ${j.recolour.vertices_changed} vertices`);
+    res.append(el("div", { class: "row" }, el("div", {}, el("small", {}, "Before"), before), el("div", {}, el("small", {}, "After"), after)),
+      el("div", { class: "row" }, el("a", { href: url, download: `refined_${op.value}_${Date.now()}.glb`, class: "btnlink" }, `Download GLB (${(bin.length / 1048576).toFixed(1)} MB)`)),
+      el("small", {}, bits.join(" · ")));
   };
 };
 // ---------- shell ----------

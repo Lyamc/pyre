@@ -749,11 +749,77 @@ function applySttPrefs(p) {
   if ($("#sttModel") && p.model) {
     if ([...($("#sttModel").options || [])].some(o => o.value === p.model)) $("#sttModel").value = p.model;
   }
+  applySttCapsGating();
 }
 function effectiveSttModel(pref) {
   const adv = $("#sttAdvanced") && $("#sttAdvanced").open;
   if (adv && pref.model) return pref.model;
   return QUALITY_MODELS[pref.quality] || QUALITY_MODELS.balanced;
+}
+function sttModelInfo(id) { return (sttCatalog.models || []).find(m => m.id === id) || null; }
+function sttFeature(cap, name) { return cap && cap.features && cap.features[name] || { supported: false, locked: false, enabled: false }; }
+function sttFeatureUsable(cap, name) {
+  const f = sttFeature(cap, name);
+  return f.supported && !f.locked;
+}
+function applySttCapsGating() {
+  const info = sttModelInfo(effectiveSttModel(loadSttPrefs()));
+  const cap = info && info.capabilities ? info.capabilities.speech : null;
+  if (!info || !cap) {
+    const box0 = $("#sttCaps");
+    if (box0) box0.textContent = "Model capabilities load with the model list.";
+    return;
+  }
+  const tuning = info.capabilities.tuning || null;
+  const feat = n => sttFeature(cap, n);
+  const setBtn = (sel, usable) => {
+    const b = $(sel); if (!b) return;
+    b.classList.toggle("cap-off", !usable);
+    b.disabled = !usable;
+    b.title = usable ? (b.dataset.tip || "") : "Not supported by this model";
+  };
+  const setInput = (el, state) => {
+    if (!el) return;
+    el.disabled = !state.supported || state.locked;
+    el.title = state.supported ? (state.locked ? "Fixed by the model — cannot be changed" : "") : "Not supported by this model";
+    if (state.supported && state.locked && "checked" in el) el.checked = true;
+    if (!state.supported && "checked" in el) el.checked = false;
+  };
+
+  // Transcription is the core capability: checked and greyed out (cannot be turned off).
+  setBtn('#sttTaskSeg [data-task="transcriptions"]', true);
+  const tb = $('#sttTaskSeg [data-task="transcriptions"]');
+  if (tb) { tb.disabled = true; tb.title = "Always on for this model"; }
+  const canTranslate = feat("translation").supported;
+  setBtn('#sttTaskSeg [data-task="translations"]', canTranslate);
+  if (!canTranslate && $("#sttTask") && $("#sttTask").value === "translations") {
+    $("#sttTask").value = "transcriptions";
+    $$("#sttTaskSeg .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.task === "transcriptions"));
+  }
+  setInput($("#sttLang"), feat("auto_transcription"));
+  setInput($("#sttTimestamps"), feat("timestamps"));
+  setInput($("#sttSentences"), feat("timestamps"));
+  const beam = feat("beam_size");
+  setInput($("#sttBeam"), beam);
+  if (beam.supported && beam.locked && tuning && $("#sttBeam")) $("#sttBeam").value = String(tuning.beam_size || 5);
+  if ($("#sttBeam") && $("#sttBeam").disabled) $("#sttBeam").title += " (uses " + ((tuning && tuning.beam_size) || 5) + ")";
+
+  const box = $("#sttCaps");
+  if (box) {
+    const badge = (label, state) => state.supported ? (state.locked ? label + " ✓" : label) : label + " ✗";
+    const parts = [
+      badge("Transcribe", feat("transcription")),
+      badge("Auto-language", feat("auto_transcription")),
+      badge("Translate→EN", feat("translation")),
+      badge("Timestamps", feat("timestamps")),
+      badge("Beam", feat("beam_size")),
+    ];
+    if (info.officially_supported) parts.push('<span class="cap-tested">Tested ✓</span>');
+    if (info.capabilities && info.capabilities.speech && info.capabilities.speech.experimental) parts.push("experimental");
+    box.innerHTML = parts.join(" · ");
+    box.title = (info.capabilities && info.capabilities.summary) || "";
+  }
+  if (typeof updateSttRunAvail === "function") updateSttRunAvail();
 }
 function persistSttState() {
   if (!sttState) { try { localStorage.removeItem("pyre." + STT_TX_KEY); } catch {} return; }
@@ -877,13 +943,23 @@ async function refreshSttModels() {
       const o = document.createElement("option");
       o.value = m.id;
       const cap = (m.capabilities && m.capabilities.summary) || "";
-      const experimental = m.capabilities && m.capabilities.speech && m.capabilities.speech.experimental;
-      o.textContent = m.id + (experimental ? " (experimental)" : "") + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
+      const speech = m.capabilities && m.capabilities.speech || {};
+      const features = speech.features || {};
+      const experimental = speech.experimental;
+      const tags = [];
+      if (features.transcription && features.transcription.supported) tags.push("T");
+      if (features.auto_transcription && features.auto_transcription.supported) tags.push("Auto");
+      if (features.translation && features.translation.supported) tags.push("→EN");
+      if (features.timestamps && features.timestamps.supported) tags.push("TS");
+      if (m.officially_supported) tags.push("Tested");
+      if (experimental) tags.push("experimental");
+      o.textContent = m.id + " [" + tags.join(",") + "]" + (m.loaded ? " *" : (m.present ? "" : " (download)")) + " — " + (m.tagline || m.description || "");
       o.title = cap;
       o.dataset.present = m.present ? "1" : "0";
       sel.append(o);
     }
     if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+    applySttCapsGating();
     updateSttDlBtn();
     if ($("#sttForm")) $("#sttForm").removeAttribute("disabled");
     if ((sttCatalog.loaded || []).length) $("#sttNote").classList.add("hidden");
@@ -1336,14 +1412,14 @@ if ($("#sttModel")) $("#sttModel").onchange = () => {
     $("#sttBeam").max = fluid ? "4" : "16";
     if (fluid && $("#sttBeam").value === "5") $("#sttBeam").value = "1";
   }
-  updateSttDlBtn();
-  saveSttPrefs(sttPrefsFromUi());
+  applySttCapsGating(); updateSttDlBtn(); saveSttPrefs(sttPrefsFromUi());
 };
 if ($("#sttQuality")) $("#sttQuality").onchange = () => {
   const p = sttPrefsFromUi();
   // sync advanced model select to the quality mapping when quality changes
   const m = QUALITY_MODELS[p.quality];
   if (m && $("#sttModel") && [...$("#sttModel").options].some(o => o.value === m)) $("#sttModel").value = m;
+  applySttCapsGating();
   saveSttPrefs(sttPrefsFromUi());
 };
 ["sttFormat","sttLang","sttTimestamps","sttSentences","sttDiar","sttBeam","sttMaxTok","sttTask","sttClean","sttTranslateWith","sttExperimental"].forEach(id => {
@@ -1372,18 +1448,23 @@ if ($("#sttGo")) $("#sttGo").onclick = async () => {
   const f = currentSttAudio(); if (!f) return alert("Choose or record audio first");
   const pref = sttPrefsFromUi(); saveSttPrefs(pref);
   const model = effectiveSttModel(pref);
+  const info = sttModelInfo(model);
+  const cap = info && info.capabilities ? info.capabilities.speech : null;
   const fd = new FormData();
   fd.append("file", f, f.name || "recording.webm");
   fd.append("model", model);
   fd.append("response_format", "verbose_json");
-  fd.append("task", pref.task === "translations" ? "translations" : "transcriptions");
-  if (pref.language) fd.append("language", pref.language);
-  fd.append("timestamps", pref.timestamps ? "true" : "false");
-  fd.append("sentences", pref.sentences ? "true" : "false");
-  const beam = (model.indexOf("fluid-speech") >= 0) ? Math.max(1, Math.min(4, pref.beam || 1)) : (pref.beam || 5);
-  fd.append("beam_size", String(beam));
+  const translate = pref.task === "translations" && sttFeatureUsable(cap, "translation");
+  fd.append("task", translate ? "translations" : "transcriptions");
+  if (pref.language && sttFeatureUsable(cap, "auto_transcription")) fd.append("language", pref.language);
+  if (sttFeatureUsable(cap, "timestamps")) fd.append("timestamps", pref.timestamps ? "true" : "false");
+  if (sttFeatureUsable(cap, "timestamps")) fd.append("sentences", pref.sentences ? "true" : "false");
+  if (sttFeatureUsable(cap, "beam_size")) {
+    const beam = (model.indexOf("fluid-speech") >= 0) ? Math.max(1, Math.min(4, pref.beam || 1)) : (pref.beam || 5);
+    fd.append("beam_size", String(beam));
+  }
   if (pref.clean) fd.append("clean_mode", "true");
-  if (pref.task === "translations") fd.append("translate_with", pref.translateWith || "whisper");
+  if (translate) fd.append("translate_with", pref.translateWith || "whisper");
   fd.append("max_tokens", String(pref.maxTok || 448));
   const diar = pref.diarize && $("#sttDiar") && !$("#sttDiar").disabled && pref.task === "transcriptions";
   if (diar) fd.append("diarize", "true");

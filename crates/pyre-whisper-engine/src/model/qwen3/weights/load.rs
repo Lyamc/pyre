@@ -1,6 +1,6 @@
 use burn::module::{Module, Param};
 use burn::nn::conv::Conv2d;
-use burn::nn::{Embedding, LayerNorm, Linear};
+use burn::nn::{Embedding, LayerNorm, Linear, LinearConfig};
 use burn::tensor::{Tensor};
 use std::error::Error;
 use std::path::Path;
@@ -151,9 +151,13 @@ fn load_thinker_layer(
     device: &burn::tensor::Device,
 ) -> Result<super::super::thinker::Qwen3ThinkerLayer, Box<dyn Error>> {
     let attn = format!("{prefix}.self_attn");
-    let q_proj = load_linear(store, &format!("{attn}.q_proj"), layer.self_attn.q_proj.clone(), device)?;
-    let k_proj = load_linear(store, &format!("{attn}.k_proj"), layer.self_attn.k_proj.clone(), device)?;
-    let v_proj = load_linear(store, &format!("{attn}.v_proj"), layer.self_attn.v_proj.clone(), device)?;
+    let q_proj = load_linear(store, &format!("{attn}.q_proj"), layer.self_attn.qkv.clone(), device)?;
+    let k_proj = load_linear(store, &format!("{attn}.k_proj"), layer.self_attn.qkv.clone(), device)?;
+    let v_proj = load_linear(store, &format!("{attn}.v_proj"), layer.self_attn.qkv.clone(), device)?;
+    let qkv_weight = Tensor::cat(vec![q_proj.weight.val().clone(), k_proj.weight.val().clone(), v_proj.weight.val().clone()], 1);
+    let [din, dout] = qkv_weight.dims();
+    let mut qkv = LinearConfig::new(din, dout).with_bias(false).init(device);
+    qkv.weight = Param::from_tensor(qkv_weight);
     let o_proj = load_linear(store, &format!("{attn}.o_proj"), layer.self_attn.o_proj.clone(), device)?;
     let q_norm = load_rms(store, &format!("{attn}.q_norm.weight"), layer.self_attn.q_norm.clone(), device)?;
     let k_norm = load_rms(store, &format!("{attn}.k_norm.weight"), layer.self_attn.k_norm.clone(), device)?;
@@ -165,21 +169,22 @@ fn load_thinker_layer(
         layer.post_attention_layernorm.clone(),
         device,
     )?;
-    let gate_proj = load_linear(store, &format!("{prefix}.mlp.gate_proj"), layer.mlp.gate_proj.clone(), device)?;
-    let up_proj = load_linear(store, &format!("{prefix}.mlp.up_proj"), layer.mlp.up_proj.clone(), device)?;
+    let gate_proj = load_linear(store, &format!("{prefix}.mlp.gate_proj"), layer.mlp.gate_up.clone(), device)?;
+    let up_proj = load_linear(store, &format!("{prefix}.mlp.up_proj"), layer.mlp.gate_up.clone(), device)?;
+    let gate_up_weight = Tensor::cat(vec![gate_proj.weight.val().clone(), up_proj.weight.val().clone()], 1);
+    let [gin, gout] = gate_up_weight.dims();
+    let mut gate_up = LinearConfig::new(gin, gout).with_bias(false).init(device);
+    gate_up.weight = Param::from_tensor(gate_up_weight);
     let down_proj = load_linear(store, &format!("{prefix}.mlp.down_proj"), layer.mlp.down_proj.clone(), device)?;
 
     let mut record = layer.clone();
-    record.self_attn.q_proj = q_proj;
-    record.self_attn.k_proj = k_proj;
-    record.self_attn.v_proj = v_proj;
+    record.self_attn.qkv = qkv;
     record.self_attn.o_proj = o_proj;
     record.self_attn.q_norm = q_norm;
     record.self_attn.k_norm = k_norm;
     record.input_layernorm = input_layernorm;
     record.post_attention_layernorm = post_attention_layernorm;
-    record.mlp.gate_proj = gate_proj;
-    record.mlp.up_proj = up_proj;
+    record.mlp.gate_up = gate_up;
     record.mlp.down_proj = down_proj;
     Ok(record)
 }

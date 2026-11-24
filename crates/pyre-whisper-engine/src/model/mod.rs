@@ -42,8 +42,30 @@ pub use vibevoice::{
 
 use burn::{
     config::Config,
-    module::Module
+    module::{Module, ModuleMapper, Param},
+    tensor::{FloatDType, Tensor},
     };
+
+/// Cast every float parameter of a loaded model (for example Whisper f32 -> f16 on CUDA).
+struct FloatCastMapper {
+    dtype: FloatDType,
+}
+
+impl ModuleMapper for FloatCastMapper {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+        if param.val().dtype() == self.dtype.into() {
+            param
+        } else {
+            Param::from_tensor(param.val().cast(self.dtype))
+        }
+    }
+}
+
+impl Model {
+    pub fn cast_float(self, dtype: FloatDType) -> Self {
+        self.map(&mut FloatCastMapper { dtype })
+    }
+}
 
 #[derive(Config, Debug)]
 pub enum ModelConfig {

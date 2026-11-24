@@ -136,6 +136,9 @@ async fn workflows(State(app): S) -> Json<Value> {
     w.insert("layers".into(), card(&app, &["isnet", "sd15"], "IS-Net cut-out + SD 1.5 inpainted background, zip of PNG layers", "needs IS-Net weights and an image model"));
     w.insert("animate".into(), card(&app, &["rife"], "RIFE 4.6 frame interpolation (GPU) -> GIF + PNG frames", "RIFE weights missing"));
     w.insert("to3d".into(), card(&app, &["triposr", "isnet"], "IS-Net cut-out + TripoSR (native, f16 weights) -> marching cubes, vertex colours, GLB", "TripoSR and/or IS-Net weights missing"));
+    w.insert("mesh".into(), ok("pyre-mesh pure-Rust mesh toolkit (CPU, no GPU lease)"));
+    w.insert("refine".into(), ok("pyre-mesh smooth / recolour (CPU, no GPU lease)"));
+    w.insert("rig".into(), ok("pyre-rig geometric auto-rigger (CPU, no GPU lease)"));
     w.insert("clothes".into(), card(&app, &["segformer", "sd15"], "SegFormer-B2 clothes parsing (auto mask) + SD 1.5 inpainting", "SegFormer clothes weights and/or image model missing"));
     w.insert("pose".into(), card(&app, &["openpose", "sd15"], "SD 1.5 + ControlNet v1.1 OpenPose, pose editor with presets", "ControlNet OpenPose and/or image model missing"));
     let (n, b) = crate::limits::leases();
@@ -381,6 +384,21 @@ async fn tsr_check(State(app): S, Json(b): Json<Value>) -> Response {
     json_or_err(tokio::task::spawn_blocking(move || small_gpu(2_300 << 20, "TripoSR check", |dev| crate::triposr::check(&dir, &rd, dev)).map(|s| json!({"report": s}))).await)
 }
 
+/// `POST /api/cabin/mesh {mesh, op, params}` - purely geometric mesh tools.
+/// `mesh` is a base64 data URL or plain base64 GLB, OBJ, PLY, or STL. `{ glb }` is accepted too.
+/// `op` is one of: stats, normals, smooth, recolour, center, scale, decimate, remesh, repair, uv, convert, sdf.
+/// CPU only: no model, no GPU lease, no VRAM.
+async fn mesh(_state: S, Json(b): Json<Value>) -> Response {
+    json_or_err(tokio::task::spawn_blocking(move || crate::mesh::run_request(&b)).await)
+}
+
+/// `POST /api/cabin/rig {mesh, template}` - geometric skeleton fit, skin weights,
+/// and a skinned GLB. `mesh` is base64 GLB, OBJ, PLY, or STL (a data URL works).
+/// `template` is `humanoid` (19 joints) or `character` (8 joints). CPU only.
+async fn rig(_state: S, Json(b): Json<Value>) -> Response {
+    json_or_err(tokio::task::spawn_blocking(move || crate::rig::run_request(&b)).await)
+}
+
 /// Label ids for a part name (character creator fields and the clothes workflow).
 fn part_labels(p: &str) -> &'static [u8] {
     match p { "hair" => &[2], "hat" => &[1], "face" | "eyes" | "expr" => &[11], "top" | "upper" => &[4, 17], "sleeves" => &[4, 14, 15], "bottom" => &[5, 6, 7], "skirt" => &[5], "pants" => &[6], "dress" => &[4, 5, 6, 7], "shoes" => &[9, 10], "acc" => &[1, 3, 8, 16, 17], "legs" => &[12, 13], "arms" => &[14, 15], "person" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], _ => &[] }
@@ -517,6 +535,8 @@ pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
         .route("/api/cabin/rife_check", post(rife_check))
         .route("/api/cabin/to3d", post(to3d).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/cabin/tsr_check", post(tsr_check))
+        .route("/api/cabin/mesh", post(mesh).layer(axum::extract::DefaultBodyLimit::max(96 << 20)))
+.route("/api/cabin/rig", post(rig).layer(axum::extract::DefaultBodyLimit::max(96 << 20)))
         .route("/api/cabin/pack", post(pack).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/api/cabin/vectorize", post(vectorize).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
 }

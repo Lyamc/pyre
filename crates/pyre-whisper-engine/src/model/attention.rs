@@ -15,17 +15,13 @@ pub struct MultiHeadAttentionConfig {
 
 impl MultiHeadAttentionConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> MultiHeadAttention {
-        let query = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let key = nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device);
-        let value = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let out = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-
         MultiHeadAttention {
             n_head: self.n_head,
-            query,
-            key,
-            value,
-            out,
+            query: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
+            key: nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device),
+            value: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
+            qkv: None,
+            out: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
         }
     }
 }
@@ -36,14 +32,61 @@ pub struct MultiHeadAttention {
     pub query: nn::Linear,
     pub key: nn::Linear,
     pub value: nn::Linear,
+    /// Set after weight loading: q/k/v packed into a single matmul (order q, k, v).
+    /// Optional so existing burnpack bundles (which name the three separately) still load.
+    pub qkv: Option<nn::Linear>,
     pub out: nn::Linear,
 }
 
 impl MultiHeadAttention {
+    /// One projection for all three, then split the last dimension into q/k/v.
+    pub fn qkv_forward(&self, x: Tensor<3>) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
+        if let Some(qkv) = &self.qkv {
+            let y = qkv.forward(x);
+            let [b, t, d3] = y.dims();
+            let d = d3 / 3;
+            (
+                y.clone().slice([0..b, 0..t, 0..d]),
+                y.clone().slice([0..b, 0..t, d..2 * d]),
+                y.slice([0..b, 0..t, 2 * d..3 * d]),
+            )
+        } else {
+            (
+                self.query.forward(x.clone()),
+                self.key.forward(x.clone()),
+                self.value.forward(x),
+            )
+        }
+    }
+
+    /// Pack the loaded q/k/v weights into one Linear. Call once after loading.
+    pub fn fuse_qkv(&mut self, device: &burn::tensor::Device) {
+        let n = self.query.weight.dims()[0];
+        let w = Tensor::cat(
+            vec![
+                self.query.weight.val().clone(),
+                self.key.weight.val().clone(),
+                self.value.weight.val().clone(),
+            ],
+            1,
+        );
+        let zero = || Tensor::zeros([n], device);
+        let b = Tensor::cat(
+            vec![
+                self.query.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+                self.key.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+                self.value.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+            ],
+            0,
+        );
+        let mut fused = nn::LinearConfig::new(n, n * 3).with_bias(true).init(device);
+        fused.weight = Param::from_tensor(w);
+        fused.bias = Some(Param::from_tensor(b));
+        self.qkv = Some(fused);
+    }
+
     pub fn forward(&self, x: Tensor<3>, mask: Option<Tensor<2>>) -> Tensor<3> {
-        let q = self.query.forward(x.clone());
-        let k = self.key.forward(x.clone());
-        let v = self.value.forward(x);
+        let (q, k, v) = self.qkv_forward(x);
         qkv_attention(q, k, v, mask, self.n_head, &self.out)
     }
 
@@ -55,9 +98,7 @@ impl MultiHeadAttention {
         past: Option<(Tensor<3>, Tensor<3>)>,
         mask: Option<Tensor<2>>,
     ) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
-        let q = self.query.forward(x_ln.clone());
-        let k_new = self.key.forward(x_ln.clone());
-        let v_new = self.value.forward(x_ln);
+        let (q, k_new, v_new) = self.qkv_forward(x_ln);
         let (k, v) = match past {
             Some((pk, pv)) => (
                 Tensor::cat(vec![pk, k_new], 1),
@@ -238,17 +279,13 @@ pub struct MultiHeadCrossAttentionConfig {
 
 impl MultiHeadCrossAttentionConfig {
     pub fn init(&self, device: &burn::tensor::Device) -> MultiHeadCrossAttention {
-        let query = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let key = nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device);
-        let value = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-        let out = nn::LinearConfig::new(self.n_state, self.n_state).init(device);
-
         MultiHeadCrossAttention {
             n_head: self.n_head,
-            query,
-            key,
-            value,
-            out,
+            query: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
+            key: nn::LinearConfig::new(self.n_state, self.n_state).with_bias(false).init(device),
+            value: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
+            qkv: None,
+            out: nn::LinearConfig::new(self.n_state, self.n_state).init(device),
         }
     }
 }
@@ -259,14 +296,60 @@ pub struct MultiHeadCrossAttention {
     pub query: nn::Linear,
     pub key: nn::Linear,
     pub value: nn::Linear,
+    /// Set after weight loading; optional so old bundles with separate q/k/v still load.
+    pub qkv: Option<nn::Linear>,
     pub out: nn::Linear,
 }
 
 impl MultiHeadCrossAttention {
+    fn qkv_forward(&self, x: Tensor<3>) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
+        if let Some(qkv) = &self.qkv {
+            let y = qkv.forward(x);
+            let [b, t, d3] = y.dims();
+            let d = d3 / 3;
+            (
+                y.clone().slice([0..b, 0..t, 0..d]),
+                y.clone().slice([0..b, 0..t, d..2 * d]),
+                y.slice([0..b, 0..t, 2 * d..3 * d]),
+            )
+        } else {
+            (
+                self.query.forward(x.clone()),
+                self.key.forward(x.clone()),
+                self.value.forward(x),
+            )
+        }
+    }
+
+    /// Pack the loaded q/k/v weights into one Linear. Call once after loading.
+    pub fn fuse_qkv(&mut self, device: &burn::tensor::Device) {
+        let n = self.query.weight.dims()[0];
+        let w = Tensor::cat(
+            vec![
+                self.query.weight.val().clone(),
+                self.key.weight.val().clone(),
+                self.value.weight.val().clone(),
+            ],
+            1,
+        );
+        let zero = || Tensor::zeros([n], device);
+        let b = Tensor::cat(
+            vec![
+                self.query.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+                self.key.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+                self.value.bias.as_ref().map(|p| p.val().clone()).unwrap_or_else(zero),
+            ],
+            0,
+        );
+        let mut fused = nn::LinearConfig::new(n, n * 3).with_bias(true).init(device);
+        fused.weight = Param::from_tensor(w);
+        fused.bias = Some(Param::from_tensor(b));
+        self.qkv = Some(fused);
+    }
+
     pub fn forward(&self, x: Tensor<3>, xa: Tensor<3>) -> Tensor<3> {
-        let q = self.query.forward(x);
-        let k = self.key.forward(xa.clone());
-        let v = self.value.forward(xa);
+        let (q, _, _) = self.qkv_forward(x);
+        let (_, k, v) = self.qkv_forward(xa);
         qkv_attention(q, k, v, None, self.n_head, &self.out)
     }
 
@@ -279,9 +362,12 @@ impl MultiHeadCrossAttention {
     ) -> (Tensor<3>, Tensor<3>, Tensor<3>) {
         let (k, v) = match past {
             Some(kv) => kv,
-            None => (self.key.forward(xa.clone()), self.value.forward(xa.clone())),
+            None => {
+                let (_, k, v) = self.qkv_forward(xa.clone());
+                (k, v)
+            }
         };
-        let q = self.query.forward(x_ln);
+        let (q, _, _) = self.qkv_forward(x_ln);
         let y = qkv_attention(q, k.clone(), v.clone(), None, self.n_head, &self.out);
         (y, k, v)
     }
@@ -345,4 +431,45 @@ pub fn attn_decoder_mask(
         mask = mask.slice_assign([i..i + 1, i + 1..seq_length], values);
     }
     mask
+}
+
+#[cfg(test)]
+mod whisper_qkv_tests {
+    use super::{MultiHeadAttentionConfig, MultiHeadCrossAttentionConfig};
+    use burn::tensor::{Distribution, Tensor};
+
+    fn close(a: Tensor<3>, b: Tensor<3>) {
+        let a = a.into_data().to_vec::<f32>().unwrap();
+        let b = b.into_data().to_vec::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn fused_qkv_matches_separate_projections() {
+        let device = burn::tensor::Device::flex();
+        let x = Tensor::<3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device);
+
+        let mut attn = MultiHeadAttentionConfig::new(8, 2).init(&device);
+        let q = attn.query.forward(x.clone());
+        let k = attn.key.forward(x.clone());
+        let v = attn.value.forward(x.clone());
+        attn.fuse_qkv(&device);
+        let (qf, kf, vf) = attn.qkv_forward(x.clone());
+        close(q, qf);
+        close(k, kf);
+        close(v, vf);
+
+        let mut cross = MultiHeadCrossAttentionConfig::new(8, 2).init(&device);
+        let q = cross.query.forward(x.clone());
+        let k = cross.key.forward(x.clone());
+        let v = cross.value.forward(x.clone());
+        cross.fuse_qkv(&device);
+        let (qf, kf, vf) = cross.qkv_forward(x);
+        close(q, qf);
+        close(k, kf);
+        close(v, vf);
+    }
 }

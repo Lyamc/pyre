@@ -310,18 +310,11 @@ fn post_convert(subdir: &str, dest: &Path, tx: &dyn Fn(Value)) -> Result<()> {
 }
 
 fn convert_triposr(dir: &Path) -> Result<()> {
-    // Prefer an existing convert.py next to the weights or under C:\Temp\qnx\int\cabin\tsr_ref
-    let py = which_python();
-    let script = dir.join("convert.py");
-    let script = if script.is_file() { script } else {
-        let alt = PathBuf::from(r"C:\Temp\qnx\int\cabin\tsr_ref\convert.py");
-        if alt.is_file() { alt } else { bail!("TripoSR convert.py not found; place convert.py next to model.ckpt") }
-    };
-    let st = dir.join("triposr_f16.safetensors");
-    let st_out = std::process::Command::new(&py).args([script.to_str().unwrap(), dir.join("model.ckpt").to_str().unwrap(), st.to_str().unwrap()]).output()
-        .with_context(|| format!("running {py}"))?;
-    if !st_out.status.success() { bail!("TripoSR convert failed: {}", String::from_utf8_lossy(&st_out.stderr)); }
-    Ok(())
+    let src = dir.join("model.ckpt");
+    let dst = dir.join("triposr_f16.safetensors");
+    if !src.is_file() { bail!("{}: model.ckpt is missing", dir.display()); }
+    crate::triposr::convert_ckpt(&src, &dst)
+        .with_context(|| format!("converting {} to f16 safetensors (native Rust)", src.display()))
 }
 
 fn which_python() -> String {

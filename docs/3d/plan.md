@@ -68,10 +68,10 @@ Neural inference stays native Rust/Burn inside pyre. No Python, ONNX, or externa
 Later PRs branch from `qwen-int` (or from the previous 3D PR only when they stack). No force-push. Each PR updates the checkboxes in this file.
 
 - [x] PR A — this document (and `docs/stt/plan.md`). Docs only.
-- [ ] PR B — mesh tools and geometric mesh→SDF. Pure Rust, unit-tested, cabin API and UI. No new neural net.
-- [ ] PR C — image→3D cleanup on TripoSR: capabilities card, Rust weight conversion to replace `convert.py`, viewer reused. Still no IDOL or Pixal3D port.
-- [ ] PR D — automatic rigging, glTF skin export, skeleton preview in the existing viewer.
-- [ ] PR E — 3D→3D geometric pass (smooth / project colours / optional SD atlas only if the image model is already the one cabin loads).
+- [x] PR B — mesh tools and geometric mesh→SDF. Pure Rust, unit-tested, cabin API and UI. No new neural net.
+- [x] PR C — image→3D cleanup on TripoSR: capabilities card, Rust weight conversion to replace `convert.py`, viewer reused. Still no IDOL or Pixal3D port.
+- [x] PR D — automatic rigging, glTF skin export, skeleton preview in the existing viewer.
+- [x] PR E — 3D→3D geometric pass (smooth / project colours / optional SD atlas only if the image model is already the one cabin loads).
 
 Effort, as scope rather than calendar time:
 
@@ -85,78 +85,166 @@ Effort, as scope rather than calendar time:
 
 ### API
 
-- [ ] `POST /api/cabin/mesh` with `{ mesh, op, params }`. `mesh` is base64 GLB, OBJ, PLY, or STL, or `{ glb }` matching `/api/cabin/to3d`.
-- [ ] Ops: `stats`, `normals`, `center`, `scale`, `decimate`, `remesh`, `repair`, `uv`, `convert`, `sdf`.
-- [ ] Response always includes `stats` (vertices, triangles, bbox, area, watertight flag, edge counts) and, when the op emits a mesh, `glb` plus `bytes`. `convert` also returns the requested format (`glb`, `obj`, `ply`, `stl`).
-- [ ] `sdf` returns a float32 grid, the origin, the spacing, the dimensions, and the sign convention (negative inside). Default resolution 64³, cap 128³ unless the request asks and the byte size stays bounded. Also return a marching-cubes GLB of the zero level set so the viewer can show it.
-- [ ] Errors are the usual cabin JSON errors. Reject a mesh over a stated triangle cap rather than allocating without limit.
-- [ ] Workflow card in `GET /api/cabin/workflows`: id `mesh`, always `ready: true`, model string names the pure-Rust toolkit and says it uses no GPU.
+- [x] `POST /api/cabin/mesh` with `{ mesh, op, params }`. `mesh` is base64 GLB, OBJ, PLY, or STL, or `{ glb }` matching `/api/cabin/to3d`.
+- [x] Ops: `stats`, `normals`, `center`, `scale`, `decimate`, `remesh`, `repair`, `uv`, `convert`, `sdf`.
+- [x] Response always includes `stats` (vertices, triangles, bbox, area, watertight flag, edge counts) and, when the op emits a mesh, `glb` plus `bytes`. `convert` also returns the requested format (`glb`, `obj`, `ply`, `stl`).
+- [x] `sdf` returns a float32 grid, the origin, the spacing, the dimensions, and the sign convention (negative inside). Default resolution 64³, cap 128³ unless the request asks and the byte size stays bounded. Also return a marching-cubes GLB of the zero level set so the viewer can show it.
+- [x] Errors are the usual cabin JSON errors. Reject a mesh over a stated triangle cap rather than allocating without limit.
+- [x] Workflow card in `GET /api/cabin/workflows`: id `mesh`, always `ready: true`, model string names the pure-Rust toolkit and says it uses no GPU.
 
 ### Geometry
 
-- [ ] In-tree mesh type: positions, triangles, optional normals, optional vertex colours, optional UVs. Load and save GLB (extend the writer in `src/triposr.rs` rather than a second GLB dialect), OBJ, PLY, STL.
-- [ ] `normals`: area-weighted vertex normals, consistent winding where the mesh is orientable.
-- [ ] `center` / `scale`: bbox center to origin, uniform scale to a requested extent (default 1).
-- [ ] `decimate`: quadric edge collapse to a target face or vertex count. Preserve vertex colours by copying the kept vertex. If UVs exist, keep them on the kept vertex and say when seams are not preserved.
-- [ ] `remesh`: triangle isotropic or voxel remesh at a requested edge length. Not Modly’s quad remesh.
-- [ ] `repair`: weld vertices, drop degenerate triangles, fix inconsistent winding on orientable patches, report non-manifold edges. Fill only small boundary loops. Say in the response what was left unfixed.
-- [ ] `uv`: box or planar projection as the first version. LSCM only if the implementation stays in-tree and the tests pass. Do not add an xatlas submodule in this PR.
-- [ ] `sdf`: closest-point distance with winding-number or pseudonormal sign. Document the method in the response (`method` field) so it is not confused with SDF-StyleGAN.
+- [x] In-tree mesh type: positions, triangles, optional normals, optional vertex colours, optional UVs. Load and save GLB (extend the writer in `src/triposr.rs` rather than a second GLB dialect), OBJ, PLY, STL.
+- [x] `normals`: area-weighted vertex normals, consistent winding where the mesh is orientable.
+- [x] `center` / `scale`: bbox center to origin, uniform scale to a requested extent (default 1).
+- [x] `decimate`: quadric edge collapse to a target face or vertex count. Preserve vertex colours by copying the kept vertex. If UVs exist, keep them on the kept vertex and say when seams are not preserved.
+- [x] `remesh`: triangle isotropic or voxel remesh at a requested edge length. Not Modly’s quad remesh.
+- [x] `repair`: weld vertices, drop degenerate triangles, fix inconsistent winding on orientable patches, report non-manifold edges. Fill only small boundary loops. Say in the response what was left unfixed.
+- [x] `uv`: box or planar projection as the first version. LSCM only if the implementation stays in-tree and the tests pass. Do not add an xatlas submodule in this PR. Box projection shipped first; LSCM added later in-tree (`mesh.rs::add_lscm_uvs`, alternating least-squares conformal fit, no external solver). `params.projection = "box" | "lscm"`, `params.iterations` (default 200) for LSCM. Responded charts/iterations/max_error; seams are not split.
+- [x] `sdf`: closest-point distance with winding-number or pseudonormal sign. Document the method in the response (`method` field) so it is not confused with SDF-StyleGAN.
 
 ### UI
 
-- [ ] New cabin card “Mesh tools” next to the existing “Image to 3D” card.
-- [ ] File input accepts GLB, OBJ, PLY, STL. A button can send the last TripoSR GLB if one is still in the page.
-- [ ] Op selector and the few numeric fields each op needs (target faces, resolution, target size, output format).
-- [ ] Reuse `meshViewer` for any returned GLB. Show stats under the viewer the way `to3d` shows vertex and triangle counts.
-- [ ] SDF result: show the marching-cubes preview and a download for the grid (`.npy` if the existing `npy` crate writes it, otherwise raw float32 plus a JSON header). State which one shipped.
-- [ ] No new tab unless the cabin card list cannot hold the tools. Prefer the cabin tab.
+- [x] New cabin card “Mesh tools” next to the existing “Image to 3D” card.
+- [x] File input accepts GLB, OBJ, PLY, STL. A button can send the last TripoSR GLB if one is still in the page.
+- [x] Op selector and the few numeric fields each op needs (target faces, resolution, target size, output format).
+- [x] Reuse `meshViewer` for any returned GLB. Show stats under the viewer the way `to3d` shows vertex and triangle counts.
+- [x] SDF result: show the marching-cubes preview and a download for the grid (`.npy` if the existing `npy` crate writes it, otherwise raw float32 plus a JSON header). State which one shipped: raw little-endian float32 plus a JSON header (no in-tree `.npy` crate was found).
+- [x] No new tab unless the cabin card list cannot hold the tools. Prefer the cabin tab.
 
 ### Capabilities
 
-- [ ] Extend `Capabilities` with `mesh_input` and `mesh_output` without changing the meaning of the current flags. Existing tests in `src/capabilities.rs` stay green.
-- [ ] Add a `three_d` object on the JSON, the way `speech` is added for transcription models: tasks, ops, `neural: false`, license `MIT` (pyre’s own code), and a one-line VRAM note (`cpu`, no lease).
-- [ ] Register a builtin card (same idea as the diarizer card in `App::model_cards`) so `/v1/models` and `/api/models` list it even though nothing is loaded. Suggested id: `pyre-mesh`. Kind string needs a new `Kind` variant or a documented `unknown` card. If a new variant is added, update every `match` and do not change detection of GGUF, Whisper, or SD folders.
-- [ ] Summary text must mention mesh in/out so the Models table shows it.
+- [x] Extend `Capabilities` with `mesh_input` and `mesh_output` without changing the meaning of the current flags. Existing tests in `src/capabilities.rs` stay green.
+- [x] Add a `three_d` object on the JSON, the way `speech` is added for transcription models: tasks, ops, `neural: false`, license `MIT` (pyre’s own code), and a one-line VRAM note (`cpu`, no lease).
+- [x] Register a builtin card (same idea as the diarizer card in `App::model_cards`) so `/v1/models` and `/api/models` list it even though nothing is loaded. Suggested id: `pyre-mesh`. Kind string needs a new `Kind` variant or a documented `unknown` card. If a new variant is added, update every `match` and do not change detection of GGUF, Whisper, or SD folders.
+- [x] Summary text must mention mesh in/out so the Models table shows it.
 
 ### Tests
 
-- [ ] Unit tests, no GPU and no weights: cube and tetrahedron stats; OBJ/STL/GLB round trip within a tolerance; decimate reduces a subdivided plane and keeps the corners; normals of an axis-aligned cube face point outward; center/scale of a translated box; repair welds a duplicated vertex.
-- [ ] SDF of a cube: sample points known to be inside are negative, outside are positive, and the zero isosurface sits near the faces. Marching cubes of that grid produces a box with six sides.
-- [ ] Non-manifold input returns a report and does not panic.
-- [ ] These tests are the parity check for this PR. There is no neural reference to match.
+- [x] Unit tests, no GPU and no weights: cube and tetrahedron stats; OBJ/STL/GLB round trip within a tolerance; decimate reduces a subdivided plane and keeps the corners; normals of an axis-aligned cube face point outward; center/scale of a translated box; repair welds a duplicated vertex.
+- [x] SDF of a cube: sample points known to be inside are negative, outside are positive, and the zero isosurface sits near the faces. Marching cubes of that grid produces a box with six sides.
+- [x] Non-manifold input returns a report and does not panic.
+- [x] These tests are the parity check for this PR. There is no neural reference to match.
 
 ## PR C — image→3D
 
-- [ ] TripoSR, when its f16 weights are present, appears in `/v1/models` and `/api/models` with `image_input`, `mesh_output`, and a `three_d` block: task `image-to-3d`, license `MIT`, lease about 2300 MiB, backend the one cabin uses.
-- [ ] The card states that IDOL and Pixal3D are not loaded and why (size and VRAM), so the choice is visible. Do not pretend they are implemented.
-- [ ] Replace `convert_triposr`’s `python convert.py` call with a Rust reader of `model.ckpt` into `triposr_f16.safetensors`. Layout must match what `Tsr::load` already requires (`dino_pos512`, `decoder.layers.18.weight`).
-- [ ] Parity: on a machine that has the checkpoint, compare a fixed image’s vertex count and a few density samples against the current converter’s output, or against the PyTorch reference if it is still available. Record the command and the deltas in the PR. If the checkpoint is not on the machine, say so and do not invent a match.
-- [ ] UI stays the existing `to3d` workflow. Point the mesh-tools card at its GLB.
-- [ ] IS-Net cut-out remains, including the non-commercial label on RMBG-1.4.
+- [x] TripoSR, when its f16 weights are present, appears in `/v1/models` and `/api/models` with `image_input`, `mesh_output`, and a `three_d` block: task `image-to-3d`, license `MIT`, lease about 2300 MiB, backend the one cabin uses.
+- [x] The card states that IDOL and Pixal3D are not loaded and why (size and VRAM), so the choice is visible. Do not pretend they are implemented.
+- [x] Replace `convert_triposr`’s `python convert.py` call with a Rust reader of `model.ckpt` into `triposr_f16.safetensors`. Layout must match what `Tsr::load` already requires (`dino_pos512`, `decoder.layers.18.weight`).
+- [x] Parity: on a machine that has the checkpoint, compare a fixed image’s vertex count and a few density samples against the current converter’s output, or against the PyTorch reference if it is still available. Record the command and the deltas in the PR. If the checkpoint is not on the machine, say so and do not invent a match.
+- [x] UI stays the existing `to3d` workflow. Point the mesh-tools card at its GLB.
+- [x] IS-Net cut-out remains, including the non-commercial label on RMBG-1.4.
+
+Parity recorded 2026-11-12 on the 3060 machine (checkpoint and Python-converted reference
+both on disk):
+
+```
+PYRE_TRIPOSR_DIR=<store>/cabin/triposr cargo test --bin pyre convert_ckpt -- --ignored --nocapture
+```
+
+- 549 f32 tensors in `model.ckpt`; 3 dropped (`pooler.*`, learned `position_embeddings`),
+  1 generated (`dino_pos512`) → 547 tensors, same names, shapes, and dtypes as the reference.
+- Same output size, 838,788,464 bytes; `decoder.*` f32 tensors bit-identical.
+- `dino_pos512` is the only recomputed tensor: max |Δ| 4.883e-4, 195 of 787,200 f16 values
+  differ (1 ulp, from f32 summation order in the bicubic kernel). Everything else identical.
+- Conversion takes 4.2 s in the test profile, entirely in Rust, no Python or torch.
+- The parity test deserializes the Rust output and asserts the exact tensor name set, shapes,
+  and dtypes of the reference that `Tsr::load` already reads, so the layout is load-compatible.
+
+Not run: an end-to-end `tsr_check` GPU mesh/density comparison against the PyTorch reference,
+and a live server smoke test of `POST /api/cabin/to3d` after conversion. The parity above is at
+the weight-conversion level. The `convert.py` that used to sit in `C:\Temp\qnx\int\cabin\tsr_ref`
+is now legacy and is not read by pyre.
 
 ## PR D — auto rigging
 
-- [ ] `POST /api/cabin/rig` with a mesh plus `template: humanoid | character`.
-- [ ] Fit a named skeleton (hips, spine, head, arms, legs for humanoid; a shorter chain for character). Place joints from the mesh bbox and principal axis, then refine by the geometric embedding method. Document the assumptions (upright, facing +Z or the glTF axis the TripoSR writer uses).
-- [ ] Skin weights: heat diffusion or a documented distance falloff if the heat solve is unstable. Weights per vertex sum to 1. At most 4 influences, matching glTF.
-- [ ] GLB contains a skin, nodes, and inverse bind matrices. The mesh primitive still has the attributes `parseGlb` needs, plus `JOINTS_0` and `WEIGHTS_0`.
-- [ ] Viewer: draw bone segments when those attributes or a `skins` array exist. Orbit controls stay as they are.
-- [ ] Capabilities: the `pyre-mesh` card grows `rig: [humanoid, character]` and notes that this is geometric, not a learned rigger.
-- [ ] Tests: a capsule or box character gets a spine of the expected joint count; weights are finite and sum to 1; the GLB JSON contains a `skins` entry. No claim of animation quality beyond that.
+- [x] `POST /api/cabin/rig` with a mesh plus `template: humanoid | character`.
+- [x] Fit a named skeleton (hips, spine, head, arms, legs for humanoid; a shorter chain for character). Place joints from the mesh bbox and principal axis, then refine by the geometric embedding method. Document the assumptions (upright, facing +Z or the glTF axis the TripoSR writer uses).
+- [x] Skin weights: heat diffusion or a documented distance falloff if the heat solve is unstable. Weights per vertex sum to 1. At most 4 influences, matching glTF.
+- [x] GLB contains a skin, nodes, and inverse bind matrices. The mesh primitive still has the attributes `parseGlb` needs, plus `JOINTS_0` and `WEIGHTS_0`.
+- [x] Viewer: draw bone segments when those attributes or a `skins` array exist. Orbit controls stay as they are.
+- [x] Capabilities: the `pyre-mesh` card grows `rig: [humanoid, character]` and notes that this is geometric, not a learned rigger.
+- [x] Tests: a capsule or box character gets a spine of the expected joint count; weights are finite and sum to 1; the GLB JSON contains a `skins` entry. No claim of animation quality beyond that.
+
+Implementation notes (2026-11-12):
+
+- `src/rig.rs`: 19-joint humanoid and 8-joint character templates. Anchors are
+  bbox fractions; the up axis is +Y unless the mesh is clearly lying down (long
+  principal axis along X or Z and a much shorter Y extent), in which case the
+  fit follows the long axis. Joints are blended 30% toward the local surface
+  centroid within 0.06 × height.
+- Weights are inverse-distance^4 over bone segments, top four influences,
+  normalised. No heat solve, so there is no linear system to become unstable.
+- `triposr::write_glb_skinned` emits POSITION, NORMAL, COLOR_0 (defaults to
+  opaque white), JOINTS_0 (u8 vec4), WEIGHTS_0 (f32 vec4), indices, one node per
+  joint, a `skins` entry, and inverse bind matrices. The cabin viewer reads the
+  joint node translations and overlays the bones in orange, with a toggle.
+- Assumptions returned in the response: upright +Y, facing +Z (TripoSR glTF
+  frame), plus the measured principal axis. Animation quality is not claimed.
+- Tests cover joint counts/names for both templates, lying-mesh orientation,
+  finite normalised weights with at most four influences, and the skinned GLB
+  JSON (`skins`, `JOINTS_0`, `WEIGHTS_0`, inverse-bind accessor count).
 
 ## PR E — 3D→3D
 
-- [ ] Ops on the mesh endpoint: `smooth` (Taubin or Laplacian, a few iterations), `recolour` (project vertex colours from a second mesh or from an image with a stated camera).
-- [ ] Optional: UV atlas plus a call into the existing SD 1.5 img2img path, only when that model is already how cabin paints images, with the same VRAM lease. Skip it if wiring it would fork the image pipeline.
-- [ ] UI card “Refine mesh” with the viewer before and after, or one viewer swapped to the result plus a download.
-- [ ] Capabilities list the ops. `neural` stays false unless the optional SD path is actually exposed, in which case the card points at the SD model’s own capabilities rather than claiming a new 3D network.
-- [ ] State in the PR that Pixal3D texture generation and IDOL were not run.
+- [x] Ops on the mesh endpoint: `smooth` (Taubin or Laplacian, a few iterations), `recolour` (project vertex colours from a second mesh or from an image with a stated camera).
+- [ ] Optional: UV atlas plus a call into the existing SD 1.5 img2img path, only when that model is already how cabin paints images, with the same VRAM lease. Skip it if wiring it would fork the image pipeline. Skipped by design; see the notes below.
+- [x] UI card “Refine mesh” with the viewer before and after, or one viewer swapped to the result plus a download.
+- [x] Capabilities list the ops. `neural` stays false unless the optional SD path is actually exposed, in which case the card points at the SD model’s own capabilities rather than claiming a new 3D network.
+- [x] State in the PR that Pixal3D texture generation and IDOL were not run.
+
+Implementation notes (2026-11-12):
+
+- `smooth`: Taubin λ/μ passes over triangle adjacency, default 2 iterations at
+  λ 0.5, μ −0.53; iterations and both factors are request parameters. Stored
+  normals are dropped so the GLB writer recomputes them.
+- `recolour` from another mesh: nearest point on the source surface via the
+  existing BVH, barycentric interpolation of `COLOR_0`.
+- `recolour` from an image: nearest-pixel sampling with a front orthographic
+  camera over the mesh bbox by default, or a pinhole camera when the request
+  supplies `{origin, target, up, fov_deg, aspect}`. That is the stated camera.
+  Vertices outside the frame keep their previous colour.
+- UI: “Refine mesh” card shows before and after viewers plus a GLB download.
+- The optional UV atlas + SD 1.5 img2img repaint is intentionally not wired:
+  the mesh endpoint has no UV atlas yet and adding an SD call there would fork
+  the image pipeline, which the plan says to skip.
+- Pixal3D texture generation and IDOL were not run or ported; the only neural
+  3D model in this series remains TripoSR for image→3D.
+
+## Verification pass (2026-11-23)
+
+The suite in this plan is present in the working tree and was exercised end to end on this machine:
+
+```
+cargo test --release --bin pyre --offline
+  test result: ok. 93 passed; 0 failed; 3 ignored; 0 measured
+  mesh::tests::*  (stats, formats, decimate, normals, center/scale, repair, uv box + LSCM,
+                   remesh, smooth, recolour from mesh/image, SDF, request round trips)
+  rig::tests::*   (joint counts, lying mesh, weights, skinned GLB)
+
+GET /api/cabin/workflows
+  mesh ready=true, refine ready=true, rig ready=true, to3d ready=true
+GET /v1/models -> pyre-mesh capabilities.three_d:
+  tasks mesh-to-mesh/mesh-to-sdf/mesh-refine/auto-rig, ops all 12,
+  rig [humanoid, character], neural false, license MIT, vram cpu
+GET /api/models.loaded -> pyre-mesh with summary "mesh in/out"
+
+POST /api/cabin/mesh {op:"stats"} on an 8-vertex cube
+  vertices=8 triangles=12 watertight=true, GLB returned
+POST /api/cabin/rig {template:"humanoid"} on the same cube
+  19 joints, skinned GLB returned
+POST /api/cabin/mesh {op:"sdf", params:{resolution:32}}
+  dimensions [32,32,32], format raw-f32-le, method pseudonormal, isosurface GLB
+```
+
+The optional UV-atlas + SD 1.5 repaint (PR E) remains intentionally unimplemented, and IDOL /
+Pixal3D / SDF-StyleGAN ports remain out of scope per the decisions above. The unverified
+end-to-end TripoSR GPU comparison noted in PR C is still recorded as not run.
 
 ## Weight conversion
 
-- [ ] PR B: none.
-- [ ] PR C: Rust conversion of TripoSR `model.ckpt` → `triposr_f16.safetensors`. Delete the requirement on `convert.py` once the Rust output loads in `Tsr::load`.
+- [x] PR B: none.
+- [x] PR C: Rust conversion of TripoSR `model.ckpt` → `triposr_f16.safetensors`. Delete the requirement on `convert.py` once the Rust output loads in `Tsr::load`.
 - [ ] IDOL files are already safetensors. A future port would map them in Rust. Not in this series.
 - [ ] Pixal3D files are already safetensors. Not in this series.
 - [ ] `cars.ckpt` is a PyTorch checkpoint. Do not convert it while the license is `other` plus ShapeNet.

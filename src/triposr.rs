@@ -1,6 +1,6 @@
 //! TripoSR (stabilityai/TripoSR, MIT): single image -> triplane NeRF -> marching-cubes mesh with vertex colours.
-//! Native Burn port. Weights: `<store>/cabin/triposr/triposr_f16.safetensors` (converted from `model.ckpt` by
-//! convert.py: f16 storage, decoder f32, DINO position table pre-interpolated to the 32x32 grid of 512 px).
+//! Native Burn port. Weights: `<store>/cabin/triposr/triposr_f16.safetensors` (converted in Rust from `model.ckpt`
+//! by [`convert_ckpt`]: f16 storage, decoder f32, DINO position table pre-interpolated to the 32x32 grid of 512 px).
 //! Graph: DINO ViT-B/16 (12 layers, 768, eps 1e-12, exact GELU) on the 512x512 grey-composited image ->
 //! 1025 tokens; learned triplane tokens [3, 1024, 32, 32] -> Transformer1D (GroupNorm 32, proj_in, 16 x
 //! [LN, self-attn, LN, cross-attn to DINO, LN, GEGLU 4096], proj_out, residual) -> ConvTranspose 2x2 to
@@ -12,6 +12,7 @@ use burn::tensor::activation::{gelu, sigmoid, softmax};
 use burn::tensor::module::{conv2d, conv_transpose2d};
 use burn::tensor::ops::{ConvOptions, ConvTransposeOptions};
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,153 @@ pub const RADIUS: f32 = 0.87;
 pub fn weights_dir(store_root: &Path) -> PathBuf { std::env::var("PYRE_TRIPOSR_DIR").map(PathBuf::from).unwrap_or_else(|_| store_root.join("cabin").join("triposr")) }
 fn file(dir: &Path) -> PathBuf { dir.join("triposr_f16.safetensors") }
 pub fn available(dir: &Path) -> bool { file(dir).is_file() }
+
+/// Convert the TripoSR `model.ckpt` PyTorch checkpoint into the runtime
+/// `triposr_f16.safetensors` layout, entirely in Rust. This mirrors the old
+/// reference `convert.py` step for step:
+///
+/// * `image_tokenizer.model.*` becomes `dino.*`;
+/// * `pooler.*` and the learned DINO `position_embeddings` are dropped, except
+///   that the position table is pre-interpolated from 14x14 to the 32x32 patch
+///   grid of a 512 px input (bicubic, `align_corners=false`) and saved as
+///   `dino_pos512` (1025 x 768);
+/// * `decoder.*` stays f32 (the density head is sensitive), everything else is
+///   stored f16 to halve the file and the VRAM footprint.
+///
+/// No Python, torch, or network access is involved.
+pub fn convert_ckpt(src: &Path, dst: &Path) -> Result<()> {
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    let reader = pytorch_reader::PytorchReader::new(src).map_err(|e| anyhow!("{}: {e}", src.display()))?;
+
+    let pe = reader
+        .get("image_tokenizer.model.embeddings.position_embeddings")
+        .ok_or_else(|| anyhow!("{}: no image_tokenizer.model.embeddings.position_embeddings", src.display()))?;
+    let pe_shape = pe.shape().to_vec();
+    let channels = *pe_shape.last().ok_or_else(|| anyhow!("position_embeddings has no shape"))?;
+    let pe_vals = tensor_f32(pe)?;
+    let pos = dino_pos_512(&pe_vals, channels)?;
+
+    // Bytes per output tensor, with the safetensors dtype they will be written as.
+    let mut tensors: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
+    tensors.push((
+        "dino_pos512".into(),
+        safetensors::Dtype::F16,
+        vec![1025, channels],
+        f32_to_f16_bytes(&pos),
+    ));
+
+    for (name, t) in reader.tensors() {
+        if name.contains("pooler") || name.ends_with("position_embeddings") {
+            continue;
+        }
+        let out_name = name.replace("image_tokenizer.model.", "dino.");
+        let vals = tensor_f32(t)?;
+        let (dtype, bytes) = if name.starts_with("decoder.") {
+            (safetensors::Dtype::F32, f32_to_f32_bytes(&vals))
+        } else {
+            (safetensors::Dtype::F16, f32_to_f16_bytes(&vals))
+        };
+        tensors.push((out_name, dtype, t.shape().to_vec(), bytes));
+    }
+
+    for required in ["dino_pos512", "dino.embeddings.cls_token", "decoder.layers.18.weight"] {
+        if !tensors.iter().any(|(n, ..)| n == required) {
+            bail!("{}: checkpoint is missing {required}", src.display());
+        }
+    }
+
+    let views: Vec<(&str, TensorView)> = tensors
+        .iter()
+        .map(|(n, dt, sh, data)| {
+            TensorView::new(*dt, sh.clone(), data)
+                .map(|v| (n.as_str(), v))
+                .map_err(|e| anyhow!("{n}: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    serialize_to_file(views, None, dst).map_err(|e| anyhow!("writing {}: {e}", dst.display()))?;
+    Ok(())
+}
+
+/// Read any float tensor as f32, whatever its stored dtype.
+fn tensor_f32(t: &pytorch_reader::Tensor) -> Result<Vec<f32>> {
+    use pytorch_reader::DType;
+    let raw = t.read().map_err(|e| anyhow!("{}: {e}", t.name))?;
+    let n = t.num_elements();
+    let vals: Vec<f32> = match t.dtype() {
+        DType::F32 => raw.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        DType::F16 => raw.chunks_exact(2).map(|c| f16_to_f32(u16::from_ne_bytes([c[0], c[1]]))).collect(),
+        DType::BF16 => raw.chunks_exact(2).map(|c| f32::from_bits((u16::from_ne_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+        DType::F64 => raw.chunks_exact(8).map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32).collect(),
+        d => bail!("{}: unsupported dtype {d:?}; expected a float tensor", t.name),
+    };
+    if vals.len() != n {
+        bail!("{}: read {} floats but the shape has {n} elements", t.name, vals.len());
+    }
+    Ok(vals)
+}
+
+fn f32_to_f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| half::f16::from_f32(*x).to_bits().to_le_bytes()).collect()
+}
+
+/// Reference `convert.py` position-table step: split CLS from the 14x14 patch
+/// grid, bicubic-resize the grid to 32x32, concat CLS back on as row 0.
+fn dino_pos_512(vals: &[f32], c: usize) -> Result<Vec<f32>> {
+    if c == 0 || vals.len() != c * 197 {
+        bail!("position_embeddings has {} values, expected 197 x {c}", vals.len());
+    }
+    let grid = &vals[c..];
+    let mut out = Vec::with_capacity(1025 * c);
+    out.extend_from_slice(&vals[..c]);
+    out.extend_from_slice(&bicubic_resize(grid, 14, 14, 32, 32, c));
+    Ok(out)
+}
+
+/// Separable bicubic resize with PyTorch's `mode='bicubic', align_corners=false`
+/// kernel (A = -0.75). `src` is row-major `[in_h, in_w, channels]`.
+fn bicubic_resize(src: &[f32], in_h: usize, in_w: usize, out_h: usize, out_w: usize, channels: usize) -> Vec<f32> {
+    debug_assert_eq!(src.len(), in_h * in_w * channels);
+    let ys: Vec<_> = (0..out_h).map(|o| cubic_weights(o, in_h, out_h)).collect();
+    let xs: Vec<_> = (0..out_w).map(|o| cubic_weights(o, in_w, out_w)).collect();
+    let mut out = vec![0.0f32; out_h * out_w * channels];
+    for (oy, (iy, wy)) in ys.iter().enumerate() {
+        for (ox, (ix, wx)) in xs.iter().enumerate() {
+            let base = (oy * out_w + ox) * channels;
+            for (ch, slot) in out[base..base + channels].iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for ky in 0..4 {
+                    for kx in 0..4 {
+                        let v = src[(iy[ky] * in_w + ix[kx]) * channels + ch];
+                        acc += wy[ky] * wx[kx] * v;
+                    }
+                }
+                *slot = acc;
+            }
+        }
+    }
+    out
+}
+
+/// Source indices and weights of the four taps for one output index.
+fn cubic_weights(out_idx: usize, in_size: usize, out_size: usize) -> ([usize; 4], [f32; 4]) {
+    let scale = in_size as f32 / out_size as f32;
+    let real = scale * (out_idx as f32 + 0.5) - 0.5;
+    let floor = real.floor();
+    let t = real - floor;
+    let i0 = floor as isize;
+    let clamp = |i: isize| i.clamp(0, in_size as isize - 1) as usize;
+    const A: f32 = -0.75;
+    let conv1 = |x: f32| ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+    let conv2 = |x: f32| ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
+    (
+        [clamp(i0 - 1), clamp(i0), clamp(i0 + 1), clamp(i0 + 2)],
+        [conv2(t + 1.0), conv1(t), conv1(1.0 - t), conv2(2.0 - t)],
+    )
+}
 
 pub struct Tsr { w: HashMap<String, (Vec<usize>, Tensor<1>)>, dev: Device }
 
@@ -251,7 +399,245 @@ pub fn image_to_mesh(m: &Tsr, img: &[f32], res: usize, thr: f32) -> Result<(Mesh
     Ok((Mesh { pos, col, tri }, info))
 }
 
-/// Binary glTF 2.0: POSITION, NORMAL (area-weighted), COLOR_0 (unsigned byte normalised), u32 indices.
+/// Binary glTF 2.0 writer shared by TripoSR and the mesh tools: POSITION, NORMAL,
+/// optional COLOR_0 (unsigned byte normalised VEC4), optional TEXCOORD_0 (f32 VEC2),
+/// u32 indices. `nor` must have the same length as `pos`.
+pub fn write_glb(pos: &[[f32; 3]], nor: &[[f32; 3]], col: Option<&[[f32; 3]]>, uv: Option<&[[f32; 2]]>, tri: &[[u32; 3]]) -> Vec<u8> {
+    let n = pos.len();
+    // Never emit an accessor whose count disagrees with its buffer view.
+    let zero_nor;
+    let nor: &[[f32; 3]] = if nor.len() == n { nor } else { zero_nor = vec![[0.0, 0.0, 1.0]; n]; &zero_nor };
+    let col = col.filter(|c| c.len() == n);
+    let uv = uv.filter(|t| t.len() == n);
+    let mut mn = [f32::MAX; 3]; let mut mx = [f32::MIN; 3];
+    for p in pos { for q in 0..3 { mn[q] = mn[q].min(p[q]); mx[q] = mx[q].max(p[q]); } }
+    if pos.is_empty() { mn = [0.0; 3]; mx = [0.0; 3]; }
+    let mut bin = Vec::new();
+    for p in pos { for q in 0..3 { bin.extend(p[q].to_le_bytes()); } }
+    let pos_len = bin.len();
+    for p in nor { for q in 0..3 { bin.extend(p[q].to_le_bytes()); } }
+    let nor_len = bin.len() - pos_len;
+    let mut views = vec![
+        serde_json::json!({"buffer": 0, "byteOffset": 0, "byteLength": pos_len, "target": 34962}),
+        serde_json::json!({"buffer": 0, "byteOffset": pos_len, "byteLength": nor_len, "target": 34962}),
+    ];
+    let mut accessors = vec![
+        serde_json::json!({"bufferView": 0, "componentType": 5126, "count": n, "type": "VEC3", "min": mn, "max": mx}),
+        serde_json::json!({"bufferView": 1, "componentType": 5126, "count": n, "type": "VEC3"}),
+    ];
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("POSITION".into(), serde_json::json!(0));
+    attrs.insert("NORMAL".into(), serde_json::json!(1));
+    if let Some(col) = col {
+        let off = bin.len();
+        for c in col { for q in 0..3 { bin.push((c[q].clamp(0.0, 1.0) * 255.0).round() as u8); } bin.push(255); }
+        let view = views.len();
+        views.push(serde_json::json!({"buffer": 0, "byteOffset": off, "byteLength": bin.len() - off, "target": 34962}));
+        accessors.push(serde_json::json!({"bufferView": view, "componentType": 5121, "normalized": true, "count": n, "type": "VEC4"}));
+        attrs.insert("COLOR_0".into(), serde_json::json!(accessors.len() - 1));
+    }
+    if let Some(uv) = uv {
+        let off = bin.len();
+        for t in uv { for q in 0..2 { bin.extend(t[q].to_le_bytes()); } }
+        let view = views.len();
+        views.push(serde_json::json!({"buffer": 0, "byteOffset": off, "byteLength": bin.len() - off, "target": 34962}));
+        accessors.push(serde_json::json!({"bufferView": view, "componentType": 5126, "count": n, "type": "VEC2"}));
+        attrs.insert("TEXCOORD_0".into(), serde_json::json!(accessors.len() - 1));
+    }
+    let idx_off = bin.len();
+    for t in tri { for &i in t { bin.extend(i.to_le_bytes()); } }
+    let idx_view = views.len();
+    views.push(serde_json::json!({"buffer": 0, "byteOffset": idx_off, "byteLength": tri.len() * 12, "target": 34963}));
+    accessors.push(serde_json::json!({"bufferView": idx_view, "componentType": 5125, "count": tri.len() * 3, "type": "SCALAR"}));
+    let idx_acc = accessors.len() - 1;
+    while bin.len() % 4 != 0 { bin.push(0); }
+    let json = serde_json::json!({
+        "asset": {"version": "2.0", "generator": "pyre (native)"},
+        "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": attrs, "indices": idx_acc, "material": 0}]}],
+        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0, "roughnessFactor": 0.9}, "doubleSided": true}],
+        "buffers": [{"byteLength": bin.len()}],
+        "bufferViews": views,
+        "accessors": accessors
+    });
+    let mut js = serde_json::to_vec(&json).unwrap(); while js.len() % 4 != 0 { js.push(b' '); }
+    let total = 12 + 8 + js.len() + 8 + bin.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend(0x4654_6C67u32.to_le_bytes()); out.extend(2u32.to_le_bytes()); out.extend((total as u32).to_le_bytes());
+    out.extend((js.len() as u32).to_le_bytes()); out.extend(0x4E4F_534Au32.to_le_bytes()); out.extend(js);
+    out.extend((bin.len() as u32).to_le_bytes()); out.extend(0x004E_4942u32.to_le_bytes()); out.extend(bin);
+    out
+}
+
+/// One joint in a skinned GLB. `translation` is the joint's world position in
+/// the mesh's bind pose; the writer derives the node's local translation and the
+/// inverse bind matrix from it.
+#[derive(Clone, Debug)]
+pub struct SkinJoint {
+    pub name: String,
+    pub parent: Option<usize>,
+    pub translation: [f32; 3],
+}
+
+/// Skinned binary glTF 2.0 writer: the same POSITION/NORMAL/COLOR_0/index layout
+/// as [`write_glb`] plus JOINTS_0 (u8 vec4), WEIGHTS_0 (f32 vec4), a `skins`
+/// entry, joint nodes, and inverse bind matrices. Colors default to opaque white
+/// when the mesh has none, so the cabin viewer always has a `COLOR_0` accessor.
+pub fn write_glb_skinned(
+    pos: &[[f32; 3]],
+    nor: &[[f32; 3]],
+    col: Option<&[[f32; 4]]>,
+    tri: &[[u32; 3]],
+    joint_index: &[[u8; 4]],
+    weights: &[[f32; 4]],
+    skeleton: &[SkinJoint],
+) -> Vec<u8> {
+    let n = pos.len();
+    let sn = skeleton.len();
+    debug_assert_eq!(nor.len(), n);
+    debug_assert_eq!(joint_index.len(), n);
+    debug_assert_eq!(weights.len(), n);
+    debug_assert!(sn > 0);
+
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for p in pos {
+        for q in 0..3 {
+            mn[q] = mn[q].min(p[q]);
+            mx[q] = mx[q].max(p[q]);
+        }
+    }
+    if pos.is_empty() {
+        mn = [0.0; 3];
+        mx = [0.0; 3];
+    }
+
+    let white;
+    let col: &[[f32; 4]] = match col {
+        Some(c) if c.len() == n => c,
+        _ => {
+            white = vec![[1.0, 1.0, 1.0, 1.0]; n];
+            &white
+        }
+    };
+
+    let mut bin = Vec::new();
+    for p in pos {
+        for q in 0..3 {
+            bin.extend(p[q].to_le_bytes());
+        }
+    }
+    let pos_len = bin.len();
+    for p in nor {
+        for q in 0..3 {
+            bin.extend(p[q].to_le_bytes());
+        }
+    }
+    let nor_len = bin.len() - pos_len;
+    let col_off = bin.len();
+    for c in col {
+        for q in 0..4 {
+            bin.push((c[q].clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    let joints_off = bin.len();
+    for j in joint_index {
+        bin.extend_from_slice(j);
+    }
+    let weights_off = bin.len();
+    for w in weights {
+        for q in 0..4 {
+            bin.extend(w[q].to_le_bytes());
+        }
+    }
+    let idx_off = bin.len();
+    for t in tri {
+        for &i in t {
+            bin.extend(i.to_le_bytes());
+        }
+    }
+    let ibm_off = bin.len();
+    for j in skeleton {
+        let t = j.translation;
+        for v in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -t[0], -t[1], -t[2], 1.0] {
+            bin.extend(v.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(bin.len() % 4, 0);
+
+    let views = vec![
+        json!({"buffer": 0, "byteOffset": 0, "byteLength": pos_len, "target": 34962}),
+        json!({"buffer": 0, "byteOffset": pos_len, "byteLength": nor_len, "target": 34962}),
+        json!({"buffer": 0, "byteOffset": col_off, "byteLength": n * 4, "target": 34962}),
+        json!({"buffer": 0, "byteOffset": joints_off, "byteLength": n * 4, "target": 34962}),
+        json!({"buffer": 0, "byteOffset": weights_off, "byteLength": n * 16, "target": 34962}),
+        json!({"buffer": 0, "byteOffset": idx_off, "byteLength": tri.len() * 12, "target": 34963}),
+        json!({"buffer": 0, "byteOffset": ibm_off, "byteLength": sn * 64}),
+    ];
+    let accessors = vec![
+        json!({"bufferView": 0, "componentType": 5126, "count": n, "type": "VEC3", "min": mn, "max": mx}),
+        json!({"bufferView": 1, "componentType": 5126, "count": n, "type": "VEC3"}),
+        json!({"bufferView": 2, "componentType": 5121, "normalized": true, "count": n, "type": "VEC4"}),
+        json!({"bufferView": 3, "componentType": 5121, "count": n, "type": "VEC4"}),
+        json!({"bufferView": 4, "componentType": 5126, "count": n, "type": "VEC4"}),
+        json!({"bufferView": 5, "componentType": 5125, "count": tri.len() * 3, "type": "SCALAR"}),
+        json!({"bufferView": 6, "componentType": 5126, "count": sn, "type": "MAT4"}),
+    ];
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("POSITION".into(), json!(0));
+    attrs.insert("NORMAL".into(), json!(1));
+    attrs.insert("COLOR_0".into(), json!(2));
+    attrs.insert("JOINTS_0".into(), json!(3));
+    attrs.insert("WEIGHTS_0".into(), json!(4));
+
+    let mut nodes = vec![json!({"name": "mesh", "mesh": 0, "skin": 0})];
+    for (i, j) in skeleton.iter().enumerate() {
+        let t = if let Some(p) = j.parent {
+            let w = skeleton[p].translation;
+            [j.translation[0] - w[0], j.translation[1] - w[1], j.translation[2] - w[2]]
+        } else {
+            j.translation
+        };
+        nodes.push(json!({"name": j.name, "translation": t}));
+    }
+    for i in 0..sn {
+        let kids: Vec<usize> = (0..sn).filter(|&k| skeleton[k].parent == Some(i)).map(|k| 1 + k).collect();
+        if !kids.is_empty() {
+            nodes[1 + i]["children"] = json!(kids);
+        }
+    }
+    let joint_nodes: Vec<usize> = (0..sn).map(|i| 1 + i).collect();
+    let json = json!({
+        "asset": {"version": "2.0", "generator": "pyre (native)"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 1]}],
+        "nodes": nodes,
+        "skins": [{"joints": joint_nodes, "inverseBindMatrices": 6, "skeleton": 1}],
+        "meshes": [{"primitives": [{"attributes": attrs, "indices": 5, "material": 0}]}],
+        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0, "roughnessFactor": 0.9}, "doubleSided": true}],
+        "buffers": [{"byteLength": bin.len()}],
+        "bufferViews": views,
+        "accessors": accessors
+    });
+    let mut js = serde_json::to_vec(&json).unwrap();
+    while js.len() % 4 != 0 {
+        js.push(b' ');
+    }
+    let total = 12 + 8 + js.len() + 8 + bin.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend(0x4654_6C67u32.to_le_bytes());
+    out.extend(2u32.to_le_bytes());
+    out.extend((total as u32).to_le_bytes());
+    out.extend((js.len() as u32).to_le_bytes());
+    out.extend(0x4E4F_534Au32.to_le_bytes());
+    out.extend(js);
+    out.extend((bin.len() as u32).to_le_bytes());
+    out.extend(0x004E_4942u32.to_le_bytes());
+    out.extend(bin);
+    out
+}
+
+/// TripoSR GLB: POSITION, NORMAL (area-weighted), COLOR_0 (unsigned byte normalised), u32 indices.
 pub fn glb(m: &Mesh) -> Vec<u8> {
     let n = m.pos.len();
     let mut nor = vec![[0f32; 3]; n];
@@ -262,38 +648,7 @@ pub fn glb(m: &Mesh) -> Vec<u8> {
         for &i in t { for q in 0..3 { nor[i as usize][q] += f[q]; } }
     }
     for x in nor.iter_mut() { let l = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt().max(1e-12); for q in 0..3 { x[q] /= l; } }
-    let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for p in &m.pos { for q in 0..3 { mn[q] = mn[q].min(p[q]); mx[q] = mx[q].max(p[q]); } }
-    let mut bin = Vec::new();
-    for p in &m.pos { for q in 0..3 { bin.extend(p[q].to_le_bytes()); } }
-    let nor_off = bin.len(); for p in &nor { for q in 0..3 { bin.extend(p[q].to_le_bytes()); } }
-    let col_off = bin.len(); for c in &m.col { for q in 0..3 { bin.push((c[q].clamp(0.0, 1.0) * 255.0).round() as u8); } bin.push(255); }
-    let idx_off = bin.len(); for t in &m.tri { for &i in t { bin.extend(i.to_le_bytes()); } }
-    while bin.len() % 4 != 0 { bin.push(0); }
-    let json = serde_json::json!({
-        "asset": {"version": "2.0", "generator": "pyre cabin (TripoSR native)"},
-        "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
-        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "COLOR_0": 2}, "indices": 3, "material": 0}]}],
-        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0, "roughnessFactor": 0.9}, "doubleSided": true}],
-        "buffers": [{"byteLength": bin.len()}],
-        "bufferViews": [
-            {"buffer": 0, "byteOffset": 0, "byteLength": nor_off, "target": 34962},
-            {"buffer": 0, "byteOffset": nor_off, "byteLength": col_off - nor_off, "target": 34962},
-            {"buffer": 0, "byteOffset": col_off, "byteLength": idx_off - col_off, "target": 34962},
-            {"buffer": 0, "byteOffset": idx_off, "byteLength": m.tri.len() * 12, "target": 34963}],
-        "accessors": [
-            {"bufferView": 0, "componentType": 5126, "count": n, "type": "VEC3", "min": mn, "max": mx},
-            {"bufferView": 1, "componentType": 5126, "count": n, "type": "VEC3"},
-            {"bufferView": 2, "componentType": 5121, "normalized": true, "count": n, "type": "VEC4"},
-            {"bufferView": 3, "componentType": 5125, "count": m.tri.len() * 3, "type": "SCALAR"}]
-    });
-    let mut js = serde_json::to_vec(&json).unwrap(); while js.len() % 4 != 0 { js.push(b' '); }
-    let total = 12 + 8 + js.len() + 8 + bin.len();
-    let mut out = Vec::with_capacity(total);
-    out.extend(0x4654_6C67u32.to_le_bytes()); out.extend(2u32.to_le_bytes()); out.extend((total as u32).to_le_bytes());
-    out.extend((js.len() as u32).to_le_bytes()); out.extend(0x4E4F_534Au32.to_le_bytes()); out.extend(js);
-    out.extend((bin.len() as u32).to_le_bytes()); out.extend(0x004E_4942u32.to_le_bytes()); out.extend(bin);
-    out
+    write_glb(&m.pos, &nor, Some(&m.col), None, &m.tri)
 }
 
 /// Prepare an RGBA cut-out like TripoSR's run.py: crop to the alpha bbox, pad square so the subject fills
@@ -336,4 +691,120 @@ pub fn check(dir: &Path, refdir: &Path, dev: &Device) -> Result<String> {
     let (v, tr) = marching_cubes(&d, 64, 25.0);
     s += &format!("mc64 {} verts {} tris; {:.1}s", v.len(), tr.len(), t.elapsed().as_secs_f64());
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bicubic_matches_pytorch_align_corners_false() {
+        // Weights sum to one everywhere, including at the clamped border.
+        for i in 0..32 {
+            let (_, w) = cubic_weights(i, 14, 32);
+            let s: f32 = w.iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "output {i}: weights sum to {s}");
+        }
+        // A constant plane resizes exactly.
+        let src = vec![2.5f32; 14 * 14];
+        let out = bicubic_resize(&src, 14, 14, 32, 32, 1);
+        assert!(out.iter().all(|v| (v - 2.5).abs() < 1e-5));
+        // Reference values from `F.interpolate(mode='bicubic', align_corners=False)`
+        // on a 1x1x4x4 input holding 0..15 (PyTorch 2.14).
+        #[rustfmt::skip]
+        let expected = [
+            -0.52734375, -0.23046875, 0.24609375, 0.875, 1.28125, 1.91015625, 2.38671875, 2.68359375,
+             0.66015625, 0.95703125, 1.43359375, 2.0625, 2.46875, 3.09765625, 3.57421875, 3.87109375,
+             2.56640625, 2.86328125, 3.33984375, 3.96875, 4.375, 5.00390625, 5.48046875, 5.77734375,
+             5.08203125, 5.37890625, 5.85546875, 6.484375, 6.890625, 7.51953125, 7.99609375, 8.29296875,
+             6.70703125, 7.00390625, 7.48046875, 8.109375, 8.515625, 9.14453125, 9.62109375, 9.91796875,
+             9.22265625, 9.51953125, 9.99609375, 10.625, 11.03125, 11.66015625, 12.13671875, 12.43359375,
+            11.12890625, 11.42578125, 11.90234375, 12.53125, 12.9375, 13.56640625, 14.04296875, 14.33984375,
+            12.31640625, 12.61328125, 13.08984375, 13.71875, 14.125, 14.75390625, 15.23046875, 15.52734375,
+        ];
+        let src: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let out = bicubic_resize(&src, 4, 4, 8, 8, 1);
+        for (i, (got, want)) in out.iter().zip(&expected).enumerate() {
+            assert!((got - want).abs() < 1e-5, "pixel {i}: got {got}, want {want}");
+        }
+        // Multi-channel resize keeps channels independent.
+        let mut rgb = vec![0f32; 14 * 14 * 3];
+        for i in 0..14 * 14 { for c in 0..3 { rgb[i * 3 + c] = c as f32 + 1.0; } }
+        let out = bicubic_resize(&rgb, 14, 14, 32, 32, 3);
+        for p in out.chunks_exact(3) {
+            assert!((p[0] - 1.0).abs() < 1e-5 && (p[1] - 2.0).abs() < 1e-5 && (p[2] - 3.0).abs() < 1e-5);
+        }
+    }
+
+    /// Parity check against the old `convert.py` output. Ignored by default: it
+    /// needs the 1.6 GB `model.ckpt` and its Python-converted reference. Run with
+    /// `PYRE_TRIPOSR_DIR=<folder with model.ckpt and triposr_f16.safetensors>`
+    /// `cargo test --bin pyre convert_ckpt -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the TripoSR model.ckpt and its converted reference safetensors"]
+    fn convert_ckpt_matches_python_reference() {
+        let Ok(dir) = std::env::var("PYRE_TRIPOSR_DIR") else {
+            println!("PYRE_TRIPOSR_DIR not set; skipping parity check");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let src = dir.join("model.ckpt");
+        let reference = dir.join("triposr_f16.safetensors");
+        assert!(src.is_file(), "missing {}", src.display());
+        assert!(reference.is_file(), "missing {}", reference.display());
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("triposr_f16.safetensors");
+        let t = std::time::Instant::now();
+        convert_ckpt(&src, &out).expect("Rust conversion");
+        println!("converted in {:.1}s -> {} bytes", t.elapsed().as_secs_f64(), std::fs::metadata(&out).unwrap().len());
+
+        let ours_bytes = std::fs::read(&out).unwrap();
+        let ref_bytes = std::fs::read(&reference).unwrap();
+        let ours = safetensors::SafeTensors::deserialize(&ours_bytes).unwrap();
+        let reference = safetensors::SafeTensors::deserialize(&ref_bytes).unwrap();
+        let mut our_names: Vec<String> = ours.names().into_iter().map(str::to_string).collect();
+        let mut ref_names: Vec<String> = reference.names().into_iter().map(str::to_string).collect();
+        our_names.sort();
+        ref_names.sort();
+        assert_eq!(our_names, ref_names, "tensor name sets differ");
+
+        let mut worst = (0f64, String::new());
+        let mut mismatched_f32 = 0usize;
+        for name in &our_names {
+            let a = ours.tensor(name).unwrap();
+            let b = reference.tensor(name).unwrap();
+            assert_eq!(a.dtype(), b.dtype(), "{name}: dtype");
+            assert_eq!(a.shape(), b.shape(), "{name}: shape");
+            let is_f32 = a.dtype() == safetensors::Dtype::F32;
+            let av = decode_safetensors(a);
+            let bv = decode_safetensors(b);
+            assert_eq!(av.len(), bv.len(), "{name}: element count");
+            let mut max = 0f64;
+            for (x, y) in av.iter().zip(&bv) {
+                let d = (*x as f64 - *y as f64).abs();
+                if d > max { max = d; }
+                if d != 0.0 && is_f32 { mismatched_f32 += 1; }
+            }
+            if max > worst.0 { worst = (max, name.clone()); }
+        }
+        println!("largest absolute difference: {:.3e} on {}", worst.0, worst.1);
+        assert_eq!(mismatched_f32, 0, "f32 tensors must be bit-identical");
+        assert!(worst.0 < 1e-3, "worst tensor {} differs by {:.3e}", worst.1, worst.0);
+        // dino_pos512 is the only tensor whose values are recomputed, so report it.
+        let a = ours.tensor("dino_pos512").unwrap();
+        let b = reference.tensor("dino_pos512").unwrap();
+        let av = decode_safetensors(a);
+        let bv = decode_safetensors(b);
+        let max = av.iter().zip(&bv).map(|(x, y)| (*x - *y).abs()).fold(0f32, f32::max);
+        let diffs = av.iter().zip(&bv).filter(|(x, y)| x != y).count();
+        println!("dino_pos512: max |diff| {max:.3e}, {diffs}/{} values differ", av.len());
+    }
+
+    fn decode_safetensors(v: safetensors::tensor::TensorView<'_>) -> Vec<f32> {
+        match v.dtype() {
+            safetensors::Dtype::F32 => v.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            safetensors::Dtype::F16 => v.data().chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+            d => panic!("unexpected dtype {d:?}"),
+        }
+    }
 }

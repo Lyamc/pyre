@@ -43,7 +43,18 @@ pub struct ParakeetConfig {
     pub max_symbols_per_step: Option<usize>,
     #[serde(default)]
     pub decoder_start_token_id: Option<usize>,
+    /// Nemotron 3.5 language-prompt slots (broadcast one-hot before the projector).
+    #[serde(default = "default_num_prompts")]
+    pub num_prompts: usize,
+    #[serde(default = "default_prompt_intermediate")]
+    pub prompt_intermediate_size: usize,
+    #[serde(default = "default_prompt_id")]
+    pub default_prompt_id: usize,
 }
+
+fn default_num_prompts() -> usize { 128 }
+fn default_prompt_intermediate() -> usize { 2048 }
+fn default_prompt_id() -> usize { 101 }
 
 impl ParakeetConfig {
     pub fn blank_id(&self) -> usize {
