@@ -3291,7 +3291,49 @@ pub static BPF_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// experts run on the int8 pool with each expert's rows decoded once per 16 (gate/up) / 8 (down) of its tokens
 /// (grouped GEMM over the tokens routed to it). Changes prompt numerics vs the exact f32 prefill -> opt-in.
 pub fn bpf() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPF").map(|v| v == "1").unwrap_or(BPF_DEFAULT.load(std::sync::atomic::Ordering::Relaxed))) }
+#[derive(Clone)]
 pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
+/// On-disk form of a prefix-cache snapshot (engine_qn PYRE_QN_PCACHE_DIR): "PYSNAP01", key u64, tokens, the seven state
+/// groups and the MTP residual window as length-prefixed little-endian f32 runs, then "END!". Written to .tmp + rename.
+fn snap_wu(w: &mut impl std::io::Write, n: usize) -> std::io::Result<()> { w.write_all(&(n as u64).to_le_bytes()) }
+fn snap_wf(w: &mut impl std::io::Write, x: &[f32]) -> std::io::Result<()> { snap_wu(w, x.len())?; w.write_all(unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) }) }
+fn snap_ru(r: &mut impl std::io::Read) -> std::io::Result<usize> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; let n = u64::from_le_bytes(b); if n > 1 << 33 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot length out of range")); } Ok(n as usize) }
+fn snap_rf(r: &mut impl std::io::Read) -> std::io::Result<Vec<f32>> { let n = snap_ru(r)?; let mut x = vec![0f32; n]; r.read_exact(unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut u8, n * 4) })?; Ok(x) }
+impl Snap {
+    pub fn save(&self, path: &std::path::Path, key: u64) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut w = std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(&tmp)?);
+            w.write_all(b"PYSNAP01")?; w.write_all(&key.to_le_bytes())?;
+            snap_wu(&mut w, self.tokens.len())?; for t in &self.tokens { w.write_all(&t.to_le_bytes())?; }
+            for g in [&self.conv, &self.ssm, &self.k, &self.v, &self.ik, &self.ib, &self.ple_hist] { snap_wu(&mut w, g.len())?; for x in g.iter() { snap_wf(&mut w, x)?; } }
+            snap_wu(&mut w, self.mtp_r.len())?; for (p, x) in &self.mtp_r { snap_wu(&mut w, *p)?; snap_wf(&mut w, x)?; }
+            w.write_all(b"END!")?; w.flush()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+    pub fn load(path: &std::path::Path, key: u64) -> std::io::Result<Snap> {
+        use std::io::Read;
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut r = std::io::BufReader::with_capacity(16 << 20, std::fs::File::open(path)?);
+        let mut h = [0u8; 16]; r.read_exact(&mut h)?;
+        if &h[..8] != b"PYSNAP01" { return Err(bad("bad magic")); }
+        if u64::from_le_bytes(h[8..].try_into().unwrap()) != key { return Err(bad("key mismatch (other model/args)")); }
+        let nt = snap_ru(&mut r)?; let mut tb = vec![0u8; nt * 4]; r.read_exact(&mut tb)?;
+        let tokens: Vec<u32> = tb.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut gs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(7);
+        for _ in 0..7 { let n = snap_ru(&mut r)?; let mut g = Vec::with_capacity(n.min(4096)); for _ in 0..n { g.push(snap_rf(&mut r)?); } gs.push(g); }
+        let nm = snap_ru(&mut r)?; let mut mtp_r = std::collections::VecDeque::new();
+        for _ in 0..nm { let p = snap_ru(&mut r)?; mtp_r.push_back((p, snap_rf(&mut r)?)); }
+        let mut e = [0u8; 4]; r.read_exact(&mut e)?; if &e != b"END!" { return Err(bad("truncated")); }
+        let mut it = gs.into_iter();
+        let mut s = Snap { tokens, conv: it.next().unwrap(), ssm: it.next().unwrap(), k: it.next().unwrap(), v: it.next().unwrap(), ik: it.next().unwrap(), ib: it.next().unwrap(), ple_hist: it.next().unwrap(), mtp_r, bytes: 0 };
+        let sz = |v: &Vec<Vec<f32>>| v.iter().map(|x| x.len() * 4).sum::<usize>();
+        s.bytes = sz(&s.conv) + sz(&s.ssm) + sz(&s.k) + sz(&s.v) + sz(&s.ik) + sz(&s.ib) + sz(&s.ple_hist) + s.mtp_r.iter().map(|r| r.1.len() * 4).sum::<usize>();
+        Ok(s)
+    }
+}
 impl Model {
     /// Snapshot of `st` (None when the GPU holds attention rows the host copy lacks, i.e. after decode steps).
     pub fn snapshot(&self, st: &mut State) -> Option<Snap> {

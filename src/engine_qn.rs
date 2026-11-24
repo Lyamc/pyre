@@ -45,7 +45,11 @@ pub fn spawn_init<R: Send + 'static>(init: impl FnOnce() -> anyhow::Result<(Mode
 
 fn worker(model: &Model, tok: &Tokenizer, eos: &[u32], rx: mpsc::Receiver<Job>, b: Arc<AtomicBool>, q: Arc<AtomicU64>) {
     let mut last: Option<State> = None; let mut pc: Vec<Snap> = vec![];
-    loop { let j = match rx.recv_timeout(std::time::Duration::from_millis(250)) { Ok(j) => j, Err(mpsc::RecvTimeoutError::Timeout) => { model.idle_hook(); continue } Err(_) => break };
+    let pd = if pcache_on() { pdisk_dir() } else { None }; let pkey = pdisk_key();
+    let mut saved: std::collections::HashSet<u64> = Default::default(); let mut idle_since = std::time::Instant::now(); let mut last_save = std::time::Instant::now();
+    if let Some(d) = &pd { pdisk_load(d, pkey, &mut pc, &mut saved); }
+    loop { let j = match rx.recv_timeout(std::time::Duration::from_millis(250)) { Ok(j) => j, Err(mpsc::RecvTimeoutError::Timeout) => { model.idle_hook();
+            if let Some(d) = &pd { if idle_since.elapsed().as_millis() >= 2000 { pdisk_save(d, pkey, &pc, &mut saved); } } continue } Err(_) => break };
         q.fetch_sub(1, Ordering::SeqCst);
         b.store(true, Ordering::SeqCst);
         match j {
@@ -59,7 +63,8 @@ fn worker(model: &Model, tok: &Tokenizer, eos: &[u32], rx: mpsc::Receiver<Job>, 
                 }
             }
         }
-        b.store(false, Ordering::SeqCst);
+        b.store(false, Ordering::SeqCst); idle_since = std::time::Instant::now();
+        if let Some(d) = &pd { let ev = pdisk_save_every(); if ev > 0 && last_save.elapsed().as_secs() >= ev { pdisk_save(d, pkey, &pc, &mut saved); last_save = std::time::Instant::now(); } }
     }
 }
 pub fn spawn(model: Arc<Model>, tok: Arc<Tokenizer>, eos: Vec<u32>) -> EngineHandle {
@@ -99,6 +104,73 @@ fn pcache_on() -> bool { std::env::var("PYRE_QN_PCACHE").map(|v| v != "0").unwra
 /// prompt were evicted by PYRE_QN_PCACHE_MB anyway.
 fn pcache_all() -> bool { std::env::var("PYRE_QN_PCACHE_ALL").map(|v| v == "1").unwrap_or(false) }
 fn pcache_mb() -> usize { std::env::var("PYRE_QN_PCACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(3072) }
+/// PYRE_QN_PCACHE_DIR=<dir> (default unset = off): persist prefix-cache snapshots so a restarted server resumes long
+/// prompts instead of prefilling them again (an agent's 22k-token prompt costs ~8 min at ~45 tok/s). The newest
+/// snapshot is written once the worker has been idle for 2 s (~1-2 s for 1.5 GB); the newest PYRE_QN_PCACHE_DISK_N
+/// (default 2) files are kept, and they are loaded into the in-RAM cache when the worker starts. Files are keyed by the
+/// server arguments, tokenizer and prefill chunk; a file with another key is ignored.
+fn pdisk_dir() -> Option<std::path::PathBuf> { std::env::var("PYRE_QN_PCACHE_DIR").ok().filter(|s| !s.trim().is_empty()).map(|s| s.trim().into()) }
+fn pdisk_n() -> usize { std::env::var("PYRE_QN_PCACHE_DISK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2) }
+fn pdisk_key() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new(); "PYSNAP01".hash(&mut h);
+    for a in std::env::args().skip(1) { a.hash(&mut h); }
+    for k in ["PYRE_QN_TOKENIZER", "PYRE_PREFILL_CHUNK", "PYRE_QN_BPG_CHUNK", "PYRE_QN_PF_MULTI", "PYRE_QN_BPF"] { std::env::var(k).unwrap_or_default().hash(&mut h); }
+    h.finish()
+}
+fn tok_hash(t: &[u32]) -> u64 { use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); t.hash(&mut h); h.finish() }
+fn pdisk_files(d: &std::path::Path) -> Vec<(std::time::SystemTime, std::path::PathBuf)> {
+    let mut v: Vec<_> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "snap"))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))).collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0)); v
+}
+fn pdisk_load(d: &std::path::Path, key: u64, pc: &mut Vec<Snap>, saved: &mut std::collections::HashSet<u64>) {
+    let t = std::time::Instant::now(); let cap = pcache_mb() << 20; let mut got: Vec<Snap> = vec![];
+    for (_, p) in pdisk_files(d).into_iter().take(pdisk_n()) {
+        match Snap::load(&p, key) {
+            Ok(s) => { if got.iter().map(|s| s.bytes).sum::<usize>() + s.bytes > cap && !got.is_empty() { break; } saved.insert(tok_hash(&s.tokens)); got.push(s); }
+            Err(e) => tracing::warn!("prefix cache: skip {}: {e}", p.display()),
+        }
+    }
+    got.reverse(); // oldest first, like the in-RAM order
+    if !got.is_empty() { tracing::info!("prefix cache: loaded {} snapshot(s) from {} ({}) in {:.1} s", got.len(), d.display(), got.iter().map(|s| format!("{} tok", s.tokens.len())).collect::<Vec<_>>().join(", "), t.elapsed().as_secs_f64()); }
+    pc.extend(got);
+}
+/// One background save at a time; a save is skipped (and retried at the next chance) while the previous one is running.
+static PDISK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// PYRE_QN_PCACHE_SAVE_S (default 900): while the server stays busy (an agent's back-to-back requests never leave it idle
+/// for 2 s), also save the newest snapshot after each request at most this often. Each save writes the whole snapshot
+/// (~2.8 GB at 30k tokens), so a short interval costs SSD wear; 0 = only when idle.
+fn pdisk_save_every() -> u64 { std::env::var("PYRE_QN_PCACHE_SAVE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(900) }
+fn pdisk_save(d: &std::path::Path, key: u64, pc: &[Snap], saved: &mut std::collections::HashSet<u64>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Some(s) = pc.last() else { return }; let h = tok_hash(&s.tokens); if saved.contains(&h) || PDISK_BUSY.load(SeqCst) { return; }
+    saved.insert(h);
+    // make room first (keep the newest N-1), then refuse to write unless the disk keeps PYRE_QN_PCACHE_MIN_FREE_GB
+    // (default 10) free afterwards; a nearly full system disk is worse than a cold prefill
+    for (_, old) in pdisk_files(d).into_iter().skip(pdisk_n().saturating_sub(1)) { let _ = std::fs::remove_file(old); }
+    let _ = std::fs::create_dir_all(d);
+    let min_free = std::env::var("PYRE_QN_PCACHE_MIN_FREE_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10) << 30;
+    let full = d.canonicalize().unwrap_or_else(|_| d.to_path_buf()); let full = std::path::PathBuf::from(full.to_string_lossy().trim_start_matches(r"\\?\").to_string());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let free = disks.list().iter().filter(|k| full.starts_with(k.mount_point())).max_by_key(|k| k.mount_point().as_os_str().len()).map(|k| k.available_space());
+    if let Some(free) = free { if free < s.bytes as u64 + min_free {
+        tracing::warn!("prefix cache: not saving {} tok ({:.0} MB): {} has {:.1} GB free, keeping >= {} GB (PYRE_QN_PCACHE_MIN_FREE_GB)", s.tokens.len(), s.bytes as f64 / 1048576.0, full.display(), free as f64 / 1073741824.0, min_free >> 30);
+        return; } }
+    // copy on the worker (a memcpy, ~0.1-0.5 s), write on a background thread so the next request is not held up
+    let t = std::time::Instant::now(); let s2 = s.clone(); let copy_ms = t.elapsed().as_secs_f64() * 1e3;
+    let p = d.join(format!("{h:016x}.snap")); let d2 = d.to_path_buf(); PDISK_BUSY.store(true, SeqCst);
+    let r = std::thread::Builder::new().name("pcache-save".into()).spawn(move || {
+        let t = std::time::Instant::now();
+        match s2.save(&p, key) {
+            Ok(()) => tracing::info!("prefix cache: saved {} tok ({:.0} MB) to {} in {:.1} s (copy {copy_ms:.0} ms)", s2.tokens.len(), s2.bytes as f64 / 1048576.0, p.display(), t.elapsed().as_secs_f64()),
+            Err(e) => { tracing::warn!("prefix cache: save {} failed: {e}", p.display()); let _ = std::fs::remove_file(p.with_extension("tmp")); }
+        }
+        for (_, old) in pdisk_files(&d2).into_iter().skip(pdisk_n()) { let _ = std::fs::remove_file(old); }
+        PDISK_BUSY.store(false, SeqCst);
+    });
+    if r.is_err() { PDISK_BUSY.store(false, SeqCst); }
+}
 
 fn run(m: &Model, tok: &Tokenizer, eos: &[u32], prev: Option<State>, r: GenRequest, pc: &mut Vec<Snap>) -> Option<State> {
     let ctx = m.max_ctx();
