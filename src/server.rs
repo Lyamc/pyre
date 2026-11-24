@@ -380,6 +380,19 @@ fn think_delta(r: String, c: String) -> Option<Value> {
 
 /// OpenAI tool calls: the model writes `<tool_call>...</tool_call>` blocks in its content, either Qwen3-coder XML
 /// (`<function=NAME><parameter=KEY>VALUE</parameter></function>`) or Hermes JSON (`{"name": .., "arguments": {..}}`).
+/// OpenAI finish_reason for a chat reply: "tool_calls" when it ends in parsed tool calls, but "length" when the
+/// max_tokens cap stopped generation (a tool call cut off by the cap may still parse; clients must not run it as complete).
+fn chat_finish(engine: &'static str, has_calls: bool) -> &'static str { if has_calls && engine != "length" { "tool_calls" } else { engine } }
+#[cfg(test)]
+mod chat_finish_tests {
+    #[test]
+    fn length_wins_over_tool_calls() {
+        assert_eq!(super::chat_finish("length", true), "length");
+        assert_eq!(super::chat_finish("stop", true), "tool_calls");
+        assert_eq!(super::chat_finish("stop", false), "stop");
+        assert_eq!(super::chat_finish("length", false), "length");
+    }
+}
 /// Content before the first block streams as text; from `<tool_call>` on it is held back and returned as `tool_calls`
 /// with finish_reason "tool_calls" (llama.cpp's behaviour). Parameter values are typed by the request's tool schemas.
 /// PYRE_TOOL_PARSE=0 leaves the raw text in `content`.
@@ -559,7 +572,7 @@ async fn chat(State(app): S, Json(req): Json<ChatReq>) -> Response {
             Ok((text, fin, t, _)) => {
                 let (mut r, mut c) = think.push(&text); let (r2, c2) = think.finish(); r.push_str(&r2); c.push_str(&c2);
                 let mut c = tools.push(&c); let (c3, calls) = tools.finish(); c.push_str(&c3);
-                let fin = if calls.is_empty() { fin } else { "tool_calls" };
+                let fin = chat_finish(fin, !calls.is_empty());
                 let mut msg = json!({"role": "assistant", "content": if calls.is_empty() || !c.trim().is_empty() { json!(c) } else { Value::Null }});
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls.clone()); }
                 let tt = ntok(&r); crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
@@ -684,7 +697,7 @@ async fn pump_chat(
                 crate::effort::THINK_TOKENS.fetch_add(tt as u64, std::sync::atomic::Ordering::Relaxed);
                 let fc = forced.load(std::sync::atomic::Ordering::Relaxed);
                 let ai = info.lock().unwrap().get("auto").cloned();
-                let fin = if calls.is_empty() { finish_reason } else { "tool_calls" };
+                let fin = chat_finish(finish_reason, !calls.is_empty());
                 if rlog { reqlog(json!({"resp": "stream", "finish": fin, "reasoning": &acc_r, "content": format!("{acc_c}{c}"), "tool_calls": &calls,
                     "effort": effort, "budget": budget, "think_tokens": tt, "forced_close": fc, "auto": &ai})); }
                 if !calls.is_empty() {
