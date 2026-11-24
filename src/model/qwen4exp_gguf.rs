@@ -3291,6 +3291,7 @@ pub static BPF_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// experts run on the int8 pool with each expert's rows decoded once per 16 (gate/up) / 8 (down) of its tokens
 /// (grouped GEMM over the tokens routed to it). Changes prompt numerics vs the exact f32 prefill -> opt-in.
 pub fn bpf() -> bool { static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *K.get_or_init(|| env_var("PYRE_QN_BPF").map(|v| v == "1").unwrap_or(BPF_DEFAULT.load(std::sync::atomic::Ordering::Relaxed))) }
+#[derive(Clone)]
 pub struct Snap { pub tokens: Vec<u32>, conv: Vec<Vec<f32>>, ssm: Vec<Vec<f32>>, k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, ik: Vec<Vec<f32>>, ib: Vec<Vec<f32>>, ple_hist: Vec<Vec<f32>>, mtp_r: std::collections::VecDeque<(usize, Vec<f32>)>, pub bytes: usize }
 /// On-disk form of a prefix-cache snapshot (engine_qn PYRE_QN_PCACHE_DIR): "PYSNAP01", key u64, tokens, the seven state
 /// groups and the MTP residual window as length-prefixed little-endian f32 runs, then "END!". Written to .tmp + rename.
