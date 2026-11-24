@@ -281,3 +281,87 @@ fn finish(mut s: Seq) -> KvCache {
     s.cache.tokens.truncate(n);
     s.cache
 }
+
+/// Scripted engine for smoke tests (`PYRE_MOCK_LLM=1`): no weights, no GPU, ~no CPU. Each request replays the text
+/// after the last `MOCK_REPLY:` in the decoded prompt (to the end of that turn; `\n` escapes allowed) token by token,
+/// honouring max_tokens ("length") and stop strings ("stop"). Exercises the real server path (templates, tool-call
+/// parsing, reasoning split, streaming, finish_reason) so a build can be checked next to a live production server.
+pub fn spawn_mock(tok: Arc<Tokenizer>) -> EngineHandle {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let busy = Arc::new(AtomicBool::new(false));
+    let queued = Arc::new(AtomicU64::new(0));
+    let (b, q) = (busy.clone(), queued.clone());
+    std::thread::Builder::new().name("mock-engine".into()).spawn(move || {
+        while let Ok(j) = rx.recv() {
+            q.fetch_sub(1, Ordering::SeqCst);
+            b.store(true, Ordering::SeqCst);
+            match j {
+                Job::Embed { tx, .. } => { let _ = tx.send(Event::Error("mock engine: no embeddings".into())); }
+                Job::Gen(r) => mock_gen(&tok, r),
+            }
+            b.store(false, Ordering::SeqCst);
+        }
+    }).expect("mock engine thread");
+    EngineHandle { tx, busy, queued }
+}
+
+/// The scripted reply for a decoded prompt (see `spawn_mock`).
+pub fn mock_reply(prompt: &str) -> String {
+    const M: &str = "MOCK_REPLY:";
+    let Some(i) = prompt.rfind(M) else { return "Hello from the pyre mock engine.".into() };
+    let s = &prompt[i + M.len()..];
+    let end = ["<|im_end|>", "<|eot_id|>", "</s>"].iter().filter_map(|m| s.find(m)).min().unwrap_or(s.len());
+    let reply = s[..end].trim().replace("\\n", "\n");
+    // A thinking template that opens `<think>` in the generation prompt: the real model's text starts inside the
+    // block, so drop a scripted leading `<think>`, and close an empty block when the script has none.
+    if prompt.trim_end().ends_with("<think>") {
+        if let Some(r) = reply.strip_prefix("<think>") { return r.trim_start_matches('\n').to_string(); }
+        if !reply.contains("</think>") { return format!("</think>\n\n{reply}"); }
+    }
+    reply
+}
+
+fn mock_gen(tok: &Tokenizer, r: GenRequest) {
+    let t0 = Instant::now();
+    let reply = mock_reply(&tok.decode(&r.prompt, false).unwrap_or_default());
+    let ids: Vec<u32> = tok.encode(reply.as_str(), false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+    let (mut out, mut text, mut finish, mut stop_word) = (Vec::<u32>::new(), String::new(), "stop", String::new());
+    let mut pending: Vec<u32> = vec![];
+    for &id in &ids {
+        if out.len() >= r.max_tokens { finish = "length"; break; }
+        out.push(id);
+        pending.push(id);
+        let full = tok.decode(&out, false).unwrap_or_default();
+        if !full.starts_with(&text) || full.ends_with('\u{FFFD}') { continue; } // hold a split UTF-8 sequence
+        if let Some((at, s)) = r.stop.iter().filter(|s| !s.is_empty()).filter_map(|s| full.find(s.as_str()).map(|at| (at, s.clone()))).min_by_key(|(at, _)| *at) {
+            let keep = at.max(text.len());
+            let piece = full[text.len()..keep].to_string();
+            text = full[..keep].to_string();
+            if !piece.is_empty() { let _ = r.tx.send(Event::Token { text: piece, ids: std::mem::take(&mut pending) }); }
+            stop_word = s;
+            break;
+        }
+        let piece = full[text.len()..].to_string();
+        text = full;
+        if r.tx.send(Event::Token { text: piece, ids: std::mem::take(&mut pending) }).is_err() { return; } // client gone
+    }
+    if finish == "stop" && stop_word.is_empty() && out.len() >= r.max_tokens && out.len() < ids.len() { finish = "length"; }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let tm = Timings { prompt_n: r.prompt.len(), prompt_ms: 0.0, prompt_per_second: 0.0, predicted_n: out.len(), predicted_ms: ms,
+        predicted_per_second: if ms > 0.0 { out.len() as f64 * 1e3 / ms } else { 0.0 }, cached_n: 0 };
+    let _ = r.tx.send(Event::Done { finish_reason: finish, text, timings: tm, stopping_word: stop_word, tokens: out });
+}
+
+#[cfg(test)]
+mod mock_tests {
+    #[test]
+    fn mock_reply_takes_last_marker_to_turn_end() {
+        let p = "<|im_start|>system\nMOCK_REPLY: no<|im_end|>\n<|im_start|>user\nMOCK_REPLY: a\\nb <|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(super::mock_reply(p), "a\nb");
+        assert_eq!(super::mock_reply("plain"), "Hello from the pyre mock engine.");
+        let open = "<|im_start|>user\nMOCK_REPLY: hi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        assert_eq!(super::mock_reply(open), "</think>\n\nhi");
+        let open2 = "<|im_start|>user\nMOCK_REPLY: <think>\\nplan\\n</think>\\n\\nok<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        assert_eq!(super::mock_reply(open2), "plan\n</think>\n\nok");
+    }
+}

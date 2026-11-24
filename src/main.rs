@@ -1,4 +1,4 @@
-﻿#![recursion_limit = "512"]
+#![recursion_limit = "512"]
 mod backend;
 mod ctx;
 mod effort;
@@ -225,12 +225,24 @@ fn main() -> Result<()> {
 
 /// Load one text-generation model and start its worker.
 pub fn load_llm(dir: &std::path::Path, id: &str, backend_name: &str, dtype: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
+    if std::env::var("PYRE_MOCK_LLM").map(|v| v == "1").unwrap_or(false) { return load_mock(dir, id, ctx_size, n_predict); }
     if qn_find::is_qwen4exp(dir) { return load_qn(dir, id, backend_name, n_predict); }
     let (llama, tok, template, eos, bname, fdt) = load_llm_parts(dir, backend_name, dtype, ctx_size)?;
     let n_ctx = llama.max_ctx;
     let engine = engine::spawn(llama, tok.clone(), eos);
     Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: dir.display().to_string(), n_ctx,
         backend: bname.to_string(), dtype: format!("{fdt:?}"), default_max_tokens: n_predict })
+}
+
+/// `PYRE_MOCK_LLM=1`: tokenizer + chat template from `dir` (a tokenizer dir is enough), scripted engine
+/// (`engine::spawn_mock`). No weights, no GPU: for smoke-testing builds next to a live server (scripts/smoke_mock.ps1).
+fn load_mock(dir: &std::path::Path, id: &str, ctx_size: usize, n_predict: usize) -> Result<server::Llm> {
+    tracing::warn!("PYRE_MOCK_LLM=1: '{id}' is a scripted mock engine (no weights), for smoke tests only");
+    let tok = Arc::new(tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?);
+    let template = template::ChatTemplate::from_model_dir(dir)?;
+    let engine = engine::spawn_mock(tok.clone());
+    Ok(server::Llm { engine, tok, template, model_id: id.to_string(), model_path: dir.display().to_string(), n_ctx: ctx_size,
+        backend: "mock".into(), dtype: "mock".into(), default_max_tokens: n_predict })
 }
 
 /// rayon pool for the CPU GGUF path (PYRE_QN_THREADS, default 16 of the 13900K's 32 threads).
