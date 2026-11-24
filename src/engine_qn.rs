@@ -137,7 +137,18 @@ fn pdisk_load(d: &std::path::Path, key: u64, pc: &mut Vec<Snap>, saved: &mut std
 }
 fn pdisk_save(d: &std::path::Path, key: u64, pc: &[Snap], saved: &mut std::collections::HashSet<u64>) {
     let Some(s) = pc.last() else { return }; let h = tok_hash(&s.tokens); if !saved.insert(h) { return; }
-    let t = std::time::Instant::now(); let _ = std::fs::create_dir_all(d); let p = d.join(format!("{h:016x}.snap"));
+    // make room first (keep the newest N-1), then refuse to write unless the disk keeps PYRE_QN_PCACHE_MIN_FREE_GB
+    // (default 10) free afterwards; a nearly full system disk is worse than a cold prefill
+    for (_, old) in pdisk_files(d).into_iter().skip(pdisk_n().saturating_sub(1)) { let _ = std::fs::remove_file(old); }
+    let _ = std::fs::create_dir_all(d);
+    let min_free = std::env::var("PYRE_QN_PCACHE_MIN_FREE_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10) << 30;
+    let full = d.canonicalize().unwrap_or_else(|_| d.to_path_buf()); let full = std::path::PathBuf::from(full.to_string_lossy().trim_start_matches(r"\\?\").to_string());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let free = disks.list().iter().filter(|k| full.starts_with(k.mount_point())).max_by_key(|k| k.mount_point().as_os_str().len()).map(|k| k.available_space());
+    if let Some(free) = free { if free < s.bytes as u64 + min_free {
+        tracing::warn!("prefix cache: not saving {} tok ({:.0} MB): {} has {:.1} GB free, keeping >= {} GB (PYRE_QN_PCACHE_MIN_FREE_GB)", s.tokens.len(), s.bytes as f64 / 1048576.0, full.display(), free as f64 / 1073741824.0, min_free >> 30);
+        return; } }
+    let t = std::time::Instant::now(); let p = d.join(format!("{h:016x}.snap"));
     match s.save(&p, key) {
         Ok(()) => tracing::info!("prefix cache: saved {} tok ({:.0} MB) to {} in {:.1} s", s.tokens.len(), s.bytes as f64 / 1048576.0, p.display(), t.elapsed().as_secs_f64()),
         Err(e) => { tracing::warn!("prefix cache: save {} failed: {e}", p.display()); let _ = std::fs::remove_file(p.with_extension("tmp")); }
