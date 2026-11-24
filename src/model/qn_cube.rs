@@ -6734,18 +6734,27 @@ impl Cube {
             nk as u32, ch as u32, pn as u32, ostr as u32, ckm, zoff as u32, boff as u32, aoff as u32, eps, dk as u32, nt as u32) }
         }
     }
+    /// Byte budget of attn_b's score scratch (PYRE_QN_ATTN_SC_MB, default 256 MiB).
+    fn attn_sc_bytes() -> usize { static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *B.get_or_init(|| std::env::var("PYRE_QN_ATTN_SC_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256).max(1) << 20) }
     /// k_attn_prep_b + k_attn3_b for t tokens at positions pos0.. (K/V of all t written first; token j attends 0..=pos0+j).
     /// cs = t rope tables (2*half each); p = t projections (stride pst); out stride ost. false = not eligible (caller loops attn()).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_b(&self, p: &Handle, pn: usize, pst: usize, ko: usize, vo: usize, qn: &Handle, kn: &Handle, cs: &Handle, kc: &Handle, vc: &Handle, cap: usize, out: &Handle, ost: usize, nh: usize, nkv: usize, hd: usize, half: usize, pos0: usize, t: usize, eps: f32) -> bool {
         if !(attn2() && attn3() && hd <= 512 && hd % 32 == 0) || pos0 + t > cap { return false; }
         let a = |hd_: &Handle, n: usize| unsafe { BufferArg::from_raw_parts(hd_.clone(), n) };
-        let q = self.empty(t * nh * hd); let sc = self.empty(t * nh * cap);
+        // the score scratch holds nh * cap floats per token (cap = the KV capacity): a 1024-token prefill chunk at a 32k
+        // context would need 4+ GiB, so the scoring runs in sub-batches of tb tokens bounded by PYRE_QN_ATTN_SC_MB (default 256)
+        let tb = (Self::attn_sc_bytes() / (nh * cap * 4).max(1)).clamp(1, t);
+        let q = self.empty(t * nh * hd); let sc = self.empty(tb * nh * cap);
         unsafe {
             k_attn_prep_b::launch_unchecked(&self.client, CubeCount::Static((nh + nkv) as u32, t as u32, 1), CubeDim::new_1d(32),
                 a(p, pn), a(qn, hd), a(kn, hd), a(cs, t * 2 * half), a(&q, t * nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), ko as u32, vo as u32, nh as u32, nkv as u32, hd as u32, half as u32, pos0 as u32, eps, pst as u32, (nh * hd) as u32, (2 * half) as u32);
-            k_attn3_b::launch_unchecked(&self.client, CubeCount::Static(nh as u32, t as u32, 1), CubeDim::new_2d(32, 8),
-                a(&q, t * nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), a(p, pn), a(&sc, t * nh * cap), a(out, t * ost), nh as u32, nkv as u32, hd as u32, (pos0 + 1) as u32, cap as u32, (hd as f32).sqrt().recip(), (hd / 32) as u32, pst as u32, (nh * hd) as u32, ost as u32, (nh * cap) as u32);
+            let mut j0 = 0usize;
+            while j0 < t { let n = tb.min(t - j0);
+                let (qo, po, oo) = (q.clone().offset_start((j0 * nh * hd * 4) as u64), p.clone().offset_start((j0 * pst * 4) as u64), out.clone().offset_start((j0 * ost * 4) as u64));
+                k_attn3_b::launch_unchecked(&self.client, CubeCount::Static(nh as u32, n as u32, 1), CubeDim::new_2d(32, 8),
+                    a(&qo, n * nh * hd), a(kc, cap * nkv * hd), a(vc, cap * nkv * hd), a(&po, pn - j0 * pst), a(&sc, n * nh * cap), a(&oo, n * ost), nh as u32, nkv as u32, hd as u32, (pos0 + j0 + 1) as u32, cap as u32, (hd as f32).sqrt().recip(), (hd / 32) as u32, pst as u32, (nh * hd) as u32, ost as u32, (nh * cap) as u32);
+                j0 += n; }
         }
         true
     }
