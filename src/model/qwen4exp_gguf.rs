@@ -1459,6 +1459,12 @@ impl Model {
     /// VRAM floor? If not, the KV is pulled to the host and dropped, and attention runs on the CPU (attn_core) for this
     /// conversation instead of aborting the server (36k-context pi session: 166 MiB KV growth with nothing left to shrink).
     fn kv_ok(&self, st: &mut State, ai: usize, need: usize) -> bool {
+        // VRAM ladder tier 2 (limits::vram_watch): K/V stays on the host until VRAM recovers
+        if crate::limits::kv_host_forced() {
+            if st.kvg.get(ai).map_or(false, |g| g.is_some()) { self.kv_pull(ai, st); st.kvg[ai] = None;
+                crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host", "layer": ai, "need": need, "reason": "vram_ladder"})); }
+            return false;
+        }
         if matches!(st.kvg.get(ai), Some(Some(g)) if g.cap >= need) { return true; }
         let fl = crate::limits::vram_floor_mb() as u64; if fl == 0 { return true; }
         let row = (self.cfg.n_kv * self.cfg.hd * 2 + self.cfg.idx_hd) as u64 * 4; let nn = need as u64; let bytes = (nn + (nn / 8).max(1024)) * row;

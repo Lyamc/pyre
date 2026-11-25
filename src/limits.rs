@@ -165,22 +165,103 @@ pub fn vram_check(bytes: u64) {
         if v.free >= bytes + hard && emergency_shrink(v.free) { return; }
         vram_breach(v.free, bytes, "allocation"); } }
 }
+// ---- VRAM ladder (int79): degrade instead of stopping when other apps push free VRAM under the floor.
+static KV_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KV_HOST_N: AtomicU64 = AtomicU64::new(0);
+/// Ladder tier 2: attention K/V is kept on the host (CPU attention) until VRAM recovers. The model's kv_ok() pulls and
+/// drops each layer's GPU K/V at its next step while this is set, and uploads again (on demand) once it clears.
+pub fn kv_host_forced() -> bool { KV_HOST.load(Ordering::Relaxed) }
+/// How many times the ladder moved attention K/V to the host (for /metrics-style reporting).
+pub fn kv_host_engages() -> u64 { KV_HOST_N.load(Ordering::Relaxed) }
+fn env_u64(k: &str, d: u64) -> u64 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+/// What the watcher does next while free VRAM is below the floor (pure, for tests).
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Rung { ShrinkCache, KvToHost, Wait, Stop }
+fn next_rung(free_mib: u64, floor_mib: u64, hard_mib: u64, cache_shrinkable: bool, kv_on_host: bool, waited_s: u64, wait_s: u64) -> Option<Rung> {
+    if free_mib >= floor_mib { return None; }
+    if free_mib < hard_mib { return Some(Rung::Stop); }
+    if cache_shrinkable { return Some(Rung::ShrinkCache); }
+    if !kv_on_host { return Some(Rung::KvToHost); }
+    if waited_s < wait_s { return Some(Rung::Wait); }
+    Some(Rung::Stop)
+}
 /// Start the 25 ms floor watcher once (call when the GPU is first used).
+/// Below the floor it climbs a ladder, one rung per 3 s, re-checking free VRAM each time:
+///   1. shrink the expert cache (to its 128 MiB minimum),
+///   2. move attention K/V to the host (CPU attention; kv_host_forced),
+///   3. keep serving for up to PYRE_VRAM_DEGRADED_WAIT_S (default 180 s) while free stays above the hard minimum
+///      max(floor / 2, 768 MiB) (pyre is not growing on the GPU any more; other apps may release memory),
+///   4. last resort: graceful stop (drain at the next step, exit 87), hard exit if still below 3 s later.
+/// Free below the hard minimum skips straight to 4. Recovery: once free >= floor + PYRE_KV_REGPU_MB (default 1536)
+/// for 60 s, K/V may go back to the GPU (kv_ok re-uploads on demand); the expert cache regrows via the governor.
+/// PYRE_VRAM_DEGRADED_WAIT_S=0 + PYRE_VRAM_LADDER=0 restore the int45 behaviour (shrink, then stop).
 pub fn vram_watch() {
     static W: std::sync::Once = std::sync::Once::new();
     W.call_once(|| { let fl = vram_floor_mb(); if fl == 0 || vram().is_none() { return; }
-        let _ = std::thread::Builder::new().name("vram-floor".into()).spawn(move || loop {
-            // int45: a watcher breach first asks for a graceful stop (drain at the next step boundary, exit 87); only if
-            // still below the floor 3 s later does it exit hard
-            if let Some(v) = vram() { if v.free < (fl << 20) {
-                if emergency_shrink(v.free) { eprintln!("pyre: VRAM below floor (watcher): free {} MiB < floor {} MiB; shrinking the expert cache", v.free >> 20, fl);
-                    std::thread::sleep(std::time::Duration::from_secs(3)); }
-                if vram().map_or(false, |v1| v1.free < (fl << 20)) {
-                eprintln!("pyre: VRAM floor breach (watcher): free {} MiB < floor {} MiB; requesting graceful stop", v.free >> 20, fl);
-                request_stop(); std::thread::sleep(std::time::Duration::from_secs(3)); }
-                if let Some(v2) = vram() { if v2.free < (fl << 20) { vram_breach(v2.free, 0, "watcher"); } } } }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+        let ladder = std::env::var("PYRE_VRAM_LADDER").map_or(true, |v| v != "0");
+        let wait_s = if ladder { env_u64("PYRE_VRAM_DEGRADED_WAIT_S", 180) } else { 0 };
+        let regpu = env_u64("PYRE_KV_REGPU_MB", 1536); let hard = (fl / 2).max(768).min(fl);
+        let _ = std::thread::Builder::new().name("vram-floor".into()).spawn(move || {
+            let sec = std::time::Duration::from_secs(3);
+            let (mut below_since, mut ok_since): (Option<std::time::Instant>, Option<std::time::Instant>) = (None, None); let mut said = false;
+            loop {
+                if let Some(v) = vram() {
+                    let free = v.free >> 20;
+                    if free < fl {
+                        let t0 = *below_since.get_or_insert_with(std::time::Instant::now); ok_since = None;
+                        let shrinkable = { let (cfg, tgt) = (XC_CFG.load(Ordering::Relaxed), XC_TGT.load(Ordering::Relaxed)); cfg > 0 && adaptive_vram() && tgt > (128 << 20) };
+                        let waited = if KV_HOST.load(Ordering::Relaxed) || !ladder { t0.elapsed().as_secs() } else { 0 };
+                        match next_rung(free, fl, hard, shrinkable, KV_HOST.load(Ordering::Relaxed) || !ladder, waited, wait_s) {
+                            Some(Rung::ShrinkCache) => { if emergency_shrink(v.free) { eprintln!("pyre: VRAM below floor (watcher): free {free} MiB < floor {fl} MiB; ladder 1/4: shrinking the expert cache"); }
+                                std::thread::sleep(sec); }
+                            Some(Rung::KvToHost) => { KV_HOST.store(true, Ordering::Relaxed); KV_HOST_N.fetch_add(1, Ordering::Relaxed); crate::metrics::warning();
+                                eprintln!("pyre: VRAM below floor (watcher): free {free} MiB < floor {fl} MiB; ladder 2/4: attention K/V to the host (CPU attention) until VRAM recovers");
+                                crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "kv_to_host_all", "free_mib": free, "floor_mib": fl}));
+                                below_since = Some(std::time::Instant::now()); std::thread::sleep(sec); }
+                            Some(Rung::Wait) => {
+                                if !said { said = true;
+                                    eprintln!("pyre: VRAM below floor (watcher): free {free} MiB < floor {fl} MiB; ladder 3/4: degraded, serving on for up to {wait_s} s (hard minimum {hard} MiB)");
+                                    crate::logbuf::event("vram_pressure", "WARN", serde_json::json!({"action": "degraded_wait", "free_mib": free, "floor_mib": fl, "hard_mib": hard, "wait_s": wait_s})); }
+                                std::thread::sleep(std::time::Duration::from_millis(250)); }
+                            Some(Rung::Stop) => {
+                                eprintln!("pyre: VRAM floor breach (watcher): free {free} MiB < floor {fl} MiB{}; ladder 4/4: requesting graceful stop", if free < hard { format!(" (below hard minimum {hard} MiB)") } else { format!(" for {} s after degrading", t0.elapsed().as_secs()) });
+                                crate::logbuf::event("vram_pressure", "ERROR", serde_json::json!({"action": "stop", "free_mib": free, "floor_mib": fl, "hard_mib": hard, "below_s": t0.elapsed().as_secs()}));
+                                request_stop(); std::thread::sleep(sec);
+                                if let Some(v2) = vram() { if v2.free < (fl << 20) { vram_breach(v2.free, 0, "watcher"); } } }
+                            None => {}
+                        }
+                    } else {
+                        said = false;
+                        if let Some(t0) = below_since.take() { if KV_HOST.load(Ordering::Relaxed) {
+                            eprintln!("pyre: VRAM back above floor (watcher): free {free} MiB after {} s; staying degraded until free >= {} MiB for 60 s", t0.elapsed().as_secs(), fl + regpu);
+                            crate::logbuf::event("vram_pressure", "INFO", serde_json::json!({"action": "above_floor", "free_mib": free, "below_s": t0.elapsed().as_secs()})); } }
+                        if KV_HOST.load(Ordering::Relaxed) {
+                            if free >= fl + regpu { let s = *ok_since.get_or_insert_with(std::time::Instant::now);
+                                if s.elapsed().as_secs() >= 60 { KV_HOST.store(false, Ordering::Relaxed); ok_since = None;
+                                    eprintln!("pyre: VRAM recovered (watcher): free {free} MiB >= {} MiB for 60 s; attention K/V may return to the GPU", fl + regpu);
+                                    crate::logbuf::event("vram_pressure", "INFO", serde_json::json!({"action": "kv_back_to_gpu", "free_mib": free})); } }
+                            else { ok_since = None; }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }); });
+}
+#[cfg(test)]
+mod ladder_tests {
+    use super::{next_rung, Rung};
+    #[test]
+    fn ladder_order() {
+        // floor 1024, hard 768, wait 180 s
+        assert_eq!(next_rung(1500, 1024, 768, true, false, 0, 180), None);
+        assert_eq!(next_rung(1000, 1024, 768, true, false, 0, 180), Some(Rung::ShrinkCache));
+        assert_eq!(next_rung(1000, 1024, 768, false, false, 0, 180), Some(Rung::KvToHost));
+        assert_eq!(next_rung(1000, 1024, 768, false, true, 10, 180), Some(Rung::Wait));
+        assert_eq!(next_rung(1000, 1024, 768, false, true, 180, 180), Some(Rung::Stop));
+        assert_eq!(next_rung(700, 1024, 768, true, false, 0, 180), Some(Rung::Stop)); // below hard minimum: straight to stop
+        assert_eq!(next_rung(1000, 1024, 768, false, true, 0, 0), Some(Rung::Stop)); // wait 0 = old behaviour
+    }
 }
 // ======================= adaptive GPU governor (int45) =======================
 // One background thread (250 ms) watches NVML utilisation, temperature, power and device free VRAM and drives
