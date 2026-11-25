@@ -162,9 +162,17 @@ pub fn vram_check(bytes: u64) {
         // int45b: with an adaptive expert cache, first shrink it (applied at the next step) and allow the allocation
         // while free stays above max(1024 MiB, floor / 2); the hard abort is the last resort
         let hard = (fl / 2).max(768).min(fl) << 20; // int45e: 768 MiB hard minimum at floor 1024 (free 1127, 126 MiB KV growth aborted the server at 22k context)
-        if v.free >= bytes + hard && emergency_shrink(v.free) { return; }
+        let shrunk = emergency_shrink(v.free);
+        if alloc_ok(v.free, bytes, hard, shrunk, ladder_on()) { return; }
         vram_breach(v.free, bytes, "allocation"); } }
 }
+/// PYRE_VRAM_LADDER (default on): the floor watcher degrades (cache, K/V to host, wait) instead of stopping.
+fn ladder_on() -> bool { std::env::var("PYRE_VRAM_LADDER").map_or(true, |v| v != "0") }
+/// May an allocation of `bytes` go ahead while free VRAM is under the floor? Below the hard minimum: never.
+/// Above it: if the expert cache just shrank (int45b), or if the VRAM ladder is on - the watcher owns the band between
+/// the hard minimum and the floor (int79: an 11-12 MiB scratch allocation at 957 MiB free aborted the server because
+/// rung 1 had already taken the cache target down, so emergency_shrink had nothing left to shrink).
+fn alloc_ok(free: u64, bytes: u64, hard: u64, shrunk: bool, ladder: bool) -> bool { free >= bytes + hard && (shrunk || ladder) }
 // ---- VRAM ladder (int79): degrade instead of stopping when other apps push free VRAM under the floor.
 static KV_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static KV_HOST_N: AtomicU64 = AtomicU64::new(0);
@@ -198,7 +206,7 @@ fn next_rung(free_mib: u64, floor_mib: u64, hard_mib: u64, cache_shrinkable: boo
 pub fn vram_watch() {
     static W: std::sync::Once = std::sync::Once::new();
     W.call_once(|| { let fl = vram_floor_mb(); if fl == 0 || vram().is_none() { return; }
-        let ladder = std::env::var("PYRE_VRAM_LADDER").map_or(true, |v| v != "0");
+        let ladder = ladder_on();
         let wait_s = if ladder { env_u64("PYRE_VRAM_DEGRADED_WAIT_S", 180) } else { 0 };
         let regpu = env_u64("PYRE_KV_REGPU_MB", 1536); let hard = (fl / 2).max(768).min(fl);
         let _ = std::thread::Builder::new().name("vram-floor".into()).spawn(move || {
@@ -505,4 +513,22 @@ pub fn governor_status() -> serde_json::Value {
         "xcache_cfg_bytes": XC_CFG.load(Ordering::Relaxed), "xcache_target_bytes": XC_TGT.load(Ordering::Relaxed), "xcache_applied_bytes": XC_CUR.load(Ordering::Relaxed),
         "xcache_shrinks": XC_SHRINKS.load(Ordering::Relaxed), "xcache_grows": XC_GROWS.load(Ordering::Relaxed), "stop_requested": STOP.load(Ordering::Relaxed),
     })
+}
+
+#[cfg(test)]
+mod alloc_tests {
+    use super::alloc_ok;
+    const M: u64 = 1 << 20;
+    #[test]
+    fn ladder_band_allows_allocation() {
+        // the int79 abort: 957 MiB free, 12 MiB scratch, hard 768, cache already at its target
+        assert!(alloc_ok(957 * M, 12 * M, 768 * M, false, true));
+        assert!(!alloc_ok(957 * M, 12 * M, 768 * M, false, false)); // old behaviour without the ladder
+        assert!(alloc_ok(957 * M, 12 * M, 768 * M, true, false));
+    }
+    #[test]
+    fn hard_minimum_still_aborts() {
+        assert!(!alloc_ok(770 * M, 12 * M, 768 * M, true, true));
+        assert!(!alloc_ok(700 * M, 8 * M, 768 * M, false, true));
+    }
 }
