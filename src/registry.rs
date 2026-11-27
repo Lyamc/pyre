@@ -110,6 +110,60 @@ impl App {
     pub fn model_cards(&self) -> Vec<Value> {
         let mut v: Vec<Value> = self.loaded().iter().map(|m| m.card()).collect();
         if let Some(d) = crate::diar::DIAR.get() { v.push(d.card()); }
+        // Builtin mesh card: always visible, shows geometric mesh tools capability
+        let mut mesh_caps = crate::capabilities::Capabilities::for_model(Kind::Mesh, &std::path::Path::new("")).to_value_for("pyre-mesh");
+        if let Some(t) = mesh_caps.get_mut("three_d") {
+            t["tasks"] = json!(["mesh-to-mesh", "mesh-to-sdf", "mesh-refine", "auto-rig"]);
+            t["uv"] = json!(["box", "lscm"]);
+            t["rig"] = json!(["humanoid", "character"]);
+            t["rig_note"] = json!("geometric bbox/surface fit with inverse-distance skin weights; not a learned rigger");
+        }
+        v.push(json!({
+            "id": "pyre-mesh",
+            "object": "model",
+            "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "owned_by": "pyre",
+            "kind": "mesh",
+            "task": "mesh",
+            "backend": "cpu",
+            "path": "",
+            "busy": false,
+            "queued": 0,
+            "unloadable": false,
+            "capabilities": mesh_caps,
+            "meta": json!({"note": "purely geometric mesh tools and auto-rigging, no neural net, VRAM: cpu, no lease"}),
+        }));
+        // TripoSR card when the converted weights are on disk, so clients see the
+        // one neural image→3D model without loading it.
+        let tsr_dir = crate::triposr::weights_dir(&self.storage.store.root);
+        if crate::triposr::available(&tsr_dir) {
+            let mut caps = crate::capabilities::Capabilities {
+                image_input: true,
+                mesh_output: true,
+                ..crate::capabilities::Capabilities::none()
+            }.to_value_for("triposr");
+            if let Some(t) = caps.get_mut("three_d") {
+                t["tasks"] = json!(["image-to-3d"]);
+                t["neural"] = json!(true);
+                t["license"] = json!("MIT");
+                t["vram_note"] = json!("~2300 MiB GPU lease, unloaded after cabin idle");
+            }
+            v.push(json!({
+                "id": "triposr",
+                "object": "model",
+                "created": now(),
+                "owned_by": "stabilityai",
+                "kind": "mesh",
+                "task": "image-to-3d",
+                "backend": self.defaults.backend,
+                "path": tsr_dir.display().to_string(),
+                "busy": false,
+                "queued": 0,
+                "unloadable": false,
+                "capabilities": caps,
+                "meta": json!({"note": "TripoSR (MIT), native Burn, IS-Net cut-out. IDOL and Pixal3D are not loaded: their DINOv3/FLUX-class weights (multi-GB) do not fit the 3060 budget beside Qwen."}),
+            }));
+        }
         v
     }
 
@@ -129,7 +183,7 @@ impl App {
         all.iter().find(|m| m.kind == kind).cloned().ok_or_else(|| {
             let code = if matches!(kind, Kind::Image | Kind::Tts | Kind::Tagger) { StatusCode::NOT_IMPLEMENTED } else { StatusCode::BAD_REQUEST };
             err(code, format!("no {} model is loaded; start pyre with {} or load one via POST /api/models/load", kind.task(),
-                match kind { Kind::Llm => "-m <model>", Kind::Image => "--image-model <model>", Kind::Stt => "--stt-model <model>", Kind::Tts => "--tts-model <model>", Kind::Tagger => "--tagger-model <model>", Kind::Unknown => "--load kind=ref" }))
+                match kind { Kind::Llm => "-m <model>", Kind::Image => "--image-model <model>", Kind::Stt => "--stt-model <model>", Kind::Tts => "--tts-model <model>", Kind::Tagger => "--tagger-model <model>", Kind::Mesh => "--load kind=mesh (builtin pyre-mesh needs no weights)", Kind::Unknown => "--load kind=ref" }))
         })
     }
 
@@ -226,6 +280,7 @@ fn load_inner(storage: &Ctx, d: &LoadDefaults, q: LoadReq) -> Result<Loaded> {
         Kind::Image => Inner::Image(Arc::new(crate::image::ImageModel::load(&dir, &backend).context("loading image model")?)),
         Kind::Tts => Inner::Tts(Arc::new(crate::tts::TtsModel::load(&dir, &backend).context("loading text-to-speech model")?)),
         Kind::Tagger => Inner::Tagger(Arc::new(crate::tagger::TaggerModel::load(&dir, &backend).context("loading image tagger")?)),
+        Kind::Mesh => anyhow::bail!("mesh tools are built in (pyre-mesh); there is no weights folder to load"),
         Kind::Unknown => anyhow::bail!("unknown model kind for {}", q.r),
     };
     Ok(Loaded { id, kind: q.kind, backend, path: dir.display().to_string(), created: now(), inner })

@@ -227,7 +227,7 @@ pub fn is_garbage_parakeet_text(text: &str) -> bool {
 
 fn load_parakeet_decode_config(model_name: &str) -> ParakeetDecodeConfig {
     let path = pyre_whisper_core::resolve_model_file(model_name, "parakeet_decode.json");
-    Path::new(&path)
+    let mut cfg = Path::new(&path)
         .exists()
         .then(|| std::fs::read_to_string(&path).ok())
         .flatten()
@@ -241,7 +241,16 @@ fn load_parakeet_decode_config(model_name: &str) -> ParakeetDecodeConfig {
             max_symbols_per_step: 10,
             decoder_start_token_id: None,
             durations: vec![0, 1, 2, 3, 4],
-        })
+        });
+    // Decode-time knob for tuning a checkpoint without editing its bundle.
+    if let Ok(v) = std::env::var("PYRE_PARAKEET_MAX_SYMBOLS") {
+        if let Ok(v) = v.parse::<usize>() {
+            if v > 0 {
+                cfg.max_symbols_per_step = v;
+            }
+        }
+    }
+    cfg
 }
 
 impl ParakeetDecodeConfig {
@@ -345,19 +354,40 @@ fn with_frames(text: String, tokens: Vec<usize>, raw_ids: &[usize], raw_frames: 
     TimedChunk { text, tokens, frames, encoder_frames }
 }
 
+/// Resolve a language code to the checkpoint's prompt slot. Empty/auto uses the
+/// checkpoint's auto-detect slot (101 by default).
+fn nemotron_prompt_id(model_name: &str, language: Option<&str>) -> usize {
+    let default = 101usize;
+    let Some(lang) = language.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty() && s != "auto") else {
+        return default;
+    };
+    let path = pyre_whisper_core::resolve_model_file(model_name, "nemotron_prompts.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<std::collections::HashMap<String, usize>>(&text).ok())
+        .and_then(|map| {
+            let base = lang.split('-').next().unwrap_or(&lang);
+            map.get(&lang).copied().or_else(|| map.get(base).copied())
+        })
+        .unwrap_or(default)
+}
+
 pub fn decode_nemotron(
     model: &crate::model::nemotron::NemotronAsr,
     bpe: &Gpt2Tokenizer,
     mel: Tensor<3>,
     model_name: &str,
+    language: Option<&str>,
     _verbose: bool,
 ) -> TimedChunk {
     let cfg = load_parakeet_decode_config(model_name);
+    let prompt_id = nemotron_prompt_id(model_name, language);
     let (tokens, frames, encoder_frames) = model.decode_rnnt(
         mel,
         cfg.blank_token_id,
         cfg.vocab_size.max(1),
         cfg.max_symbols_per_step.max(1),
+        prompt_id,
     );
     let (text, kept) = finalize_parakeet_decode(bpe, &tokens, cfg.blank_token_id, model_name);
     with_frames(text, kept, &tokens, &frames, encoder_frames)

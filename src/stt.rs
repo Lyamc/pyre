@@ -113,7 +113,20 @@ impl SttModel {
                 let rt = me.rt.lock().unwrap_or_else(|p| p.into_inner());
                 let t = std::time::Instant::now();
                 let o = pyre_whisper_core::TaskOptions::default();
-                match rt.transcribe_waveform(&me.name, vec![0.0f32; 16_000], 16_000, &o) {
+                // Eight seconds of quiet synthetic audio covers the mel/attention shapes of
+                // ordinary clips and forces a full decode, so JIT/autotune happens here rather
+                // than on the first real request. Deterministic noise keeps the decoder busy
+                // past the first few tokens (silence emits EOS almost immediately).
+                let secs = std::env::var("PYRE_STT_WARMUP_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8)
+                    .clamp(1, 60);
+                let mut warm = Vec::with_capacity(16_000 * secs);
+                for i in 0..16_000 * secs {
+                    warm.push((i as f32 * 0.017).sin() * 0.02);
+                }
+                match rt.transcribe_waveform(&me.name, warm, 16_000, &o) {
                     Ok(_) => tracing::info!("stt {} warm-up took {:.1}s", me.name, t.elapsed().as_secs_f64()),
                     Err(e) => tracing::warn!("stt {} warm-up failed: {e}", me.name),
                 }
@@ -428,6 +441,257 @@ fn render(_: &Transcript, _: &str, _: f64, _: bool, _: (Option<bool>, bool), _: 
 #[cfg(feature = "stt")]
 type Transcript = pyre_whisper_core::TranscriptResult;
 
+/// CTC checkpoints emit no timestamp tokens, so generating timestamp segments only adds
+/// work and can surface bogus boundaries. TDT checkpoints do emit them. Callers can still
+/// request `timestamps=true` explicitly.
+pub(crate) fn default_include_timestamps(model: &str) -> bool {
+    // Keep the request default in sync with the capability the UI displays.
+    // Fluid Speech Pro can give TDT word timestamps (clean_mode profile) but they stay opt-in,
+    // like the other Parakeet checkpoints.
+    let p = crate::speech_caps::profile(model);
+    p.timestamps && !p.clean_mode
+}
+
+/// Beam size that gives the best measured latency at unchanged WER for each Whisper size.
+/// Measured with `scripts/stt_tune.ps1` on `samples/speech.wav` (RTX 3060, CUDA f16):
+/// tiny/base/small/large all reach their best WER at beam 1; medium needs beam 2 to
+/// recover one word ("Pyre"). Distilled checkpoints have no beam that fixes their BPE
+/// error, so they keep the library default. Callers can always set `beam_size` explicitly.
+pub(crate) fn default_beam(model: &str) -> usize {
+    let name = model.to_ascii_lowercase();
+    if name.contains("distil") {
+        5
+    } else if name.contains("medium") {
+        2
+    } else if name.contains("tiny")
+        || name.contains("base")
+        || name.contains("small")
+        || name.contains("large")
+    {
+        1
+    } else {
+        5
+    }
+}
+
+/// Carries speaker identities across independently diarized segments. The diarizer numbers
+/// speakers densely in arrival order for each call, so `SPEAKER_00` in segment N can be a
+/// different person than `SPEAKER_00` in segment N-1. The 5 s decode overlap gives us a
+/// common time window: a turn there is matched to the previous segment's turn with the
+/// largest time overlap, and only unmatched speakers get a new global id.
+#[cfg(feature = "stt")]
+struct SpeakerMap {
+    next: usize,
+    local_to_global: Vec<Option<usize>>,
+    prev: Vec<(f64, f64, usize)>,
+    /// Global ids in first-appearance order for the previous and current segment.
+    prev_order: Vec<usize>,
+    order: Vec<usize>,
+}
+
+#[cfg(feature = "stt")]
+impl SpeakerMap {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            local_to_global: Vec::new(),
+            prev: Vec::new(),
+            prev_order: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+
+    fn global(&mut self, local: usize, start: f64, end: f64) -> usize {
+        if self.local_to_global.len() <= local {
+            self.local_to_global.resize(local + 1, None);
+        }
+        if let Some(g) = self.local_to_global[local] {
+            return g;
+        }
+        let best = self
+            .prev
+            .iter()
+            .filter_map(|(ps, pe, pg)| {
+                let overlap = (end.min(*pe) - start.max(*ps)).max(0.0);
+                (overlap > 0.15).then_some((overlap, *pg))
+            })
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .map(|(_, g)| g);
+        // If nobody spoke across the seam, fall back to arrival order: the diarizer
+        // numbers speakers by first appearance, so the k-th new speaker in this segment
+        // is usually the k-th speaker from the previous one.
+        let g = best.or_else(|| {
+            self.prev_order
+                .iter()
+                .find(|g| !self.order.contains(g))
+                .copied()
+        }).unwrap_or_else(|| {
+            let g = self.next;
+            self.next += 1;
+            g
+        });
+        self.local_to_global[local] = Some(g);
+        if !self.order.contains(&g) {
+            self.order.push(g);
+        }
+        g
+    }
+
+    fn finish_segment(&mut self, turns: &[(f64, f64, usize)]) {
+        self.prev = turns.to_vec();
+        self.prev_order = self.order.clone();
+        self.order.clear();
+        self.local_to_global.clear();
+    }
+}
+
+/// Transcribe a long upload in ~10-minute decoded segments. Each segment is converted to
+/// 16 kHz mono and released before the next, so peak host memory stays flat for hours of audio.
+#[cfg(feature = "stt")]
+fn run_segmented(
+    stt: &SttModel,
+    rt: &InferenceRuntime,
+    q: &Req,
+    o: &pyre_whisper_core::TaskOptions,
+    ext: &str,
+    dur: f64,
+    diarize: bool,
+    attribution: &str,
+) -> Result<(Transcript, f64, f64, String)> {
+    use pyre_whisper_core::TranscriptSegment as TS;
+    use pyre_whisper_audio::decode::{
+        for_each_decoded_segment, TRANSCRIBE_SEGMENT_OVERLAP_SECS, TRANSCRIBE_SEGMENT_SECS,
+    };
+    let name = stt.name.clone();
+    let t = std::time::Instant::now();
+    let mut text = String::new();
+    let mut segments: Vec<TS> = Vec::new();
+    let mut last_end = 0.0f64;
+    let mut offset = 0.0f64;
+    let mut first = true;
+    let mut language = None;
+    let mut speakers = SpeakerMap::new();
+    let data = q.file.clone();
+    for_each_decoded_segment(
+        data,
+        ext,
+        TRANSCRIBE_SEGMENT_SECS,
+        TRANSCRIBE_SEGMENT_OVERLAP_SECS,
+        None,
+        |seg| {
+            let seg = seg.ensure_sample_rate(16_000)?;
+            let seg_secs = seg.duration_secs();
+            let samples = seg.samples;
+            let mut piece: Vec<TS> = Vec::new();
+            let mut piece_lang = None;
+
+            if diarize {
+                let d = crate::diar::DIAR
+                    .get()
+                    .ok_or_else(|| pyre_whisper_core::WhisburnError::Inference("no diarization model loaded".into()))?;
+                let turns = d.turns(&samples, if attribution == "midpoint" { 0.3 } else { 1.0 });
+                if attribution == "midpoint" {
+                    let r = rt
+                        .transcribe_waveform(&name, samples, 16_000, o)
+                        .map_err(|e| pyre_whisper_core::WhisburnError::Inference(e.to_string()))?;
+                    piece_lang = r.language.clone();
+                    let mapped: Vec<(f64, f64, usize)> = turns
+                        .iter()
+                        .map(|tu| {
+                            let (a, b) = (offset + tu.start, offset + tu.end);
+                            let g = speakers.global(tu.speaker, a, b);
+                            (a, b, g)
+                        })
+                        .collect();
+                    for mut s in r.segments {
+                        let mid = (s.start + s.end) / 2.0;
+                        let best = mapped.iter().max_by(|a, b| {
+                            let ov = |t: &(f64, f64, usize)| (s.end.min(t.1) - s.start.max(t.0)).max(0.0);
+                            let dist = |t: &(f64, f64, usize)| {
+                                if mid >= t.0 && mid <= t.1 { 0.0 } else { (t.0 - mid).abs().min((t.1 - mid).abs()) }
+                            };
+                            ov(a).partial_cmp(&ov(b)).unwrap().then(dist(b).partial_cmp(&dist(a)).unwrap())
+                        });
+                        s.speaker = best.map(|m| crate::diar::label(m.2));
+                        piece.push(s);
+                    }
+                    speakers.finish_segment(&mapped);
+                } else {
+                    let mut mapped: Vec<(f64, f64, usize)> = Vec::new();
+                    for tu in &turns {
+                        let (a, b) = (offset + tu.start, offset + tu.end);
+                        let g = speakers.global(tu.speaker, a, b);
+                        mapped.push((a, b, g));
+                        if b <= last_end {
+                            continue;
+                        }
+                        let lo = (((tu.start - 0.15) * 16_000.0).max(0.0) as usize).min(samples.len());
+                        let hi = (((tu.end + 0.15) * 16_000.0).max(0.0) as usize).min(samples.len());
+                        if hi <= lo + 4_800 {
+                            continue;
+                        }
+                        let r = rt
+                            .transcribe_waveform(&name, samples[lo..hi].to_vec(), 16_000, o)
+                            .map_err(|e| pyre_whisper_core::WhisburnError::Inference(e.to_string()))?;
+                        let txt = r.text.trim().to_string();
+                        if txt.is_empty() {
+                            continue;
+                        }
+                        let mut s = TS::new(tu.start, tu.end, txt);
+                        s.speaker = Some(crate::diar::label(g));
+                        piece.push(s);
+                        if piece_lang.is_none() {
+                            piece_lang = r.language.clone();
+                        }
+                    }
+                    speakers.finish_segment(&mapped);
+                }
+            } else {
+                let r = rt
+                    .transcribe_waveform(&name, samples, 16_000, o)
+                    .map_err(|e| pyre_whisper_core::WhisburnError::Inference(e.to_string()))?;
+                piece_lang = r.language.clone();
+                piece = r.segments;
+            }
+
+            if first {
+                language = piece_lang;
+                first = false;
+            }
+            // Stitch on timestamps, not shared words: repeated phrases at a segment seam
+            // would otherwise be swallowed as "overlap". The 5 s decode overlap is already
+            // removed by dropping segments that end before the previous one.
+            for mut s in piece {
+                s.start += offset;
+                s.end += offset;
+                if s.end <= last_end {
+                    continue;
+                }
+                s.start = s.start.max(last_end);
+                last_end = s.end;
+                segments.push(s);
+            }
+            offset += (seg_secs - TRANSCRIBE_SEGMENT_OVERLAP_SECS).max(0.0);
+            Ok(())
+        },
+    )
+    .map_err(|e| anyhow!("long-audio decode: {e}"))?;
+    let text = if segments.is_empty() {
+        text
+    } else {
+        segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ")
+    };
+    let result = Transcript {
+        text,
+        segments,
+        language,
+        model: name,
+        task: if q.translate_task { "translate".into() } else { "transcribe".into() },
+    };
+    let _ = dur;
+    Ok((result, dur, t.elapsed().as_secs_f64(), q.format.clone()))
+}
+
 #[cfg(feature = "stt")]
 fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64, String)> {
     let rt = stt.rt.lock().unwrap_or_else(|p| p.into_inner());
@@ -437,9 +701,34 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     impl Drop for Clear<'_> { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
     let _c = Clear(&stt.busy);
     let ext = Path::new(&q.filename).extension().and_then(|e| e.to_str()).unwrap_or("wav").to_ascii_lowercase();
+    let mut o = pyre_whisper_core::TaskOptions::default();
+    o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
+    if let Some(l) = &q.language { o.language = pyre_whisper_core::LanguageCode::new(l.clone()); }
+    // whisburn only walks past the first 30 s window / sentence in timestamp mode, so always use it.
+    // Callers may turn it off (whisburn CLI default for *_en models) to get whisburn-identical text.
+    o.include_timestamps = q.timestamps.unwrap_or_else(|| default_include_timestamps(&stt.name));
+    if let Some(b) = q.beam_size {
+        o.beam_size = b.clamp(1, 16);
+    } else {
+        o.beam_size = default_beam(&stt.name);
+    }
+    o.clean_mode = q.clean_mode;
+    if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
+    o.group_into_sentences = q.sentences;
+
+    // Long uploads are decoded in bounded 10-minute segments. Never build a full f32
+    // waveform for them: 6 h at 16 kHz is ~1.4 GB as f32, and resampling doubles that.
+    if pyre_whisper_audio::decode::should_transcribe_in_segments(q.file.len(), None) {
+        let dur = pyre_whisper_audio::decode::probe_bytes_duration_secs(&q.file, &ext)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
+        crate::speech_caps::gate_long_audio(&stt.name, dur, q.experimental).map_err(|e| anyhow!(e))?;
+        return run_segmented(stt, &rt, q, &o, &ext, dur, q.diarize, &q.attribution);
+    }
+
     let wav = pyre_whisper_audio::decode_bytes_to_mono_pcm(&q.file, &ext).map_err(|e| anyhow!("could not decode audio ({ext}): {e}"))?;
     let wav = wav.ensure_sample_rate(16_000).map_err(|e| anyhow!("resample: {e}"))?;
-    // Whisper STFT needs >= n_fft (400) samples; pad tiny clips instead of asserting in the engine.
     let mut wav = wav;
     const MIN_SAMPLES: usize = 400;
     if wav.samples.len() < MIN_SAMPLES {
@@ -448,16 +737,6 @@ fn run(stt: &SttModel, q: &Req, translate: bool) -> Result<(Transcript, f64, f64
     }
     let dur = wav.duration_secs();
     crate::speech_caps::gate_long_audio(&stt.name, dur, q.experimental).map_err(|e| anyhow!(e))?;
-    let mut o = pyre_whisper_core::TaskOptions::default();
-    o.task = if translate { pyre_whisper_core::SpeechTask::Translate } else { pyre_whisper_core::SpeechTask::Transcribe };
-    if let Some(l) = &q.language { o.language = pyre_whisper_core::LanguageCode::new(l.clone()); }
-    // whisburn only walks past the first 30 s window / sentence in timestamp mode, so always use it.
-    // Callers may turn it off (whisburn CLI default for *_en models) to get whisburn-identical text.
-    o.include_timestamps = q.timestamps.unwrap_or(true);
-    if let Some(b) = q.beam_size { o.beam_size = b.clamp(1, 16); }
-    o.clean_mode = q.clean_mode;
-    if let Some(t) = q.max_tokens { o.max_tokens = t.clamp(1, 448); }
-    o.group_into_sentences = q.sentences;
     let t = std::time::Instant::now();
     let name = stt.name.clone();
     let samples = wav.samples.clone();
@@ -968,6 +1247,43 @@ mod map_ref_tests {
         let (name, explicit) = result.unwrap();
         assert_eq!(name, "base");
         assert!(explicit.is_none(), "registry name was treated as {explicit:?}");
+    }
+
+    #[test]
+    fn non_whisper_models_default_to_no_timestamp_segments() {
+        assert!(!super::default_include_timestamps("parakeet-ctc-0.6b"));
+        assert!(!super::default_include_timestamps("parakeet-ctc-1.1b"));
+        assert!(!super::default_include_timestamps("parakeet-tdt-0.6b-v3"));
+        assert!(!super::default_include_timestamps("parakeet-tdt-0.6b-v2"));
+        assert!(!super::default_include_timestamps("fluid-speech-pro"));
+        assert!(super::default_include_timestamps("tiny_en"));
+    }
+
+    #[test]
+    fn speaker_ids_survive_segment_seams() {
+        let mut m = super::SpeakerMap::new();
+        // Segment 1: local speaker 0 at 590-605 s becomes global 0.
+        assert_eq!(m.global(0, 590.0, 605.0), 0);
+        m.finish_segment(&[(590.0, 605.0, 0)]);
+        // Segment 2: local 0 overlaps that speaker across the 5 s seam -> still global 0.
+        assert_eq!(m.global(0, 600.0, 612.0), 0);
+        // A speaker with no overlap is a new global id.
+        assert_eq!(m.global(1, 700.0, 710.0), 1);
+        m.finish_segment(&[(600.0, 612.0, 0), (700.0, 710.0, 1)]);
+        // Segment 3: local 1 now maps back to global 1.
+        assert_eq!(m.global(1, 706.0, 718.0), 1);
+    }
+
+    #[test]
+    fn default_beam_matches_measured_whisper_tuning() {
+        for name in ["tiny", "tiny_en", "base", "base_en", "small", "small_en", "large-v1", "large-v2", "large-v3", "large-v3-turbo"] {
+            assert_eq!(super::default_beam(name), 1, "{name}");
+        }
+        for name in ["medium", "medium_en"] {
+            assert_eq!(super::default_beam(name), 2, "{name}");
+        }
+        assert_eq!(super::default_beam("distil-medium-en"), 5);
+        assert_eq!(super::default_beam("other-asr"), 5);
     }
 
     #[test]

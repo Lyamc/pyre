@@ -172,6 +172,281 @@ Turso's Windows IO backend rejects, so the cache silently fell back to memory ev
 branch (`C:/Build/ai/cubecl-pyre-fix`, `pyre-windows-wal-fix`) wired in with `[patch]`; not pushed.
 Load-time warm-up: `PYRE_SD_WARMUP=0` disables, `PYRE_SD_WARMUP_STEPS` (default 2).
 
+### Whisper decode speed (RTX 3060, CUDA, beam 5)
+
+Measured warm on `samples/speech.wav` (7.54 s). Baseline is pyre at `02189de` with Whisper
+`medium`; the reference is the local faster-whisper-xxl server (medium, CUDA/float16, port 8686).
+The GPU clock ramps make the absolute numbers noisy; compare within a paired run.
+
+| | before | after (medium) | after (large-v3-turbo, beam 2) | faster-whisper medium |
+|---|---|---|---|---|
+| 7.54 s clip | 2.09 s (3.6x RT) | ~0.82 s (9.2x RT) | **0.385 s (19.6x RT)** | 0.41–0.72 s |
+| encode / decode (medium) | 0.22 / 1.85 s | 0.12 / 0.65 s | — | — |
+
+All transcripts match the reference words (`scripts/stt_wer.py`: WER 0); only casing and the
+space after a period differ. `distil-medium-en` is faster (~0.25 s) but drops a letter
+("Pire", WER 4.8%), so `large-v3-turbo` is the better speed/quality choice.
+
+Changes in `crates/pyre-whisper-engine` and `src/stt.rs`:
+
+- The per-token logit mask is built once on the device, and only the top `beam_size` log-probs
+  are copied off the GPU instead of the whole vocabulary.
+- Each attention's q/k/v weights are packed into one `Linear` after the bundle loads
+  (`Whisper::fuse_qkv`), removing two matmul launches per attention per token. The bundle keeps
+  the old three tensor names, so existing `.bpk` files still load. The original weights remain
+  resident (~0.9 GB extra VRAM on medium).
+- Whisper parameters are cast to f16 on CUDA at load time (`PYRE_STT_F16=0` opts out), matching
+  faster-whisper's float16. Host transfers/reductions stay f32.
+- Long-audio stitching uses Whisper's 20 ms timestamp tokens to drop the 3 s left-context
+  overlap; the word stitch is now only a fallback for models whose frame ids collapse.
+- Without an explicit `beam_size`, turbo models default to beam 2 (same WER, ~10% faster).
+
+Final paired result (10 warm alternating runs for the short clip, 6 for the long clip;
+`large-v3-turbo`, beam 2 default, both servers pre-warmed):
+
+| sample | pyre median | faster-whisper median | pyre WER | faster-whisper WER |
+|---|---|---|---|---|
+| `samples/speech.wav` (7.54 s) | **0.39 s** | 0.41 s | 0.000% (0/19) | 0.000% (0/19) |
+| 3x repeated speech + silences (23.3 s) | **1.61 s** | 5.63 s | 0.000% (0/57) | 0.000% (0/57) |
+
+The long clip only works because window starts are moved onto nearby silent gaps
+(`silence_aligned_starts` in `transcribe/mod.rs`): fixed 10 s shifts cut phrases in half and
+produced garbled or missing repeats. The alignment is computed from waveform RMS (20 ms frames,
+relative threshold), so no VAD model runs on the inference path.
+
+### Qwen3-ASR 0.6B comparison
+
+Fastest local Qwen runtime found: `transcribe.cpp` v0.4.2 with the CUDA provider and its
+`Qwen3-ASR-0.6B-Q8_0.gguf` (Windows, RTX 3060). Benchmark script:
+`scripts/qwen_tcpp_bench.py`. On `samples/speech.wav`:
+
+```
+transcribe.cpp CUDA   median=0.160s  transcript exact
+transcribe.cpp Vulkan median=0.171s  transcript exact
+pyre (before tuning)  median=0.582s  transcript exact
+pyre (after tuning)   median=0.481s  transcript exact
+```
+
+pyre is still ~3× slower. Profiling (`PYRE_STT_PROFILE=1`) shows audio encode 0.025 s and
+greedy decode 0.449 s for 22 tokens. Packing Q/K/V and gate/up projections into one matmul
+each in `Qwen3ThinkerLayer` gave ~21% (0.582 → 0.481 s); f16 cast gave no further gain.
+The remaining gap is per-layer kernel launch overhead in the 28-layer decoder. Qwen3-ASR
+is nevertheless registered, auto-downloaded, tuned and added to `OFFICIALLY_SUPPORTED`.
+
+### Feature verification / outperform summary
+
+Re-measured on this machine after the long-audio and speaker work:
+
+```
+pyre parakeet-v3   median=0.084s  WER 5.263% (1/19)
+sherpa int8 CPU    median=0.303s  WER 10.526% (2/19)
+```
+
+pyre is ~3.6× faster with half the WER. Earlier paired runs in this log also show
+`large-v3-turbo` at 0.39 s vs faster-whisper 0.41 s (WER 0 both), and `fluid-speech-pro`
+at 0.084 s vs FluidVoice's own ONNX runtime at 0.957 s (better WER on the long clip).
+
+Speaker features were exercised through the real API with a loaded `Nemotron-3-Diarization`
+model: both `attribution=turns` and `attribution=midpoint` produce speaker-labelled
+segments on an 11-minute two-voice clip, and the labels stay stable across the 600 s
+segment seam. The web UI enables the "Separate speakers" toggle only when `/api/diarizer`
+reports a loaded diarizer, and the request path re-checks that flag before sending it.
+
+Known gap: `nemotron-3.5-asr-streaming-0.6b` is registered, converts and loads, but still
+decodes blank tokens (prompt-projector weights were verified against the HF checkpoint),
+so it is not listed in `OFFICIALLY_SUPPORTED` and does not participate in these comparisons.
+
+### Speakers across long-audio segment seams
+
+Segmented transcription now diarizes each 10-minute segment too. The diarizer numbers
+speakers densely per call, so `SpeakerMap` in `src/stt.rs` carries identities across seams:
+a turn in the 5 s overlap is matched to the previous segment's turn with the largest time
+overlap; when nobody speaks across the seam, the k-th newly seen speaker inherits the k-th
+global speaker from the previous segment. Unknown speakers get a fresh global id.
+
+Verified with a 10.8-minute alternating two-voice WAV (Nemotron-3-Diarization +
+`tiny_en`, `attribution=turns`): before the fallback the output had `SPEAKER_00/01/02`
+(the second voice was relabelled at 600 s); after it, exactly `SPEAKER_00` (63 turns) and
+`SPEAKER_01` (61 turns), with the second voice still `SPEAKER_01` after the seam.
+
+### Long-audio OOM hardening
+
+`POST /api/audio/jobs` previously capped uploads at 128 MB and `src/stt.rs::run` decoded the
+whole file into `Vec<f32>` (and resampled it, doubling peak memory). Both are fixed:
+
+- Audio routes accept up to 2 GB (`src/api.rs`, `src/audio_jobs.rs`).
+- Long uploads use the existing `for_each_decoded_segment` API: 10-minute segments with 5 s
+  overlap are decoded, transcribed and released one at a time. Segments are stitched by
+  timestamp (dropping the overlap) rather than by shared words, which would delete repeated
+  phrases at a seam. `run_segmented` uses the already-held model mutex — locking it twice
+  deadlocked an earlier draft.
+
+`scripts/stt_long_stress.ps1` starts pyre with a model, transcribes a long WAV through the jobs
+endpoint and samples the server's working set. Two hours (`samples/speech.wav` looped) passed
+on every locally available officially supported model; six hours passed on `tiny_en`:
+
+| model | 2 h elapsed | peak RSS | shape |
+|---|---|---|---|
+| tiny | 175 s | 1.45 GB | flat after ~30 s |
+| tiny_en | 248 s | 1.48 GB | flat |
+| base | 226 s | 1.48 GB | flat |
+| small | 461 s | 1.69 GB | flat |
+| parakeet-tdt-0.6b-v3 | 101 s | 1.47 GB | flat |
+| parakeet-tdt-0.6b-v2 | 77 s | 1.41 GB | flat |
+| parakeet-ctc-0.6b | 174 s | 1.46 GB | flat |
+| fluid-speech-pro | 77 s | 1.43 GB | flat |
+| tiny_en, 6 h | 507 s | 1.79 GB | flat from 30 s to 6 h |
+
+Before the segmented path, the 6 h run took 4,026 s and peaked at 3.66 GB. After it, 507 s
+and 1.79 GB, with no upward trend over the full six hours.
+
+### Officially supported STT models
+
+A model is officially supported when it is in `MODEL_REGISTRY` (so `/api/audio/jobs`
+downloads and converts it on demand), has a `SpeechProfile` with recorded capabilities,
+uses measured tuning defaults, and was benchmarked end-to-end. `OFFICIALLY_SUPPORTED` in
+`src/speech_caps.rs` is the list; `GET /api/audio/models` marks those models with
+`officially_supported: true` and returns their feature matrix and tuning.
+
+| model | transcribe | auto-detect language | translate→EN | timestamps | beam default | tested |
+|---|---|---|---|---|---|---|
+| tiny / tiny_en | yes | multilingual: yes, `_en`: no | multilingual: yes, `_en`: no | yes | 1 | yes |
+| base / small / medium | yes | yes | yes | yes | 1 / 1 / 2 | yes |
+| large-v3 / large-v3-turbo | yes | yes | yes | yes | 1 | yes |
+| parakeet-tdt-0.6b-v3 | yes | yes (25 EU languages) | no | no | fixed (5) | yes |
+| parakeet-tdt-0.6b-v2 | yes | no (English) | no | no | fixed (5) | yes |
+| parakeet-ctc-0.6b | yes | no (English) | no | no | fixed (5) | yes |
+| fluid-speech-pro | yes | yes (25 EU languages) | no | no | fixed (5) | yes |
+
+The web UI (`ui/index.html`, `ui/app.js`) uses that matrix: unsupported features are
+unchecked + disabled + greyed out; always-on or fixed features are checked + disabled;
+adjustable ones stay interactive. The model dropdown shows `[T, Auto, →EN, TS, Tested]`
+tags so transcription vs auto-transcription vs auto-translation is explicit. The request
+code re-checks the capability matrix before sending `task`, `language`, `timestamps` or
+`beam_size`, so a stale browser pref cannot request an unsupported feature.
+
+Auto-download was verified end-to-end with `small`: `/api/audio/jobs` downloaded,
+converted and loaded it, then transcribed `samples/speech.wav` with WER 0.
+
+### Fluid Speech Pro (FluidVoice) in pyre
+
+FluidVoice is a dictation app; its open speech model, `FluidVoice-Labs/fluid-speech-pro`, is a
+0.63B FastConformer-TDT checkpoint built on Parakeet TDT v3. pyre now registers it as
+`fluid-speech-pro`, converts it with the Parakeet converter, and runs it on CUDA.
+
+Two fixes were needed to get usable transcripts:
+
+- `crates/pyre-whisper-engine/src/audio/mod.rs`: the Parakeet mel path (128-bin Slaney filters,
+  symmetric Hann window, preemphasis, n_fft 512) is now selected for `fluid-speech-*` names.
+  Without it the model produced an empty transcript.
+- All HF tensor names map through the existing Parakeet converter, so the checkpoint's extra
+  block is covered by the `encoder.subsampling.linear` → `pre_encode_out` mapping.
+
+Comparison against FluidVoice's own ONNX runtime (`fluid-speech-pro-onnx` int8, sherpa-onnx
+2.0.2 CPU, 8 threads), warm medians:
+
+| sample | pyre (CUDA) | FluidVoice ONNX (CPU) | pyre WER | ONNX WER |
+|---|---|---|---|---|
+| `samples/speech.wav` (7.54 s) | **0.084 s** | 0.957 s | 5.26% (1/19) | 5.26% (1/19) |
+| 3x repeated speech (23.3 s) | **0.177 s** | 1.664 s | 1.75% (1/57) | 3.51% (2/57) |
+
+pyre is ~11× (short) and ~9× (long) faster, with equal or better WER. `PYRE_STT_EXPERIMENTAL=1`
+is required because the model is new.
+
+Reproduce:
+
+```powershell
+$env:PYRE_STT_EXPERIMENTAL = '1'
+.\target\x86_64-pc-windows-msvc\release\pyre.exe serve --stt-model fluid-speech-pro -b cuda --port 8099
+.\scripts\parakeet_compare.ps1 -File samples\speech.wav -Runs 6
+# baseline: SHERPA_MODEL_DIR=<flat copy of fluid-speech-pro-onnx int8 files> ...
+```
+
+### Parakeet TDT 0.6B v3 vs sherpa-onnx on Windows
+
+Baseline: `sherpa-onnx` 2.0.2 with `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
+(encoder/decoder/joiner int8 ONNX, CPU provider, 8 threads — fastest of 1/2/4/8/16 threads).
+pyre runs its native Burn port on CUDA. Warm medians, `scripts/parakeet_compare.ps1`:
+
+| sample | pyre | sherpa-onnx int8 | pyre WER | sherpa WER |
+|---|---|---|---|---|
+| `samples/speech.wav` (7.54 s) | **0.082 s** | 0.271 s | 5.26% (1/19) | 10.53% (2/19) |
+| 3x repeated speech (23.3 s) | **0.212 s** | 0.754 s | 0.000% (0/57) | 8.77% (5/57) |
+
+The first request used to take ~23 s after startup because the 1 s silence warm-up did not
+compile the kernels used by a real clip. `src/stt.rs::warm_in_background` now runs 8 s of
+deterministic quiet audio, which moved that JIT cost into the background: first request
+22.7 s -> 1.07 s, warm-up 23.3 s -> 9.7 s.
+
+### Per-Parakeet-model profile
+
+Warm medians on the same machine (CUDA, `scripts/parakeet_compare.ps1` style timing):
+
+| registered model | 7.54 s | 7.54 s WER | 23.3 s | 23.3 s WER | default timestamps |
+|---|---|---|---|---|---|
+| `parakeet-tdt-0.6b-v3` | 0.082 s | 5.26% (1/19) | 0.212 s | 0.000% (0/57) | on |
+| `parakeet-tdt-0.6b-v2` | 0.084 s | **0.000% (0/19)** | 0.180 s | 7.02% (4/57) | on |
+| `parakeet-ctc-0.6b` | **0.052 s** | 5.26% (1/19) | **0.093 s** | 8.93% (5/57) | off (no timestamp tokens) |
+| `parakeet-ctc-1.1b` | not measured (download exceeded free disk) | — | — | — | off |
+
+`src/stt.rs::default_include_timestamps` applies the CTC/TDT distinction when a request does
+not set `timestamps`. `PYRE_PARAKEET_MAX_SYMBOLS` overrides `max_symbols_per_step` for
+experimenting; measurements at 1/2/4/10 on v3 were identical (0.082–0.087 s, same WER), so the
+checkpoint's own value stays the default. `PYRE_STT_WARMUP_SECS` (default 8) tunes the
+synthetic warm-up length; longer values did not improve total time-to-first-transcript.
+
+pyre currently registers **four** Parakeet models. The NVIDIA Hub lists more variants
+(`parakeet-tdt-1.1b`, `parakeet-rnnt-*`, `parakeet-unified-en-0.6b`, `parakeet-tdt_ctc-*`),
+but they are not in `MODEL_REGISTRY` or the converter's allow-list, so they are not loaded by
+`--stt-model`. Adding them needs per-architecture decode support and was not done here.
+
+Note: f16 weight casting in the loader is now restricted to Whisper (`Model::Whisper`).
+Parakeet's mixed device-created f32 tensors and f16 weights produced a `DTypeMismatch` panic.
+
+Reproduce:
+
+```powershell
+$env:PYRE_STT_EXPERIMENTAL = '1'
+.\target\x86_64-pc-windows-msvc\release\pyre.exe serve --stt-model parakeet-tdt-0.6b-v3 -b cuda --port 8099
+.\scripts\parakeet_compare.ps1 -File samples\speech.wav -Runs 6
+```
+
+### Per-model Whisper tuning
+
+`scripts/stt_tune.ps1` sweeps beam sizes and scores each transcript with `scripts/stt_wer.py`.
+On `samples/speech.wav` (RTX 3060, CUDA, f16) the fastest setting that reaches the model's
+best WER is:
+
+| model | default beam | median | WER | note |
+|---|---|---|---|---|
+| tiny / tiny_en | 1 | 0.14–0.16 s | 5.3% | beam does not fix "Pire"/"Fire" |
+| base / base_en | 1 | 0.16 s | 10.5% | same at every beam |
+| small / small_en | 1 | 0.34 s | 0.0% | beam 2–5 slower, no WER gain |
+| medium / medium_en | 2 | 0.76 s | 0.0% | beam 1 drops one word ("Pyr") |
+| large-v1 / v2 / v3 | 1 | 0.95–1.05 s | 0.0% | same decoder depth as v3-turbo |
+| large-v3-turbo | 1 | 0.38 s | 0.0% | beam 2–5 slower, no WER gain |
+| distil-* | 5 (library default) | — | 4.8% | no beam fixes the distilled BPE error |
+
+`src/stt.rs::default_beam` applies this when a request does not set `beam_size`; an explicit
+`beam_size` always wins. `large-v1`, `large-v2` and `large-v3` were added to the registry (the
+converter already accepted them). End-to-end check with no explicit beam:
+
+```
+tiny_en        beam=default median= 0.159s  WER 5.263% (1/19)
+small          beam=default median= 0.348s  WER 0.000% (0/19)
+large-v3       beam=default median= 1.045s  WER 0.000% (0/19)
+large-v3-turbo beam=default median= 0.401s  WER 0.000% (0/19)
+```
+
+Reproduce with a paired benchmark once both servers are up and warm:
+
+```powershell
+.\target\x86_64-pc-windows-msvc\release\pyre.exe serve --stt-model large-v3-turbo -b cuda --port 8099
+python -m uvicorn app:app --host 0.0.0.0 --port 8686   # in C:\Users\Lyam\whisper-server
+.\scripts\stt_compare.ps1 -Runs 8
+python scripts\stt_wer.py "the quick brown fox jumps over the lazy dog pyre runs speech recognition with burn on the graphics card" "<hypothesis>"
+```
+
 ## Text to speech (VITS, hand-written Burn port)
 
 `--tts-model facebook/mms-tts-eng` loads Meta's MMS English VITS (`src/tts.rs`, no burn-onnx). The

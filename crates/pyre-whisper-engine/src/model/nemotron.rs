@@ -57,6 +57,11 @@ pub struct NemotronConfig {
     pub sliding_window: usize,
     pub max_symbols: usize,
     pub blank_id: usize,
+    /// Nemotron 3.5 only: language prompt slots and projection size. Zero means the
+    /// older checkpoint, which has no prompt projector.
+    pub num_prompts: usize,
+    pub prompt_intermediate: usize,
+    pub default_prompt_id: usize,
 }
 
 impl NemotronConfig {
@@ -102,6 +107,16 @@ impl NemotronConfig {
             blank_id: self.blank_id,
             n_mels: self.n_mels,
             sub_kernel: self.sub_kernel,
+            prompt: if self.num_prompts > 0 {
+                Some(NemotronPrompt {
+                    linear1: LinearConfig::new(self.d_model + self.num_prompts, self.prompt_intermediate).init(device),
+                    linear2: LinearConfig::new(self.prompt_intermediate, self.d_model).init(device),
+                    num_prompts: self.num_prompts,
+                    default_id: self.default_prompt_id,
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -400,10 +415,39 @@ pub struct NemotronAsr {
     pub blank_id: usize,
     pub n_mels: usize,
     pub sub_kernel: usize,
+    /// Nemotron 3.5: one-hot language prompt fused into the encoder output.
+    pub prompt: Option<NemotronPrompt>,
+}
+
+#[derive(Module, Debug)]
+pub struct NemotronPrompt {
+    pub linear1: Linear,
+    pub linear2: Linear,
+    pub num_prompts: usize,
+    pub default_id: usize,
+}
+
+impl NemotronPrompt {
+    fn apply(&self, hidden: Tensor<3>, language_id: usize) -> Tensor<3> {
+        let [b, t, d] = hidden.dims();
+        let mut one_hot = Tensor::<3>::zeros([b, t, self.num_prompts], &hidden.device());
+        let id = language_id.min(self.num_prompts.saturating_sub(1));
+        one_hot = one_hot.slice_assign(
+            [0..b, 0..t, id..id + 1],
+            Tensor::ones([b, t, 1], &hidden.device()),
+        );
+        let fused = Tensor::cat(vec![hidden, one_hot], 2);
+        self.linear2.forward(relu(self.linear1.forward(fused)))
+    }
 }
 
 impl NemotronAsr {
     pub fn encode(&self, mel: Tensor<3>) -> Tensor<3> {
+        let id = self.prompt.as_ref().map(|p| p.default_id).unwrap_or(101);
+        self.encode_with_prompt(mel, id)
+    }
+
+    pub fn encode_with_prompt(&self, mel: Tensor<3>, prompt_id: usize) -> Tensor<3> {
         let [_, _, mel_t] = mel.dims();
         let x = self.sub.forward(mel);
         let valid = nemotron_subsampled_frames(mel_t, self.sub_kernel, 2, 3).min(x.dims()[1]);
@@ -416,6 +460,9 @@ impl NemotronAsr {
         for layer in &self.layers {
             h = layer.forward(h, pos.clone(), mask.clone(), valid);
         }
+        if let Some(prompt) = &self.prompt {
+            h = prompt.apply(h, prompt_id);
+        }
         self.final_proj.forward(h)
     }
 
@@ -425,8 +472,8 @@ impl NemotronAsr {
     /// No extra left-context silence. Padding ~5.6 s and then slicing it off doubled the
     /// error (LDC 27.3% → 63.6%) and dropped the first 5–15 words. The chunk mask already
     /// gives frame 0 only its own chunk, which is how this checkpoint was trained.
-    pub fn decode_rnnt(&self, mel: Tensor<3>, blank: usize, vocab: usize, max_symbols: usize) -> (Vec<usize>, Vec<usize>, usize) {
-        let enc = self.encode(mel.clone());
+    pub fn decode_rnnt(&self, mel: Tensor<3>, blank: usize, vocab: usize, max_symbols: usize, prompt_id: usize) -> (Vec<usize>, Vec<usize>, usize) {
+        let enc = self.encode_with_prompt(mel.clone(), prompt_id);
         let [_, frames, joint] = enc.dims();
         let [_, _, mel_t] = mel.dims();
         let valid = nemotron_subsampled_frames(mel_t, self.sub_kernel, 2, 3).min(frames);
@@ -439,6 +486,7 @@ impl NemotronAsr {
         let mut frames = Vec::new();
         let limit = valid.saturating_mul(max_symbols.max(1).saturating_add(1)).max(1);
         let mut steps = 0usize;
+        let mut debug_scores: Vec<(usize, f32, usize)> = Vec::new();
         while frame < valid && steps < limit {
             let enc_frame = enc.clone().slice([0..1, frame..frame + 1, 0..joint]).squeeze_dim::<2>(1);
             let update = current != blank;
@@ -453,6 +501,7 @@ impl NemotronAsr {
                     best = i;
                 }
             }
+            if debug_scores.len() < 6 { debug_scores.push((best, best_s, frame)); }
             if best == blank {
                 frame += 1;
                 symbols = 0;
@@ -468,6 +517,9 @@ impl NemotronAsr {
                 }
             }
             steps += 1;
+        }
+        if std::env::var("PYRE_STT_DEBUG_TOKENS").is_ok() {
+            eprintln!("NEMOTRON DEBUG prompt_id={prompt_id} valid={valid} steps={steps} tokens={:?} last_scores={:?}", &decoded[..decoded.len().min(40)], &debug_scores[..debug_scores.len().min(6)]);
         }
         (decoded, frames, valid)
     }
@@ -544,6 +596,9 @@ mod tests {
             sliding_window: 5,
             max_symbols: 4,
             blank_id: 19,
+            num_prompts: 0,
+            prompt_intermediate: 0,
+            default_prompt_id: 101,
         };
         let model = cfg.init(&device);
         let mel = Tensor::<3>::zeros([1, 16, 20], &device);

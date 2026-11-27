@@ -5,7 +5,7 @@ use crate::model::conformer::FeedForwardModule;
 use crate::model::load::components::{load_conv1d, load_conv2d, load_layer_norm, load_linear};
 use crate::model::load::helpers::{load_tensor, load_usize};
 use crate::model::load::parakeet::load_parakeet_decoder;
-use crate::model::nemotron::{NemotronAsr, NemotronAttention, NemotronBlock, NemotronConfig, NemotronConv};
+use crate::model::nemotron::{NemotronAsr, NemotronAttention, NemotronBlock, NemotronConfig, NemotronConv, NemotronPrompt};
 use std::error::Error;
 
 pub fn load_nemotron(path: &str, device: &burn::tensor::Device) -> Result<(NemotronAsr, NemotronConfig), Box<dyn Error>> {
@@ -24,6 +24,9 @@ pub fn load_nemotron(path: &str, device: &burn::tensor::Device) -> Result<(Nemot
     let decoder_layers = load_usize("decoder_layers", &enc, device).unwrap_or(2);
     let max_symbols = load_usize("max_symbols", &enc, device).unwrap_or(10);
     let blank_id = load_usize("blank_id", &enc, device).unwrap_or(1024);
+    let num_prompts = load_usize("num_prompts", &enc, device).unwrap_or(0);
+    let prompt_intermediate = load_usize("prompt_intermediate", &enc, device).unwrap_or(2048);
+    let default_prompt_id = load_usize("default_prompt_id", &enc, device).unwrap_or(101);
     let joint_w = load_tensor::<2>("weight", &format!("{path}/ctc_linear"), device)?;
     let n_vocab = joint_w.dims()[1];
 
@@ -43,6 +46,9 @@ pub fn load_nemotron(path: &str, device: &burn::tensor::Device) -> Result<(Nemot
         sliding_window,
         max_symbols,
         blank_id,
+        num_prompts,
+        prompt_intermediate,
+        default_prompt_id,
     };
     let mut model = cfg.clone().init(device);
     model.sub.conv_in = load_causal2d(&format!("{enc}/sub/conv_in"), 1, device)?;
@@ -67,6 +73,22 @@ pub fn load_nemotron(path: &str, device: &burn::tensor::Device) -> Result<(Nemot
     drop(joint_w);
     model.joint = load_linear(&format!("{path}/ctc_linear"), jin, jout, device)?;
     model.decoder = load_parakeet_decoder(path, device)?.ok_or("nemotron checkpoint has no LSTM decoder")?;
+    if num_prompts > 0 {
+        let w1 = load_tensor::<2>("weight", &format!("{path}/prompt_projector/linear1"), device)?;
+        let [i1, o1] = w1.dims();
+        drop(w1);
+        let linear1 = load_linear(&format!("{path}/prompt_projector/linear1"), i1, o1, device)?;
+        let w2 = load_tensor::<2>("weight", &format!("{path}/prompt_projector/linear2"), device)?;
+        let [i2, o2] = w2.dims();
+        drop(w2);
+        let linear2 = load_linear(&format!("{path}/prompt_projector/linear2"), i2, o2, device)?;
+        model.prompt = Some(NemotronPrompt {
+            linear1,
+            linear2,
+            num_prompts,
+            default_id: default_prompt_id,
+        });
+    }
     Ok((model, cfg))
 }
 

@@ -207,6 +207,8 @@ button[data-avail="0"]:hover, [data-avail="0"]:hover { /* title carries reason *
 .seg-btn:last-child { border-right: 0; }
 .seg-btn.active { background: rgba(80,140,255,.18); font-weight: 600; }
 .seg-btn:hover:not(.active) { background: rgba(127,127,127,.1); }
+.seg-btn.cap-off { opacity: .4; cursor: not-allowed; pointer-events: none; }
+.cap-tested { color: #7ee2a8; }
 .dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 120px; padding: 20px; border: 2px dashed var(--border, #444); border-radius: 12px; cursor: pointer; text-align: center; background: rgba(127,127,127,.04); transition: border-color .15s, background .15s; }
 .dropzone:hover, .dropzone.drag { border-color: #508cff; background: rgba(80,140,255,.08); }
 .dropzone.has-file { border-style: solid; }

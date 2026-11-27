@@ -40,21 +40,30 @@ async fn list_models(State(app): S) -> Response {
                 json!({
                     "id": m.name, "hf": m.hf_id, "description": m.description, "tagline": m.tagline,
                     "vram_mb": m.vram_mb, "present": present,
+                    "officially_supported": crate::speech_caps::OFFICIALLY_SUPPORTED.contains(&m.name),
                     "loaded": loaded.iter().any(|id| id == m.name || id.contains(m.name)),
                     "size": format!("{:?}", m.size).to_ascii_lowercase(),
                     "quality": format!("{:?}", m.quality).to_ascii_lowercase(),
                     "capabilities": {
                         "summary": format!("audio in, text out, {}", speech.brief()),
                         "speech": speech.to_json(),
+                        "tuning": {
+                            "beam_size": crate::stt::default_beam(m.name),
+                            "beam_adjustable": speech.family == "whisper",
+                            "timestamps": crate::stt::default_include_timestamps(m.name),
+                        },
                     },
                 })
             }).collect();
+        let first = loaded.first().cloned().unwrap_or_else(|| "base".into());
         return Json(json!({
             "models": models, "loaded": loaded,
             "formats": ["json","txt","srt","vtt","verbose_json","whisburn_json"],
-            "defaults": { "model": loaded.first().cloned().unwrap_or_else(|| "base".into()),
-                "format": "verbose_json", "language": "", "timestamps": true,
-                "beam_size": 5, "max_tokens": 448, "sentences": false, "diarize": false, "task": "transcriptions" }
+            "defaults": { "model": first,
+                "format": "verbose_json", "language": "",
+                "timestamps": crate::stt::default_include_timestamps(&first),
+                "beam_size": crate::stt::default_beam(&first),
+                "max_tokens": 448, "sentences": false, "diarize": false, "task": "transcriptions" }
         })).into_response();
     }
     #[cfg(not(feature = "stt"))]
@@ -119,6 +128,6 @@ async fn start_job_async(State(app): S, mp: Multipart) -> Response {
 
 pub fn routes(r: Router<Arc<App>>) -> Router<Arc<App>> {
     r.route("/api/audio/models", axum::routing::get(list_models))
-        .route("/api/audio/jobs", axum::routing::post(start_job_async).layer(axum::extract::DefaultBodyLimit::max(128 << 20)))
+        .route("/api/audio/jobs", axum::routing::post(start_job_async).layer(axum::extract::DefaultBodyLimit::max(2 << 30)))
         .route("/api/audio/jobs/cancel", axum::routing::post(cancel_job))
 }

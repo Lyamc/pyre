@@ -1,6 +1,6 @@
 use burn::{
     module::Module,
-    tensor::{Tensor},
+    tensor::{FloatDType, Tensor},
     config::Config,
 };
 use crate::model::*;
@@ -17,6 +17,13 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
+
+/// Whisper runs in f16 on CUDA by default (the same precision faster-whisper uses).
+/// Opt out with `PYRE_STT_F16=0`.
+fn stt_f16(device: &burn::tensor::Device) -> bool {
+    !matches!(std::env::var("PYRE_STT_F16").as_deref(), Ok("0" | "false" | "off"))
+        && format!("{device:?}").to_ascii_lowercase().contains("cuda")
+}
 
 pub fn load_model_from_npy(
     path: &str,
@@ -71,6 +78,9 @@ pub fn load_model_from_npy(
         }
         return Err("Model loaded successfully but architecture is not yet implemented in Burn.".into());
     } else {
+        // Keep this path as the plain npy load: the model converter writes the bundle from
+        // it, so fusing here would persist qkv tensors that the runtime bundle loader does
+        // not expect. Runtime fuses after `try_load_file` instead.
         let (whisper, config) = load_whisper(path, device)?;
         Ok((Model::Whisper(whisper), ModelConfig::Whisper(config)))
     }
@@ -194,13 +204,21 @@ pub fn load_model(
     pb.set_message(format!("Loading model weights from {}...", final_path.display()));
     // Burnpack (`model.bpk`), written by pyre's converter with the workspace Burn. Burn 0.21
     // `.mpk` recorder bundles are not readable by this Burn; they are re-converted from HF.
-    let model: Model = match model_config.init(device).try_load_file(&final_path) {
+    let mut model: Model = match model_config.init(device).try_load_file(&final_path) {
         Ok(m) => m,
         Err(e) => {
             pb.finish_and_clear();
             return Err(format!("Failed to load model weights {}: {e:?}", final_path.display()).into());
         }
     };
+    if let Model::Whisper(whisper) = &mut model {
+        whisper.fuse_qkv(device);
+    }
+    // Only Whisper has an all-f16 forward path; the other families mix device-created f32
+    // tensors with weights and would fail with a dtype mismatch.
+    if matches!(model, Model::Whisper(_) | Model::Qwen3(_)) && stt_f16(device) {
+        model = model.cast_float(FloatDType::F16);
+    }
     pb.set_message("Moving model to device...");
     let mut model = model.to_device(device);
     if dir.join("fluid").exists() {

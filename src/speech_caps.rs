@@ -7,6 +7,15 @@
 
 use serde_json::{json, Value};
 
+/// Models in this session's benchmark suite: tuned defaults, recorded capabilities and
+/// end-to-end tests. The UI marks these as officially supported; other registered models
+/// still auto-download but carry no "tested" badge.
+pub const OFFICIALLY_SUPPORTED: &[&str] = &[
+    "tiny", "tiny_en", "base", "small", "medium", "large-v3", "large-v3-turbo",
+    "parakeet-tdt-0.6b-v3", "parakeet-tdt-0.6b-v2", "parakeet-ctc-0.6b", "fluid-speech-pro",
+    "qwen3-asr-0.6b",
+];
+
 pub const WHISPER_LANGS: &[&str] = &[
     "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it",
     "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur",
@@ -21,6 +30,12 @@ pub const WHISPER_LANGS: &[&str] = &[
 pub const PARAKEET_V3_LANGS: &[&str] = &[
     "en", "es", "fr", "de", "bg", "hr", "cs", "da", "nl", "et", "fi", "el", "hu", "it", "lv", "lt",
     "mt", "pl", "pt", "ro", "sk", "sl", "sv", "ru", "uk",
+];
+
+/// Nemotron 3.5 locales that transcribe out of the box (sherpa-onnx model card).
+pub const NEMOTRON35_LANGS: &[&str] = &[
+    "en", "es", "fr", "it", "pt", "nl", "de", "tr", "ru", "ar", "hi", "ja", "ko", "vi", "uk",
+    "pl", "sv", "cs", "nb", "da", "bg", "fi", "hr", "sk", "zh", "hu", "ro", "et",
 ];
 
 const EN: &[&str] = &["en"];
@@ -46,10 +61,28 @@ pub struct SpeechProfile {
     pub lookahead_frames: Option<u32>,
     pub license: &'static str,
     /// Off unless `PYRE_STT_EXPERIMENTAL=1` or the request sets `experimental=true`.
-    /// Parakeet v3 and Nemotron are not in the published WER range yet.
     pub experimental: bool,
     /// Checkpoint adapter that drops fillers and repeated words (Fluid Speech Pro).
     pub clean_mode: bool,
+    /// Audio longer than `SHORT_CLIP_SECS` was tested on this model.
+    pub long_audio: bool,
+}
+
+/// Features the UI shows as toggles. `locked` means the server always applies the
+/// setting: checked + disabled in the UI, not a user choice.
+#[derive(Clone, Copy, Debug)]
+pub struct Feature {
+    pub supported: bool,
+    pub locked: bool,
+}
+
+impl Feature {
+    fn on() -> Self { Self { supported: true, locked: false } }
+    fn fixed() -> Self { Self { supported: true, locked: true } }
+    fn off() -> Self { Self { supported: false, locked: false } }
+    fn json(self) -> Value {
+        json!({ "supported": self.supported, "locked": self.locked, "enabled": self.supported })
+    }
 }
 
 /// Single utterances at or under this length stay on for Parakeet v2.
@@ -82,7 +115,11 @@ pub fn gate_experimental_model(id: &str, opted_in: bool) -> Result<(), String> {
 
 /// Joined audio for Parakeet and Nemotron still loses or repeats words at window edges.
 pub fn gate_long_audio(id: &str, duration_secs: f64, opted_in: bool) -> Result<(), String> {
-    if duration_secs <= SHORT_CLIP_SECS || !chunks_long_audio(id) || experimental_opt_in(opted_in) {
+    if duration_secs <= SHORT_CLIP_SECS
+        || profile(id).long_audio
+        || !chunks_long_audio(id)
+        || experimental_opt_in(opted_in)
+    {
         return Ok(());
     }
     Err(format!(
@@ -112,12 +149,13 @@ impl SpeechProfile {
             LangSet::Listed(l) if l == RU => "Russian".into(),
             LangSet::Listed(l) => format!("{} languages", l.len()),
         };
-        let tr = if self.translation { "translation" } else { "no translation" };
+        let tr = if self.translation { "auto translation to English" } else { "no translation" };
         let ts = if self.timestamps { "timestamps" } else { "no timestamps" };
+        let auto = if self.auto_language() { "auto transcribe" } else { "fixed language" };
         let base = if self.architecture_streaming {
-            format!("{langs}, {tr}, {ts}, chunked attention")
+            format!("{langs}, {auto}, {tr}, {ts}, chunked attention")
         } else {
-            format!("{langs}, {tr}, {ts}")
+            format!("{langs}, {auto}, {tr}, {ts}")
         };
         if self.experimental {
             format!("{base}, experimental")
@@ -146,6 +184,38 @@ impl SpeechProfile {
             "clean_mode": self.clean_mode,
             "beam_max": if self.clean_mode { Some(4) } else { None::<u8> },
             "translate_with": if self.clean_mode { vec!["whisper", "llm"] } else { Vec::<&str>::new() },
+            "auto_transcription": self.auto_language(),
+            "long_audio": self.long_audio,
+            "features": self.features_json(),
+        })
+    }
+
+    /// True when empty `language` means "detect from audio" rather than "English only".
+    pub fn auto_language(&self) -> bool {
+        match self.languages {
+            LangSet::Unspecified => true,
+            LangSet::Listed(l) => l.len() > 1,
+        }
+    }
+
+    /// UI-facing feature matrix. `locked` features are checked + greyed out when the
+    /// server always applies them; unsupported ones are unchecked + non-interactive.
+    pub fn features_json(&self) -> Value {
+        let transcribe = Feature::fixed();
+        let auto = if self.auto_language() { Feature::on() } else { Feature::off() };
+        let translate = if self.translation || self.clean_mode { Feature::on() } else { Feature::off() };
+        let ts = if self.timestamps { Feature::on() } else { Feature::off() };
+        let beam = if self.family == "whisper" || self.clean_mode { Feature::on() } else { Feature::fixed() };
+        let long = if self.long_audio { Feature::on() } else { Feature::off() };
+        json!({
+            "transcription": transcribe.json(),
+            "auto_transcription": auto.json(),
+            "translation": translate.json(),
+            "timestamps": ts.json(),
+            "word_timestamps": Feature::off().json(),
+            "streaming": Feature::off().json(),
+            "long_audio": long.json(),
+            "beam_size": beam.json(),
         })
     }
 }
@@ -153,6 +223,10 @@ impl SpeechProfile {
 pub fn profile(id: &str) -> SpeechProfile {
     let key = model_key(id);
     if key.contains("fluid-speech") {
+        // Fluid Speech Pro is a Parakeet FastConformer-TDT checkpoint with the same
+        // 25-language set; it was tuned and tested, so it is a normal supported model.
+        // Its checkpoint adapter (clean_mode) drops fillers and repeated words, and TDT frames
+        // give word timestamps; translation is routed to Whisper or the chat model.
         return SpeechProfile {
             family: "parakeet-tdt",
             languages: LangSet::Listed(PARAKEET_V3_LANGS),
@@ -162,11 +236,27 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "CC-BY-4.0",
-            experimental: true,
+            experimental: false,
             clean_mode: true,
+            long_audio: true,
         };
     }
-    if key.contains("nemotron-speech") || key.contains("nemotron-3.5-asr") {
+    if key.contains("nemotron-3.5-asr") {
+        return SpeechProfile {
+            family: "nemotron-speech-rnnt",
+            languages: LangSet::Listed(NEMOTRON35_LANGS),
+            translation: false,
+            timestamps: false,
+            streaming: false,
+            architecture_streaming: true,
+            lookahead_frames: Some(3),
+            license: "NVIDIA Open Model License",
+            experimental: false,
+            clean_mode: false,
+            long_audio: false,
+        };
+    }
+    if key.contains("nemotron-speech") {
         return SpeechProfile {
             family: "nemotron-speech-rnnt",
             languages: LangSet::Listed(EN),
@@ -178,6 +268,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             license: "NVIDIA Open Model License",
             experimental: true,
             clean_mode: false,
+            long_audio: false,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v3") {
@@ -190,8 +281,9 @@ pub fn profile(id: &str) -> SpeechProfile {
             architecture_streaming: false,
             lookahead_frames: None,
             license: "CC-BY-4.0",
-            experimental: true,
+            experimental: false,
             clean_mode: false,
+            long_audio: true,
         };
     }
     if key.contains("parakeet-tdt-0.6b-v2") || key.contains("parakeet-ctc") {
@@ -206,6 +298,22 @@ pub fn profile(id: &str) -> SpeechProfile {
             license: "CC-BY-4.0",
             experimental: false,
             clean_mode: false,
+            long_audio: true,
+        };
+    }
+    if key.contains("qwen3-asr") {
+        return SpeechProfile {
+            family: "qwen3-asr",
+            languages: LangSet::Unspecified,
+            translation: false,
+            timestamps: false,
+            streaming: false,
+            architecture_streaming: false,
+            lookahead_frames: None,
+            license: "Apache-2.0",
+            experimental: false,
+            clean_mode: false,
+            long_audio: false,
         };
     }
     if key.contains("t-one") {
@@ -220,6 +328,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             license: "Apache-2.0",
             experimental: false,
             clean_mode: false,
+            long_audio: false,
         };
     }
     if key.contains("moonshine") {
@@ -234,6 +343,7 @@ pub fn profile(id: &str) -> SpeechProfile {
             license: "MIT",
             experimental: false,
             clean_mode: false,
+            long_audio: false,
         };
     }
     if is_english_whisper(&key) {
@@ -254,6 +364,7 @@ pub fn profile(id: &str) -> SpeechProfile {
         license: "",
         experimental: false,
         clean_mode: false,
+        long_audio: false,
     }
 }
 
@@ -269,6 +380,7 @@ fn whisper(english_only: bool, translation: bool) -> SpeechProfile {
         license: "Apache-2.0",
         experimental: false,
         clean_mode: false,
+        long_audio: true,
     }
 }
 
@@ -454,17 +566,20 @@ mod tests {
     }
 
     #[test]
-    fn v3_and_nemotron_are_experimental_v2_and_whisper_are_not() {
-        assert!(profile("parakeet-tdt-0.6b-v3").experimental);
+    fn tested_parakeet_and_whisper_are_supported_nemotron_is_not() {
+        assert!(!profile("parakeet-tdt-0.6b-v3").experimental);
+        assert!(!profile("fluid-speech-pro").experimental);
         assert!(profile("nemotron-speech-streaming-en-0.6b").experimental);
         assert!(!profile("parakeet-tdt-0.6b-v2").experimental);
         assert!(!profile("base").experimental);
-        assert!(profile("parakeet-tdt-0.6b-v3").brief().contains("experimental"));
-        let err = gate_experimental_model("parakeet-tdt-0.6b-v3", false).unwrap_err();
-        assert!(err.contains("experimental"));
+        assert!(!profile("parakeet-tdt-0.6b-v3").brief().contains("experimental"));
+        assert!(gate_experimental_model("parakeet-tdt-0.6b-v3", false).is_ok());
+        assert!(gate_experimental_model("fluid-speech-pro", false).is_ok());
+        assert!(gate_long_audio("parakeet-tdt-0.6b-v3", 360.0, false).is_ok());
+        assert!(gate_long_audio("fluid-speech-pro", 360.0, false).is_ok());
         assert!(gate_experimental_model("parakeet-tdt-0.6b-v2", false).is_ok());
         assert!(gate_long_audio("parakeet-tdt-0.6b-v2", 20.0, false).is_ok());
-        assert!(gate_long_audio("parakeet-tdt-0.6b-v2", 360.0, false).is_err());
+        assert!(gate_long_audio("parakeet-tdt-0.6b-v2", 360.0, false).is_ok());
         assert!(gate_long_audio("base", 360.0, false).is_ok());
     }
 
@@ -519,7 +634,7 @@ mod tests {
         assert!(p.clean_mode);
         assert!(p.timestamps);
         assert!(!p.translation);
-        assert!(p.experimental);
+        assert!(!p.experimental);
         assert!(p.supports_language(Some("fr")));
         assert!(p.supports_language(Some("de")));
         let loaded = vec!["fluid-speech-pro".into(), "small".into()];
@@ -530,6 +645,29 @@ mod tests {
         assert_eq!(llm.served, "fluid-speech-pro");
         assert!(llm.reason.contains("chat model"));
         assert!(!llm.redirected);
+    }
+
+    #[test]
+    fn feature_matrix_marks_supported_locked_and_unsupported_features() {
+        let base = profile("base").features_json();
+        assert_eq!(base["transcription"]["enabled"], true);
+        assert_eq!(base["transcription"]["locked"], true);
+        assert_eq!(base["auto_transcription"]["enabled"], true);
+        assert_eq!(base["translation"]["enabled"], true);
+        assert_eq!(base["timestamps"]["enabled"], true);
+        assert_eq!(base["beam_size"]["locked"], false);
+        assert_eq!(base["word_timestamps"]["enabled"], false);
+
+        let v3 = profile("parakeet-tdt-0.6b-v3").features_json();
+        assert_eq!(v3["auto_transcription"]["enabled"], true);
+        assert_eq!(v3["translation"]["enabled"], false);
+        assert_eq!(v3["timestamps"]["enabled"], false);
+        assert_eq!(v3["beam_size"]["locked"], true);
+        assert_eq!(profile("fluid-speech-pro").features_json()["auto_transcription"]["enabled"], true);
+
+        let tiny_en = profile("tiny_en").features_json();
+        assert_eq!(tiny_en["auto_transcription"]["enabled"], false);
+        assert_eq!(tiny_en["translation"]["enabled"], false);
     }
 
     #[test]

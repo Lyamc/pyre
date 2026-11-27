@@ -117,7 +117,7 @@ pub fn load_multihead_attention(
 ) -> Result<MultiHeadAttention, Box<dyn Error>> {
     let n_head: usize = load_usize("n_head", path, device)?;
     let query = load_linear(&format!("{}/{}", path, "query"), n_state, n_state, device)?;
-    
+
     // Key bias is optional in many Whisper models
     let key_path = format!("{}/{}", path, "key");
     let key_weight = load_tensor::<2>("weight", &key_path, device)?;
@@ -132,8 +132,8 @@ pub fn load_multihead_attention(
 
     let value = load_linear(&format!("{}/{}", path, "value"), n_state, n_state, device)?;
     let out = load_linear(&format!("{}/{}", path, "out"), n_state, n_state, device)?;
-    
-    Ok(MultiHeadAttention { n_head, query, key, value, out })
+
+    Ok(MultiHeadAttention { n_head, query, key, value, qkv: None, out })
 }
 
 pub fn load_rel_pos_multihead_attention(
@@ -246,7 +246,7 @@ pub fn load_multihead_cross_attention(path: &str, n_state: usize, device: &burn:
     let key = load_linear(&format!("{}/{}", path, "key"), n_state, n_state, device)?;
     let value = load_linear(&format!("{}/{}", path, "value"), n_state, n_state, device)?;
     let out = load_linear(&format!("{}/{}", path, "out"), n_state, n_state, device)?;
-    Ok(MultiHeadCrossAttention { n_head, query, key, value, out })
+    Ok(MultiHeadCrossAttention { n_head, query, key, value, qkv: None, out })
 }
 
 pub fn load_mlp(path: &str, n_state: usize, device: &burn::tensor::Device) -> Result<MLP, Box<dyn Error>> {
