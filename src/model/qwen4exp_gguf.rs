@@ -177,6 +177,26 @@ fn wflush() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock:
 fn vgraph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_VGRAPH").map(|v| v != "0").unwrap_or(true)) && !VGRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct LGraph { xn: H, da: H, mixed: H, proj: H, o: H, co: H, ob: H, df: H, rd: H, g: Option<burn_cubecl::cubecl::client::Graph>, key: String, keep: Vec<H> }
 type H = burn_cubecl::cubecl::server::Handle;
+
+/// Floats [a, b) of `h`. kv_pull used to read the whole cap-sized K/V/ik buffers (all layers) to append only the
+/// positions the host lacks; this reads just that window through an offset handle, so a prefix-cache snapshot after
+/// a prefill moves the new rows instead of the full context. PYRE_QN_KVPULL_FULL=1: the old full read.
+/// PYRE_QN_KVPULL_VERIFY=1: also do the full read, compare, and warn on any mismatch (for the first runs).
+fn kv_read_range(cb: &super::qn_cube::Cube, h: &H, a: usize, b: usize) -> Vec<f32> {
+    static M: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (full, verify) = *M.get_or_init(|| (env_var("PYRE_QN_KVPULL_FULL").map_or(false, |v| v == "1"), env_var("PYRE_QN_KVPULL_VERIFY").map_or(false, |v| v == "1")));
+    if b <= a { return vec![]; }
+    let used = h.size_in_used() as usize;
+    if full || b * 4 > used { return cb.read(h)[a..b].to_vec(); }
+    let v = cb.read(&h.clone().offset_start((a * 4) as u64).offset_end((used - b * 4) as u64));
+    // a backend that ignored an offset would return the wrong length: fall back to the full read (warn once)
+    if v.len() != b - a { static W: std::sync::Once = std::sync::Once::new(); W.call_once(|| tracing::warn!("kv_read_range: ranged read returned {} floats, want {}; using full reads", v.len(), b - a)); return cb.read(h)[a..b].to_vec(); }
+    if verify {
+        let f = cb.read(h);
+        if v.len() != b - a || f[a..b] != v[..] { tracing::warn!("PYRE_QN_KVPULL_VERIFY: ranged read [{a}, {b}) differs from the full read (len {} vs {})", v.len(), b - a); return f[a..b].to_vec(); }
+    }
+    v
+}
 static GRAPH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn graph_on() -> bool { static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *G.get_or_init(|| env_var("PYRE_QN_GRAPH").map(|v| v == "1").unwrap_or(false)) && !GRAPH_OFF.load(std::sync::atomic::Ordering::Relaxed) }
 pub struct Model { mtp_gkv: std::sync::Mutex<Option<super::mtp::GRing>>, vg: std::sync::Mutex<std::collections::HashMap<(usize, usize), VGraph>>, vxs: std::sync::Mutex<std::collections::HashMap<usize, Vec<H>>>, mtp_headc: std::sync::OnceLock<Option<super::qn_cube::CMat>>, mtp_dense: std::sync::OnceLock<std::collections::HashMap<usize, super::qn_cube::CMat>>, xpk: std::sync::Mutex<XPk>, xper: std::sync::Mutex<Option<H>>, lg: std::sync::Mutex<std::collections::HashMap<usize, LGraph>>, headc: Option<super::qn_cube::CMat>, xc: Option<std::sync::Mutex<XCache>>, cube: Option<super::qn_cube::Cube>, cl: Vec<Option<super::qn_cube::CLayer>>, pub gpu: Option<super::qn_gpu::Gpu>, gmats: std::collections::HashMap<usize, super::qn_gpu::GMat>, gl: Vec<Option<super::qn_gpu::GLayer>>, pub cfg: Cfg, pub g: Gguf, embd: QMat, out: QMat, head: Hc, ple_tab: Option<QMat>, layers: Vec<Layer>, rope_inv: Vec<f32>, rope_mscale: f32, mtp: Option<super::mtp::Mtp> }
@@ -1452,8 +1472,9 @@ impl Model {
         { let row = self.cfg.n_kv * self.cfg.hd; let hl = st.k[ai].len() / row; if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get_mut(ai)) { if hl < g.q8n { kv8_drop(cb, g, row, "host behind int8 region"); } } }
         let row = self.cfg.n_kv * self.cfg.hd;
         if let (Some(cb), Some(Some(g))) = (&self.cube, st.kvg.get(ai)) { let cl = st.k[ai].len() / row;
-            if g.len > cl { let o = g.q8n; let (kk, vv) = (cb.read(&g.k), cb.read(&g.v)); st.k[ai].extend_from_slice(&kk[(cl - o) * row..(g.len - o) * row]); st.v[ai].extend_from_slice(&vv[(cl - o) * row..(g.len - o) * row]);
-                let ih = self.cfg.idx_hd; if self.has_idx() { let ii = cb.read(&g.ik); st.ik[ai].extend_from_slice(&ii[cl * ih..g.len * ih]); } } }
+            if g.len > cl { let o = g.q8n; let (a, b) = ((cl - o) * row, (g.len - o) * row);
+                st.k[ai].extend_from_slice(&kv_read_range(cb, &g.k, a, b)); st.v[ai].extend_from_slice(&kv_read_range(cb, &g.v, a, b));
+                let ih = self.cfg.idx_hd; if self.has_idx() { st.ik[ai].extend_from_slice(&kv_read_range(cb, &g.ik, cl * ih, g.len * ih)); } } }
     }
     /// int45f: can this attention layer keep (or grow) its KV on the GPU for `need` positions without going under the
     /// VRAM floor? If not, the KV is pulled to the host and dropped, and attention runs on the CPU (attn_core) for this
