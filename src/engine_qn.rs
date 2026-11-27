@@ -111,12 +111,39 @@ fn pcache_mb() -> usize { std::env::var("PYRE_QN_PCACHE_MB").ok().and_then(|v| v
 /// server arguments, tokenizer and prefill chunk; a file with another key is ignored.
 fn pdisk_dir() -> Option<std::path::PathBuf> { std::env::var("PYRE_QN_PCACHE_DIR").ok().filter(|s| !s.trim().is_empty()).map(|s| s.trim().into()) }
 fn pdisk_n() -> usize { std::env::var("PYRE_QN_PCACHE_DISK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2) }
-fn pdisk_key() -> u64 {
+/// Snapshot key over the server arguments that can change the LLM state: arguments that only pick audio/image/tagger
+/// models or the listen address (see `llm_args`) are left out, so adding an STT model keeps the prefix cache (int78).
+fn pdisk_key() -> u64 { pdisk_key_of(llm_args(std::env::args().skip(1))) }
+/// The key before int78 (every argument); still accepted when loading so the first int78 start keeps the cache.
+fn pdisk_key_legacy() -> u64 { pdisk_key_of(std::env::args().skip(1).collect()) }
+fn pdisk_key_of(args: Vec<String>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new(); "PYSNAP01".hash(&mut h);
-    for a in std::env::args().skip(1) { a.hash(&mut h); }
+    for a in args { a.hash(&mut h); }
     for k in ["PYRE_QN_TOKENIZER", "PYRE_PREFILL_CHUNK", "PYRE_QN_BPG_CHUNK", "PYRE_QN_PF_MULTI", "PYRE_QN_BPF"] { std::env::var(k).unwrap_or_default().hash(&mut h); }
     h.finish()
+}
+/// Server arguments minus the ones that cannot change the LLM's state: `--load kind=ref` for kind != llm, the
+/// stt/tts/image/tagger model flags, host/port/metrics address, alias and API key (both `--flag v` and `--flag=v`).
+/// Everything else (model, backend, context, unknown flags) stays in the key.
+fn llm_args(args: impl Iterator<Item = String>) -> Vec<String> {
+    const DROP: &[&str] = &["--stt-model", "--tts-model", "--image-model", "--tagger-model", "--host", "--port", "--metrics-bind", "-a", "--alias", "--api-key"];
+    let args: Vec<String> = args.collect(); let mut out = Vec::with_capacity(args.len()); let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (flag, inline) = match a.split_once('=') { Some((f, v)) if f.starts_with('-') => (f, Some(v.to_string())), _ => (a.as_str(), None) };
+        let has_val = inline.is_none() && i + 1 < args.len();
+        if DROP.contains(&flag) { i += if has_val { 2 } else { 1 }; continue; }
+        if flag == "--load" {
+            let v = inline.or_else(|| if has_val { Some(args[i + 1].clone()) } else { None }).unwrap_or_default();
+            let llm = v.split_once('=').map_or(true, |(k, _)| k.trim().eq_ignore_ascii_case("llm") || k.split(':').next().map_or(false, |k| k.eq_ignore_ascii_case("llm")));
+            let step = if a.contains('=') && a.starts_with("--load=") { 1 } else if has_val { 2 } else { 1 };
+            if llm { out.extend(args[i..i + step].iter().cloned()); }
+            i += step; continue;
+        }
+        out.push(a.clone()); i += 1;
+    }
+    out
 }
 fn tok_hash(t: &[u32]) -> u64 { use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); t.hash(&mut h); h.finish() }
 fn pdisk_files(d: &std::path::Path) -> Vec<(std::time::SystemTime, std::path::PathBuf)> {
@@ -127,7 +154,7 @@ fn pdisk_files(d: &std::path::Path) -> Vec<(std::time::SystemTime, std::path::Pa
 fn pdisk_load(d: &std::path::Path, key: u64, pc: &mut Vec<Snap>, saved: &mut std::collections::HashSet<u64>) {
     let t = std::time::Instant::now(); let cap = pcache_mb() << 20; let mut got: Vec<Snap> = vec![];
     for (_, p) in pdisk_files(d).into_iter().take(pdisk_n()) {
-        match Snap::load(&p, key) {
+        match Snap::load(&p, key).or_else(|e| if e.to_string().contains("key mismatch") { Snap::load(&p, pdisk_key_legacy()) } else { Err(e) }) {
             Ok(s) => { if got.iter().map(|s| s.bytes).sum::<usize>() + s.bytes > cap && !got.is_empty() { break; } saved.insert(tok_hash(&s.tokens)); got.push(s); }
             Err(e) => tracing::warn!("prefix cache: skip {}: {e}", p.display()),
         }
@@ -326,4 +353,18 @@ impl crate::spec::Target for QnTarget<'_> {
     fn can_verify(&self) -> bool { self.m.multi_ok() }
     fn max_window(&self) -> usize { self.m.spec_max_window() }
     fn draft(&mut self, history: &[u32], k: usize, s: Option<&mut Sampler>) -> Option<Vec<(u32, Option<Vec<(u32, f32)>>)>> { self.m.mtp_draft(self.st, history, k, s) }
+}
+
+#[cfg(test)]
+mod pcache_key_tests {
+    fn v(s: &str) -> Vec<String> { s.split(' ').map(String::from).collect() }
+    #[test]
+    fn audio_and_address_args_do_not_change_the_llm_args() {
+        let a = super::llm_args(v("serve -m M -a A --host 0.0.0.0 --port 8099 -c 65536 -b cuda --load stt:cpu=base --load stt:cpu=fluid-speech-pro").into_iter());
+        let b = super::llm_args(v("serve -m M -a B --host 127.0.0.1 --port 8100 -c 65536 -b cuda --load stt:cpu=base --load stt:cpu=large-v3-turbo --load=tts=x --stt-model y").into_iter());
+        assert_eq!(a, b);
+        assert_eq!(a, v("serve -m M -c 65536 -b cuda"));
+        let c = super::llm_args(v("serve -m M -c 32768 -b cuda --load llm=other").into_iter());
+        assert_eq!(c, v("serve -m M -c 32768 -b cuda --load llm=other"));
+    }
 }
